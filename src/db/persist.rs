@@ -887,9 +887,10 @@ impl Database {
         let meta: Meta = fsutil::read_bincode(&dir.join(META_FILE))?;
         let dict: Dictionary = fsutil::read_bincode(&dir.join(DICT_FILE))?;
         let store: TripleStore = fsutil::read_bincode(&dir.join(STORE_FILE))?;
-        // Named graphs are optional (older databases / no GRAPH data).
-        let named: BTreeMap<u32, TripleStore> =
-            fsutil::read_bincode(&dir.join(NAMED_FILE)).unwrap_or_default();
+        // Only a missing named.bin means "no named graphs" (databases written
+        // before named graphs existed); any other read error fails the open
+        // (review db#1 / robust#4 / durability#3).
+        let named = Database::read_named_graphs(dir)?;
         // Sanity check that the snapshot is internally consistent.
         if store.triple_count() != meta.triple_num {
             return Err(GStoreError::Database(format!(
@@ -930,6 +931,35 @@ impl Database {
         db.index_valid = true;
         db.home = Some(dir.to_path_buf());
         Ok(db)
+    }
+
+    /// The named graphs stored in `dir`'s `named.bin`.
+    ///
+    /// Every snapshot save writes `named.bin`, so only a database written
+    /// before named graphs existed lacks it: a missing file (and only that —
+    /// not a dangling symlink) reads as "no named graphs". Every other error
+    /// — EIO, EACCES, EMFILE, a truncated or undecodable file — is returned
+    /// with the file's path: treating it as "no named graphs" would let the
+    /// next save or `gcompact --reclaim` overwrite the graphs with an empty
+    /// map and free their terms (review db#1 / robust#4 / durability#3). The
+    /// snapshot format records no per-member length or checksum, so a file
+    /// that decodes is trusted as it is.
+    pub(super) fn read_named_graphs(dir: &Path) -> Result<BTreeMap<u32, TripleStore>> {
+        let path = dir.join(NAMED_FILE);
+        match fsutil::read_bincode(&path) {
+            Ok(named) => Ok(named),
+            Err(GStoreError::Io(e))
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && fs::symlink_metadata(&path).is_err() =>
+            {
+                Ok(BTreeMap::new())
+            }
+            Err(e) => Err(GStoreError::Database(format!(
+                "cannot read the named graphs of the database at '{}' from '{}': {e}",
+                dir.display(),
+                path.display()
+            ))),
+        }
     }
 
     // ---- on-disk B+ tree KVstore ---------------------------------------------
@@ -2714,8 +2744,10 @@ mod rocks_layout {
             ))
         })?;
         let meta: Option<Meta> = fsutil::read_bincode(&dir.join(META_FILE)).ok();
-        let named: BTreeMap<u32, TripleStore> =
-            fsutil::read_bincode(&dir.join(NAMED_FILE)).unwrap_or_default();
+        // As for a snapshot: only a missing named.bin means "no named graphs";
+        // an unreadable one stops the migration before anything is retired
+        // (review db#1 / robust#4).
+        let named = super::Database::read_named_graphs(dir)?;
         if meta.as_ref().map(|m| m.triple_num) != Some(rocks.triple_count()) {
             // The old build applied updates to RocksDB but saved its dictionary
             // only on an explicit save; triples with terms it never saved cannot

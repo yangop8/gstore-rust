@@ -175,22 +175,32 @@ fn query(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
 
 /// The answer of an applied update (upstream: `isUpdate` responses carry no
 /// result and no `OutputLimit`).
+///
+/// An update whose check_point save failed (`warning`) is not acknowledged:
+/// it answers `1005` with the warning (`"applied in memory but not durable:
+/// <cause>"`) as `StatusMsg` — the code `batchInsert` answers for a failed
+/// save, as upstream fails an operation whose save fails — keeping `AnsNum`
+/// and the warning as a `"warning"` field (a Rust extension). The HTTP status
+/// stays 200, as for every `/api` answer (review durability#2).
 fn update_response(
     changed: usize,
     warning: Option<String>,
     query_time: &str,
     thread_id: &str,
 ) -> GResp {
+    let (code, msg) = match &warning {
+        None => (0, "update query returns true."),
+        Some(w) => (Status::OperationFailed.code(), w.as_str()),
+    };
     let mut r = GResp::json(
         Json::obj()
-            .with("StatusCode", 0)
-            .with("StatusMsg", "update query returns true.")
+            .with("StatusCode", code)
+            .with("StatusMsg", msg)
             .with("AnsNum", changed)
             .with("QueryTime", query_time)
             .with("ThreadId", thread_id),
     );
     if let Some(w) = warning {
-        // A Rust extension: the change is applied, but saving it failed.
         r.set("warning", w);
     }
     r
@@ -495,12 +505,11 @@ fn end(ctx: &mut Ctx<'_>, p: &Params, commit: bool) -> GResp {
         .inner
         .end_txn(dbh.as_ref(), &db, tid, ctx.user(), commit)
     {
-        Ok(warning) => {
-            let mut r = GResp::success(done);
-            if let Some(w) = warning {
-                r.set("warning", w);
-            }
-            r
+        Ok(None) => GResp::success(done),
+        // Committed in memory but not saved: not acknowledged (review
+        // durability#2) — the code `batchInsert` answers for a failed save.
+        Ok(Some(w)) => {
+            GResp::error(Status::OperationFailed, format!("{fail_prefix}: {w}")).with("warning", w)
         }
         Err(e) => txn_error(&fail_prefix, e),
     }
@@ -586,6 +595,9 @@ fn query_error(e: OpError) -> GResp {
         OpErrorKind::Query => {
             GResp::error(Status::OperationFailed, format!("Query fail: {}", e.msg))
         }
+        // An update that failed part-way and whose applied part could not be
+        // saved: `"applied in memory but not durable: …"` (review durability#2).
+        OpErrorKind::Persist => GResp::error(Status::OperationFailed, e.msg),
         _ => GResp::error(Status::OperationFailed, e.msg),
     }
 }

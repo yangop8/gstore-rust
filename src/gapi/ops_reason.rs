@@ -382,7 +382,10 @@ fn run_data_op(ctx: &mut Ctx<'_>, db: &str, name: &str, op: DataOp) -> GResp {
             match outcome {
                 Ok(mut r) => {
                     if let Some(w) = warning {
-                        // A Rust extension (as `query`'s): applied, not saved.
+                        // Applied in memory but not saved: not acknowledged
+                        // (as `query`'s update answer, review durability#2).
+                        r.set("StatusCode", Status::OperationFailed.code());
+                        r.set("StatusMsg", w.clone());
                         r.set("warning", w);
                     }
                     r

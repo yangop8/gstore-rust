@@ -15,8 +15,11 @@
 //! (upstream's level-1 check).
 //!
 //! The file format is upstream's (`conf/ipAllow.config`, `conf/ipDeny.config`):
-//! one entry per line; a line containing `#` is a comment, as is any line
-//! shorter than 7 characters. An entry is
+//! one entry per line; a line containing `#` is a comment, as is any other
+//! line shorter than 7 characters that is not an entry (upstream skips every
+//! line shorter than 7 characters; a short IPv6 form such as `::1` is an
+//! entry here, so a list `ipmanage` saved loads back as it was saved). An
+//! entry is
 //!
 //! * an address — `192.168.1.10` (an IPv6 address works too);
 //! * a closed range `first-last` — `192.168.1.120-192.168.1.129`. Upstream
@@ -173,17 +176,24 @@ struct IpList {
 
 impl IpList {
     /// Parse a list file's text (upstream `ReadIPFromFile`): lines containing
-    /// `#` and lines shorter than 7 characters are skipped. Entries that do
-    /// not parse are listed but match nothing.
+    /// `#` are skipped, and so are lines shorter than 7 characters unless
+    /// they are an entry — upstream skips every short line, which would drop
+    /// the short IPv6 forms (`::1`, `::`, `1::`) that `ipmanage` accepts and
+    /// writes, and could leave a saved allow list empty (review gapi#7).
+    /// Entries that do not parse are listed but match nothing.
     fn parse(text: &str) -> IpList {
         let mut list = IpList::default();
         for line in text.lines() {
             let line = line.trim();
-            if line.len() < 7 || line.contains('#') {
+            if line.contains('#') {
+                continue;
+            }
+            let rule = Rule::parse(line);
+            if line.len() < 7 && rule.is_none() {
                 continue;
             }
             if list.entries.insert(line.to_string()) {
-                if let Some(rule) = Rule::parse(line) {
+                if let Some(rule) = rule {
                     list.rules.push(rule);
                 }
             }
@@ -348,7 +358,9 @@ impl IpFilter {
 
     /// Replace list `kind`'s file with `ips` (upstream `UpdateIPToFile`,
     /// written atomically) and reload it. Every entry must be an address, a
-    /// range or a pattern.
+    /// range or a pattern, and the file is written only if the loader reads
+    /// back every entry (an allow list never silently loses one, review
+    /// gapi#7).
     pub fn save(&self, kind: ListKind, ips: &[String]) -> Result<(), SaveError> {
         for ip in ips {
             if ip.contains('#') || Rule::parse(ip).is_none() {
@@ -368,12 +380,20 @@ impl IpFilter {
             text.push_str(ip.trim());
             text.push('\n');
         }
+        let saved = IpList::parse(&text);
+        if let Some(lost) = ips
+            .iter()
+            .map(|ip| ip.trim())
+            .find(|ip| !saved.entries.contains(*ip))
+        {
+            return Err(SaveError::Invalid(lost.to_string()));
+        }
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir).map_err(|e| SaveError::Io(e.to_string()))?;
         }
         crate::db::fsutil::atomic_write(path, text.as_bytes())
             .map_err(|e| SaveError::Io(e.to_string()))?;
-        *list = IpList::parse(&text);
+        *list = saved;
         Ok(())
     }
 }
@@ -486,7 +506,10 @@ mod tests {
         let l = IpList::parse(
             "10.0.0.1\n192.168.1.120-192.168.1.129\r\n 172.16.*.* \nshort\n1.2.3.4 # c\n::1\nfe80::1:2\n",
         );
-        assert_eq!(l.entries.len(), 4, "{:?}", l.entries);
+        // review gapi#7: `::1` (shorter than 7 characters) used to be skipped
+        // as upstream skips short lines, so a list ipmanage saved with it lost
+        // the entry; a short line that is a valid entry now loads.
+        assert_eq!(l.entries.len(), 5, "{:?}", l.entries);
         let m = |ip: &str| l.matches(ip.parse().ok().map(normalize));
         assert!(m("10.0.0.1"));
         assert!(!m("10.0.0.2"));
@@ -496,8 +519,12 @@ mod tests {
         assert!(!m("172.17.0.1"));
         assert!(m("fe80::1:2"));
         assert!(
-            !m("::1"),
-            "a line shorter than 7 characters is skipped, as upstream"
+            m("::1"),
+            "review gapi#7: a short line that is an entry is loaded"
+        );
+        assert!(
+            !l.entries.contains("short"),
+            "a short line that is not an entry is skipped, as upstream"
         );
         assert!(m("::ffff:10.0.0.1"), "IPv4-mapped peers match IPv4 entries");
         assert!(!m("1.2.3.4"), "a line with # is a comment");

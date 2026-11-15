@@ -172,10 +172,13 @@ fn upstream_option_spellings_work_for_every_tool() {
 
     // gmonitor -db / gshow -db.
     let r = ok(GMONITOR, &["-db", "lubm"], &dir);
-    assert!(
-        r.out.contains("triple_num") && r.out.contains("25"),
-        "{r:?}"
-    );
+    // review tests-a#11: this was `contains("triple_num") && contains("25")`,
+    // which a 25 anywhere else (disk_used, the id lines) also passed.
+    let triple_num = r.out.lines().find_map(|l| {
+        let (key, value) = l.split_once(" : ")?;
+        (key.trim() == "triple_num").then(|| value.trim().to_string())
+    });
+    assert_eq!(triple_num.as_deref(), Some("25"), "{r:?}");
     let r = ok(GSHOW, &["--database", "lubm"], &dir);
     assert!(r.out.contains("triples   : 25"), "{r:?}");
 

@@ -54,9 +54,14 @@
 //! that changed data — is saved to `<root>/<name>.db` before it is
 //! acknowledged. An UPDATE that fails part-way counts as a write too: its
 //! operations before the failing one stay applied (the error says so), so they
-//! are saved like any other change. With the policy off, changes stay in
-//! memory until `/checkpoint` (which always forces a save), `/unload` (which
-//! saves a dirty database before dropping it) or a graceful shutdown.
+//! are saved like any other change. A write whose save (or, with the policy
+//! off, whose commit point) fails is never acknowledged: it stays applied in
+//! memory (and is saved again on the next save) but is answered as a failure,
+//! `"applied in memory but not durable: <cause>"` — HTTP 500 on the REST
+//! endpoints, HTTP 200 with `StatusCode` 1005 on `/api`. With the policy off,
+//! changes stay in memory until `/checkpoint` (which always forces a save),
+//! `/unload` (which saves a dirty database before dropping it) or a graceful
+//! shutdown.
 //!
 //! **Graceful shutdown.** [`ApiServer::shutdown`] (or a
 //! [`ShutdownHandle`] — e.g. wired to `SIGINT`/`SIGTERM` with
@@ -356,15 +361,31 @@ impl Resp {
         Resp::new(200, JSON, status_json(0, msg))
     }
 
-    /// [`ok`](Self::ok) plus an optional `"warning"` (e.g. a failed check_point
-    /// save after an applied write).
+    /// The answer to a write: [`ok`](Self::ok) when it is durable, or — when
+    /// `warning` reports that persisting it failed ([`DbSlot::wrote`]) — the
+    /// failure of [`write_outcome`](Self::write_outcome).
     fn ok_warn(msg: &str, warning: &Option<String>) -> Resp {
+        Resp::write_outcome(msg, "", warning)
+    }
+
+    /// The answer to a write with extra JSON `fields` (`,"key":value…`, or
+    /// empty). Durable (`warning` is `None`): HTTP 200 `{"StatusCode":0,
+    /// "StatusMsg":msg<fields>}`. Applied in memory but not durable (`warning`
+    /// is the [`DbSlot::wrote`] text): a failure, never an acknowledgement —
+    /// HTTP 500 `{"StatusCode":500,"StatusMsg":"applied in memory but not
+    /// durable: <cause>"<fields>,"warning":…}`, the warning kept as the detail
+    /// field earlier clients looked for (review durability#2).
+    fn write_outcome(msg: &str, fields: &str, warning: &Option<String>) -> Resp {
+        let (status, code, msg) = match warning {
+            None => (200, 0, msg),
+            Some(w) => (500, 500, w.as_str()),
+        };
         let body = format!(
-            "{{\"StatusCode\":0,\"StatusMsg\":{}{}}}",
+            "{{\"StatusCode\":{code},\"StatusMsg\":{}{fields}{}}}",
             json_str(msg),
             warn_field(warning)
         );
-        Resp::new(200, JSON, body.into_bytes())
+        Resp::new(status, JSON, body.into_bytes())
     }
 
     /// A `{"StatusCode":code,"StatusMsg":…}` error envelope at HTTP `status`.
@@ -391,6 +412,11 @@ impl From<crate::gapi::GResp> for Resp {
 fn status_json(code: i64, msg: &str) -> Vec<u8> {
     format!("{{\"StatusCode\":{code},\"StatusMsg\":{}}}", json_str(msg)).into_bytes()
 }
+
+/// How every write that was applied in memory but whose save or commit point
+/// failed is reported (REST, `/api` and the single-database server): the
+/// message starts with this, followed by `": <cause>"`.
+pub(crate) const NOT_DURABLE: &str = "applied in memory but not durable";
 
 /// `,"warning":"…"` when there is a warning, else empty (spliced into a JSON
 /// object just before its closing brace).
@@ -1391,7 +1417,10 @@ impl DbSlot {
     /// Record that a committed write changed data: mark dirty and, under the
     /// check_point policy, save now. Returns a warning when that save failed
     /// (the write itself stays applied in memory and is retried on unload /
-    /// shutdown / `/checkpoint`).
+    /// shutdown / `/checkpoint`): `"applied in memory but not durable:
+    /// <cause>"` ([`NOT_DURABLE`]). The caller must answer such a write as a
+    /// failure — REST HTTP 500, `/api` `StatusCode` 1005 — never as a success
+    /// carrying a warning (review durability#2).
     ///
     /// With check_point off an on-disk / RocksDB database still gets a commit
     /// point ([`Database::sync`], a no-op for an in-memory snapshot): its
@@ -1402,14 +1431,14 @@ impl DbSlot {
         let warning = if !check_point {
             self.db.sync().err().map(|e| {
                 format!(
-                    "change to '{}' applied in memory but could not be made durable: {e}",
+                    "{NOT_DURABLE}: the commit point of '{}' failed: {e}",
                     self.dir.display()
                 )
             })
         } else {
             self.save().err().map(|e| {
                 format!(
-                    "change applied in memory but saving to '{}' failed: {e}",
+                    "{NOT_DURABLE}: saving to '{}' failed: {e}",
                     self.dir.display()
                 )
             })
@@ -1542,6 +1571,10 @@ pub(crate) enum OpErrorKind {
     Query,
     /// An internal failure (I/O, save, begin/commit) — REST `500`.
     Failed,
+    /// A write was applied in memory but persisting it failed (an UPDATE that
+    /// failed part-way and whose applied part could not be saved) — REST
+    /// `500`, `/api` `1005`; the message starts with [`NOT_DURABLE`].
+    Persist,
 }
 
 impl OpError {
@@ -1560,7 +1593,7 @@ impl OpError {
             OpErrorKind::NotOwner => 403,
             OpErrorKind::ShuttingDown => 503,
             OpErrorKind::Query => 400,
-            OpErrorKind::Failed => 500,
+            OpErrorKind::Failed | OpErrorKind::Persist => 500,
         }
     }
 
@@ -2960,12 +2993,22 @@ impl ApiInner {
     fn execute_query_job(&self, job: QueryJob, qlog: RestQueryLog) -> Resp {
         let fmt = job.fmt;
         let out = self.run_query_job(job);
+        // An update applied in memory but not saved is logged as the failure
+        // it is answered as (HTTP 500), not as a success (review
+        // durability#2).
+        let not_durable = match &out {
+            Ok(JobOutput::Updated {
+                warning: Some(w), ..
+            }) => Some(OpError::new(OpErrorKind::Persist, w.clone())),
+            _ => None,
+        };
         qlog.finish(
             self,
-            match &out {
-                Ok(JobOutput::Read(result)) => Ok(answer_count(result)),
-                Ok(JobOutput::Updated { changed, .. }) => Ok(*changed),
-                Err(e) => Err(e),
+            match (&out, &not_durable) {
+                (_, Some(e)) => Err(e),
+                (Ok(JobOutput::Read(result)), None) => Ok(answer_count(result)),
+                (Ok(JobOutput::Updated { changed, .. }), None) => Ok(*changed),
+                (Err(e), None) => Err(e),
             },
         );
         match out {
@@ -3055,12 +3098,24 @@ impl ApiInner {
                 Ok(JobOutput::Read(result))
             }
             Err(e) => {
+                let warning = if wrote {
+                    slot.wrote(self.save_writes())
+                } else {
+                    None
+                };
+                // A failed save of the applied part is a persistence failure
+                // (REST 500), not a query error (400): review durability#2.
+                let kind = if warning.is_some() {
+                    OpErrorKind::Persist
+                } else {
+                    OpErrorKind::Query
+                };
                 let msg = if wrote {
-                    partial_update_msg(&e, slot.wrote(self.save_writes()))
+                    partial_update_msg(&e, warning)
                 } else {
                     e.to_string()
                 };
-                Err(OpError::new(OpErrorKind::Query, msg))
+                Err(OpError::new(kind, msg))
             }
         }
     }
@@ -4108,13 +4163,13 @@ impl ApiInner {
             // (Lifecycle endpoints like /build and /load don't append to
             // query.log either; the access log — written unconditionally in
             // `handle` — already records that this request happened.)
-            let body = format!(
-                "{{\"StatusCode\":0,\"StatusMsg\":\"upload complete\",\"db_name\":{},\"format\":{},\"triples_parsed\":{parsed},\"triples_inserted\":{inserted}{}}}",
+            // Inserted but not saved: a failure (HTTP 500), review durability#2.
+            let fields = format!(
+                ",\"db_name\":{},\"format\":{},\"triples_parsed\":{parsed},\"triples_inserted\":{inserted}",
                 json_str(&name),
                 json_str(&format),
-                warn_field(&warning),
             );
-            Resp::new(200, JSON, body.into_bytes())
+            Resp::write_outcome("upload complete", &fields, &warning)
         }))
     }
 
@@ -4706,7 +4761,8 @@ impl ApiInner {
     /// of `user`; `dbh` is the handle of `db` (looked up beforehand, `None`
     /// when it is no longer loaded). Must be called with no lock held. Returns
     /// the warning of a failed check_point save after a commit that changed
-    /// data (the commit itself stands).
+    /// data (the commit stands in memory but is not durable: callers answer
+    /// it as a failure — REST 500, `/api` 1005; review durability#2).
     pub(crate) fn end_txn(
         &self,
         dbh: Option<&DbHandle>,
@@ -5244,12 +5300,12 @@ impl ApiInner {
             }
             let failed = parsed - applied;
             let verb = if insert { "inserted" } else { "removed" };
-            let body = format!(
-                "{{\"StatusCode\":0,\"StatusMsg\":\"batch {verb}\",\"format\":{},\"parsed\":{parsed},\"applied\":{applied},\"failed\":{failed},\"changed\":{applied},\"success_num\":{applied},\"failed_num\":{failed}{}}}",
+            // Applied but not saved: a failure (HTTP 500), review durability#2.
+            let fields = format!(
+                ",\"format\":{},\"parsed\":{parsed},\"applied\":{applied},\"failed\":{failed},\"changed\":{applied},\"success_num\":{applied},\"failed_num\":{failed}",
                 json_str(format),
-                warn_field(&warning),
             );
-            Resp::new(200, JSON, body.into_bytes())
+            Resp::write_outcome(&format!("batch {verb}"), &fields, &warning)
         }))
     }
 
@@ -5996,25 +6052,23 @@ fn render_result(fmt: ResultFormat, result: &QueryResult) -> Resp {
 
 /// The error message of an UPDATE that failed after applying part of its
 /// operations (which stay applied — and were saved, unless `warning` says the
-/// save failed).
+/// save failed: the message then starts with that warning, `"applied in
+/// memory but not durable: …"`).
 fn partial_update_msg(e: &GStoreError, warning: Option<String>) -> String {
     match warning {
-        Some(w) => format!("{e} (operations before the failing one were applied; {w})"),
+        Some(w) => format!(
+            "{w} (the update failed part-way: {e}; the operations before the failing one \
+             were applied)"
+        ),
         None => format!("{e} (operations before the failing one were applied)"),
     }
 }
 
-/// The JSON answer to an applied UPDATE, with an optional `"warning"`.
+/// The JSON answer to an applied UPDATE: `{"StatusCode":0,"StatusMsg":
+/// "success","changed":N}`, or — when its save failed (`warning`) — the HTTP
+/// 500 failure of [`Resp::write_outcome`] (review durability#2).
 fn update_resp(changed: usize, warning: &Option<String>) -> Resp {
-    Resp::new(
-        200,
-        JSON,
-        format!(
-            "{{\"StatusCode\":0,\"StatusMsg\":\"success\",\"changed\":{changed}{}}}",
-            warn_field(warning)
-        )
-        .into_bytes(),
-    )
+    Resp::write_outcome("success", &format!(",\"changed\":{changed}"), warning)
 }
 
 /// Parse a `/batchInsert` / `/batchRemove` payload into triples, returning the

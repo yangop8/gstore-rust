@@ -125,6 +125,20 @@ fn json_field<'a>(body: &'a str, key: &str) -> Option<&'a str> {
     Some(&rest[..rest.find('"')?])
 }
 
+/// The answer of a SPARQL `ASK` reply `(status, body)`: the request must have
+/// succeeded with a SPARQL JSON boolean result.
+///
+/// review tests-a#11: these checks were `body.contains("true")` /
+/// `contains("false")`, which an error body mentioning either word (or a
+/// failed request) also passed.
+fn ask_answer((status, body): (u16, String)) -> bool {
+    assert_eq!(status, 200, "ASK failed: {body}");
+    gstore::json::parse(&body)
+        .ok()
+        .and_then(|j| j.get("boolean").and_then(gstore::json::Json::as_bool))
+        .unwrap_or_else(|| panic!("not a SPARQL JSON boolean result: {body}"))
+}
+
 /// Whether the database saved at `dir` contains `<s> <p> <o>` (full IRIs).
 /// Read as a detached copy: a server (or a `gserver` child) may hold the
 /// directory's lock. An on-disk database's files are copied first (the
@@ -726,13 +740,15 @@ fn api_transaction_is_owned_by_its_user_in(layout: Layout) {
     );
     let (s, body) = api.root("POST", &format!("/commit?tid={tid}"), "");
     assert_eq!(s, 200, "root may commit any transaction: {body}");
-    let (_, body) = api.as_user(
-        "bob",
-        "POST",
-        "/sparql?db_name=o",
-        "ASK { <http://ex/al> <http://ex/p> <http://ex/o> }",
+    assert!(
+        ask_answer(api.as_user(
+            "bob",
+            "POST",
+            "/sparql?db_name=o",
+            "ASK { <http://ex/al> <http://ex/p> <http://ex/o> }",
+        )),
+        "committed data is visible"
     );
-    assert!(body.contains("true"), "committed data is visible: {body}");
 }
 
 #[test]
@@ -818,14 +834,19 @@ fn api_other_clients_never_read_uncommitted_data_in(layout: Layout) {
     let ask_new = "ASK { <http://ex/dirty> <http://ex/p> <http://ex/o> }";
     let ask_old = "ASK { <http://ex/a> <http://ex/p> <http://ex/b> }";
     // The owner sees its own writes inside the transaction...
-    let (_, body) = api.as_user("alice", "POST", &format!("/tquery?tid={tid}"), ask_new);
-    assert!(body.contains("true"), "read-your-writes in the txn: {body}");
+    assert!(
+        ask_answer(api.as_user("alice", "POST", &format!("/tquery?tid={tid}"), ask_new)),
+        "read-your-writes in the txn"
+    );
     // ...but no one else does — neither the insert nor the delete.
-    let (s, body) = api.as_user("bob", "POST", "/sparql?db_name=d", ask_new);
-    assert_eq!(s, 200);
-    assert!(body.contains("false"), "dirty read of an insert: {body}");
-    let (_, body) = api.as_user("bob", "POST", "/sparql?db_name=d", ask_old);
-    assert!(body.contains("true"), "dirty read of a delete: {body}");
+    assert!(
+        !ask_answer(api.as_user("bob", "POST", "/sparql?db_name=d", ask_new)),
+        "dirty read of an insert"
+    );
+    assert!(
+        ask_answer(api.as_user("bob", "POST", "/sparql?db_name=d", ask_old)),
+        "dirty read of a delete"
+    );
     let (s, body) = api.as_user("bob", "GET", "/export?db_name=d", "");
     assert_eq!(s, 200);
     assert!(
@@ -847,12 +868,13 @@ fn api_other_clients_never_read_uncommitted_data_in(layout: Layout) {
             .0,
         200
     );
-    let (_, body) = api.as_user("bob", "POST", "/sparql?db_name=d", ask_new);
-    assert!(body.contains("true"), "visible once committed: {body}");
-    let (_, body) = api.as_user("bob", "POST", "/sparql?db_name=d", ask_old);
     assert!(
-        body.contains("false"),
-        "the delete is visible once committed: {body}"
+        ask_answer(api.as_user("bob", "POST", "/sparql?db_name=d", ask_new)),
+        "visible once committed"
+    );
+    assert!(
+        !ask_answer(api.as_user("bob", "POST", "/sparql?db_name=d", ask_old)),
+        "the delete is visible once committed"
     );
     let (_, body) = api.root("GET", "/show", "");
     assert!(body.contains("\"triples\":3"), "{body}");
@@ -880,15 +902,9 @@ fn api_rolled_back_writes_are_never_visible_in(layout: Layout) {
     );
     assert_eq!(s, 200);
     let ask = "ASK { <http://ex/rb> <http://ex/p> <http://ex/o> }";
-    assert!(api
-        .root("POST", "/sparql?db_name=b", ask)
-        .1
-        .contains("false"));
+    assert!(!ask_answer(api.root("POST", "/sparql?db_name=b", ask)));
     assert_eq!(api.root("POST", &format!("/rollback?tid={tid}"), "").0, 200);
-    assert!(api
-        .root("POST", "/sparql?db_name=b", ask)
-        .1
-        .contains("false"));
+    assert!(!ask_answer(api.root("POST", "/sparql?db_name=b", ask)));
     assert!(!on_disk_has(
         &api.db_dir("b"),
         "http://ex/rb",
@@ -936,7 +952,23 @@ fn api_isolevel_is_validated_and_reported_in(layout: Layout) {
     for bad in ["0", "4", "abc"] {
         let (s, body) = api.root("POST", &format!("/begin?db_name=i&isolevel={bad}"), "");
         assert_eq!(s, 400, "isolevel={bad} must be rejected: {body}");
-        assert!(body.contains("1"), "{body}");
+        // review tests-a#11: this was `body.contains("1")`, which any message
+        // holding a 1 passed; the envelope and the message are checked now.
+        let j = gstore::json::parse(&body).unwrap_or_else(|e| panic!("{e}: {body}"));
+        assert_eq!(
+            j.get("StatusCode").and_then(gstore::json::Json::as_i64),
+            Some(400),
+            "{body}"
+        );
+        let msg = j
+            .get("StatusMsg")
+            .and_then(gstore::json::Json::as_str)
+            .unwrap_or_default();
+        assert!(
+            msg.contains(&format!("invalid isolevel '{bad}'"))
+                && msg.contains("1 (SERIALIZABLE), 2 (SNAPSHOT) or 3 (READ_COMMITTED)"),
+            "{body}"
+        );
     }
     // A rejected begin opened nothing.
     let (_, body) = api.root("GET", "/status", "");
@@ -1117,39 +1149,60 @@ fn api_load_of_a_loaded_database_keeps_unsaved_changes_in(layout: Layout) {
     let (s, body) = api.root("POST", "/load?db_name=l", "");
     assert_eq!(s, 200, "{body}");
     assert!(body.contains("already loaded"), "{body}");
-    let (_, body) = api.root(
-        "POST",
-        "/sparql?db_name=l",
-        "ASK { <http://ex/c> <http://ex/p> <http://ex/d> }",
-    );
     assert!(
-        body.contains("true"),
-        "the unsaved update survives /load: {body}"
+        ask_answer(api.root(
+            "POST",
+            "/sparql?db_name=l",
+            "ASK { <http://ex/c> <http://ex/p> <http://ex/d> }",
+        )),
+        "the unsaved update survives /load"
     );
 }
 
 // ---- the real gserver binary, stopped with SIGTERM ------------------------
 
-/// Spawn `gserver` with `args`, wait for its "listening on http://ADDR" line,
-/// and return the child plus the address. Remaining stdout lines are collected
-/// by a background thread into the returned handle.
+/// A `gserver` child that is killed (`SIGKILL`) and reaped when dropped, so a
+/// test failing before [`terminate`] leaves no server running.
+///
+/// review tests-a#9: the child used to be a bare `Child` (a failed assertion
+/// left it serving, reparented to init, holding the deleted temp root).
+#[cfg(unix)]
+struct GserverChild(std::process::Child);
+
+#[cfg(unix)]
+impl Drop for GserverChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Spawn `gserver` with `args` in the directory `cwd`, wait for its
+/// "listening on http://ADDR" line, and return the child plus the address.
+/// Remaining stdout lines are collected by a background thread into the
+/// returned handle.
+///
+/// review tests-a#9: gserver reads `./conf/conf.ini` when there is one, so it
+/// runs in the test's own temp directory — never in the crate root, where a
+/// developer's `conf/conf.ini` would change the results.
 #[cfg(unix)]
 fn spawn_gserver(
+    cwd: &Path,
     args: &[&str],
-) -> (
-    std::process::Child,
-    SocketAddr,
-    thread::JoinHandle<Vec<String>>,
-) {
+) -> (GserverChild, SocketAddr, thread::JoinHandle<Vec<String>>) {
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
-    let mut child = Command::new(env!("CARGO_BIN_EXE_gserver"))
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn gserver");
-    let stdout = child.stdout.take().unwrap();
+    std::fs::create_dir_all(cwd).unwrap();
+    let mut child = GserverChild(
+        Command::new(env!("CARGO_BIN_EXE_gserver"))
+            .args(args)
+            .current_dir(cwd)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn gserver"),
+    );
+    let stdout = child.0.stdout.take().unwrap();
     let (tx, rx) = mpsc::channel();
     let reader = thread::spawn(move || {
         let mut lines = Vec::new();
@@ -1170,7 +1223,8 @@ fn spawn_gserver(
 
 /// Send `SIGTERM` to `child` and wait (bounded) for it to exit successfully.
 #[cfg(unix)]
-fn terminate(child: &mut std::process::Child) {
+fn terminate(child: &mut GserverChild) {
+    let child = &mut child.0;
     let status = std::process::Command::new("kill")
         .args(["-TERM", &child.id().to_string()])
         .status()
@@ -1199,7 +1253,9 @@ fn gserver_sigterm_saves_single_database() {
         .save(&dir)
         .unwrap();
     let dir_s = dir.to_string_lossy().into_owned();
-    let (mut child, addr, reader) = spawn_gserver(&[&dir_s, "--port", "0", "--no-checkpoint"]);
+    let cwd = tmp_dir("gserver_single_cwd");
+    let (mut child, addr, reader) =
+        spawn_gserver(&cwd, &[&dir_s, "--port", "0", "--no-checkpoint"]);
     let (s, body) = request(&addr, "POST", "/update", None, NEW_TRIPLE);
     assert_eq!(s, 200, "{body}");
     assert!(
@@ -1221,15 +1277,19 @@ fn gserver_sigterm_saves_single_database() {
 fn gserver_sigterm_saves_api_databases() {
     let root = tmp_dir("gserver_api");
     let root_s = root.to_string_lossy().into_owned();
-    let (mut child, addr, reader) = spawn_gserver(&[
-        &root_s,
-        "--api",
-        "--port",
-        "0",
-        "--password",
-        "pw",
-        "--no-checkpoint",
-    ]);
+    let cwd = tmp_dir("gserver_api_cwd");
+    let (mut child, addr, reader) = spawn_gserver(
+        &cwd,
+        &[
+            &root_s,
+            "--api",
+            "--port",
+            "0",
+            "--password",
+            "pw",
+            "--no-checkpoint",
+        ],
+    );
     let auth = basic("root", "pw");
     let (s, body) = request(&addr, "POST", "/build?db_name=g", Some(&auth), DATA);
     assert_eq!(s, 200, "{body}");

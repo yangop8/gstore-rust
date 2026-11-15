@@ -110,7 +110,7 @@
 //! The built-in `root` user always holds every privilege and cannot be dropped
 //! or have its privileges changed (gStore semantics).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::io;
@@ -711,11 +711,27 @@ struct Session {
     created: Instant,
 }
 
+/// The most live login sessions one user may hold: a login beyond it ends
+/// that user's oldest session, so a client that logs in per request (and
+/// never logs out) cannot grow the session table without bound, and one
+/// user's logins never end another user's sessions (review sec#12 / http#12).
+pub const MAX_SESSIONS_PER_USER: usize = 1024;
+
+/// A login sweeps expired sessions out of the table once it holds this many
+/// entries; the next sweep then waits until the table has doubled, so
+/// sweeping costs O(1) amortised per login.
+const SESSION_SWEEP_MIN: usize = 1024;
+
 /// The persistent user database plus in-memory sessions.
 pub struct UserStore {
     path: PathBuf,
     users: HashMap<String, User>,
     sessions: HashMap<String, Session>,
+    /// Each user's session tokens, oldest first (exactly the tokens of
+    /// `sessions`): the per-user cap and per-user revocation.
+    user_sessions: HashMap<String, VecDeque<String>>,
+    /// The size of `sessions` at which the next login sweeps expired ones.
+    sweep_at: usize,
     ttl: Duration,
     /// Fast path for repeated verification of the same credentials (HTTP Basic
     /// auth and the `/api` protocol re-send them on every request): (user,
@@ -749,6 +765,8 @@ impl UserStore {
             path: path.as_ref().to_path_buf(),
             users: HashMap::new(),
             sessions: HashMap::new(),
+            user_sessions: HashMap::new(),
+            sweep_at: SESSION_SWEEP_MIN,
             ttl: Duration::from_secs(24 * 3600),
             verified: Mutex::new(HashMap::new()),
             verified_key: HmacSha256::new(&key),
@@ -925,24 +943,38 @@ impl UserStore {
                 db_privileges: BTreeMap::new(),
             },
         );
-        self.save().map_err(|e| e.to_string())
+        // Memory and users.db always agree: a user whose save failed does not
+        // exist (review sec#15).
+        if let Err(e) = self.save() {
+            self.users.remove(name);
+            return Err(e.to_string());
+        }
+        Ok(())
     }
 
-    /// Drop a user. `root` cannot be dropped.
+    /// Drop a user. `root` cannot be dropped. When the save fails the user
+    /// stays (in memory as on disk) and keeps their sessions (review sec#15).
     pub fn drop_user(&mut self, name: &str) -> Result<(), String> {
         if name == ROOT_USER {
             return Err("cannot drop the root user".into());
         }
-        if self.users.remove(name).is_none() {
+        let Some(user) = self.users.remove(name) else {
             return Err(format!("user '{name}' does not exist"));
+        };
+        if let Err(e) = self.save() {
+            self.users.insert(name.to_string(), user);
+            return Err(e.to_string());
         }
         self.forget_verified(name);
         // Invalidate any live sessions for the dropped user.
-        self.sessions.retain(|_, s| s.user != name);
-        self.save().map_err(|e| e.to_string())
+        self.end_sessions_of(name);
+        Ok(())
     }
 
-    /// Change a user's password, revoking the user's live sessions.
+    /// Change a user's password, revoking the user's live sessions. When the
+    /// save fails the old password stays in force (in memory as on disk, so
+    /// a restart does not bring it back) and the sessions are kept (review
+    /// sec#15).
     pub fn set_password(&mut self, name: &str, password: &str) -> Result<(), String> {
         if password.is_empty() {
             return Err("password must not be empty".into());
@@ -951,12 +983,18 @@ impl UserStore {
             .users
             .get_mut(name)
             .ok_or_else(|| format!("user '{name}' does not exist"))?;
-        user.password = PasswordHash::new(password);
+        let old = std::mem::replace(&mut user.password, PasswordHash::new(password));
+        if let Err(e) = self.save() {
+            if let Some(user) = self.users.get_mut(name) {
+                user.password = old;
+            }
+            return Err(e.to_string());
+        }
         self.forget_verified(name);
         // A changed (or admin-reset) password revokes the user's live sessions,
         // so a token captured before the change stops working.
-        self.sessions.retain(|_, s| s.user != name);
-        self.save().map_err(|e| e.to_string())
+        self.end_sessions_of(name);
+        Ok(())
     }
 
     /// Grant privileges to a user (`root`'s privileges are immutable).
@@ -1059,12 +1097,17 @@ impl UserStore {
     /// database of the same name starts without them — upstream
     /// `remove_databaseinfo`). Returns whether anything changed.
     pub fn forget_database(&mut self, db: &str) -> io::Result<bool> {
+        let before = self.users.clone();
         let mut changed = false;
         for u in self.users.values_mut() {
             changed |= u.db_privileges.remove(db).is_some();
         }
         if changed {
-            self.save()?;
+            // A failed save keeps the grants in memory too (review sec#15).
+            if let Err(e) = self.save() {
+                self.users = before;
+                return Err(e);
+            }
         }
         Ok(changed)
     }
@@ -1079,6 +1122,7 @@ impl UserStore {
                 format!("invalid database name '{to}'"),
             ));
         }
+        let before = self.users.clone();
         let mut changed = false;
         for u in self.users.values_mut() {
             if let Some(set) = u.db_privileges.get(from).cloned() {
@@ -1090,7 +1134,11 @@ impl UserStore {
             }
         }
         if changed {
-            self.save()?;
+            // A failed save copies nothing, in memory either (review sec#15).
+            if let Err(e) = self.save() {
+                self.users = before;
+                return Err(e);
+            }
         }
         Ok(changed)
     }
@@ -1262,8 +1310,27 @@ impl UserStore {
     /// Issue a session token for `name`, whose credentials the caller has
     /// just verified (e.g. through [`begin_check`](Self::begin_check) …
     /// [`finish_check`](Self::finish_check)).
+    ///
+    /// The table stays bounded (review sec#12 / http#12): once it has grown
+    /// enough a login first sweeps out every expired session (amortised
+    /// O(1) per login), and a user holding [`MAX_SESSIONS_PER_USER`] sessions
+    /// loses the oldest one.
     pub fn start_session(&mut self, name: &str) -> String {
+        if self.sessions.len() >= self.sweep_at {
+            self.sweep_expired_sessions();
+            self.sweep_at = SESSION_SWEEP_MIN.max(2 * self.sessions.len());
+        }
         let token = new_token();
+        let tokens = self.user_sessions.entry(name.to_string()).or_default();
+        while tokens.len() >= MAX_SESSIONS_PER_USER {
+            match tokens.pop_front() {
+                Some(oldest) => {
+                    self.sessions.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+        tokens.push_back(token.clone());
         self.sessions.insert(
             token.clone(),
             Session {
@@ -1276,9 +1343,9 @@ impl UserStore {
 
     /// Resolve a session token to its username, pruning it if expired.
     pub fn session_user(&mut self, token: &str) -> Option<String> {
-        let expired = self.sessions.get(token)?.created.elapsed() > self.ttl;
+        let expired = self.sessions.get(token)?.created.elapsed() >= self.ttl;
         if expired {
-            self.sessions.remove(token);
+            self.end_session(token);
             return None;
         }
         // The session must still point at an existing user.
@@ -1286,14 +1353,68 @@ impl UserStore {
         if self.users.contains_key(&name) {
             Some(name)
         } else {
-            self.sessions.remove(token);
+            self.end_session(token);
             None
         }
     }
 
     /// Invalidate a session token (logout). Returns whether it existed.
     pub fn logout(&mut self, token: &str) -> bool {
-        self.sessions.remove(token).is_some()
+        self.end_session(token)
+    }
+
+    /// How many login sessions the table holds (expired ones not yet swept
+    /// included).
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
+    }
+
+    /// Set how long a login session stays valid (24 hours by default). A
+    /// session is expired once its age reaches the TTL.
+    pub fn set_session_ttl(&mut self, ttl: Duration) {
+        self.ttl = ttl;
+    }
+
+    /// Remove session `token`; returns whether it existed.
+    fn end_session(&mut self, token: &str) -> bool {
+        let Some(session) = self.sessions.remove(token) else {
+            return false;
+        };
+        if let Some(tokens) = self.user_sessions.get_mut(&session.user) {
+            tokens.retain(|t| t != token);
+            if tokens.is_empty() {
+                self.user_sessions.remove(&session.user);
+            }
+        }
+        true
+    }
+
+    /// Remove every session of user `name`.
+    fn end_sessions_of(&mut self, name: &str) {
+        for token in self.user_sessions.remove(name).unwrap_or_default() {
+            self.sessions.remove(&token);
+        }
+    }
+
+    /// Remove every expired session. A user's tokens are kept oldest first,
+    /// so only the expired front of each list is visited.
+    fn sweep_expired_sessions(&mut self) {
+        let ttl = self.ttl;
+        let sessions = &mut self.sessions;
+        self.user_sessions.retain(|_, tokens| {
+            while let Some(token) = tokens.front() {
+                if sessions
+                    .get(token)
+                    .is_some_and(|s| s.created.elapsed() < ttl)
+                {
+                    break;
+                }
+                if let Some(token) = tokens.pop_front() {
+                    sessions.remove(&token);
+                }
+            }
+            !tokens.is_empty()
+        });
     }
 
     /// Whether `name` holds privilege `p` on every database (unknown user ⇒

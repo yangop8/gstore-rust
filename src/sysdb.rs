@@ -407,8 +407,26 @@ impl SysDb {
         Ok(changed)
     }
 
+    /// Only a database whose directory is confirmed gone (`NotFound`) is
+    /// unregistered (and its grants forgotten, see
+    /// [`take_vanished`](Self::take_vanished)). A directory that exists but
+    /// cannot be examined — a dangling symlink to a volume not mounted yet, a
+    /// stat failing with EACCES or EIO — keeps its registration, and when the
+    /// root itself cannot be listed nothing is reconciled at all: losing the
+    /// grants of a database that is merely unreachable for a moment would be
+    /// permanent (review gapi#9). Each case is reported on the log.
     fn reconcile(&mut self, loaded: &[String]) -> bool {
-        let on_disk = database_dirs(&self.root);
+        let on_disk = match database_dirs(&self.root) {
+            Ok(dirs) => dirs,
+            Err(e) => {
+                crate::gs_warn!(
+                    "cannot list the database directories under '{}': {e}; the database \
+                     registry is not reconciled with the disk this time",
+                    self.root.display()
+                );
+                return false;
+            }
+        };
         let mut changed = false;
         for (name, dir) in &on_disk {
             // A directory holding no database (one whose build was cut short)
@@ -429,10 +447,32 @@ impl SysDb {
                 changed = true;
             }
         }
+        let root = &self.root;
         let gone: Vec<String> = self
             .dbs
             .keys()
             .filter(|name| !on_disk.contains_key(*name) && !loaded.iter().any(|l| l == *name))
+            .filter(|name| {
+                let dir = root.join(format!("{name}{}", crate::DB_SUFFIX));
+                match fs::symlink_metadata(&dir) {
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => true,
+                    Err(e) => {
+                        crate::gs_warn!(
+                            "database '{name}': cannot examine '{}': {e}; it stays registered",
+                            dir.display()
+                        );
+                        false
+                    }
+                    Ok(_) => {
+                        crate::gs_warn!(
+                            "database '{name}': '{}' exists but is not a readable directory \
+                             (a dangling symlink?); it stays registered",
+                            dir.display()
+                        );
+                        false
+                    }
+                }
+            })
             .cloned()
             .collect();
         for name in &gone {
@@ -460,14 +500,18 @@ fn registrable(name: &str) -> bool {
     name != SYSTEM_DB && crate::http_api::valid_db_name(name)
 }
 
-/// The database directories under `root`: `<name>.db` directories whose
-/// `name` is a valid, non-system database name.
-fn database_dirs(root: &Path) -> BTreeMap<String, PathBuf> {
+/// The database directories under `root`: `<name>.db` directories (or
+/// symlinks to directories) whose `name` is a valid, non-system database
+/// name. An error listing `root` is returned, never read as "no databases"
+/// (review gapi#9).
+fn database_dirs(root: &Path) -> io::Result<BTreeMap<String, PathBuf>> {
+    #[cfg(test)]
+    if tests::FAIL_LIST_ROOT.with(std::cell::Cell::get) {
+        return Err(io::Error::other("injected failure listing the root"));
+    }
     let mut out = BTreeMap::new();
-    let Ok(rd) = fs::read_dir(root) else {
-        return out;
-    };
-    for entry in rd.flatten() {
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
         let fname = entry.file_name().to_string_lossy().into_owned();
         let Some(name) = fname.strip_suffix(crate::DB_SUFFIX) else {
             continue;
@@ -476,7 +520,7 @@ fn database_dirs(root: &Path) -> BTreeMap<String, PathBuf> {
             out.insert(name.to_string(), entry.path());
         }
     }
-    out
+    Ok(out)
 }
 
 fn parse_registry(text: &str, path: &Path) -> io::Result<BTreeMap<String, DbRecord>> {
@@ -778,6 +822,56 @@ pub fn modified_datetime(path: &Path) -> Option<String> {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    thread_local! {
+        /// Test failpoint: [`database_dirs`] fails as if the root could not
+        /// be listed (EACCES, EMFILE, EIO).
+        pub(super) static FAIL_LIST_ROOT: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    /// Startup reconcile does not take a root it cannot list for an empty
+    /// one: registrations and grants survive (review gapi#9).
+    #[test]
+    fn an_unlistable_root_keeps_registrations_and_grants() {
+        /// Removes the root also when the test fails.
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                FAIL_LIST_ROOT.with(|f| f.set(false));
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = tmp_root("unlistable");
+        let _cleanup = Cleanup(root.clone());
+        let (mut users, mut sys) = open_system(&root, "pw").unwrap();
+        fs::create_dir_all(root.join("lubm.db")).unwrap();
+        fs::write(root.join("lubm.db").join("meta.bin"), b"").unwrap();
+        sys.register("lubm", "alice").unwrap();
+        users
+            .add("alice", "pw", BTreeSet::from([Privilege::Query]))
+            .unwrap();
+        users
+            .grant_on("alice", "lubm", &BTreeSet::from([Privilege::Update]))
+            .unwrap();
+        drop((users, sys));
+        FAIL_LIST_ROOT.with(|f| f.set(true));
+        let reopened = open_system(&root, "pw");
+        let mut sys2 = SysDb::open(&root).unwrap();
+        let synced = sys2.sync_with_disk(&[]);
+        FAIL_LIST_ROOT.with(|f| f.set(false));
+        let (users, sys) = reopened.unwrap();
+        assert_eq!(sys.names(), vec!["lubm".to_string()]);
+        assert_eq!(sys.get("lubm").unwrap().creator, "alice");
+        assert!(users.has_priv_on("alice", Privilege::Update, "lubm"));
+        assert!(!synced.unwrap(), "an unlistable root changes nothing");
+        assert!(sys2.take_vanished().is_empty());
+        // Listed again: still there, and a removed directory now goes.
+        fs::remove_dir_all(root.join("lubm.db")).unwrap();
+        let (users, sys) = open_system(&root, "pw").unwrap();
+        assert!(sys.names().is_empty());
+        assert!(!users.has_priv_on("alice", Privilege::Update, "lubm"));
+    }
 
     fn tmp_root(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
