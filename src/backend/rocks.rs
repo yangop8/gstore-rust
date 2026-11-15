@@ -788,8 +788,9 @@ impl RocksStore {
         // pending range (see the module docs). The replay reloads the
         // counters once it has run.
         store.recover_journal()?;
-        let pending = store.pending_reclaim(1)?;
-        store.pending.store(!pending.is_empty(), Ordering::SeqCst);
+        // Whether candidates wait (also ones an earlier open left): read
+        // once here, cleared once they are settled.
+        store.pending_reclaim(1)?;
         store.sync_wal()?;
         Ok(store)
     }
@@ -1054,6 +1055,7 @@ impl RocksStore {
         if self.pending.load(Ordering::SeqCst) {
             if let Ok(pending) = self.pending_reclaim(usize::MAX) {
                 if self.settle_pending(&pending, &[]).is_ok() {
+                    self.pending.store(false, Ordering::SeqCst);
                     out.extend(pending);
                 }
             }
@@ -1081,6 +1083,11 @@ impl RocksStore {
             Ok(out.len() < limit)
         })
         .map_err(|e| e.into_error("pending reclamation"))?;
+        if out.is_empty() {
+            // Settled: later `take_replayed` calls (one per statement of a
+            // `Database`) need not look again.
+            self.pending.store(false, Ordering::SeqCst);
+        }
         Ok(out)
     }
 
