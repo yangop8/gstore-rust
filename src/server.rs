@@ -158,13 +158,17 @@ pub struct HttpOptions {
     /// cannot pin a worker forever.
     pub write_timeout: Duration,
     /// Minimum average rate, in bytes per second, at which a request body
-    /// must arrive (default [`DEFAULT_MIN_BODY_RATE`], 64 KiB/s): a body of
-    /// `n` bytes must be in within `read_timeout + n / min_body_rate` of the
-    /// end of its head (a chunked body within `read_timeout` plus the bytes
-    /// received so far over the rate), so a client trickling it in cannot
-    /// hold a worker of the bounded pool for long. `0` turns this total
-    /// deadline off: then only no single read may wait longer than
-    /// [`read_timeout`](Self::read_timeout). `conf.ini`: `min_body_rate`.
+    /// must arrive (default [`DEFAULT_MIN_BODY_RATE`], 64 KiB/s), after a
+    /// grace of [`read_timeout`](Self::read_timeout): `t` after the end of
+    /// its head, at least `(t - read_timeout) * min_body_rate` bytes of it
+    /// must have been received, or the connection is closed. The allowance
+    /// grows with the bytes actually received (what the client declares in
+    /// `Content-Length` earns it nothing), so a client trickling a body in
+    /// cannot hold a worker of the bounded pool for longer than
+    /// `read_timeout` plus what it really sent at that rate — never longer
+    /// than `read_timeout + n / min_body_rate` for a body of `n` bytes. `0`
+    /// turns this off: then only no single read may wait longer than
+    /// `read_timeout`. `conf.ini`: `min_body_rate`.
     pub min_body_rate: u64,
     /// Most connections one client IP address may have open at once, those
     /// waiting for a worker included (default [`DEFAULT_MAX_CONNS_PER_IP`],
@@ -1327,8 +1331,8 @@ struct Deadline {
 struct BodyClock {
     /// When its first byte was awaited (the end of the head).
     start: Instant,
-    /// Its `Content-Length`; `None` for a chunked body, whose allowance
-    /// grows with the bytes received instead.
+    /// Its `Content-Length` (`None` for a chunked body): the most its
+    /// allowance can grow to.
     declared: Option<u64>,
     /// Bytes read from the socket since `start`.
     received: u64,
@@ -1418,14 +1422,20 @@ pub(crate) struct ReadLimits {
 }
 
 impl ReadLimits {
-    /// When `body` must be in: `read_timeout` after its start plus its
-    /// allowance (its length, or for a chunked body the bytes received so
-    /// far) at `min_body_rate`; `None` when the rate floor is off.
+    /// When the next bytes of `body` must be in: `read_timeout` after its
+    /// start plus its allowance — the bytes received so far (at most its
+    /// declared length) — at `min_body_rate`; `None` when the rate floor is
+    /// off. The allowance is earned, not declared: a client announcing a
+    /// large `Content-Length` and dripping it is cut off after about
+    /// `read_timeout` (review robust#3's scenario), while one that keeps
+    /// sending at the rate keeps moving the deadline ahead of it.
     fn body_deadline(&self, body: &BodyClock) -> Option<Instant> {
         if self.min_body_rate == 0 {
             return None;
         }
-        let allowance = body.declared.unwrap_or(body.received);
+        let allowance = body
+            .declared
+            .map_or(body.received, |len| body.received.min(len));
         let nanos = u128::from(allowance) * 1_000_000_000 / u128::from(self.min_body_rate);
         let extra = Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX));
         body.start
@@ -1852,8 +1862,10 @@ fn read_head<R: BufRead>(r: &mut R, max_body: usize) -> Result<Option<Head>, Bad
 }
 
 /// Read a `Content-Length` body of `len` bytes. On a connection it must
-/// arrive within `read_timeout + len / min_body_rate` from here, however it
-/// trickles in ([`HttpOptions::min_body_rate`]; enforced by [`ConnSocket`]).
+/// keep up [`HttpOptions::min_body_rate`] on average after a grace of
+/// `read_timeout` from here — so it is in within `read_timeout + len /
+/// min_body_rate` at the latest, however it trickles in (enforced by
+/// [`ConnSocket`]).
 fn read_body<R: BufRead>(r: &mut R, len: usize) -> Result<Vec<u8>, BadRequest> {
     // Grow as the bytes actually arrive instead of trusting the header.
     let mut body = Vec::with_capacity(len.min(1 << 20));

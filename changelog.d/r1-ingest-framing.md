@@ -6,10 +6,15 @@ Behaviour changes (both HTTP servers, the single-database `Server` and the
 `/api` + REST `ApiServer`, which share the connection layer):
 
 - **A slow client can no longer hold a worker thread** (review H-1: sec#3,
-  http#1, robust#3, http#3). A request body must now arrive within
-  `read_timeout + length / min_body_rate` of the end of its head (a chunked
-  body: within `read_timeout` plus the bytes received so far at
-  `min_body_rate`, i.e. at that rate on average), however it trickles in;
+  http#1, robust#3, http#3). A request body must now arrive at
+  `min_body_rate` on average after a grace of `read_timeout` from the end
+  of its head: `t` seconds in, at least `(t - read_timeout) *
+  min_body_rate` bytes of it must have been received (chunked and
+  `Content-Length` bodies alike). The allowance is earned by the bytes
+  actually received, never by the declared `Content-Length`, so a client
+  announcing a 1 GiB body and dripping it is cut off after about
+  `read_timeout`, and no body can hold a worker longer than `read_timeout
+  + length / min_body_rate`, however it trickles in;
   before, only no single read could wait longer than `read_timeout` (30 s),
   so one byte every 29 s held a worker indefinitely, before authentication,
   and `thread_num + 1` such connections disabled the server. Under TLS the
@@ -65,16 +70,18 @@ Behaviour changes (both HTTP servers, the single-database `Server` and the
   `/api`) against a body-dripping client (`Content-Length` and chunked), a
   trickling TLS handshake, TLS request head and TLS body (`--features
   tls`): the server closes that connection and serves the request queued
-  behind it on its only worker; bodies within their allowance (256 KiB at
-  once, 5 bytes over 200 ms) are served; the per-address cap refuses a
+  behind it on its only worker, also when the dripped body declares a
+  64 MiB `Content-Length`; bodies within their allowance (256 KiB at once,
+  5 bytes over 200 ms, and 3000 bytes kept up at twice the rate over 1.5
+  times the read timeout) are served; the per-address cap refuses a
   third connection from 127.0.0.1 while 127.0.0.2 is served (Linux: the
   test binds a second loopback source address) and re-admits it once one
   connection ended; a framing rejection table (one `400`, then closed, a
   smuggled follow-up request never served) and its well-formed neighbours;
   the control-character table (no bare CR in any response). All of them
-  fail on the previous code except the two positive controls (bodies within
-  their allowance, well-formed framing), which pass on both; no existing
-  test needed a change.
+  fail on the previous code except the three positive controls (bodies
+  within their allowance, a body keeping up the rate, well-formed framing),
+  which pass on both; no existing test needed a change.
 
 ## GAP_PLAN status line
 
@@ -90,12 +97,14 @@ none
   address (a client that rotates addresses within its prefix is not held to
   one count — pair with a firewall limit if that matters). `min_body_rate`
   (default 64 KiB/s after a 30 s grace) cuts off slower uploads: lower it
-  (or `0`) for clients on very slow links; it bounds how long a worker can
-  be held by one request to `30 s + max_body / min_body_rate`, so with a
-  large `upload_max_body_size` a paced client still holds a worker for
-  long — keep `max_conns_per_ip` below `thread_num` where untrusted clients
-  connect. Neither is an upstream-compat switch (upstream has no such limit;
-  no conformance switch needed).
+  (or `0`) for clients on very slow links. A client that drips its body is
+  cut off after about 30 s whatever `Content-Length` it declares; holding a
+  worker longer takes really sending at least `min_body_rate` (one worker
+  per 64 KiB/s of the client's bandwidth), and no request holds one longer
+  than `30 s + max_body / min_body_rate` — keep `max_conns_per_ip` below
+  `thread_num` where untrusted clients with fast links connect. Neither is
+  an upstream-compat switch (upstream has no such limit; no conformance
+  switch needed).
 - **docs/DEPLOY.md / README.md** (HTTP behaviour): request framing is now
   strict RFC 9112 (see the Changelog list); clients sending
   `Transfer-Encoding: identity`, a signed `Content-Length`, header lines
@@ -197,3 +206,16 @@ number below is noisy, and none was measured quietly.
   `wait_for_request` keep theirs; no call site outside the package changed.
 - Not done: authentication from the request head before the body is read
   (H-1's other suggestion) is r1-ingest-caps' pre-body hook.
+- Review note: the plan's approach gave a `Content-Length` body the
+  allowance `read_timeout + len / min_rate` from its declared length; the
+  package review changed it to the bytes actually received (capped at the
+  declared length), as for chunked bodies. With the declared length a
+  client announcing `max_body` and sending one byte every 29 s still held a
+  worker for `30 s + max_body / 64 KiB/s` — over 4 hours with gserver's
+  default 1 GiB `upload_max_body_size`, about 17 minutes with
+  r1-ingest-caps' 64 MiB pre-auth cap — which is robust#3's own scenario.
+  The acceptance bound (`read_timeout + len / min_rate` at most) still
+  holds; tests `a_dripped_body_gains_nothing_by_declaring_a_large_length`
+  (fails with the declared-length allowance) and
+  `a_body_that_keeps_up_the_rate_may_outlast_the_read_timeout` (positive
+  control).

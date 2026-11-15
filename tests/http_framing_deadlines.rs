@@ -4,9 +4,10 @@
 //! framings are refused.
 //!
 //! * **Deadlines** (sec#3, http#1, robust#3, http#3): a request body must
-//!   arrive within `read_timeout + len / min_body_rate` (a chunked one at
-//!   `min_body_rate` on average), and a TLS handshake and request head within
-//!   the head deadline (`read_timeout`), however the bytes trickle in. Each
+//!   arrive at `min_body_rate` on average after a grace of `read_timeout`
+//!   (the allowance is earned by the bytes received, whatever length was
+//!   declared), and a TLS handshake and request head within the head
+//!   deadline (`read_timeout`), however the bytes trickle in. Each
 //!   test runs a one-worker server, lets a client drip its request one byte at
 //!   a time, and checks that the server lets go of that connection and serves
 //!   a concurrent request on its only worker.
@@ -23,7 +24,9 @@
 //! The only timeout is [`HANG_GUARD`]; no assertion depends on elapsed time.
 
 use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+#[cfg(target_os = "linux")]
+use std::net::Ipv4Addr;
+use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
@@ -242,14 +245,35 @@ fn post_head(len: usize) -> Vec<u8> {
 
 /// sec#3 / http#1 / robust#3: a body trickling in (each byte far within the
 /// read timeout) no longer holds the only worker: the connection is closed
-/// once `read_timeout + len / min_body_rate` has passed, and the request
-/// queued behind it is served. (Before: the worker waited for all 1000
-/// bytes, 40 s, and the queued request with it.)
+/// once `read_timeout` plus what the bytes received earned at
+/// `min_body_rate` has passed, and the request queued behind it is served.
+/// (Before: the worker waited for all 1000 bytes, 40 s, and the queued
+/// request with it.)
 #[test]
 fn a_dripped_body_is_cut_off_and_the_worker_serves_the_next_request() {
     let srv = serve(one_worker());
     let body = vec![b' '; 1000];
     let dripper = start_dripper(dripping_conn(srv.addr), post_head(body.len()), body);
+    let resp = http(srv.addr, GET_STATUS.as_bytes());
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp:?}");
+    assert_let_go(dripper, 1000);
+}
+
+/// robust#3's scenario: a client declaring a large body (64 MiB, far within
+/// `max_body`) and dripping it gains nothing by the size it announces — the
+/// allowance grows with the bytes actually received, not with the declared
+/// length, so the connection is cut off after `read_timeout` plus what the
+/// few bytes sent earned. (Before: a declared-length allowance gave it
+/// `read_timeout + 64 MiB / 64 KiB/s`, over 17 minutes; with `Content-Length:
+/// 1 GiB` against gserver's default `upload_max_body_size`, over 4 hours.)
+#[test]
+fn a_dripped_body_gains_nothing_by_declaring_a_large_length() {
+    let srv = serve(one_worker());
+    let dripper = start_dripper(
+        dripping_conn(srv.addr),
+        post_head(64 << 20),
+        vec![b' '; 1000],
+    );
     let resp = http(srv.addr, GET_STATUS.as_bytes());
     assert!(resp.starts_with("HTTP/1.1 200"), "{resp:?}");
     assert_let_go(dripper, 1000);
@@ -310,7 +334,7 @@ fn bodies_within_their_allowance_are_served() {
         read_timeout: Duration::from_secs(5),
         ..HttpOptions::default()
     });
-    // 256 KiB in one go: allowance 5 s + 4 s.
+    // 256 KiB in one go: in long before its deadline (5 s + 4 s).
     let mut big = b"ASK {} #".to_vec();
     big.resize(256 * 1024, b'x');
     let mut raw = post_head(big.len());
@@ -333,6 +357,37 @@ fn bodies_within_their_allowance_are_served() {
     for b in b"ASK{}" {
         thread::sleep(DRIP); // pacing, not synchronisation
         s.write_all(&[*b]).unwrap();
+    }
+    let resp = exchange(s, b"");
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp:?}");
+}
+
+/// The allowance is earned as the body arrives: a body that keeps up the
+/// rate is served even though, as a whole, it takes several times the read
+/// timeout — the deadline is a rate floor, not a fixed cap.
+#[test]
+fn a_body_that_keeps_up_the_rate_may_outlast_the_read_timeout() {
+    let srv = serve(HttpOptions {
+        threads: 1,
+        read_timeout: Duration::from_secs(1),
+        min_body_rate: 1000,
+        ..HttpOptions::default()
+    });
+    // 3000 bytes in 30 slices, one every 50 ms (2000 bytes/s, 1.5 s in
+    // all): every slice extends the deadline by 100 ms, so it stays at
+    // least the 1 s grace ahead of the client.
+    let mut body = b"ASK {} #".to_vec();
+    body.resize(3000, b'x');
+    let mut s = TcpStream::connect(srv.addr).unwrap();
+    let mut head = post_head(body.len());
+    head.splice(
+        head.len() - 2..,
+        b"Connection: close\r\n\r\n".iter().copied(),
+    );
+    s.write_all(&head).unwrap();
+    for slice in body.chunks(100) {
+        thread::sleep(Duration::from_millis(50)); // pacing, not synchronisation
+        s.write_all(slice).unwrap();
     }
     let resp = exchange(s, b"");
     assert!(resp.starts_with("HTTP/1.1 200"), "{resp:?}");

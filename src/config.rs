@@ -344,9 +344,9 @@ pub struct GStoreConfig {
     /// keep-alive off (default `60`, upstream workflow's default).
     pub keep_alive_timeout: u64,
     /// *(Rust extension)* Minimum average rate, in bytes per second, at which
-    /// a request body must arrive: one of `n` bytes must be in within 30 s
-    /// plus `n / min_body_rate` (a chunked one at this rate on average), so a
-    /// client trickling it in cannot hold a worker thread; `0` turns this
+    /// a request body must arrive after a 30 s grace (the allowance grows
+    /// with the bytes received, not with the declared `Content-Length`), so
+    /// a client trickling it in cannot hold a worker thread; `0` turns this
     /// off (default `65536`, 64 KiB/s). See
     /// [`HttpOptions::min_body_rate`].
     pub min_body_rate: u64,

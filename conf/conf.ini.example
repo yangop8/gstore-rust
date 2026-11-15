@@ -41,9 +41,11 @@ ip_deny_path="./conf/ipDeny.config"
 # keep-alive idle timeout in seconds, 0 turns keep-alive off (default 60)
 # keep_alive_timeout=60
 # minimum average rate, in bytes per second, at which a request body must
-# arrive: a body of N bytes must be received within 30 s + N / min_body_rate
-# (a chunked one at this rate on average), so a client trickling it in cannot
-# hold a worker thread; 0 turns the limit off (default 65536, 64 KiB/s)
+# arrive after a 30 s grace: T seconds after the request head, at least
+# (T - 30) * min_body_rate bytes of the body must be in (what was really
+# received counts, not the declared Content-Length), so a client trickling it
+# in cannot hold a worker thread; 0 turns the limit off (default 65536,
+# 64 KiB/s)
 # min_body_rate=65536
 # most connections one client IP address may have open at once, those
 # waiting for a worker thread included; further ones are closed at once.
