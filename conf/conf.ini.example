@@ -261,6 +261,10 @@ unzip_max_size = 10737418240
 # bloom filters of RocksDB's point-lookup column families: bits per key,
 # on (= 10) or off; options only, files open either way
 # rocksdb_bloom=10
+# the most files a RocksDB database keeps open (20..1048576; 0 = unlimited,
+# RocksDB's own default: one descriptor per table file, kept while the
+# database is open); options only, files open with any value
+# rocksdb_max_open_files=4096
 
 # Reasoning rules (/api reasonManage, stored per database in
 # <db>.db/reason_rule_files/) have no conf.ini keys: their limits are fixed --

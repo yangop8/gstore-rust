@@ -583,6 +583,10 @@ impl Database {
     /// snapshot of an in-memory one. Errors if the database has no home (it was
     /// built in memory and never opened from a directory) or if an earlier
     /// update could not be persisted.
+    ///
+    /// For a RocksDB database it also flushes the memtables to table files
+    /// (a [`save`](Self::save) at home only syncs the WAL): no more durable,
+    /// but the next open has no log to replay.
     pub fn checkpoint(&self) -> Result<()> {
         let Some(home) = self.home.clone() else {
             return Err(GStoreError::Database(format!(
@@ -591,7 +595,12 @@ impl Database {
             )));
         };
         let _persist = self.persist_guard();
-        self.save_locked(&home)
+        self.save_locked(&home)?;
+        #[cfg(feature = "rocksdb")]
+        if let Some(rocks) = self.store.as_rocks() {
+            rocks.flush()?;
+        }
+        Ok(())
     }
 
     /// A commit point without a full save: make every mutation applied so far
@@ -673,9 +682,11 @@ impl Database {
     /// * On-disk database: at its home directory, commits the write-through to
     ///   `kvstore.kv` — no shadow `store.bin` is written. Into another
     ///   directory, it commits and then copies the store files there.
-    /// * RocksDB database: at its home directory, commits (flushes) RocksDB.
-    ///   Into another directory, it writes a RocksDB checkpoint to
-    ///   `dir/rocksdb` — a consistent, openable copy of every column family.
+    /// * RocksDB database: at its home directory, a commit point (RocksDB's
+    ///   WAL is fsynced; memtables are flushed by [`checkpoint`](Self::checkpoint)
+    ///   and when the database is closed). Into another directory, it writes
+    ///   a RocksDB checkpoint to `dir/rocksdb` — a consistent, openable copy
+    ///   of every column family.
     ///
     /// Inside an open transaction, the persistent layouts save only what has
     /// been committed; an in-memory snapshot captures the live state.
@@ -713,7 +724,12 @@ impl Database {
         if let Some(rocks) = self.store.as_rocks() {
             self.commit_point()?;
             if at_home {
-                return rocks.flush();
+                // The commit point (a WAL fsync) is all the durability a save
+                // at home needs: a memtable flush per save — check_point's
+                // save after every write — would leave a few small table
+                // files (and descriptors) behind per write. Memtables are
+                // flushed by an explicit `checkpoint`, a backup and close.
+                return Ok(());
             }
             let target = dir.join(ROCKS_SUBDIR);
             let staged = fsutil::tmp_path(&target);

@@ -105,6 +105,22 @@
 //! refuses further triple and quad writes until a retry succeeds — a stale
 //! journal replayed later would otherwise undo newer writes.
 //!
+//! ## Commit points and bounded resources
+//!
+//! The `Database`'s commit point fsyncs RocksDB's write-ahead log
+//! ([`sync_wal`](RocksStore::sync_wal)): every write acknowledged so far
+//! survives a crash or a power failure. That includes a save at the
+//! database's home — the servers' `check_point` save after every write — so
+//! memtables are flushed to table files only by an explicit
+//! `Database::checkpoint`, a backup (a RocksDB checkpoint) and when the
+//! store is closed, and RocksDB's own size limits (a full memtable, the WAL
+//! total of 256 MiB). A flush per write would add no
+//! durability, only a few small table files — and with them open
+//! descriptors and compaction work — per write. RocksDB keeps at most
+//! [`RocksTuning::max_open_files`] files open (`[storage]
+//! rocksdb_max_open_files`, default [`DEFAULT_MAX_OPEN_FILES`]) and
+//! four old info logs.
+//!
 //! ## Write errors
 //!
 //! [`MutableStore`] returns a plain `bool`, so a failed RocksDB write cannot be
@@ -147,8 +163,9 @@
 //! every store of the process with the same capacity; default
 //! [`DEFAULT_BLOCK_CACHE_MB`] MiB, environment [`BLOCK_CACHE_ENV`]) and
 //! whole-key bloom filters on the column families read by point lookups
-//! (`spo`, `stats`, `gspo`). Neither changes a key, a value or the column
-//! family set: files written with or without them open either way.
+//! (`spo`, `stats`, `gspo`), and the bound on open files above. None
+//! changes a key, a value or the column family set: files written with or
+//! without them open either way.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -236,6 +253,20 @@ fn check_len(cf: &str, k: &[u8], len: usize) -> std::result::Result<(), String> 
     ))
 }
 
+/// The default bound on the files RocksDB keeps open (`[storage]
+/// rocksdb_max_open_files`). RocksDB's own default (unlimited) keeps a
+/// descriptor per table file for as long as the store is open.
+pub const DEFAULT_MAX_OPEN_FILES: i32 = 4096;
+/// How many old RocksDB info logs (`LOG.old.*`) are kept: each open starts
+/// a new one, and a backup copies them all.
+const KEEP_LOG_FILES: usize = 4;
+/// The write-ahead logs' total size at which RocksDB flushes the column
+/// families that still hold the oldest log. A commit point only syncs the
+/// WAL (a memtable flush adds no durability), so without a bound the logs a
+/// rarely written column family keeps alive would pile up until its
+/// memtable filled.
+const MAX_TOTAL_WAL_BYTES: u64 = 256 << 20;
+
 /// The environment variable setting the shared block cache, in MiB (`0`:
 /// RocksDB's own default, a 32 MiB cache per column family).
 pub const BLOCK_CACHE_ENV: &str = "GSTORE_ROCKS_BLOCK_CACHE_MB";
@@ -255,6 +286,10 @@ pub struct RocksTuning {
     /// Bits per key of the whole-key bloom filters written for the column
     /// families read by point lookups (`spo`, `stats`, `gspo`); `0` = none.
     pub bloom_bits_per_key: f64,
+    /// The most files RocksDB keeps open (table files beyond it are closed
+    /// and reopened through its table cache); `-1` = unlimited, RocksDB's
+    /// own default (one descriptor per table file).
+    pub max_open_files: i32,
 }
 
 impl Default for RocksTuning {
@@ -269,8 +304,9 @@ impl Default for RocksTuning {
 static INSTALLED_TUNING: Mutex<Option<RocksTuning>> = Mutex::new(None);
 
 /// Install the tuning stores of this process open with (a server installs
-/// `conf.ini`'s `[storage] rocksdb_block_cache_mb` / `rocksdb_bloom`); the
-/// environment ([`BLOCK_CACHE_ENV`]) still overrides the block cache.
+/// `conf.ini`'s `[storage] rocksdb_block_cache_mb` / `rocksdb_bloom` /
+/// `rocksdb_max_open_files`); the environment ([`BLOCK_CACHE_ENV`]) still
+/// overrides the block cache.
 pub fn set_default_rocks_tuning(tuning: RocksTuning) {
     *INSTALLED_TUNING
         .lock()
@@ -279,7 +315,8 @@ pub fn set_default_rocks_tuning(tuning: RocksTuning) {
 
 impl RocksTuning {
     /// The defaults — the installed tuning ([`set_default_rocks_tuning`]),
-    /// else [`DEFAULT_BLOCK_CACHE_MB`] and [`DEFAULT_BLOOM_BITS`] — with the
+    /// else [`DEFAULT_BLOCK_CACHE_MB`], [`DEFAULT_BLOOM_BITS`] and
+    /// [`DEFAULT_MAX_OPEN_FILES`] — with the
     /// block cache taken from [`BLOCK_CACHE_ENV`] when it is set to a number
     /// of MiB (the environment wins, as for the other storage settings). A
     /// value that is not one is logged (once per process) and ignored.
@@ -291,6 +328,7 @@ impl RocksTuning {
         let base = installed.unwrap_or(RocksTuning {
             block_cache_bytes: DEFAULT_BLOCK_CACHE_MB << 20,
             bloom_bits_per_key: DEFAULT_BLOOM_BITS,
+            max_open_files: DEFAULT_MAX_OPEN_FILES,
         });
         let env = std::env::var(BLOCK_CACHE_ENV).ok();
         let (mb, warning) = block_cache_mb(env.as_deref());
@@ -310,15 +348,17 @@ impl RocksTuning {
                 base.block_cache_bytes
             },
             bloom_bits_per_key: base.bloom_bits_per_key,
+            max_open_files: base.max_open_files,
         }
     }
 
-    /// RocksDB's own defaults (per-column-family caches, no filters): the
-    /// options of stores before Phase 6.
+    /// RocksDB's own defaults (per-column-family caches, no filters, no
+    /// bound on open files): the options of stores before Phase 6.
     pub fn rocksdb_defaults() -> RocksTuning {
         RocksTuning {
             block_cache_bytes: 0,
             bloom_bits_per_key: 0.0,
+            max_open_files: -1,
         }
     }
 }
@@ -576,7 +616,7 @@ impl RocksStore {
         RocksStore::open_with(path, &RocksTuning::default())
     }
 
-    /// [`open`](Self::open) with explicit read-side tuning.
+    /// [`open`](Self::open) with explicit tuning.
     pub fn open_with<P: AsRef<Path>>(path: P, tuning: &RocksTuning) -> Result<RocksStore> {
         RocksStore::open_inner(path.as_ref(), tuning, false)
     }
@@ -596,6 +636,12 @@ impl RocksStore {
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
+        // Bounded resources (options only, the files are the same): open
+        // table files, old info logs, and the WAL kept alive by column
+        // families that are written rarely (see the constants).
+        db_opts.set_max_open_files(tuning.max_open_files);
+        db_opts.set_keep_log_file_num(KEEP_LOG_FILES);
+        db_opts.set_max_total_wal_size(MAX_TOTAL_WAL_BYTES);
 
         let cfs = ALL_CFS
             .iter()
@@ -2529,6 +2575,16 @@ impl RocksStore {
             )),
             Err(e) => Err(format!("rocksdb read ({CF_SPO}): {}", e.into_string())),
         }
+    }
+}
+
+impl Drop for RocksStore {
+    /// Closing flushes the memtables: a commit point only syncs the WAL
+    /// (see the module docs), so without this the next open would replay
+    /// the log written since the last flush. Not needed for durability; a
+    /// failure is ignored (the WAL still holds every write).
+    fn drop(&mut self) {
+        let _ = self.flush();
     }
 }
 
