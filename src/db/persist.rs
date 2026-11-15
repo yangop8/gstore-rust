@@ -233,11 +233,16 @@ pub(super) struct DiskSink {
     pub(super) store: DiskStore,
     /// Mutations of the open transaction, applied at commit.
     pending: Vec<DiskOp>,
-    /// Set once a write-through failed: the store may no longer match the
-    /// working set, so every later commit point fails.
+    /// Set once a write-through or a commit (flush) failed: the store may no
+    /// longer match the working set — or its pager is failed, half-applied
+    /// until a reopen replays its write-ahead log — so every later commit
+    /// point fails and nothing is flushed again (not on drop either).
     broken: Option<String>,
     /// Whether mutations reached `store` since its last flush.
     dirty: bool,
+    /// Mutations applied (or, once broken, skipped) since the last successful
+    /// flush: what reopening without a commit point drops.
+    unflushed: u64,
 }
 
 impl fmt::Debug for DiskSink {
@@ -248,6 +253,7 @@ impl fmt::Debug for DiskSink {
             .field("pending", &self.pending.len())
             .field("dirty", &self.dirty)
             .field("broken", &self.broken)
+            .field("unflushed", &self.unflushed)
             .finish()
     }
 }
@@ -259,7 +265,20 @@ impl DiskSink {
             pending: Vec::new(),
             broken: None,
             dirty: false,
+            unflushed: 0,
         }
+    }
+
+    /// Why the sink is broken, with how many mutations since its last
+    /// successful commit point did not reach the file (see
+    /// [`Database::storage_failure`]).
+    fn failure(&self) -> Option<String> {
+        self.broken.as_ref().map(|e| {
+            format!(
+                "{e}; {} change(s) since the last successful commit point are not durable",
+                self.unflushed
+            )
+        })
     }
 
     fn fail(&mut self, msg: impl Into<String>) {
@@ -269,6 +288,7 @@ impl DiskSink {
     }
 
     fn apply(&mut self, op: &DiskOp) {
+        self.unflushed += 1;
         if self.broken.is_some() {
             return;
         }
@@ -289,8 +309,10 @@ impl DiskSink {
             },
             DiskOp::Free { space, key } => self.store.free_key(*space, key),
         };
-        if let Err(e) = res {
-            self.fail(e.to_string());
+        match res {
+            Ok(_) => {}
+            Err(GStoreError::StorageFailed(why)) => self.fail(why),
+            Err(e) => self.fail(e.to_string()),
         }
     }
 
@@ -313,18 +335,28 @@ impl DiskSink {
         self.pending.clear();
     }
 
-    /// Commit the store's dirty pages to `kvstore.kv` (WAL-protected).
+    /// Commit the store's dirty pages to `kvstore.kv` (WAL-protected). A
+    /// failure breaks the sink: the pages may be half-applied (the pager is
+    /// then failed and only a reopen, replaying its log, repairs the file),
+    /// and a retry must never commit them again on top.
     fn flush(&mut self) -> Result<()> {
         if let Some(e) = &self.broken {
-            return Err(GStoreError::Database(format!(
+            return Err(GStoreError::StorageFailed(format!(
                 "an update could not be written to the on-disk store ({e}); its contents may \
-                 no longer match this session, so nothing more is committed — reopen the database"
+                 no longer match this session, so nothing more is committed"
             )));
         }
         if self.dirty {
-            self.store.flush()?;
+            if let Err(e) = self.store.flush() {
+                self.fail(match &e {
+                    GStoreError::StorageFailed(why) => why.clone(),
+                    other => other.to_string(),
+                });
+                return Err(e);
+            }
             self.dirty = false;
         }
+        self.unflushed = 0;
         Ok(())
     }
 }
@@ -347,7 +379,9 @@ fn sink_mut(disk: &mut Mutex<Option<DiskSink>>) -> &mut Option<DiskSink> {
 impl Drop for DiskSink {
     /// Best-effort: commit mutations applied since the last commit point, so a
     /// tool that inserts through the API and exits without `save()` loses
-    /// nothing. Queued (uncommitted-transaction) mutations are dropped.
+    /// nothing. Queued (uncommitted-transaction) mutations are dropped. A
+    /// broken sink commits nothing: the file keeps its last committed state
+    /// (or the batch its write-ahead log holds, replayed by the next open).
     fn drop(&mut self) {
         if self.broken.is_none() && self.dirty {
             let _ = self.store.flush();
@@ -1763,6 +1797,34 @@ impl Database {
                 sink
             }
         }
+    }
+
+    /// Why the on-disk (`kvstore.kv`) store of this database is broken, if it
+    /// is: a write or a commit failed — in Stream mode the store refuses
+    /// every statement, in Materialize mode the working set may hold changes
+    /// the file does not — so every later commit point fails until the
+    /// database is reopened. The text names the failure and how many changes
+    /// since the last successful commit point are not durable.
+    ///
+    /// Such a database is retired *without* a commit point (a server's
+    /// `unload`, or simply dropping it): its file is consistent through its
+    /// write-ahead log, and reopening replays a complete log (so the batch of
+    /// a commit that failed after its log was written survives) and drops
+    /// everything else that was not committed. `None` for a healthy store
+    /// and for the other layouts.
+    pub fn storage_failure(&self) -> Option<String> {
+        if let Some(sink) = self.disk_guard().as_ref() {
+            if let Some(f) = sink.failure() {
+                return Some(f);
+            }
+        }
+        let dt = self.store.as_disk()?;
+        dt.broken().map(|e| {
+            format!(
+                "{e}; {} change(s) since the last successful commit point are not durable",
+                dt.unsynced_writes()
+            )
+        })
     }
 
     /// The pending persistence failure, through its lock (a plain value: a

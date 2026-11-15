@@ -281,6 +281,25 @@ pub struct DiskDict {
 /// the write (the store sharing the pager is broken).
 pub type WriteCheck = Arc<dyn Fn() -> Result<()> + Send + Sync>;
 
+/// A term write whose operation could not be ended: ending it commits the
+/// page cache when the operation outgrew it, and that commit failed. The
+/// term's pages stay in the cache, applied, but this backend's counts and
+/// caches do not know them — and the commit carried the triple store's
+/// applied writes too. So the shared pager is marked failed (the first
+/// reason wins; a commit that failed after its write-ahead log got its name
+/// failed it already), which breaks the
+/// [`DiskTriples`](super::DiskTriples) sharing it: nothing more is written
+/// until the database is reopened, and the reopen replays the log.
+fn fail_shared_pager(pager: &Pager, e: GStoreError) -> GStoreError {
+    pager.mark_failed(format!("committing a dictionary term write failed ({e})"));
+    match e {
+        e @ GStoreError::StorageFailed(_) => e,
+        e => GStoreError::StorageFailed(
+            pager.failure().map_or_else(|| e.to_string(), str::to_string),
+        ),
+    }
+}
+
 impl DiskDict {
     /// Build a backend sharing `pager` with its `DiskStore`. The `BTree` handles
     /// are copies of the store's dictionary trees; `*_count` are the live term
@@ -633,7 +652,9 @@ impl DiskTermSource for DiskDict {
             });
             match outcome {
                 Ok(r) => {
-                    op.commit()?;
+                    if let Err(e) = op.commit() {
+                        return Err(fail_shared_pager(&guard, e));
+                    }
                     if r.1 {
                         // Visible to readers only now that the pages hold it.
                         self.reload_roots(&guard, space);
@@ -687,7 +708,9 @@ impl DiskTermSource for DiskDict {
             });
             match outcome {
                 Ok(freed) => {
-                    op.commit()?;
+                    if let Err(e) = op.commit() {
+                        return Err(fail_shared_pager(&guard, e));
+                    }
                     if freed {
                         self.reload_roots(&guard, space);
                     }

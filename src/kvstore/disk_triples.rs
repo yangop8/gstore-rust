@@ -42,6 +42,13 @@
 //! point, but a crash in the middle of applying a very large one can leave
 //! part of it on disk (docs/PHASE6_PLAN.md D12).
 //!
+//! The broken state *is* the shared pager's failed state
+//! ([`Pager::failure`]): breaking the store fails the pager, so nothing —
+//! not the dictionary sharing it either — writes or commits through it any
+//! more, and a pager that failed by itself (a commit of the dictionary's
+//! terms that failed after its write-ahead log got its name) breaks the
+//! store at once. A reopen replays the log and starts afresh.
+//!
 //! ## Locking
 //!
 //! Lock order (C8): gate → pager. The gate's mutex is only ever held for a
@@ -56,7 +63,7 @@ use std::fmt;
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::dict::{DiskTermSource, Space, TermId};
@@ -66,7 +73,7 @@ use crate::model::IdTriple;
 use crate::store::read_scope::note_read_error;
 use crate::store::{MutableStore, Overlay, OverlayChanges, OverlayView, TripleSource};
 
-use super::pager::Pager;
+use super::pager::{FailureFlag, Pager};
 use super::store::DiskStore;
 
 // ---- reporting reads ---------------------------------------------------------
@@ -332,8 +339,10 @@ pub(crate) struct DiskShared {
     epoch: AtomicU64,
     /// Set when the `DiskTriples` was dropped or closed.
     closed: AtomicBool,
-    /// The first write or flush error; set once, never cleared.
-    broken: OnceLock<String>,
+    /// The first write or flush error; set once, never cleared. It is the
+    /// shared pager's [`FailureFlag`]: breaking the store fails the pager,
+    /// and a failed pager is a broken store.
+    broken: FailureFlag,
 }
 
 thread_local! {
@@ -347,13 +356,13 @@ thread_local! {
 const DRAIN_WARN_AFTER: Duration = Duration::from_secs(10);
 
 impl DiskShared {
-    fn new() -> DiskShared {
+    fn new(broken: FailureFlag) -> DiskShared {
         DiskShared {
             gate: Mutex::new(GateState::default()),
             left: Condvar::new(),
             epoch: AtomicU64::new(0),
             closed: AtomicBool::new(false),
-            broken: OnceLock::new(),
+            broken,
         }
     }
 
@@ -600,8 +609,8 @@ fn broken_io(e: &str) -> io::Error {
 }
 
 fn broken_error(e: &str) -> GStoreError {
-    GStoreError::Database(format!(
-        "the on-disk store is broken by an earlier write error ({e}); reopen the database"
+    GStoreError::StorageFailed(format!(
+        "the on-disk store is broken by an earlier write error ({e})"
     ))
 }
 
@@ -664,6 +673,9 @@ pub struct DiskTriples {
     fail_after: AtomicU64,
     /// Long posting lists of the committed store (see [`ListCache`]).
     lists: Mutex<ListCache>,
+    /// Triple and quad changes applied since the last successful commit
+    /// point (see [`unsynced_writes`](Self::unsynced_writes)).
+    unsynced: AtomicU64,
 }
 
 impl fmt::Debug for DiskTriples {
@@ -691,14 +703,20 @@ impl DiskTriples {
         // by the first commit point — `sync`, a checkpoint, the close — so
         // the next open does not rebuild them again.
         let dirty = store.stats_rebuilt();
+        let broken = store
+            .shared_pager()
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .failure_flag();
         Ok(DiskTriples {
             store,
-            shared: Arc::new(DiskShared::new()),
+            shared: Arc::new(DiskShared::new(broken)),
             txn: None,
             dirty: AtomicBool::new(dirty),
             error: Mutex::new(None),
             fail_after: AtomicU64::new(NO_INJECTION),
             lists: Mutex::new(ListCache::default()),
+            unsynced: AtomicU64::new(0),
         })
     }
 
@@ -741,9 +759,23 @@ impl DiskTriples {
         }
     }
 
-    /// The first write or flush error, if the store is broken.
+    /// The first write or flush error, if the store is broken (also when
+    /// the shared pager failed by itself, see the module docs).
     pub fn broken(&self) -> Option<&str> {
         self.shared.broken.get().map(String::as_str)
+    }
+
+    /// How many triple and quad changes were applied to the pages since the
+    /// last successful [`commit_point`](Self::commit_point): what a broken
+    /// store drops when it is closed without one (unless the failed commit's
+    /// write-ahead log was complete, which the next open replays).
+    pub fn unsynced_writes(&self) -> u64 {
+        self.unsynced.load(Ordering::SeqCst)
+    }
+
+    /// Count `n` applied changes towards [`unsynced_writes`](Self::unsynced_writes).
+    fn applied(&self, n: u64) {
+        self.unsynced.fetch_add(n, Ordering::SeqCst);
     }
 
     /// A check that fails once this store is broken: for a dictionary
@@ -926,7 +958,11 @@ impl DiskTriples {
         match self.store.try_exists(t.sub, t.pred, t.obj) {
             Err(e) => Err(self.fail(GStoreError::Io(e))),
             Ok(true) => Ok(false),
-            Ok(false) => self.under_gate(|dt| dt.apply(|st| st.insert_ids(t))),
+            Ok(false) => {
+                let new = self.under_gate(|dt| dt.apply(|st| st.insert_ids(t)))?;
+                self.applied(u64::from(new));
+                Ok(new)
+            }
         }
     }
 
@@ -945,7 +981,11 @@ impl DiskTriples {
         match self.store.try_exists(t.sub, t.pred, t.obj) {
             Err(e) => Err(self.fail(GStoreError::Io(e))),
             Ok(false) => Ok(false),
-            Ok(true) => self.under_gate(|dt| dt.apply(|st| st.delete_ids(t))),
+            Ok(true) => {
+                let gone = self.under_gate(|dt| dt.apply(|st| st.delete_ids(t)))?;
+                self.applied(u64::from(gone));
+                Ok(gone)
+            }
         }
     }
 
@@ -982,6 +1022,7 @@ impl DiskTriples {
             }
             Ok(n > 0)
         })?;
+        self.applied(n);
         Ok(n)
     }
 
@@ -1018,6 +1059,7 @@ impl DiskTriples {
             }
             Ok(n > 0)
         })?;
+        self.applied(n);
         Ok(n)
     }
 
@@ -1040,7 +1082,7 @@ impl DiskTriples {
             Ok(exists) if exists == insert => return Ok(()),
             Ok(_) => {}
         }
-        self.under_gate(|dt| {
+        let changed = self.under_gate(|dt| {
             dt.apply(|st| {
                 if insert {
                     st.insert_quad_ids(graph, t)
@@ -1049,6 +1091,7 @@ impl DiskTriples {
                 }
             })
         })?;
+        self.applied(u64::from(changed));
         Ok(())
     }
 
@@ -1161,7 +1204,10 @@ impl DiskTriples {
         if changes.is_empty() && named_ops.is_empty() {
             return Ok(());
         }
-        self.under_gate(|dt| dt.apply_changes(&named_ops, &changes))?;
+        if self.under_gate(|dt| dt.apply_changes(&named_ops, &changes))? {
+            let n = named_ops.len() + changes.removed.len() + changes.added.len();
+            self.applied(n as u64);
+        }
         Ok(())
     }
 
@@ -1202,6 +1248,7 @@ impl DiskTriples {
         match flushed {
             Ok(()) => {
                 self.dirty.store(false, Ordering::SeqCst);
+                self.unsynced.store(0, Ordering::SeqCst);
                 Ok(())
             }
             Err(e) => Err(self.fail(e)),
@@ -1220,6 +1267,7 @@ impl DiskTriples {
         if self.dirty.load(Ordering::SeqCst) {
             self.store.commit()?;
             self.dirty.store(false, Ordering::SeqCst);
+            self.unsynced.store(0, Ordering::SeqCst);
         }
         Ok(())
     }
@@ -1309,7 +1357,9 @@ impl DiskTriples {
 
 impl Drop for DiskTriples {
     /// Drain the gate, mark the views closed and commit applied writes (best
-    /// effort; nothing when broken). An open transaction is dropped.
+    /// effort; nothing when broken — the failed pager would refuse anyway,
+    /// and the next open replays its write-ahead log). An open transaction
+    /// is dropped.
     fn drop(&mut self) {
         if self.shared.closed.load(Ordering::SeqCst) {
             return;
@@ -1610,6 +1660,117 @@ mod tests {
         assert!(dt.has_subject(0), "has_* answer true when in doubt");
         assert!(scope.take_error().unwrap().contains("broken"));
         drop(dt);
+        cleanup(&p);
+    }
+
+    // ---- review C-1 (durability#1, disk#1): the broken state is the pager's
+    // ---- failed state; nothing writes through a broken store
+
+    fn wal_of(p: &Path) -> std::path::PathBuf {
+        let mut wal = p.as_os_str().to_owned();
+        wal.push(".wal");
+        wal.into()
+    }
+
+    #[test]
+    fn a_commit_point_that_fails_mid_apply_breaks_the_store_and_a_reopen_replays_it() {
+        use super::super::pager::failpoints;
+        let p = tmp("fail_apply_cp");
+        let mut dt = seeded(&p, 8);
+        assert!(dt.insert_triple(IdTriple::new(0, 1, 2)).unwrap());
+        dt.commit_point().unwrap();
+        let n = dt
+            .insert_many((1..6).map(|i| IdTriple::new(i, 1, i + 1)))
+            .unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(dt.unsynced_writes(), 5);
+        {
+            let _fp = failpoints::fail_apply_after(2);
+            let e = dt.commit_point().unwrap_err();
+            assert!(matches!(e, GStoreError::StorageFailed(_)), "{e}");
+        }
+        assert!(dt.broken().is_some());
+        let pager = dt.store.shared_pager();
+        assert!(pager.read().unwrap().failure().is_some());
+        assert_eq!(dt.unsynced_writes(), 5, "reported, not reset");
+        let e = dt.insert_triple(IdTriple::new(7, 1, 7)).unwrap_err();
+        assert!(e.to_string().contains("broken"), "{e}");
+        assert!(dt.commit_point().is_err());
+        let file = std::fs::read(&p).unwrap();
+        let log = std::fs::read(wal_of(&p)).unwrap();
+        drop(dt);
+        assert_eq!(std::fs::read(&p).unwrap(), file, "a broken store's drop writes nothing");
+        assert_eq!(std::fs::read(wal_of(&p)).unwrap(), log);
+        drop(pager);
+        // The complete log is replayed: the failed batch whole.
+        let dt = DiskTriples::open(&p, 64).unwrap();
+        assert!(dt.broken().is_none());
+        assert_eq!(dt.triple_count(), 6);
+        drop(dt);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn a_commit_point_whose_log_could_not_be_written_breaks_the_store_and_loses_the_batch() {
+        use super::super::pager::failpoints;
+        let p = tmp("fail_wal_cp");
+        let mut dt = seeded(&p, 8);
+        assert!(dt.insert_triple(IdTriple::new(0, 1, 2)).unwrap());
+        dt.commit_point().unwrap();
+        assert!(dt.insert_triple(IdTriple::new(3, 1, 4)).unwrap());
+        {
+            let _fp = failpoints::fail_wal_write_after(100);
+            assert!(dt.commit_point().is_err());
+        }
+        // The pager itself could retry, but the store broke and fails it.
+        assert!(dt.broken().is_some());
+        let pager = dt.store.shared_pager();
+        assert!(pager.read().unwrap().failure().is_some());
+        drop(dt);
+        drop(pager);
+        assert!(!wal_of(&p).exists());
+        let dt = DiskTriples::open(&p, 64).unwrap();
+        assert_eq!(dt.triple_count(), 1, "the batch never got a log: absent");
+        drop(dt);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn a_failed_dictionary_commit_breaks_the_store_sharing_its_pager() {
+        // Review disk#1: a commit made by the dictionary (ending a term
+        // write that outgrew the page cache) used to fail without breaking
+        // the triple store, whose drop then committed again.
+        use super::super::disk_dict::DiskDict;
+        use super::super::pager::failpoints;
+        use crate::dict::DiskTermSource;
+        let p = tmp("fail_dict_commit");
+        let mut ds = DiskStore::open(&p, 8).unwrap();
+        ds.intern_entity("<e0>").unwrap();
+        ds.flush().unwrap();
+        let dt = DiskTriples::new(ds).unwrap();
+        let dict = DiskDict::open_shared(dt.shared_pager().unwrap())
+            .unwrap()
+            .with_write_check(dt.write_check())
+            .writable();
+        let failed = {
+            let _fp = failpoints::fail_apply_after(1);
+            (0..20_000)
+                .map(|i| dict.intern(Space::Entity, &format!("<http://ex/term/{i}>")))
+                .find_map(Result::err)
+                .expect("some term write commits the cache")
+        };
+        assert!(matches!(failed, GStoreError::StorageFailed(_)), "{failed}");
+        assert!(dt.broken().is_some(), "routed to the triple store");
+        assert!(dict.intern(Space::Entity, "<http://ex/after>").is_err());
+        assert!(dt.commit_point().is_err());
+        drop((dict, dt));
+        // The failed commit's log is complete: the reopen replays it and the
+        // file is consistent.
+        let ds = DiskStore::open(&p, 64).unwrap();
+        let eager = ds.dictionary().unwrap();
+        assert_eq!(eager.entity_id("<e0>"), Some(0));
+        assert_eq!(eager.entity_id("<http://ex/term/0>"), Some(1));
+        drop(ds);
         cleanup(&p);
     }
 }
