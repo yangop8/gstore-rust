@@ -1,6 +1,6 @@
 //! The policy of the upstream `/api` layer's file routes (`/file/download`,
 //! `/file/upload`) and of the files they serve (review sec#4, gapi#2,
-//! gapi#4, robust#7, sec#11, gapi#14, gapi#11):
+//! gapi#4, robust#7, sec#11, sec#14, gapi#13, gapi#14, gapi#11):
 //!
 //! * a download needs credentials by default; `anonymous_download=on`
 //!   restores upstream's public export directory;
@@ -9,7 +9,9 @@
 //!   download and as a `batchInsert` source;
 //! * export and result names carry 128 random bits;
 //! * a download is streamed (bounded memory), and only so many run at once;
-//! * `format=file` results are written without a result tree in memory.
+//! * `format=file` results are written without a result tree in memory;
+//! * expired server-written files and orphaned task results are removed;
+//!   uploads have an optional per-user quota.
 //!
 //! Memory is measured with a counting global allocator, so the tests of this
 //! file run one at a time ([`serial`]).
@@ -22,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use gstore::config::GStoreConfig;
 use gstore::http_api::ApiServer;
@@ -730,6 +732,27 @@ fn uploads_are_private_to_their_uploader() {
     ));
 }
 
+/// sec#14 / gapi#14: with `upload_user_quota`, each user's uploads are
+/// capped.
+#[test]
+fn uploads_are_capped_per_user() {
+    let _g = serial();
+    let root = TempRoot::new("quota");
+    let srv = start_at(&root.0, |c| set(c, "upload_user_quota", "100"));
+    let a = &srv.addr;
+    for u in ["alice", "bob"] {
+        add_user(a, u);
+    }
+    let sixty = format!("<http://ex/s> <http://ex/p> \"{}\" .\n", "x".repeat(27));
+    assert_eq!(sixty.len(), 60);
+    ok(&upload_as(a, "alice", "one.nt", sixty.as_bytes()));
+    let j = upload_as(a, "alice", "two.nt", sixty.as_bytes());
+    assert_eq!(code(&j), 1005, "{j}");
+    assert!(string(&j, "StatusMsg").contains("quota"), "{j}");
+    // bob's quota is his own.
+    ok(&upload_as(a, "bob", "one.nt", sixty.as_bytes()));
+}
+
 // ---------------------------------------------------------------------------
 // Names
 // ---------------------------------------------------------------------------
@@ -985,4 +1008,149 @@ fn format_file_results_are_written_without_a_result_tree() {
         peak < 3 * size,
         "a {size}-byte format=file result took {peak} bytes of heap at its peak"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Retention, orphaned task results
+// ---------------------------------------------------------------------------
+
+fn backdate(path: &Path, by: Duration) {
+    let f = File::options().write(true).open(path).unwrap();
+    f.set_modified(SystemTime::now() - by).unwrap();
+}
+
+/// The names in `dir` that contain `needle` (files and their owner records).
+fn entries_with(dir: &Path, needle: &str) -> Vec<String> {
+    fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.contains(needle))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Poll `checkOperationState` until the operation has ended.
+fn wait_done(addr: &SocketAddr, opt_id: &str) {
+    let until = Instant::now() + Duration::from_secs(60);
+    loop {
+        let j = api(
+            addr,
+            &[("operation", "checkOperationState"), ("opt_id", opt_id)],
+        );
+        ok(&j);
+        if j.get("state").and_then(Json::as_i64) != Some(0) {
+            return;
+        }
+        assert!(Instant::now() < until, "operation {opt_id} never finished");
+        thread::yield_now();
+    }
+}
+
+/// sec#14 / gapi#13: expired uploads, exports and `format=file` results are
+/// removed (operator files are not), and so are the spilled task results a
+/// previous run of the server left behind.
+#[test]
+fn expired_files_and_orphaned_task_results_are_removed() {
+    let _g = serial();
+    let root = TempRoot::new("retention");
+    // The first run writes an export, a result, an upload and an async
+    // query result, then stops.
+    let (export, result, upload, opt_id) = {
+        let srv = start_at(&root.0, |_| {});
+        let a = &srv.addr;
+        two_databases(&srv);
+        let export = file_name(&export_as(a, "root", "dba"));
+        let result = query_file_as(a, "root", "dba", "SELECT ?o WHERE { ?s ?p ?o }");
+        let j = upload_as(a, "alice", "old.nt", DATA_B.as_bytes());
+        ok(&j);
+        let upload = file_name(&string(&j, "filepath"));
+        let j = api(
+            a,
+            &[
+                ("operation", "query"),
+                ("db_name", "dba"),
+                ("sparql", "SELECT ?o WHERE { ?s ?p ?o }"),
+                ("async", "true"),
+            ],
+        );
+        ok(&j);
+        let opt_id = string(&j, "opt_id");
+        wait_done(a, &opt_id);
+        (export, result, upload, opt_id)
+    };
+    let tasks = root.0.join("tasks");
+    let spilled = tasks.join(format!("{opt_id}.json"));
+    assert!(spilled.is_file(), "the async result was spilled");
+    let export_dir = root.0.join("export");
+    let upload_dir = root.0.join("upload");
+    let day = Duration::from_secs(24 * 3600);
+    backdate(&export_dir.join(&export), day);
+    backdate(&export_dir.join(&result), day);
+    backdate(&upload_dir.join(&upload), day);
+    // An old file the operator put there: never the sweep's.
+    fs::write(export_dir.join("operator.nt"), DATA_B).unwrap();
+    backdate(&export_dir.join("operator.nt"), day);
+    backdate(&upload_dir.join("a.nt"), day);
+    // The next run keeps files for an hour; its first file operation sweeps.
+    let srv = start_at(&root.0, |c| set(c, "file_retention_hours", "1"));
+    ok(&api(
+        &srv.addr,
+        &[("operation", "load"), ("db_name", "dba")],
+    ));
+    let fresh = file_name(&export_as(&srv.addr, "root", "dba"));
+    assert!(
+        entries_with(&export_dir, &export).is_empty(),
+        "expired export (and record)"
+    );
+    assert!(
+        entries_with(&export_dir, &result).is_empty(),
+        "expired result (and record)"
+    );
+    assert!(
+        entries_with(&upload_dir, &upload).is_empty(),
+        "expired upload (and record)"
+    );
+    assert!(export_dir.join(&fresh).is_file(), "a fresh export stays");
+    assert!(
+        export_dir.join("operator.nt").is_file(),
+        "operator files stay"
+    );
+    assert!(upload_dir.join("a.nt").is_file(), "operator files stay");
+    assert!(
+        !spilled.exists(),
+        "the previous run's task result is removed"
+    );
+    // The records of the removed files went with them: the fresh export's
+    // is the only one left.
+    let recorded: Vec<String> = fs::read_dir(root.0.join("file_owners"))
+        .unwrap()
+        .flatten()
+        .map(|e| {
+            let j = json::parse(&fs::read_to_string(e.path()).unwrap()).unwrap();
+            string(&j, "path")
+        })
+        .collect();
+    let fresh_path = export_dir.join(&fresh).to_string_lossy().into_owned();
+    assert_eq!(recorded, [fresh_path]);
+    // This run's own async results stay.
+    let j = api(
+        &srv.addr,
+        &[
+            ("operation", "query"),
+            ("db_name", "dba"),
+            ("sparql", "SELECT ?o WHERE { ?s ?p ?o }"),
+            ("async", "true"),
+        ],
+    );
+    ok(&j);
+    let mine = string(&j, "opt_id");
+    wait_done(&srv.addr, &mine);
+    assert!(tasks.join(format!("{mine}.json")).is_file());
+    let j = api(
+        &srv.addr,
+        &[("operation", "checkOperationState"), ("opt_id", &mine)],
+    );
+    ok(&j);
 }

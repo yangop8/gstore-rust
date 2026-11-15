@@ -297,6 +297,7 @@ fn write_result_file(
     };
     let dir = ctx.export_dir();
     fs::create_dir_all(&dir).map_err(fail)?;
+    super::ops_file::sweep_files(ctx);
     let stem = format!(
         "{db}_{thread_id}_{}_{}",
         compact_utc_now(),

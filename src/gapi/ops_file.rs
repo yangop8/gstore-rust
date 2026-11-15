@@ -27,7 +27,7 @@
 //! whether or not the file exists, so the check reveals nothing about the
 //! rest of the file system.
 //!
-//! # Owner records and names
+//! # Owner records, names and retention
 //!
 //! Every file the server writes for a client — an upload, an export, a
 //! `format=file` query result — gets an **owner record** (its path, the kind
@@ -44,7 +44,13 @@
 //! Export and query-result names carry 128 random bits
 //! (`<db>_<YYYYmmddHHMMSS>_<32 hex digits>.nt`, `<db>_<thread>_<UTC
 //! time>_<32 hex digits>.json`): clients use the name the answer reports, so
-//! nothing depends on guessing one.
+//! nothing depends on guessing one. The recorded files are removed once they
+//! are older than `file_retention_hours` (`conf.ini`), and the spilled
+//! results of asynchronous operations an earlier run of the server left
+//! under `<root>/tasks` are removed too: a lazy sweep, run on uploads,
+//! exports, downloads, `format=file` queries and asynchronous submissions, at
+//! most once a minute per server (review sec#14, gapi#13). An upload beyond
+//! the uploader's `upload_user_quota` is refused (`1005`).
 //!
 //! # `/file/upload`
 //!
@@ -102,6 +108,7 @@ use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant, SystemTime};
 
 use super::auth::{self, IpStage};
 use super::envelope::{FileBody, GResp, Status};
@@ -625,14 +632,16 @@ pub(super) fn check_source(
 // Per-server state
 // ---------------------------------------------------------------------------
 
-/// Per-server state of the file routes: the downloads in flight.
+/// Per-server state of the file routes: the downloads in flight and when
+/// the retention sweep last ran.
 #[derive(Default)]
 struct FileState {
     downloads: AtomicUsize,
+    last_sweep: Mutex<Option<Instant>>,
 }
 
 /// The [`FileState`] of `ctx`'s server, kept by server (`None` before it
-/// serves: no download limit).
+/// serves: no download limit, every sweep runs).
 fn file_state(ctx: &Ctx<'_>) -> Option<Arc<FileState>> {
     // Each entry keeps its server's allocation (not the server) alive, so a
     // later server never shares an address — and an entry — with a dropped
@@ -647,6 +656,72 @@ fn file_state(ctx: &Ctx<'_>) -> Option<Arc<FileState>> {
     let state = Arc::new(FileState::default());
     states.push((me, Arc::clone(&state)));
     Some(state)
+}
+
+// ---------------------------------------------------------------------------
+// Retention (see the module docs)
+// ---------------------------------------------------------------------------
+
+/// How often the retention sweep runs at most, per server.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The lazy retention sweep (see the module docs; review sec#14, gapi#13):
+/// remove the recorded files older than `file_retention_hours` (with their
+/// records, and records whose file is gone), and the spilled results under
+/// `<root>/tasks` that no task of this server owns. At most once per
+/// [`SWEEP_INTERVAL`] per server.
+pub(super) fn sweep_files(ctx: &Ctx<'_>) {
+    if let Some(state) = file_state(ctx) {
+        let mut last = locked(&state.last_sweep);
+        if last.is_some_and(|t| t.elapsed() < SWEEP_INTERVAL) {
+            return;
+        }
+        *last = Some(Instant::now());
+    }
+    let hours = ctx.inner.config().file_retention_hours;
+    let max_age = (hours > 0).then(|| Duration::from_secs(hours.saturating_mul(3600)));
+    sweep_records(ctx, max_age);
+    ctx.inner
+        .tasks
+        .remove_orphan_results(&ctx.task_result_dir());
+}
+
+/// The record half of [`sweep_files`]: every record whose file is gone is
+/// dropped; with `max_age`, every recorded file older than that is removed
+/// with its record. Only files inside the upload and export directories are
+/// ever removed.
+fn sweep_records(ctx: &Ctx<'_>, max_age: Option<Duration>) {
+    let Ok(records) = fs::read_dir(owner_dir(ctx)) else {
+        return;
+    };
+    let roots: Vec<PathBuf> = [upload_dir(ctx), ctx.export_dir()]
+        .iter()
+        .filter_map(|r| fs::canonicalize(r).ok())
+        .collect();
+    let now = SystemTime::now();
+    for record in records.flatten() {
+        let record = record.path();
+        let Some((file, _)) = fs::read_to_string(&record)
+            .ok()
+            .and_then(|t| parse_record(&t))
+        else {
+            continue;
+        };
+        let Ok(meta) = fs::symlink_metadata(&file) else {
+            let _ = fs::remove_file(&record);
+            continue;
+        };
+        let expired = max_age.is_some_and(|max| {
+            meta.modified()
+                .ok()
+                .and_then(|t| now.duration_since(t).ok())
+                .is_some_and(|age| age > max)
+        });
+        if expired && meta.is_file() && roots.iter().any(|r| file.starts_with(r)) {
+            let _ = fs::remove_file(&file);
+            let _ = fs::remove_file(&record);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -692,6 +767,7 @@ fn upload(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
             "You have no upload privilege",
         );
     }
+    sweep_files(ctx);
     let empty = || GResp::error(Status::ParamIsIllegal, "Upload file can not be empty!");
     let Some(file) = p.file("file") else {
         return empty();
@@ -724,6 +800,20 @@ fn upload(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         );
     }
     let dir = upload_dir(ctx);
+    if cfg.upload_user_quota > 0 {
+        let used = uploads_of(ctx, ctx.user());
+        if used.saturating_add(file.data.len() as u64) > cfg.upload_user_quota {
+            return GResp::error(
+                Status::OperationFailed,
+                format!(
+                    "Upload quota exceeded: your uploads take {used} bytes, this one {} more, \
+                     the quota is {} bytes (upload_user_quota)",
+                    file.data.len(),
+                    cfg.upload_user_quota
+                ),
+            );
+        }
+    }
     let stem = format!("{}_{}", safe_stem(&filename), timestamp_now());
     let fail = |e: std::io::Error| {
         GResp::error(
@@ -745,6 +835,20 @@ fn upload(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         return fail(e);
     }
     GResp::success("success").with("filepath", shown(&dir, &name))
+}
+
+/// The bytes of `user`'s recorded uploads (those still there).
+fn uploads_of(ctx: &Ctx<'_>, user: &str) -> u64 {
+    let Ok(records) = fs::read_dir(owner_dir(ctx)) else {
+        return 0;
+    };
+    records
+        .flatten()
+        .filter_map(|r| parse_record(&fs::read_to_string(r.path()).ok()?))
+        .filter(|(_, o)| o.kind == FileKind::Upload && o.user == user)
+        .filter_map(|(file, _)| fs::metadata(file).ok())
+        .map(|m| m.len())
+        .sum()
 }
 
 // ---------------------------------------------------------------------------
@@ -968,6 +1072,7 @@ fn download(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         Ok(true) if is_admin(ctx) => Reach::Admin,
         Ok(true) => Reach::User,
     };
+    sweep_files(ctx);
     let Some(path) = download_file(ctx, &requested, reach) else {
         return not_found();
     };

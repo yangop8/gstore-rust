@@ -2288,6 +2288,7 @@ fn export(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     if let Err(e) = fs::create_dir_all(&target) {
         return fail(e.to_string());
     }
+    ops_file::sweep_files(ctx);
     let slot = match ApiInner::lock_for_op_read(&dbh, &db, "exporting") {
         Ok(s) => s,
         Err(e) => return op_error(&db, "Export fail: ", e),
