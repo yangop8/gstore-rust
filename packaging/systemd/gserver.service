@@ -30,6 +30,13 @@ WorkingDirectory=/var/lib/gstore
 StateDirectory=gstore
 StateDirectoryMode=0750
 ExecStart=/usr/bin/gserver -s -c /etc/gstore/conf.ini
+# Root's initial password: a fresh deb/rpm install writes a random one to this
+# file (0640 root:gstore), and gserver sets it when it creates the user store
+# at its first start (conf.ini, a configuration file of the package, is never
+# rewritten). A missing file is ignored (an upgrade, a password already set):
+# conf.ini's root_password then seeds a new store. Delete the file once root's
+# password has been changed.
+Environment=GSTORE_ROOT_PASSWORD_FILE=/etc/gstore/root_password
 # Stopping: SIGTERM to gserver (what `gserver -t` sends) shuts it down
 # gracefully — in-flight requests finish (up to 10 s), open transactions roll
 # back, unsaved changes are saved — then it exits 0. Only the main process is

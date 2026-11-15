@@ -62,8 +62,11 @@
 //! - `--password PW`: root's password when the user store is first created
 //!   (`root_password`).
 //! - `--password-file FILE`: the same, read from the first line of `FILE`
-//!   (also `$GSTORE_ROOT_PASSWORD_FILE`, e.g. a Docker secret), so it shows
-//!   in neither `ps` nor `docker inspect`.
+//!   (also `$GSTORE_ROOT_PASSWORD_FILE`, e.g. a Docker secret, or the
+//!   packages' first-start `/etc/gstore/root_password`), so it shows in
+//!   neither `ps` nor `docker inspect`. A file the environment variable
+//!   names but that does not exist is skipped with a warning (conf.ini's
+//!   `root_password` applies); `--password-file` must be readable.
 //!
 //! While `root` still has the default password `123456` (whatever
 //! `conf.ini` says now: it only seeds a new user store), the multi-database
@@ -446,14 +449,35 @@ fn load_config(cli: &Cli) -> GStoreConfig {
     if let Some(a) = &cli.addr {
         cfg.listen_addr = a.clone();
     }
-    let password_file = cli.password_file.clone().or_else(|| {
+    // `--password-file` must be readable. A file named by the environment
+    // variable may be missing: the packages' systemd unit always names
+    // `/etc/gstore/root_password`, which only a fresh install has (and which
+    // the administrator deletes once root's password is changed); the
+    // password only seeds a new user store, and conf.ini's `root_password`
+    // seeds it then (gserver refuses the default one, see
+    // `refuse_default_password`).
+    let env_password_file = || {
         std::env::var_os(ENV_PASSWORD_FILE)
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
-    });
+            .filter(|file| {
+                let present = !matches!(
+                    file.symlink_metadata(),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound
+                );
+                if !present {
+                    cfg.warn(format!(
+                        "${ENV_PASSWORD_FILE} names '{}', which does not exist: root's \
+                         password for a new user store comes from conf.ini's root_password",
+                        file.display()
+                    ));
+                }
+                present
+            })
+    };
     if let Some(pw) = &cli.password {
         cfg.root_password = pw.clone();
-    } else if let Some(file) = password_file {
+    } else if let Some(file) = cli.password_file.clone().or_else(env_password_file) {
         match read_password_file(&file) {
             Ok(pw) => cfg.root_password = pw,
             Err(e) => {

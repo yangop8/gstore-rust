@@ -111,12 +111,28 @@ at startup for every switch that is on):
   remedies. Compat switch: `allow_default_root_password=on` — gserver then
   starts on a loopback address only (still refused beyond loopback) and
   the password is accepted from local clients only.
-- **Packages set a random root password on a fresh install**: the deb
-  postinst and the rpm `%post` replace `root_password="123456"` in
-  `/etc/gstore/conf.ini` with a random 32-hex-digit password when no user
-  store exists under `/var/lib/gstore` yet, keeping the file's owner and
-  mode (`0640 root:gstore`), and print where it is (not the password).
-  Upgrades, existing user stores and passwords already set are left alone.
+- **Packages set a random root password on a fresh install**: when no user
+  store exists under `/var/lib/gstore` yet and `/etc/gstore/conf.ini` still
+  names the default password, the deb postinst and the rpm `%post` write a
+  random 32-hex-digit password to `/etc/gstore/root_password` (`0640
+  root:gstore`; written beside it, synced and renamed into place, every
+  step's status checked) and print where it is (not the password). The
+  systemd unit sets `GSTORE_ROOT_PASSWORD_FILE=/etc/gstore/root_password`,
+  so gserver seeds the user store with it at the first start. `conf.ini`
+  is left byte-identical: it is a dpkg conffile, which maintainer scripts
+  must not change (Debian Policy 10.7.3; a rewritten conffile made every
+  later upgrade that ships a new `conf.ini` stop at the conffile prompt).
+  Round-1 review fix: the block first rewrote `conf.ini` in place (`cat >`,
+  unchecked in the rpm scriptlet, so a failed write left it truncated and
+  still printed success). A deb purge removes the password file. gserver
+  skips a file that `$GSTORE_ROOT_PASSWORD_FILE` names but that does not
+  exist, with a warning (an upgrade, or the file deleted after root's
+  password was changed: the user store exists; a new store is seeded from
+  `conf.ini`'s `root_password`, whose default gserver refuses);
+  `--password-file` must still be readable. Upgrades, existing user stores
+  and passwords already set are left alone. Test:
+  `tests/packaging_first_start.rs` (its fresh-install assertions pinned the
+  rewritten `conf.ini` and are corrected).
 - **Upgrade note**: an API server whose stored root password is still
   `123456` refuses to start after the upgrade. Change the password first,
   or start once on `127.0.0.1` with `[server]
@@ -188,10 +204,14 @@ the query text are still skipped by the parser (unchanged known gap).
   refuses proxied requests unless `trust_proxy_headers=on` (prefer the API
   mode behind a proxy).
 - docs/DEPLOY.md — first start / upgrade: packages generate root's
-  password on a fresh install (read it in `/etc/gstore/conf.ini` as root,
-  change it after the first start); the upgrade note above for servers
-  whose root still has 123456; the Docker image already requires a
-  password (unchanged).
+  password on a fresh install (read it in `/etc/gstore/root_password` as
+  root, change it after the first start, then delete the file; the unit's
+  `GSTORE_ROOT_PASSWORD_FILE` names it, and a missing file is skipped);
+  `conf.ini` stays as shipped, so later package upgrades raise no conffile
+  prompt; the upgrade note above for servers whose root still has 123456;
+  the Docker image already requires a password (unchanged; a
+  `GSTORE_ROOT_PASSWORD_FILE` that names a missing file is now skipped with
+  a warning instead of stopping gserver).
 - README.md — the quick start must set root's password (gserver refuses
   123456): `gserver --api DIR --password-file FILE`, or `root_password` in
   conf.ini for a new store; the HTTP section: POST `application/sparql-query`

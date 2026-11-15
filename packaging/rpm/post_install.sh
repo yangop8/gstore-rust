@@ -19,30 +19,43 @@ fi
 # >>> first-start root password (tests/packaging_first_start.rs runs this
 # block). A fresh install gets its own random root password instead of
 # upstream's shared default 123456, which gserver refuses to serve (conf.ini's
-# allow_default_root_password): it seeds the user store at the first start.
-# An upgrade, or a server that already has a user store, keeps its
-# configuration as it is. The paths can be overridden for tests.
+# allow_default_root_password). It goes to a file of its own,
+# GSTORE_PKG_PWFILE (0640 root:gstore), never into conf.ini (the package's
+# configuration file, the administrator's from now on). The systemd unit
+# hands the file to gserver (GSTORE_ROOT_PASSWORD_FILE), which seeds the user
+# store with it at the first start. An upgrade, a server that already has a
+# user store, or a conf.ini with a password of its own is left as it is. The
+# paths and the group can be overridden for tests. (No `set -e` in an rpm
+# scriptlet: every step's status is checked.)
 GSTORE_PKG_CONF=${GSTORE_PKG_CONF:-/etc/gstore/conf.ini}
 GSTORE_PKG_DATA=${GSTORE_PKG_DATA:-/var/lib/gstore}
+GSTORE_PKG_PWFILE=${GSTORE_PKG_PWFILE:-/etc/gstore/root_password}
+GSTORE_PKG_GROUP=${GSTORE_PKG_GROUP:-gstore}
 if [ "$1" = 1 ] && [ ! -e "$GSTORE_PKG_DATA/dbhome/users.db" ] \
+    && [ ! -e "$GSTORE_PKG_PWFILE" ] \
     && grep -q '^[[:space:]]*root_password[[:space:]]*=[[:space:]]*"\{0,1\}123456"\{0,1\}[[:space:]]*$' \
         "$GSTORE_PKG_CONF"; then
-    gstore_pw=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
-    if [ ${#gstore_pw} -eq 32 ] && ( umask 077
-        sed "s/^\([[:space:]]*root_password[[:space:]]*=\).*\$/\1\"$gstore_pw\"/" \
-            "$GSTORE_PKG_CONF" >"$GSTORE_PKG_CONF.gstore-new" ); then
-        # Rewritten in place (cat keeps the file's owner and mode); the copy
-        # is private while it exists.
-        cat "$GSTORE_PKG_CONF.gstore-new" >"$GSTORE_PKG_CONF"
-        echo "gstore: root's initial password is a random one, set as root_password in" \
-            "$GSTORE_PKG_CONF (readable by root and the gstore group); change it after the" \
-            "first start (gconsole setpswd, or the /api userPassword operation)."
+    gstore_pw=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n') || gstore_pw=
+    gstore_tmp="$GSTORE_PKG_PWFILE.gstore-new"
+    # Written beside the target, private until it is complete, then given
+    # its group and mode, synced and renamed into place: the file is either
+    # absent or whole.
+    if [ ${#gstore_pw} -eq 32 ] \
+        && ( umask 077; printf '%s\n' "$gstore_pw" >"$gstore_tmp" ) \
+        && chgrp "$GSTORE_PKG_GROUP" "$gstore_tmp" \
+        && chmod 0640 "$gstore_tmp" \
+        && { sync "$gstore_tmp" 2>/dev/null || sync; } \
+        && mv -f "$gstore_tmp" "$GSTORE_PKG_PWFILE"; then
+        echo "gstore: root's initial password is a random one, in $GSTORE_PKG_PWFILE" \
+            "(readable by root and the gstore group); gserver sets it when it creates the" \
+            "user store at its first start. Change it after the first start (gconsole" \
+            "setpswd, or the /api userPassword operation), then delete the file."
     else
+        rm -f "$gstore_tmp"
         echo "gstore: could not set a random root password: set root_password in" \
             "$GSTORE_PKG_CONF before the first start" >&2
     fi
-    rm -f "$GSTORE_PKG_CONF.gstore-new"
-    unset gstore_pw
+    unset gstore_pw gstore_tmp
 fi
 # <<< first-start root password
 chgrp gstore /etc/gstore /etc/gstore/conf.ini || :
