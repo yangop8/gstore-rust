@@ -20,7 +20,8 @@
   export and upload directories without a record (put there by an operator,
   or written by an older version) are `root`'s / `admin`'s alone. A refused
   download is upstream's `FileNotFound` (`StatusCode` 11); a refused source
-  is `1003`.
+  is `1003` (for a `dir`, the answer names the directory only, never the
+  unreadable file in it, so an export's random name does not leak).
 - **Behaviour change (sec#4, gapi#2):** export and query-result file names
   carry 128 random bits: `<db>_<YYYYmmddHHMMSS>_<32 hex>.nt|nq|zip` and
   `<db>_<threadId>_<UTC YYYYmmddHHMMSS>_<32 hex>.json|txt`. Clients use the
@@ -59,7 +60,7 @@
   held until it has been sent), `GBody::File`, `GResp::file`,
   `GResp::into_http` and `HttpBody`. `GResp::into_parts` keeps its signature:
   it reads a file body into memory.
-- New tests: `tests/gapi_download_policy.rs`, 11 tests plus a `gzip`-feature
+- New tests: `tests/gapi_download_policy.rs`, 12 tests plus a `gzip`-feature
   variant. Memory is measured with a counting global allocator.
   `envelope::tests::file_bodies_stay_streamed_and_release_their_permit`,
   `server::streamed_response_tests`, and
@@ -105,9 +106,20 @@ none
     quota check and the upload are not atomic: two concurrent uploads of one
     user can both pass the check. Accepted for a soft quota. (sec#14,
     gapi#14)
-  - The orphan rule for `<root>/tasks` assumes one server per root, which the
-    root lock enforces. Two `ApiServer`s on one root in one process would
-    remove each other's spilled results. (gapi#13)
+  - The orphan rule for `<root>/tasks` assumes one server per root, which
+    gserver's pid-file check enforces ("the server already running"). Two
+    `ApiServer`s on one root in one process would remove each other's
+    spilled results. (gapi#13)
+  - Owner records are written with a plain `fs::write`, neither fsynced nor
+    renamed into place. After a crash a file can lose its record; it then
+    fails closed (root / admin only, kept by the sweep like an operator
+    file), and an unparsable record is skipped by the sweep. (sec#4,
+    sec#14)
+  - A refused `build` / `batch*` `file` says "refused", a missing one "not
+    exist": a user holding `update` somewhere can test whether another
+    user's upload of a guessable name (`<stem>_<YYYYmmddHHMMSS>`) exists,
+    without reading it. Exports and query results have random names, and a
+    download answers `FileNotFound` either way. (gapi#14)
   - Streaming `format=file` removes the serialization multiplier. The
     `ResultSet` itself is still fully materialized and uncapped for the file
     formats, so a huge result still costs its own size. Streaming rows from
@@ -180,7 +192,7 @@ none
   - `src/bin/gserver.rs` `report_config()`: one standalone warning line, to
     fold into `upstream_compat_warnings()` (r1-http-surface) after the merge.
 - One-line edits outside the granted functions (integrators expect them):
-  - `src/gapi/ops_db.rs` `dir_files()`: one `ops_file::check_source(…)?`
+  - `src/gapi/ops_db.rs` `dir_files()`: one `ops_file::check_dir_source(…)?`
     call per listed file. Without it, `batchInsert dir=<export dir>` would
     bypass the owner check.
   - `src/gapi/tasks.rs` `run_async()`: one `super::ops_file::sweep_files(ctx)`
