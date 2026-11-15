@@ -2155,6 +2155,43 @@ upload_allow_compress_packages = "zip"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Convention 3/13c of the review-fix campaign: every D1 upstream-compat
+    /// switch, when on, yields exactly one startup warning line
+    /// `upstream-compat: <key>=<value>` from
+    /// [`GStoreConfig::upstream_compat_warnings`] (gserver prints them and
+    /// `scripts/conformance.sh` checks them), and none is reported while
+    /// the secure defaults are in place. A package adding a switch adds it
+    /// to `SWITCHES`.
+    #[test]
+    fn every_upstream_compat_switch_reports_one_startup_warning() {
+        const SWITCHES: &[(&str, &str)] = &[
+            ("cors_allow_origin", "*"),
+            ("allowed_hosts", "gstore.example"),
+            ("allow_get_update", "on"),
+            ("trust_proxy_headers", "on"),
+            ("allow_default_root_password", "on"),
+            ("anonymous_download", "on"),
+        ];
+        let defaults = GStoreConfig::default();
+        assert_eq!(
+            defaults.upstream_compat_warnings(),
+            Vec::<String>::new(),
+            "the secure defaults report no compat switch"
+        );
+        for (key, value) in SWITCHES {
+            let mut c = GStoreConfig::default();
+            c.set(key, value).unwrap();
+            let lines = c.upstream_compat_warnings();
+            let prefix = format!("upstream-compat: {key}={value}");
+            assert_eq!(
+                lines.iter().filter(|l| l.starts_with(&prefix)).count(),
+                1,
+                "{key}: {lines:?}"
+            );
+            assert_eq!(lines.len(), 1, "{key} alone: {lines:?}");
+        }
+    }
+
     /// `[pfn]`: the PFN sandbox limits reach the query settings; bad values
     /// warn and keep the default.
     #[test]
