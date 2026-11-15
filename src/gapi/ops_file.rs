@@ -497,7 +497,10 @@ fn record_path(ctx: &Ctx<'_>, path: &Path) -> PathBuf {
 }
 
 /// Record `owner` as the owner of `file` (written right after `file` was
-/// created, before its name is reported to anyone).
+/// created, before its name is reported to anyone). The record is written
+/// atomically and durably (temp file, `fsync`, rename, directory `fsync`):
+/// a crash never leaves a torn record, which would make the file unreadable
+/// to its owner and exempt from retention and the upload quota.
 pub(super) fn record_owner(ctx: &Ctx<'_>, file: &Path, owner: &Owner) -> io::Result<()> {
     let path = fs::canonicalize(file)?;
     let mut j = Json::obj()
@@ -507,8 +510,20 @@ pub(super) fn record_owner(ctx: &Ctx<'_>, file: &Path, owner: &Owner) -> io::Res
     if let Some(db) = &owner.db {
         j.set("db", db.as_str());
     }
-    fs::create_dir_all(owner_dir(ctx))?;
-    fs::write(record_path(ctx, &path), j.to_string())
+    let dir = owner_dir(ctx);
+    if !dir.is_dir() {
+        fs::create_dir_all(&dir)?;
+        crate::db::fsutil::sync_dir(ctx.root_dir()).map_err(to_io)?;
+    }
+    crate::db::fsutil::atomic_write(&record_path(ctx, &path), j.to_string().as_bytes())
+        .map_err(to_io)
+}
+
+fn to_io(e: crate::error::GStoreError) -> io::Error {
+    match e {
+        crate::error::GStoreError::Io(e) => e,
+        other => io::Error::other(other.to_string()),
+    }
 }
 
 /// A record's file and owner.
@@ -709,10 +724,26 @@ pub(super) fn sweep_files(ctx: &Ctx<'_>) {
         .remove_orphan_results(&ctx.task_result_dir());
 }
 
+/// How old an owner-record entry that does not parse must be before the
+/// sweep takes it for garbage when no retention is configured (with one,
+/// `file_retention_hours`): a record is written atomically, but its staging
+/// file (`<key>.json.tmp`) exists while it is written.
+const STALE_RECORD_AGE: Duration = Duration::from_secs(3600);
+
 /// The record half of [`sweep_files`]: every record whose file is gone is
 /// dropped; with `max_age`, every recorded file older than that is removed
 /// with its record. Only files inside the upload and export directories are
 /// ever removed.
+///
+/// An entry that does not parse — a record torn by a crash (records were
+/// once written in place, without `fsync`), or the staging file of one a
+/// crash interrupted — is dropped once it is older than `max_age` (else
+/// [`STALE_RECORD_AGE`]), by its own modification time. Its file is found by
+/// the record's name (the SHA-256 of the file's path, [`record_path`]) among
+/// the files of the upload and export directories; with `max_age` that file
+/// is removed too once it is older than that (it was written by the server
+/// for a client, as its record says). Before, such an entry was skipped for
+/// ever, and its file escaped retention.
 fn sweep_records(ctx: &Ctx<'_>, max_age: Option<Duration>) {
     let Ok(records) = fs::read_dir(owner_dir(ctx)) else {
         return;
@@ -722,29 +753,79 @@ fn sweep_records(ctx: &Ctx<'_>, max_age: Option<Duration>) {
         .filter_map(|r| fs::canonicalize(r).ok())
         .collect();
     let now = SystemTime::now();
+    let older_than = |meta: &fs::Metadata, max: Duration| {
+        meta.modified()
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age > max)
+    };
+    // The files of the roots by record name, built on the first torn record.
+    let mut by_key: Option<std::collections::HashMap<String, PathBuf>> = None;
     for record in records.flatten() {
         let record = record.path();
         let Some((file, _)) = fs::read_to_string(&record)
             .ok()
             .and_then(|t| parse_record(&t))
         else {
+            let stale = fs::symlink_metadata(&record)
+                .is_ok_and(|m| m.is_file() && older_than(&m, max_age.unwrap_or(STALE_RECORD_AGE)));
+            if !stale {
+                continue;
+            }
+            let key = record
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.split('.').next())
+                .unwrap_or_default()
+                .to_string();
+            let files = by_key.get_or_insert_with(|| files_by_record_key(&roots));
+            if let (Some(max), Some(file)) = (max_age, files.get(&key)) {
+                match fs::symlink_metadata(file) {
+                    Ok(meta) if !older_than(&meta, max) => continue, // not expired yet
+                    Ok(meta) if meta.is_file() => {
+                        let _ = fs::remove_file(file);
+                    }
+                    _ => {}
+                }
+            }
+            let _ = fs::remove_file(&record);
             continue;
         };
         let Ok(meta) = fs::symlink_metadata(&file) else {
             let _ = fs::remove_file(&record);
             continue;
         };
-        let expired = max_age.is_some_and(|max| {
-            meta.modified()
-                .ok()
-                .and_then(|t| now.duration_since(t).ok())
-                .is_some_and(|age| age > max)
-        });
+        let expired = max_age.is_some_and(|max| older_than(&meta, max));
         if expired && meta.is_file() && roots.iter().any(|r| file.starts_with(r)) {
             let _ = fs::remove_file(&file);
             let _ = fs::remove_file(&record);
         }
     }
+}
+
+/// The regular files under `roots` (canonical directories; symlinks are not
+/// followed), by the name their owner record would have ([`record_path`]).
+fn files_by_record_key(roots: &[PathBuf]) -> std::collections::HashMap<String, PathBuf> {
+    let mut out = std::collections::HashMap::new();
+    let mut pending: Vec<PathBuf> = roots.to_vec();
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if kind.is_dir() {
+                pending.push(path);
+            } else if kind.is_file() {
+                let key = crate::query::hash::sha256_hex(&path.to_string_lossy());
+                out.insert(key, path);
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------

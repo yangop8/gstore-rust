@@ -52,6 +52,18 @@
   queries and asynchronous submissions, at most once a minute per server.
   `TaskManager::remove_orphan_results` is the new library entry point for
   the task half.
+- **Owner records are written atomically and durably; a torn one is swept**
+  (round-1 review of sec#14 / gapi#13): a record is written through a temp
+  file, `fsync`, rename and directory `fsync` before the answer names its
+  file (it was a plain `fs::write`, while the upload itself was
+  `fsync`ed). An entry of `file_owners/` that does not parse — a record a
+  crash tore under the old code, or the staging file of an interrupted
+  write — is no longer skipped for ever: once it is older than
+  `file_retention_hours` (by its own modification time; one hour when
+  retention is off) it is dropped, and the file it names, found by the
+  record's name among the upload and export directories, is removed with
+  it once that file has expired too. Test:
+  `tests/torn_owner_records_are_swept.rs`.
 - **Upload quota (gapi#14, sec#14):** new key `[upload] upload_user_quota`
   sets how many bytes of retained uploads each user may keep (default `0`,
   no quota). An upload beyond it answers `1005 "Upload quota exceeded: …"`.
@@ -110,10 +122,11 @@ none
     gserver's pid-file check enforces ("the server already running"). Two
     `ApiServer`s on one root in one process would remove each other's
     spilled results. (gapi#13)
-  - Owner records are written with a plain `fs::write`, neither fsynced nor
-    renamed into place. After a crash a file can lose its record; it then
-    fails closed (root / admin only, kept by the sweep like an operator
-    file), and an unparsable record is skipped by the sweep. (sec#4,
+  - Owner records: a crash between creating a file and writing its record
+    (records are written atomically and durably since the round-1 review
+    fix) can still leave a file without a record; it then fails closed
+    (root / admin only, kept by the sweep like an operator file). A torn
+    record left by the older non-atomic writes is now swept. (sec#4,
     sec#14)
   - A refused `build` / `batch*` `file` says "refused", a missing one "not
     exist": a user holding `update` somewhere can test whether another
