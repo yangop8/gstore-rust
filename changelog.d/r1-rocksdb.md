@@ -11,8 +11,13 @@
   batchInsert` / `batchRemove`). A crash part-way (SIGKILL, OOM kill, power
   loss) is undone as a whole at the next open, so the database reopens at
   a statement boundary — never half of a DELETE/INSERT rename, half a LOAD
-  or half a CLEAR — like the disk layout, whose commit point writes a
-  statement as one. A statement that fails part-way keeps what it applied
+  or half a CLEAR — whatever the statement's size. (A disk-layout statement
+  is crash-atomic only while its dirty pages fit the page cache; a larger
+  one is committed in several batches mid-statement and a crash can leave
+  a prefix of it — D12, r1-storage-failstate's backlog item 2. The round-1
+  review corrected this fragment and three code comments, which compared
+  the two layouts as if the disk layout's commit point always wrote a
+  statement as one.) A statement that fails part-way keeps what it applied
   (the documented semantics): its journal is committed too — also when it
   panics (a bug the servers answer with a 500 while they keep serving), so
   the journal never stays open to refuse later statements and
@@ -20,9 +25,11 @@
   journaled statement frees are freed at its end, in the batch that deletes
   the journal (until then they are neither deleted nor reused). A failed
   `LOAD` stays "no change at all" (mutation count and CSR put back).
-  Direct-API writes (`insert_triple`, `materialize_rdfs`, …) and REST
-  `/batchInsert` / `/batchRemove` (one `try_insert_triple` per triple in
-  `http_api.rs`) are still atomic per triple only.
+  Direct-API writes (`insert_triple`, `materialize_rdfs`, …), REST
+  `/batchInsert` / `/batchRemove` (`handle_batch`) and REST `/upload` into
+  a loaded database (`handle_upload`) — one `try_insert_triple` per triple
+  in `http_api.rs`, each its own RocksDB write batch and not journaled —
+  are still atomic per triple only: a crash part-way leaves a prefix.
 - **No orphan dictionary terms after a crash on RocksDB**
   (gap-rocksdb-exec#4). Terms written new inside a transaction or a
   journaled statement are recorded in the journal in the same batch, so a
@@ -125,10 +132,15 @@ none
   end (`remove_sources` keeps only the dead ones between batches, and
   probes each candidate once when its batch is read and once at the end).
 - docs/REFACTOR_BACKLOG.md: (a) REST `/batchInsert` / `/batchRemove`
-  (`http_api.rs` handle_batch) apply one `try_insert_triple` per triple,
-  each its own RocksDB write: not crash-atomic as a whole on RocksDB until
-  the handler runs as one journaled statement (gap-rocksdb-exec#1
-  follow-up; `http_api.rs` is r3-rest-parity's in R3). (b) Direct-API
+  (`http_api.rs` handle_batch) and REST `/upload` into a loaded database
+  (`handle_upload`) apply one `try_insert_triple` per triple, each its own
+  RocksDB write and not journaled: not crash-atomic as a whole on RocksDB
+  until each handler runs its loop as one journaled statement
+  (`rocks_begin_statement` / `rocks_statement_body` /
+  `rocks_end_statement`, as `insert_sources` does; H-11 asks for every
+  auto-commit statement to be journaled; gap-rocksdb-exec#1 follow-up;
+  `http_api.rs` is r3-rest-parity's in R3, which should take both
+  handlers). (b) Direct-API
   multi-triple calls (`insert_data`, `materialize_rdfs`, …) stay atomic
   per triple, and can leave an orphan term if a crash falls between a new
   term and its triple (gap-rocksdb-exec#4 residue; `gcompact --reclaim`

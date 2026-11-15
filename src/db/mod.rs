@@ -2177,10 +2177,10 @@ impl Database {
             eval.check_update_calls(&ops)?;
         }
         // RocksDB, outside a transaction: the request is journaled, so a
-        // crash part-way undoes all of it (crash-atomic, as on the disk
-        // layout, whose commit point writes it as one); the journal is
-        // deleted at its commit point (`apply_update_ops`), or when it fails
-        // or panics.
+        // crash part-way undoes all of it (crash-atomic as a whole, whatever
+        // its size — the disk layout is so only while its dirty pages fit
+        // the page cache, D12); the journal is deleted at its commit point
+        // (`apply_update_ops`), or when it fails or panics.
         let journaled = self.rocks_begin_statement()?;
         self.rocks_statement_body(journaled, |db| {
             db.apply_update_ops(sparql, ops, cancel, pfn, journaled)

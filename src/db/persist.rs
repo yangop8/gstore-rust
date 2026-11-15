@@ -1816,9 +1816,12 @@ impl Database {
 
     /// RocksDB, outside a transaction: journal the auto-commit statement
     /// about to run (a SPARQL UPDATE request, `insert_sources` /
-    /// `remove_sources`), so that it is crash-atomic like a statement on the
-    /// disk layout — a crash before [`rocks_end_statement`](Self::rocks_end_statement)
-    /// undoes all of it at the next open, never a prefix. While the journal
+    /// `remove_sources`), so that it is crash-atomic as a whole — a crash
+    /// before [`rocks_end_statement`](Self::rocks_end_statement) undoes all
+    /// of it at the next open, never a prefix, whatever its size (a
+    /// disk-layout statement is crash-atomic only while its dirty pages fit
+    /// the page cache; a larger one is committed in several batches, D12).
+    /// While the journal
     /// records, freed ids wait for the statement's end (as in a
     /// transaction). `Ok(false)` (nothing to end) for the other layouts and
     /// inside a transaction (whose own journal records the statement); an

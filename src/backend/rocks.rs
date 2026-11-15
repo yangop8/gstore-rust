@@ -68,11 +68,13 @@
 //! auto-commit statement the same way — a SPARQL UPDATE request (`LOAD`,
 //! `CLEAR`, `DROP`, `COPY`, `MOVE`, `ADD` included) and an `insert_sources` /
 //! `remove_sources` import (`gadd`, `gsub`, `/api batchInsert` /
-//! `batchRemove`) — so that a statement is crash-atomic like on the disk
-//! layout, whose commit point writes it as one: never a prefix of it (half
-//! of a DELETE/INSERT rename). A failed statement's journal is committed
-//! too, and so is a panicking one's: what it applied before failing stays
-//! applied, as documented.
+//! `batchRemove`) — so that a statement is crash-atomic as a whole: never a
+//! prefix of it (half of a DELETE/INSERT rename), whatever its size. (The
+//! disk layout's commit point writes a statement as one only while its dirty
+//! pages fit the page cache; a larger one is committed in several batches
+//! and a crash can leave a prefix of it, D12.) A failed statement's journal
+//! is committed too, and so is a panicking one's: what it applied before
+//! failing stays applied, as documented.
 //!
 //! Commit deletes the whole journal in one batch, together with the
 //! dictionary terms the transaction or statement freed
