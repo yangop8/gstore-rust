@@ -2296,16 +2296,50 @@ fn read_body<R: BufRead>(r: &mut R, len: usize) -> Result<Vec<u8>, BadRequest> {
     Ok(body)
 }
 
+/// The framing a chunked body may carry besides its data
+/// ([`read_chunked_body`]): chunk-size lines with their extensions, the CRLFs
+/// and the trailer fields may take [`CHUNK_FRAMING_MIN`] plus a sixteenth of
+/// the body cap — ordinary chunking (a few bytes per chunk of kilobytes)
+/// stays far below, and a body near its cap in chunks of 128 bytes or more
+/// still fits.
+fn chunk_framing_allowance(max_body: usize) -> usize {
+    CHUNK_FRAMING_MIN.saturating_add(max_body / 16)
+}
+
+/// The fixed part of [`chunk_framing_allowance`]: 64 KiB.
+const CHUNK_FRAMING_MIN: usize = 64 * 1024;
+
 /// Decode a `Transfer-Encoding: chunked` request body (RFC 9112 §7.1), at most
 /// `max_body` bytes in total; chunk extensions and trailers are ignored, a
-/// malformed chunk size is refused. On a connection it must keep up
+/// malformed chunk size is refused. Everything it reads — data and framing
+/// (chunk-size lines, extensions, CRLFs, trailers) — counts against
+/// `max_body` plus [`chunk_framing_allowance`] (and at most one line of
+/// [`MAX_HEADER_LINE`] past it before the check), so megabytes of
+/// extensions or trailers cannot ride along a small body: such a body is
+/// answered as too large. On a connection it must keep up
 /// [`HttpOptions::min_body_rate`] on average: from here, `read_timeout` plus
-/// the bytes received so far at that rate ([`ConnSocket`]).
+/// the bytes received so far — at most that wire bound — at that rate
+/// ([`ConnSocket`]), so it is in within `read_timeout + (max_body +
+/// allowance) / min_body_rate` at the latest.
 fn read_chunked_body<R: BufRead>(r: &mut R, max_body: usize) -> Result<Vec<u8>, BadRequest> {
-    let _clock = BodyScope::enter(None);
+    let wire_max = max_body.saturating_add(chunk_framing_allowance(max_body));
+    let _clock = BodyScope::enter(Some(
+        wire_max.saturating_add(MAX_HEADER_LINE as usize) as u64
+    ));
     let mut body = Vec::new();
+    // The framing bytes read so far (a line counts with its CRLF).
+    let mut framing = 0usize;
+    let mut count_line = |line: &str, body_len: usize| {
+        framing = framing.saturating_add(line.len() + 2);
+        if body_len.saturating_add(framing) > wire_max {
+            Err(BadRequest::TOO_LARGE)
+        } else {
+            Ok(())
+        }
+    };
     loop {
         let line = read_line_bounded(r)?.ok_or(BadRequest::MALFORMED)?;
+        count_line(&line, body.len())?;
         let size = chunk_size(&line)?;
         if size == 0 {
             break;
@@ -2322,14 +2356,15 @@ fn read_chunked_body<R: BufRead>(r: &mut R, max_body: usize) -> Result<Vec<u8>, 
             return Err(BadRequest::MALFORMED);
         }
         // The CRLF after the chunk data.
-        if read_line_bounded(r)?.is_none_or(|l| !l.is_empty()) {
-            return Err(BadRequest::MALFORMED);
+        match read_line_bounded(r)? {
+            Some(l) if l.is_empty() => count_line(&l, body.len())?,
+            _ => return Err(BadRequest::MALFORMED),
         }
     }
     // Trailer fields, up to the empty line that ends the message.
     for _ in 0..MAX_HEADERS {
         match read_line_bounded(r)? {
-            Some(l) if !l.is_empty() => {}
+            Some(l) if !l.is_empty() => count_line(&l, body.len())?,
             _ => return Ok(body),
         }
     }

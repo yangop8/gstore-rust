@@ -14,7 +14,9 @@ Behaviour changes (both HTTP servers, the single-database `Server` and the
   actually received, never by the declared `Content-Length`, so a client
   announcing a 1 GiB body and dripping it is cut off after about
   `read_timeout`, and no body can hold a worker longer than `read_timeout
-  + length / min_body_rate`, however it trickles in;
+  + length / min_body_rate`, however it trickles in (a chunked body: its
+  wire length, data and framing, is at most the cap plus 64 KiB plus a
+  sixteenth of the cap, see below);
   before, only no single read could wait longer than `read_timeout` (30 s),
   so one byte every 29 s held a worker indefinitely, before authentication,
   and `thread_num + 1` such connections disabled the server. Under TLS the
@@ -31,6 +33,15 @@ Behaviour changes (both HTTP servers, the single-database `Server` and the
   per second, default `65536` = 64 KiB/s; `0` restores the per-read timeout
   alone). A legitimate upload slower than 64 KiB/s on average (after the
   30 s grace) is now cut off: lower the key for such clients.
+- **A chunked body's framing counts against the body cap** (round-1 review
+  fix): chunk-size lines with their extensions, the CRLFs and the trailer
+  fields may take 64 KiB plus a sixteenth of the cap besides the data; a
+  body whose framing exceeds that is answered `413` like a body over the
+  cap. Before, only the decoded data was compared with the cap, so 80
+  chunks of one byte with 60 KiB extensions each (4.9 MB on the wire) passed
+  a 1 KiB pre-authentication cap, charged to the body budget and earning
+  `min_body_rate` time with every byte. Test:
+  `tests/chunked_framing_counts_against_the_body_cap.rs`.
 - **New `[server] max_conns_per_ip`** (`HttpOptions::max_conns_per_ip`,
   default `64`, `0` = no limit): a further connection from an address that
   already has that many open — waiting for a worker included — is closed
@@ -101,7 +112,8 @@ none
   cut off after about 30 s whatever `Content-Length` it declares; holding a
   worker longer takes really sending at least `min_body_rate` (one worker
   per 64 KiB/s of the client's bandwidth), and no request holds one longer
-  than `30 s + max_body / min_body_rate` — keep `max_conns_per_ip` below
+  than `30 s + (max_body + 64 KiB + max_body / 16) / min_body_rate` (the
+  last two terms: a chunked body's framing allowance) — keep `max_conns_per_ip` below
   `thread_num` where untrusted clients with fast links connect. Neither is
   an upstream-compat switch (upstream has no such limit; no conformance
   switch needed).

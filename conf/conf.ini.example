@@ -44,8 +44,9 @@ ip_deny_path="./conf/ipDeny.config"
 # arrive after a 30 s grace: T seconds after the request head, at least
 # (T - 30) * min_body_rate bytes of the body must be in (what was really
 # received counts, not the declared Content-Length), so a client trickling it
-# in cannot hold a worker thread; 0 turns the limit off (default 65536,
-# 64 KiB/s)
+# in cannot hold a worker thread. A chunked body's framing (chunk extensions,
+# trailers) counts against the body cap too. 0 turns the limit off (default
+# 65536, 64 KiB/s)
 # min_body_rate=65536
 # most connections one client IP address may have open at once, those
 # waiting for a worker thread included; further ones are closed at once.
