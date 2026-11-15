@@ -76,9 +76,17 @@ at startup for every switch that is on):
   itself (`http://` or `https://` followed by the request's own `Host`) nor
   an origin of `cors_allow_origin` answers `403` (`/api`: 1101), on both
   servers. Clients that send no `Origin` — curl, the SDKs, the upstream
-  scripts, gconsole — are unaffected; the bundled web consoles are
-  same-origin. A web front end served from another origin (e.g. upstream's
-  Workbench) needs its origin in `cors_allow_origin`.
+  scripts, gconsole — are unaffected. The bundled web consoles POST
+  `/sparql` from the page, so the browser sends the page's `Origin`: it
+  matches when the console is opened at the server's own address. Behind a
+  reverse proxy that rewrites `Host` to the upstream address (nginx's
+  default `proxy_pass`), the public `Origin` matches no `Host` and the
+  console's queries are refused (`403`): list the public origin in
+  `cors_allow_origin`, or let the proxy keep the client's `Host` (nginx
+  `proxy_set_header Host $host;`) and list that name in `allowed_hosts`
+  (test `tests/http_browser_surface.rs::a_host_rewriting_proxy_needs_the_public_origin_listed`).
+  A web front end served from another origin (e.g. upstream's Workbench)
+  needs its origin in `cors_allow_origin`.
 - **Proxies are not local clients** (sec#9, gapi#22): one predicate,
   `server::peer_is_trusted_local`, decides whether a client is local: a
   loopback peer that forwards `Forwarded`, `X-Forwarded-For` or
@@ -88,7 +96,11 @@ at startup for every switch that is on):
   `/login`: `401`; `/api`: `1001`, plaintext or `encryption=1`), and the
   `/api` layer's `trust_inner_localhost` no longer applies to it. Compat
   switch: `trust_proxy_headers=on` (every loopback peer is local, as
-  upstream). The default-password refusal is a constant comparison (it
+  upstream). The detection relies on the proxy adding one of those
+  headers: a same-host proxy that adds none (nginx without
+  `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`, HAProxy
+  without `option forwardfor`, stunnel, ssh / socat tunnels) cannot be told
+  apart from a local client. The default-password refusal is a constant comparison (it
   tells nothing about root's actual password) and does not count towards
   the failed-login lockout (which would lock out every client behind the
   proxy).
@@ -110,11 +122,17 @@ at startup for every switch that is on):
   or start once on `127.0.0.1` with `[server]
   allow_default_root_password=on`, change it (gconsole `setpswd`, `/api`
   `userPassword`), and remove the switch. Behind a reverse proxy on the
-  same host: list the public name in `allowed_hosts` if the proxy passes
-  the client's `Host` (nginx's default `proxy_pass` sends the upstream
-  address, which needs nothing; Caddy passes the client's `Host`), and add
-  the web origins that call the server from a browser to
-  `cors_allow_origin`.
+  same host: make it add `X-Forwarded-For` (nginx: `proxy_set_header
+  X-Forwarded-For $proxy_add_x_forwarded_for;`, which its default
+  `proxy_pass` does not send) so its clients are not taken for local ones.
+  If the proxy passes the client's `Host` (Caddy; nginx with
+  `proxy_set_header Host $host;`), list the public name in `allowed_hosts`.
+  If it rewrites `Host` to the upstream address (nginx's default
+  `proxy_pass`), the `Host` check passes, but a browser page served through
+  it — the bundled web console included — sends its public `Origin`, which
+  matches no `Host`: list that origin in `cors_allow_origin`. Add every
+  other web origin that calls the server from a browser to
+  `cors_allow_origin` too.
 
 New configuration keys (`[server]`, all documented in
 `conf/conf.ini.example` as commented-out lines showing the secure
@@ -155,10 +173,20 @@ the query text are still skipped by the parser (unchanged known gap).
 - docs/DEPLOY.md — a "Browser-facing defaults" paragraph: what each guard
   stops (CSRF via GET/text-plain/foreign Origin, DNS rebinding, CORS
   reads), that clients without `Origin` (scripts, SDKs) are unaffected, and
-  the reverse-proxy advice: same-host proxies are not local clients;
-  `allowed_hosts` for proxies that pass the client's Host; the
-  single-database mode refuses proxied requests unless
-  `trust_proxy_headers=on` (prefer the API mode behind a proxy).
+  the reverse-proxy advice: a same-host proxy is not a local client *when
+  it adds `Forwarded`, `X-Forwarded-For` or `X-Real-IP`* — the server
+  cannot detect a proxy that adds none, so configure it to (nginx:
+  `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`, not sent
+  by its default `proxy_pass`; HAProxy: `option forwardfor`), and never put
+  the unauthenticated single-database mode or
+  `allow_default_root_password=on` behind a proxy that does not;
+  `allowed_hosts` for proxies that pass the client's Host; behind a proxy
+  that rewrites `Host` (nginx's default), the public origin of every
+  browser page — the bundled web console included — goes into
+  `cors_allow_origin` (or keep the client's Host with `proxy_set_header
+  Host $host;` and list it in `allowed_hosts`); the single-database mode
+  refuses proxied requests unless `trust_proxy_headers=on` (prefer the API
+  mode behind a proxy).
 - docs/DEPLOY.md — first start / upgrade: packages generate root's
   password on a fresh install (read it in `/etc/gstore/conf.ini` as root,
   change it after the first start); the upgrade note above for servers

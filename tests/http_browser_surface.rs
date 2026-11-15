@@ -678,6 +678,60 @@ fn a_foreign_origin_cannot_change_state() {
     assert_eq!(api.count_dba(ROOT), 2);
 }
 
+/// What the reverse-proxy advice of the docs says (round-1 review: the
+/// r1-http-surface notes called the bundled consoles same-origin and nginx's
+/// default `proxy_pass` "needs nothing"): a proxy that rewrites `Host` to the
+/// upstream address while the browser sends the page's public `Origin` gets
+/// the console's `POST /sparql` refused, until the public origin is listed
+/// in `cors_allow_origin` — or the proxy keeps the client's `Host` and that
+/// name is listed in `allowed_hosts`.
+#[test]
+fn a_host_rewriting_proxy_needs_the_public_origin_listed() {
+    let public = "https://db.example.com";
+    // What the bundled console's fetch sends: a form body to /sparql.
+    let console = format!("query={}", enc("ASK {}"));
+    let post = |srv: &Single, host: &str| {
+        send(
+            srv.addr,
+            "POST",
+            "/sparql",
+            &[("Host", host), ("Origin", public), FORM],
+            &console,
+        )
+    };
+
+    // nginx's default proxy_pass: Host is the upstream address.
+    let srv = Single::start("");
+    let upstream = format!("127.0.0.1:{}", srv.addr.port());
+    let r = post(&srv, &upstream);
+    assert_eq!(r.status, 403, "{r:?}");
+    assert!(r.body.contains("cors_allow_origin"), "{r:?}");
+    // Opened at the server's own address the console is same-origin.
+    let own = format!("http://{upstream}");
+    let r = send(
+        srv.addr,
+        "POST",
+        "/sparql",
+        &[("Host", upstream.as_str()), ("Origin", own.as_str()), FORM],
+        &console,
+    );
+    assert_eq!(r.status, 200, "{r:?}");
+
+    let listed = Single::start("[server]\ncors_allow_origin=https://db.example.com\n");
+    let upstream = format!("127.0.0.1:{}", listed.addr.port());
+    let r = post(&listed, &upstream);
+    assert_eq!(r.status, 200, "the public origin listed: {r:?}");
+
+    // A proxy that keeps the client's Host (nginx `proxy_set_header Host
+    // $host;`): the name must be listed, and the Origin is then same-origin.
+    let r = post(&srv, "db.example.com");
+    assert_eq!(r.status, 403, "{r:?}");
+    assert!(r.body.contains("allowed_hosts"), "{r:?}");
+    let kept = Single::start("[server]\nallowed_hosts=db.example.com\n");
+    let r = post(&kept, "db.example.com");
+    assert_eq!(r.status, 200, "the client's Host kept and listed: {r:?}");
+}
+
 // ---- proxies: loopback privileges ---------------------------------------------
 
 const PROXIED: [(&str, &str); 3] = [

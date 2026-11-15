@@ -77,7 +77,11 @@ ip_deny_path="./conf/ipDeny.config"
 # besides IP addresses, localhost and names without a dot (a guard against
 # DNS rebinding: a web page whose own name is re-resolved to 127.0.0.1 is
 # refused). List the public name a reverse proxy passes on, if it passes the
-# client's Host. '*' turns the check off. Default: none.
+# client's Host. '*' turns the check off. Default: none. A web page served
+# through a proxy that rewrites Host to this server's address (nginx's
+# default proxy_pass) sends its public Origin, which then matches no Host:
+# list that origin in cors_allow_origin, or let the proxy keep the client's
+# Host (nginx: proxy_set_header Host $host;) and list the name here.
 ;allowed_hosts=
 # on: GET /sparql may run a SPARQL UPDATE and /update takes a body of any type
 # (text/plain included), as upstream; a web page can then change the data
@@ -88,7 +92,12 @@ ip_deny_path="./conf/ipDeny.config"
 # counts as a local client, as upstream. off (the default): it is a reverse
 # proxy speaking for remote clients, so it gets none of the privileges of a
 # local client (the unauthenticated single-database mode, root's default
-# password, the /api layer's trust_inner_localhost).
+# password, the /api layer's trust_inner_localhost). This works only for a
+# proxy that sends one of those headers: one that adds none (nginx without
+# proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; HAProxy
+# without option forwardfor; stunnel, ssh or socat tunnels) cannot be told
+# apart from a local client. Never put the unauthenticated single-database
+# mode or allow_default_root_password=on behind such a proxy.
 ;trust_proxy_headers=off
 # on: gserver starts the API server although root still has the default
 # password "123456" -- on a loopback address only, and the password is then
