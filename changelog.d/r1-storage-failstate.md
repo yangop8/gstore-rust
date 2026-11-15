@@ -38,8 +38,13 @@ Behaviour changes first:
   place** (`/api`: `"Database loaded successfully."` + `warning`; REST:
   `database '…' reopened` + `warning`). A healthy loaded database keeps
   the upstream answer ("The database already load yet." / "already
-  loaded"). REST `/build` over a loaded broken database now replaces it
-  instead of failing on the save that could not succeed.
+  loaded") at once: the failure is checked without waiting for the
+  database and without reserving it, so such a load never waits behind a
+  running statement nor makes the database busy for a concurrent begin or
+  unload. A broken database that is busy at that very moment is answered
+  "already loaded" too; load it again (or unload it). REST `/build` over a
+  loaded broken database now replaces it instead of failing on the save
+  that could not succeed.
 - **The write-ahead log is never truncated or rewritten in place** (review
   durability#1, durability#8, robust#12): a commit stages the log as
   `<file>.wal.tmp`, fsyncs it, renames it to `<file>.wal` and fsyncs the
@@ -67,7 +72,9 @@ New API and tests:
 - Test-only pager failpoints (`kvstore::pager::failpoints`: fail the apply
   after k pages, fail the WAL write after n bytes, fail the WAL removal,
   unreadable WAL, a directory-fsync counter) and pager / DiskTriples unit
-  tests built on them.
+  tests built on them, including a dictionary commit that fails before and
+  after its log got its name (both break the triple store sharing the
+  pager).
 - `tests/storage_fault_injection.rs`: the review's two-ENOSPC scenario with
   `RLIMIT_FSIZE` children (SIGXFSZ ignored): library Materialize and Stream
   with a clean drop and with a crash, small-cache variants, `gserver` +
@@ -97,7 +104,8 @@ none
   whose write-ahead log was complete is replayed when the database is
   opened again. Free the space (or fix the I/O problem), then `unload` and
   `load` the database (`/api` operations or REST `/unload`, `/load`), or
-  just `load` it, which reopens a broken loaded database in place. The
+  just `load` it, which reopens a broken loaded database in place (one
+  busy with a request at that moment answers "already loaded": repeat). The
   answer's `warning` and the server log name the failure and how many
   changes since the last successful commit are discarded; clients were told
   of each failed update when it happened. In the single-database mode
