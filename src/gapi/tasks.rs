@@ -1160,6 +1160,7 @@ pub(crate) fn run_async(ctx: &mut Ctx<'_>, spec: &OpSpec, params: &Params) -> GR
     let mut params = params.clone();
     params.set("async", false);
     let handler = spec.handler;
+    let local_trusted = ctx.local_trusted;
     let (remote_ip, op, user, db_name, inner_request, config) = (
         ctx.remote_ip.clone(),
         ctx.op.clone(),
@@ -1200,6 +1201,7 @@ pub(crate) fn run_async(ctx: &mut Ctx<'_>, spec: &OpSpec, params: &Params) -> GR
             inner: &inner,
             req: &req,
             remote_ip,
+            local_trusted,
             op,
             user,
             db_name,

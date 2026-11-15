@@ -11,6 +11,13 @@
 //! | `POST /update` | run a SPARQL UPDATE |
 //! | `GET /status` | report [`DbStats`](crate::db::DbStats) |
 //!
+//! Parameters come from the URL and form bodies only (see the crate-private
+//! `Request`'s *Parameters*): a POSTed `application/sparql-query` /
+//! `application/sparql-update` body is the statement, verbatim. The
+//! protocol's dataset parameters (`default-graph-uri`, `named-graph-uri`,
+//! `using-graph-uri`, `using-named-graph-uri`) are answered `400`: there is
+//! no RDF dataset support (FROM / FROM NAMED are not supported either).
+//!
 //! SELECT/ASK results are content-negotiated (see [`crate::sparql_results`]):
 //! JSON (default), XML, CSV, or TSV via the `Accept` header or a `format=`
 //! query parameter; CONSTRUCT/DESCRIBE return N-Triples. Connections run
@@ -59,9 +66,18 @@
 //!   `Connection: close`, HTTP/1.0 semantics and `Keep-Alive: timeout=, max=`).
 //!   An idle connection gives its worker up early when other connections are
 //!   waiting for one, and closes at once when a shutdown begins;
-//! * **CORS**: with [`HttpOptions::cors`] (the default) every response carries
-//!   `Access-Control-Allow-Origin: *` and `OPTIONS` preflights are answered
-//!   directly (as upstream does for `/file/upload` and `/file/download`);
+//! * **CORS**: with [`HttpOptions::cors`] (the default) `OPTIONS` preflights
+//!   are answered directly (as upstream does for `/file/upload` and
+//!   `/file/download`) and responses carry `Access-Control-Allow-Origin` —
+//!   for the origins of [`HttpOptions::cors_allow_origin`] only (none by
+//!   default; `*` is upstream's header on every response);
+//! * **the browser policy** (secure defaults, each with an upstream-compat
+//!   switch in [`HttpOptions`]): a request arriving over loopback must name a
+//!   local `Host` (DNS rebinding); a state-changing request with a foreign
+//!   `Origin` is refused (CSRF); `GET` never runs a SPARQL UPDATE and
+//!   `/update` takes typed bodies only (`allow_get_update`); a loopback peer
+//!   forwarding proxy headers is not a local client
+//!   (`peer_is_trusted_local`, `trust_proxy_headers`);
 //! * **request body caps** ([`HttpOptions::preauth_max_body`] before
 //!   authentication, [`HttpOptions::max_body`] for a payload route whose
 //!   request is authenticated from its head) and a **body budget** shared by
@@ -181,9 +197,42 @@ pub struct HttpOptions {
     /// they arrive: a request that would exceed it is answered `503`.
     /// `gserver`: `request_body_budget`.
     pub body_budget: usize,
-    /// Add `Access-Control-Allow-Origin: *` to every response and answer
-    /// `OPTIONS` preflight requests (default on).
+    /// CORS processing (default on): answer `OPTIONS` preflights directly
+    /// and add `Access-Control-Allow-Origin` to the responses — for the
+    /// origins [`cors_allow_origin`](Self::cors_allow_origin) lists only.
     pub cors: bool,
+    /// The origins (`scheme://host[:port]`) whose web pages may call the
+    /// server cross-origin: they get `Access-Control-Allow-Origin` (and
+    /// `Vary: Origin`), their preflights are answered, and their
+    /// state-changing requests are accepted. Empty by default: no foreign
+    /// origin. `*` restores upstream's `Access-Control-Allow-Origin: *` on
+    /// every response (any web page could then read the answers and send
+    /// writes through a visitor's browser). `conf.ini`: `cors_allow_origin`.
+    pub cors_allow_origin: Vec<String>,
+    /// Host names a request arriving over loopback may carry in its `Host`
+    /// header besides the ones always accepted — IP literals, `localhost`
+    /// (and `*.localhost`), and names without a dot. Any other name is
+    /// refused with `403`: a DNS-rebinding page (`http://attacker.example`
+    /// re-resolved to 127.0.0.1) cannot reach a loopback server. `*` turns
+    /// the check off. Empty by default. `conf.ini`: `allowed_hosts`.
+    pub allowed_hosts: Vec<String>,
+    /// Upstream behaviour (default off): let `GET /sparql` run a SPARQL
+    /// UPDATE and `/update` accept a `text/plain` or `multipart/form-data`
+    /// body. Off, an UPDATE must be POSTed (SPARQL 1.1 Protocol), and
+    /// `/update` refuses those two types (`415`) — the ones besides forms a
+    /// web page can POST cross-site without a CORS preflight; it takes
+    /// `application/sparql-update`, a form, an unlabelled body, or another
+    /// type (which a browser sends only after a preflight). `conf.ini`:
+    /// `allow_get_update`.
+    pub allow_get_update: bool,
+    /// Treat a loopback peer as a local client even when it forwards
+    /// `Forwarded` / `X-Forwarded-For` / `X-Real-IP` (upstream behaviour;
+    /// default off). Off, such a request comes from a reverse proxy on this
+    /// machine, not from a local client: it loses the loopback privileges
+    /// (the unauthenticated single-database mode, root's default password,
+    /// the `/api` layer's `trust_inner_localhost`). `conf.ini`:
+    /// `trust_proxy_headers`.
+    pub trust_proxy_headers: bool,
 }
 
 /// The default worker-pool size (gStore's `thread_num` default).
@@ -202,6 +251,10 @@ impl Default for HttpOptions {
             preauth_max_body: crate::preauth::PREAUTH_MAX_BODY,
             body_budget: crate::preauth::DEFAULT_BODY_BUDGET,
             cors: true,
+            cors_allow_origin: Vec::new(),
+            allowed_hosts: Vec::new(),
+            allow_get_update: false,
+            trust_proxy_headers: false,
         }
     }
 }
@@ -950,17 +1003,41 @@ impl BadRequest {
     };
 }
 
-/// Per-response connection facts a request handler must honour: the headers
-/// to add to its response (`Connection`/`Keep-Alive`, CORS). The client's
-/// address is available through [`current_peer`].
+/// Per-request connection facts a request handler must honour: the headers
+/// to add to its response (`Connection`/`Keep-Alive`, CORS) and the verdict
+/// of the connection's browser policy ([`HttpOptions`]: `Host` / `Origin`
+/// admission, whether the client counts as local, `allow_get_update`). The
+/// client's address is available through [`current_peer`].
 pub(crate) struct ConnMeta {
     headers: Vec<(&'static str, String)>,
-    /// `Access-Control-Allow-Origin: *` is part of `headers`.
-    cors: bool,
+    /// The `Access-Control-Allow-Origin` value of this response (also in
+    /// `headers`): `*`, or the request's own `Origin` when it is listed.
+    allow_origin: Option<String>,
+    /// Why the request must be refused (`403`) before it is routed: a
+    /// foreign `Host` on a loopback connection, or a foreign `Origin` on a
+    /// state-changing request.
+    refusal: Option<&'static str>,
+    /// The client is local ([`peer_is_trusted_local`]).
+    local_trusted: bool,
+    /// The client is a reverse proxy on this machine whose forwarding
+    /// headers are not trusted (a loopback peer, not local).
+    forwarded: bool,
+    /// [`HttpOptions::allow_get_update`].
+    allow_get_update: bool,
 }
 
 impl ConnMeta {
-    fn new(keep_alive: bool, idle: Duration, remaining: usize, cors: bool) -> ConnMeta {
+    /// The facts for one response: keep-alive (`remaining` requests left on
+    /// the connection, `idle` timeout), and — for a parsed `req` — the CORS
+    /// header and the policy verdict of `opts`. Without a request (a
+    /// malformed one is answered) the policy allows nothing.
+    pub(crate) fn new(
+        keep_alive: bool,
+        idle: Duration,
+        remaining: usize,
+        opts: &HttpOptions,
+        req: Option<&Request>,
+    ) -> ConnMeta {
         let mut headers: Vec<(&'static str, String)> = Vec::new();
         if keep_alive {
             headers.push(("Connection", "keep-alive".to_string()));
@@ -971,10 +1048,35 @@ impl ConnMeta {
         } else {
             headers.push(("Connection", "close".to_string()));
         }
-        if cors {
-            headers.push(("Access-Control-Allow-Origin", "*".to_string()));
+        let origin = req.and_then(|r| r.header("origin"));
+        let allow_origin = if !opts.cors {
+            None
+        } else if origin_listed("*", &opts.cors_allow_origin) {
+            Some("*".to_string())
+        } else {
+            origin
+                .filter(|o| origin_listed(o, &opts.cors_allow_origin))
+                .map(str::to_string)
+        };
+        if let Some(o) = &allow_origin {
+            headers.push(("Access-Control-Allow-Origin", o.clone()));
         }
-        ConnMeta { headers, cors }
+        if opts.cors && !opts.cors_allow_origin.is_empty() && allow_origin.as_deref() != Some("*") {
+            // The answer depends on the request's Origin: caches must know.
+            headers.push(("Vary", "Origin".to_string()));
+        }
+        let peer = current_peer();
+        let loopback = peer.is_some_and(|p| ip_is_loopback(p.ip()));
+        ConnMeta {
+            headers,
+            allow_origin,
+            refusal: req.and_then(|r| admission_refusal(r, loopback, opts)),
+            local_trusted: req
+                .is_some_and(|r| peer_is_trusted_local(peer, r, opts.trust_proxy_headers)),
+            forwarded: req
+                .is_some_and(|r| loopback && r.is_forwarded() && !opts.trust_proxy_headers),
+            allow_get_update: opts.allow_get_update,
+        }
     }
 
     /// `extra` followed by this connection's headers, ready for
@@ -985,14 +1087,168 @@ impl ConnMeta {
         out
     }
 
-    /// The CORS header alone (for a streamed response, which always closes).
-    fn cors_headers(&self) -> Vec<(&'static str, &'static str)> {
-        if self.cors {
-            vec![("Access-Control-Allow-Origin", "*")]
-        } else {
-            Vec::new()
+    /// The CORS headers alone (for a streamed response, which always closes).
+    fn cors_headers(&self) -> Vec<(&'static str, &str)> {
+        let mut out = Vec::new();
+        if let Some(o) = &self.allow_origin {
+            out.push(("Access-Control-Allow-Origin", o.as_str()));
+        }
+        out.extend(
+            self.headers
+                .iter()
+                .filter(|(k, _)| *k == "Vary")
+                .map(|(k, v)| (*k, v.as_str())),
+        );
+        out
+    }
+
+    /// Why the request is refused before routing (answer `403`), if it is:
+    /// see [`HttpOptions::allowed_hosts`] and
+    /// [`HttpOptions::cors_allow_origin`].
+    pub(crate) fn refusal(&self) -> Option<&'static str> {
+        self.refusal
+    }
+
+    /// Whether the client counts as local ([`peer_is_trusted_local`]): the
+    /// loopback privileges (root's default password, the `/api` layer's
+    /// `trust_inner_localhost`) are granted to it only.
+    pub(crate) fn local_trusted(&self) -> bool {
+        self.local_trusted
+    }
+
+    /// Whether the client is a reverse proxy on this machine (a loopback
+    /// peer forwarding `Forwarded` / `X-Forwarded-For` / `X-Real-IP`) whose
+    /// headers are not trusted ([`HttpOptions::trust_proxy_headers`]).
+    pub(crate) fn forwarded(&self) -> bool {
+        self.forwarded
+    }
+
+    /// [`HttpOptions::allow_get_update`].
+    pub(crate) fn allow_get_update(&self) -> bool {
+        self.allow_get_update
+    }
+}
+
+/// Message of a refused `Host` (see [`HttpOptions::allowed_hosts`]).
+const HOST_REFUSED: &str = "request refused: a request arriving over loopback must name a local \
+     host (an IP address, localhost, or a name without a dot) in its Host header; add the \
+     name to [server] allowed_hosts to serve it";
+
+/// Message of a refused cross-origin write (see
+/// [`HttpOptions::cors_allow_origin`]).
+const ORIGIN_REFUSED: &str = "request refused: a state-changing request from a foreign web \
+     origin (its Origin header names neither this server nor an origin listed in [server] \
+     cors_allow_origin)";
+
+/// Message of a refused proxied request to a server without credentials
+/// (see [`HttpOptions::trust_proxy_headers`]).
+const FORWARDED_REFUSED: &str = "request refused: this server has no authentication and serves \
+     local clients only, but the request was forwarded by a proxy (Forwarded / X-Forwarded-For \
+     / X-Real-IP); serve it through the authenticated multi-database API, or set [server] \
+     trust_proxy_headers=on if the proxy forwards local clients only";
+
+/// Message of a refused `GET` UPDATE (see [`HttpOptions::allow_get_update`]).
+pub(crate) const GET_UPDATE_REFUSED: &str = "a SPARQL UPDATE is not run over GET (SPARQL 1.1 \
+     Protocol): POST it to /update (set [server] allow_get_update=on to restore the upstream \
+     behaviour)";
+
+/// Message of a refused `/update` body type (`415`; see
+/// [`HttpOptions::allow_get_update`] and [`BodyKind::Simple`]).
+pub(crate) const UPDATE_BODY_REFUSED: &str = "/update takes an application/sparql-update or \
+     application/x-www-form-urlencoded body, not text/plain or multipart/form-data (set \
+     [server] allow_get_update=on to accept them, as upstream does)";
+
+/// Whether the SPARQL text `q` is an UPDATE, by a parse alone (nothing
+/// runs). A text holding none of the keywords an update starts with
+/// (`INSERT`, `DELETE`, `LOAD`, `CLEAR`, `DROP`, `CREATE`, `WITH`, `ADD`,
+/// `MOVE`, `COPY`, in any case) is a query without being parsed, so a
+/// `GET` query is not parsed twice.
+pub(crate) fn is_update_text(q: &str) -> bool {
+    const STARTS: [&[u8]; 10] = [
+        b"INSERT", b"DELETE", b"LOAD", b"CLEAR", b"DROP", b"CREATE", b"WITH", b"ADD", b"MOVE",
+        b"COPY",
+    ];
+    let b = q.as_bytes();
+    // A backslash (an escape sequence) is parsed whatever it spells.
+    let maybe = b.contains(&b'\\')
+        || STARTS
+            .iter()
+            .any(|kw| b.windows(kw.len()).any(|w| w.eq_ignore_ascii_case(kw)));
+    maybe && Statement::parse(q).is_ok_and(|stmt| stmt.is_update())
+}
+
+/// Whether `origin` is one of `list` (case-insensitive, a trailing `/`
+/// ignored). `*` in the list matches only the query `*`.
+fn origin_listed(origin: &str, list: &[String]) -> bool {
+    let norm = |s: &str| s.trim().trim_end_matches('/').to_ascii_lowercase();
+    let origin = norm(origin);
+    list.iter().any(|o| norm(o) == origin)
+}
+
+/// The browser policy's verdict on a request (`None`: admitted): on a
+/// loopback connection the `Host` must be local; a state-changing request
+/// (any method but `GET`, `HEAD` and `OPTIONS`) with an `Origin` header must
+/// come from this server's own origin or a listed one.
+fn admission_refusal(req: &Request, loopback: bool, opts: &HttpOptions) -> Option<&'static str> {
+    let host = req.header("host");
+    if loopback && host.is_some_and(|h| !host_allowed(h, &opts.allowed_hosts)) {
+        return Some(HOST_REFUSED);
+    }
+    if !matches!(req.method.as_str(), "GET" | "HEAD" | "OPTIONS") {
+        if let Some(origin) = req.header("origin") {
+            // `get`, not slicing: a header may hold any UTF-8, and this runs
+            // outside the handlers' panic isolation.
+            let same = host.is_some_and(|h| {
+                let o = origin.trim().trim_end_matches('/');
+                ["http://", "https://"].iter().any(|scheme| {
+                    o.get(..scheme.len())
+                        .is_some_and(|s| s.eq_ignore_ascii_case(scheme))
+                        && o.get(scheme.len()..)
+                            .is_some_and(|rest| rest.eq_ignore_ascii_case(h.trim()))
+                })
+            });
+            if !same
+                && !origin_listed(origin, &opts.cors_allow_origin)
+                && !origin_listed("*", &opts.cors_allow_origin)
+            {
+                return Some(ORIGIN_REFUSED);
+            }
         }
     }
+    None
+}
+
+/// Whether a `Host` header value names a local host: an IP literal (a
+/// browser sends one only for a URL naming that address, so it cannot be a
+/// rebound name), `localhost` or `*.localhost`, a name without a dot (not
+/// registrable in public DNS), or a name of `allowed` (`*`: any).
+fn host_allowed(host: &str, allowed: &[String]) -> bool {
+    let host = host.trim();
+    if host.is_empty() {
+        return true; // as no Host header: no name to check
+    }
+    if host.starts_with('[') {
+        // `[v6]` or `[v6]:port`
+        return host.find(']').is_some_and(|end| {
+            host[1..end].parse::<Ipv6Addr>().is_ok()
+                && (host.len() == end + 1 || host[end + 1..].starts_with(':'))
+        });
+    }
+    let name = match host.rsplit_once(':') {
+        Some((n, port)) if port.bytes().all(|b| b.is_ascii_digit()) => n,
+        _ => host,
+    };
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    if name.parse::<Ipv4Addr>().is_ok() || name == "localhost" || name.ends_with(".localhost") {
+        return true;
+    }
+    if !name.is_empty() && !name.contains('.') && !name.contains(':') {
+        return true;
+    }
+    allowed.iter().any(|a| {
+        let a = a.trim().trim_end_matches('.');
+        a == "*" || a.eq_ignore_ascii_case(&name)
+    })
 }
 
 thread_local! {
@@ -1008,6 +1264,32 @@ thread_local! {
 #[allow(dead_code)]
 pub(crate) fn current_peer() -> Option<SocketAddr> {
     CURRENT_PEER.with(Cell::get)
+}
+
+/// Whether the client of `req` counts as **local** — the one predicate
+/// behind the loopback privileges (the unauthenticated single-database
+/// mode, root's default password, the `/api` layer's
+/// `trust_inner_localhost`): its TCP `peer` is a loopback address, and it
+/// is not a reverse proxy on this machine — it forwards none of
+/// `Forwarded`, `X-Forwarded-For`, `X-Real-IP` — unless
+/// `trust_proxy_headers` (upstream behaviour: every loopback peer is local).
+pub(crate) fn peer_is_trusted_local(
+    peer: Option<SocketAddr>,
+    req: &Request,
+    trust_proxy_headers: bool,
+) -> bool {
+    peer.is_some_and(|p| ip_is_loopback(p.ip())) && (trust_proxy_headers || !req.is_forwarded())
+}
+
+/// A loopback address, IPv4-mapped IPv6 (`::ffff:127.0.0.1`, a dual-stack
+/// listener's view of an IPv4 client) included.
+pub(crate) fn ip_is_loopback(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    }
 }
 
 /// Serve one connection: read requests and hand each to `handle` — which
@@ -1075,7 +1357,7 @@ pub(crate) fn serve_connection<S: Read + Write>(
             Ok(None) => return, // closed before sending anything
             Ok(Some(r)) => r,
             Err(bad) => {
-                let meta = ConnMeta::new(false, idle, 0, opts.cors);
+                let meta = ConnMeta::new(false, idle, 0, opts, None);
                 let stream = &mut reader.get_mut().inner;
                 stream.start_response(false);
                 let _ = handle(stream, Err(bad), &meta);
@@ -1097,7 +1379,13 @@ pub(crate) fn serve_connection<S: Read + Write>(
             && served < max_requests
             && wants_keep_alive(&req, info.http10)
             && !life.stopping();
-        let meta = ConnMeta::new(keep, idle, max_requests.saturating_sub(served), opts.cors);
+        let meta = ConnMeta::new(
+            keep,
+            idle,
+            max_requests.saturating_sub(served),
+            opts,
+            Some(&req),
+        );
         let stream = &mut reader.get_mut().inner;
         // A response to HEAD is written like any other, minus its body.
         stream.start_response(req.method.eq_ignore_ascii_case("HEAD"));
@@ -1271,8 +1559,27 @@ fn keep_alive_hints(req: &Request) -> (Option<Duration>, Option<usize>) {
 }
 
 /// Answer a CORS preflight (`OPTIONS`) like upstream's `/file/upload` and
-/// `/file/download` routes: `200 ok` with `Access-Control-Allow-*` headers.
+/// `/file/download` routes — `200 ok` with `Access-Control-Allow-*` headers —
+/// when the request's `Origin` is allowed ([`HttpOptions::cors_allow_origin`]);
+/// a preflight from any other origin is refused (`403`, no CORS headers), as
+/// is one the browser policy refuses outright (a foreign `Host`). A
+/// preflight without `Origin` (no browser sent it) is answered without
+/// `Access-Control-Allow-Origin`.
 fn write_preflight<W: Write>(stream: &mut W, req: &Request, meta: &ConnMeta) -> io::Result<()> {
+    if let Some(why) = meta.refusal() {
+        return write_response_ext(
+            stream,
+            403,
+            "text/plain",
+            &meta.headers(&[]),
+            why.as_bytes(),
+        );
+    }
+    if req.header("origin").is_some() && meta.allow_origin.is_none() {
+        let body =
+            b"CORS preflight refused: the origin is not listed in [server] cors_allow_origin";
+        return write_response_ext(stream, 403, "text/plain", &meta.headers(&[]), body);
+    }
     let methods = if req.path == "/file/upload" {
         "POST"
     } else if req.path == "/file/download" || req.path.starts_with("/file/download/") {
@@ -1843,6 +2150,18 @@ impl ServerInner {
                 return Ok(false);
             }
         };
+        // The browser policy (HttpOptions): a foreign Host on a loopback
+        // connection, a foreign Origin on a state-changing request.
+        if let Some(why) = meta.refusal() {
+            write_response_ext(
+                stream,
+                403,
+                "text/plain",
+                &meta.headers(&[]),
+                why.as_bytes(),
+            )?;
+            return Ok(true);
+        }
         // Auth gate: when credentials are configured every request must present
         // a matching `Authorization: Basic` header.
         if let Some((user, pass)) = &self.auth {
@@ -1856,11 +2175,24 @@ impl ServerInner {
                 )?;
                 return Ok(true);
             }
+        } else if meta.forwarded() {
+            // Without credentials the server relies on serving local clients
+            // only (gserver refuses to listen beyond loopback); a reverse
+            // proxy on this machine would hand that to anyone reaching it.
+            write_response_ext(
+                stream,
+                403,
+                "text/plain",
+                &meta.headers(&[]),
+                FORWARDED_REFUSED.as_bytes(),
+            )?;
+            return Ok(true);
         }
-        let reply = catch_unwind(AssertUnwindSafe(|| self.route(&req))).unwrap_or_else(|_| {
-            crate::gs_error!("request handler panicked: {} {}", req.method, req.path);
-            Reply::plain(500, "application/json", &err_json(PANIC_MSG))
-        });
+        let reply =
+            catch_unwind(AssertUnwindSafe(|| self.route(&req, meta))).unwrap_or_else(|_| {
+                crate::gs_error!("request handler panicked: {} {}", req.method, req.path);
+                Reply::plain(500, "application/json", &err_json(PANIC_MSG))
+            });
         // The client's `Accept-Encoding` (used to optionally compress buffered
         // bodies under the `gzip` feature; ignored without it).
         let enc = req.header("accept-encoding");
@@ -1887,10 +2219,24 @@ impl ServerInner {
     }
 
     /// Route a parsed, authorized request to its handler.
-    fn route(&self, req: &Request) -> Reply {
+    fn route(&self, req: &Request, meta: &ConnMeta) -> Reply {
         match (req.method.as_str(), req.path.as_str()) {
-            ("GET" | "POST", "/sparql") => self.handle_sparql(req),
-            ("POST", "/update") => self.run_update(&req.body_string()),
+            ("GET" | "POST", "/sparql") => self.handle_sparql(req, meta.allow_get_update()),
+            ("POST", "/update") => {
+                if let Some(p) = req.first_param_of(UPDATE_DATASET_PARAMS) {
+                    return Reply::buffered(
+                        400,
+                        "application/json",
+                        err_json(&dataset_param_refusal(p)),
+                    );
+                }
+                match req.update_text(meta.allow_get_update()) {
+                    Ok(update) => self.run_update(&update),
+                    Err((status, msg)) => {
+                        Reply::buffered(status, "application/json", err_json(msg))
+                    }
+                }
+            }
             ("GET", "/status") => self.status_json(),
             ("GET", "/" | "/console") => Reply::buffered(
                 200,
@@ -1912,12 +2258,21 @@ impl ServerInner {
     /// Run a `/sparql` request: negotiate a result format, then answer with a
     /// buffered (`Content-Length`) body, or a chunked stream when `?stream=true`.
     /// The [`Database`] guard is released before any serialization or network
-    /// write, so it is held only for the statement itself.
-    fn handle_sparql(&self, req: &Request) -> Reply {
+    /// write, so it is held only for the statement itself. A `GET` never runs
+    /// an UPDATE (SPARQL 1.1 Protocol; a web page triggers a GET with a mere
+    /// `<img>`) unless `allow_get_update`: such a statement is classified by
+    /// a parse alone, before anything runs. Dataset parameters are refused.
+    fn handle_sparql(&self, req: &Request, allow_get_update: bool) -> Reply {
         let q = match req.query_string() {
             Some(q) => q,
             None => return Reply::plain(400, SPARQL_JSON, &err_json("missing query")),
         };
+        if let Some(p) = req.first_param_of(QUERY_DATASET_PARAMS) {
+            return Reply::plain(400, SPARQL_JSON, &err_json(&dataset_param_refusal(p)));
+        }
+        if req.method == "GET" && !allow_get_update && is_update_text(&q) {
+            return Reply::plain(400, SPARQL_JSON, &err_json(GET_UPDATE_REFUSED));
+        }
         let fmt = ResultFormat::negotiate(req.format_param().as_deref(), req.header("accept"));
         let (result, warning) = self.execute(&q);
         match result {
@@ -2103,6 +2458,18 @@ fn failure_status(warning: &Option<String>) -> u16 {
 ///
 /// `pub(crate)` so the richer [`crate::http_api`] endpoint can reuse the same
 /// parser and accessors rather than re-implementing HTTP request parsing.
+///
+/// **Parameters** ([`param`](Self::param) and the accessors built on it) come
+/// from the URL query string and from a **form body** only: one labelled
+/// `application/x-www-form-urlencoded`, or an unlabelled one (no
+/// `Content-Type`) shaped like a form — see [`body_kind`](Self::body_kind).
+/// Any other body — `application/sparql-query`, `application/sparql-update`,
+/// RDF, JSON, `text/plain`, an unlabelled SPARQL text — is content, taken
+/// verbatim: text inside it that looks like `&update=…` or `&db_name=…` is
+/// never a parameter (review H-9). A lookup scans the form body once
+/// without copying it; nothing scans the body for a session token (http#4).
+/// (The upstream `/api` protocol reads its parameters with
+/// `gapi::params::Params`, which keeps upstream's own rules.)
 pub(crate) struct Request {
     pub(crate) method: String,
     pub(crate) path: String,
@@ -2141,10 +2508,10 @@ impl Request {
 
     /// Look up a header by (case-insensitive) name.
     pub(crate) fn header(&self, name: &str) -> Option<&str> {
-        let name = name.to_ascii_lowercase();
+        // The stored names are lowercase: no lowercased copy of `name`.
         self.headers
             .iter()
-            .find(|(k, _)| *k == name)
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
     }
 
@@ -2168,13 +2535,7 @@ impl Request {
 
     /// The negotiated result format token from `?format=` (URL or form body).
     pub(crate) fn format_param(&self) -> Option<String> {
-        if let Some(q) = &self.query {
-            if let Some(v) = form_get(q, "format") {
-                return Some(v);
-            }
-        }
-        let b = String::from_utf8_lossy(&self.body);
-        form_get(&b, "format")
+        self.param("format")
     }
 
     /// True when the URL query string requests a chunked stream
@@ -2188,18 +2549,61 @@ impl Request {
             .unwrap_or(false)
     }
 
+    /// What the body is, for parameter lookups (see the type's docs): by its
+    /// `Content-Type`, or — without one — by its shape (a legacy client's
+    /// unlabelled form body, versus raw SPARQL / RDF text).
+    pub(crate) fn body_kind(&self) -> BodyKind {
+        if self.body.is_empty() {
+            return BodyKind::Empty;
+        }
+        let Some(ct) = self.header("content-type") else {
+            return if looks_like_form(&self.body) {
+                BodyKind::Form
+            } else {
+                BodyKind::Untyped
+            };
+        };
+        let media = ct.split(';').next().unwrap_or_default().trim();
+        if media.eq_ignore_ascii_case("application/x-www-form-urlencoded") {
+            BodyKind::Form
+        } else if media.eq_ignore_ascii_case("application/sparql-query") {
+            BodyKind::SparqlQuery
+        } else if media.eq_ignore_ascii_case("application/sparql-update") {
+            BodyKind::SparqlUpdate
+        } else if media.eq_ignore_ascii_case("text/plain")
+            || media.eq_ignore_ascii_case("multipart/form-data")
+        {
+            BodyKind::Simple
+        } else {
+            BodyKind::Other
+        }
+    }
+
+    /// The body, when it is a form ([`BodyKind::Form`]), without a trailing
+    /// line break (a literal one is never part of a form value).
+    fn form_body(&self) -> Option<&[u8]> {
+        if self.body_kind() != BodyKind::Form {
+            return None;
+        }
+        let end = self
+            .body
+            .iter()
+            .rposition(|&b| b != b'\r' && b != b'\n')
+            .map_or(0, |i| i + 1);
+        Some(&self.body[..end])
+    }
+
     /// Look up a parameter by name in the URL query string first, then in a
-    /// form-encoded body. Used by [`crate::http_api`] for its `db=`/`name=`/
-    /// `txn=`/`username=` … parameters. Returns `None` when the body is raw
-    /// (non-form) content.
+    /// form body ([`BodyKind::Form`]; never in any other body). Used by
+    /// [`crate::http_api`] for its `db=`/`name=`/`txn=`/`username=` …
+    /// parameters.
     pub(crate) fn param(&self, key: &str) -> Option<String> {
         if let Some(q) = &self.query {
             if let Some(v) = form_get(q, key) {
                 return Some(v);
             }
         }
-        let b = String::from_utf8_lossy(&self.body);
-        form_get(&b, key)
+        self.form_body().and_then(|b| form_lookup(b, key))
     }
 
     /// The raw request body as a UTF-8 (lossy) string.
@@ -2207,8 +2611,29 @@ impl Request {
         String::from_utf8_lossy(&self.body).into_owned()
     }
 
+    /// The body as a statement or document: its (lossy UTF-8, trimmed) text
+    /// when it is not a form and not empty.
+    pub(crate) fn raw_statement(&self) -> Option<String> {
+        if matches!(self.body_kind(), BodyKind::Form | BodyKind::Empty) {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&self.body);
+        let trimmed = text.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    }
+
+    /// Whether the request was forwarded by a proxy: it carries a
+    /// `Forwarded`, `X-Forwarded-For` or `X-Real-IP` header.
+    pub(crate) fn is_forwarded(&self) -> bool {
+        ["forwarded", "x-forwarded-for", "x-real-ip"]
+            .iter()
+            .any(|h| self.header(h).is_some())
+    }
+
     /// Extract a session/bearer token from `Authorization: Bearer …`, the
-    /// `X-Session-Token` header, or a `session=`/`token=` parameter.
+    /// `X-Session-Token` header, or a `session=`/`token=` parameter of the
+    /// URL. The body is never searched: the caller is not authenticated yet,
+    /// and the body is theirs to make as large as the cap allows (http#4).
     pub(crate) fn bearer_or_session_token(&self) -> Option<String> {
         if let Some(h) = self.header("authorization") {
             let h = h.trim_start();
@@ -2223,33 +2648,135 @@ impl Request {
         if let Some(h) = self.header("x-session-token") {
             return Some(h.trim().to_string());
         }
-        self.param("session").or_else(|| self.param("token"))
+        let q = self.query.as_deref()?;
+        form_get(q, "session").or_else(|| form_get(q, "token"))
     }
 
-    /// The query text: from the URL `?query=`, a form-encoded `query=` body, or
-    /// (for POST with a `application/sparql-query` body) the raw body.
+    /// The query text: from the URL `?query=`, a form body's `query=`, or
+    /// the raw body of any other kind (`application/sparql-query`, the SPARQL
+    /// Protocol's "POST directly"; an unlabelled one too). A form body
+    /// without `query=` has no query.
     pub(crate) fn query_string(&self) -> Option<String> {
         if let Some(q) = &self.query {
             if let Some(v) = form_get(q, "query") {
                 return Some(v);
             }
         }
-        let b = String::from_utf8_lossy(&self.body);
-        if let Some(v) = form_get(&b, "query") {
-            return Some(v);
+        if let Some(form) = self.form_body() {
+            return form_lookup(form, "query");
         }
-        let trimmed = b.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
-        }
-        None
+        self.raw_statement()
     }
 
-    /// The update text: a form-encoded `update=` body, else the raw body.
-    fn body_string(&self) -> String {
-        let b = String::from_utf8_lossy(&self.body);
-        form_get(&b, "update").unwrap_or_else(|| b.into_owned())
+    /// The update text of a `POST /update`: an `application/sparql-update`
+    /// (or unlabelled, non-form) body verbatim, or the `update=` parameter
+    /// of a form body (or of the URL). A `text/plain` or
+    /// `multipart/form-data` body — the types a web page can send cross-site
+    /// without a CORS preflight ([`BodyKind::Simple`]) — is refused with
+    /// `415` unless `any_body` ([`HttpOptions::allow_get_update`]), which
+    /// takes it verbatim. Any other type needs a preflight (which follows
+    /// [`HttpOptions::cors_allow_origin`]) and is taken verbatim.
+    pub(crate) fn update_text(&self, any_body: bool) -> Result<String, (u16, &'static str)> {
+        const MISSING: (u16, &str) = (400, "missing update statement");
+        match self.body_kind() {
+            BodyKind::Form | BodyKind::Empty => self.param("update").ok_or(MISSING),
+            BodyKind::Simple if !any_body => Err((415, UPDATE_BODY_REFUSED)),
+            BodyKind::SparqlUpdate
+            | BodyKind::Untyped
+            | BodyKind::SparqlQuery
+            | BodyKind::Simple
+            | BodyKind::Other => self.raw_statement().ok_or(MISSING),
+        }
     }
+
+    /// The first of `keys` the request carries as a parameter (see
+    /// [`param`](Self::param)).
+    pub(crate) fn first_param_of(&self, keys: &[&'static str]) -> Option<&'static str> {
+        keys.iter().copied().find(|k| self.param(k).is_some())
+    }
+}
+
+/// What a request body is, for parameter lookups ([`Request::body_kind`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BodyKind {
+    /// No body.
+    Empty,
+    /// `application/x-www-form-urlencoded`, or an unlabelled body shaped
+    /// like one: it supplies parameters.
+    Form,
+    /// `application/sparql-query`.
+    SparqlQuery,
+    /// `application/sparql-update`.
+    SparqlUpdate,
+    /// No `Content-Type`, and not shaped like a form (SPARQL or RDF text).
+    Untyped,
+    /// `text/plain` or `multipart/form-data`: besides forms, the types a web
+    /// page can POST cross-site without a CORS preflight.
+    Simple,
+    /// Any other `Content-Type` (JSON, RDF, …).
+    Other,
+}
+
+/// The SPARQL Protocol's dataset parameters of a query
+/// (`default-graph-uri`, `named-graph-uri`), which the endpoints do not
+/// support: a request naming one is refused rather than answered over the
+/// whole default graph (review gap-doc-claims#2).
+pub(crate) const QUERY_DATASET_PARAMS: &[&str] = &["default-graph-uri", "named-graph-uri"];
+
+/// The dataset parameters of an update (`using-graph-uri`,
+/// `using-named-graph-uri`), refused likewise.
+pub(crate) const UPDATE_DATASET_PARAMS: &[&str] = &["using-graph-uri", "using-named-graph-uri"];
+
+/// The message refusing dataset parameter `param`.
+pub(crate) fn dataset_param_refusal(param: &str) -> String {
+    format!(
+        "the SPARQL Protocol dataset parameter '{param}' is not supported (this endpoint has no \
+         RDF dataset support; the query would run over the default graph instead)"
+    )
+}
+
+/// Whether an unlabelled body is shaped like an
+/// `application/x-www-form-urlencoded` form: `name=value` pairs joined by
+/// `&` in the characters such a form is written in (no whitespace, braces,
+/// angle brackets or quotes, which every SPARQL statement and RDF document
+/// contains), apart from a trailing line break.
+fn looks_like_form(body: &[u8]) -> bool {
+    let end = body
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map_or(0, |i| i + 1);
+    let body = &body[..end];
+    // The character check first: it stops at the first space or brace of a
+    // SPARQL / RDF body, where a search for `=` would read all of it.
+    !body.is_empty()
+        && body.iter().all(|&b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'-' | b'.'
+                        | b'_'
+                        | b'~'
+                        | b'%'
+                        | b'+'
+                        | b'&'
+                        | b'='
+                        | b'*'
+                        | b'!'
+                        | b'\''
+                        | b'('
+                        | b')'
+                        | b','
+                        | b';'
+                        | b':'
+                        | b'/'
+                        | b'?'
+                        | b'@'
+                        | b'$'
+                        | b'['
+                        | b']'
+                )
+        })
+        && body.contains(&b'=')
 }
 
 // --- response helpers --------------------------------------------------------
@@ -2584,41 +3111,53 @@ pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Look up `key` in an `application/x-www-form-urlencoded` string.
 fn form_get(qs: &str, key: &str) -> Option<String> {
-    for pair in qs.split('&') {
-        if let Some((k, v)) = pair.split_once('=') {
-            if url_decode(k) == key {
-                return Some(url_decode(v));
-            }
-        }
-    }
-    None
+    form_lookup(qs.as_bytes(), key)
 }
 
-fn url_decode(s: &str) -> String {
-    let b = s.as_bytes();
+/// Look up `key` in an `application/x-www-form-urlencoded` byte string: the
+/// value of the first pair whose decoded name is `key`. One pass, and no
+/// allocation but the value found: names are compared as they are decoded.
+fn form_lookup(form: &[u8], key: &str) -> Option<String> {
+    form.split(|&b| b == b'&').find_map(|pair| {
+        let eq = pair.iter().position(|&b| b == b'=')?;
+        decoded_eq(&pair[..eq], key.as_bytes()).then(|| url_decode_bytes(&pair[eq + 1..]))
+    })
+}
+
+/// Whether the form-decoding of `enc` is exactly `want`.
+fn decoded_eq(enc: &[u8], want: &[u8]) -> bool {
+    let (mut i, mut j) = (0, 0);
+    while i < enc.len() {
+        let (b, step) = decode_at(enc, i);
+        if want.get(j) != Some(&b) {
+            return false;
+        }
+        i += step;
+        j += 1;
+    }
+    j == want.len()
+}
+
+/// The byte a form encoding holds at `i` (`+` a space, `%XX` an escape,
+/// a malformed `%` itself) and how many input bytes it took.
+fn decode_at(b: &[u8], i: usize) -> (u8, usize) {
+    match b[i] {
+        b'+' => (b' ', 1),
+        b'%' if i + 2 < b.len() => match (hex(b[i + 1]), hex(b[i + 2])) {
+            (Some(h), Some(l)) => (h * 16 + l, 3),
+            _ => (b'%', 1),
+        },
+        c => (c, 1),
+    }
+}
+
+fn url_decode_bytes(b: &[u8]) -> String {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        match b[i] {
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b'%' if i + 2 < b.len() => match (hex(b[i + 1]), hex(b[i + 2])) {
-                (Some(h), Some(l)) => {
-                    out.push(h * 16 + l);
-                    i += 3;
-                }
-                _ => {
-                    out.push(b'%');
-                    i += 1;
-                }
-            },
-            c => {
-                out.push(c);
-                i += 1;
-            }
-        }
+        let (c, step) = decode_at(b, i);
+        out.push(c);
+        i += step;
     }
     String::from_utf8_lossy(&out).into_owned()
 }
@@ -3650,7 +4189,37 @@ mod tests {
 
     #[test]
     fn options_preflight_and_cors_headers() {
+        // review http#2 / sec#8 / infra#3: by default no origin is listed, so
+        // a browser's preflight from a foreign origin is refused and no
+        // response carries Access-Control-Allow-Origin (it used to be `*`
+        // on every response, letting any web page read the database).
         let (_srv, addr) = start();
+        let resp = http(
+            &addr,
+            "OPTIONS /file/upload HTTP/1.1\r\nOrigin: http://w\r\nConnection: close\r\n\r\n",
+        );
+        let (head, _) = split_resp(&resp);
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        assert!(!head.contains("Access-Control-Allow"), "{head}");
+        let resp = http(
+            &addr,
+            &get_status("Origin: http://w\r\nConnection: close\r\n"),
+        );
+        assert!(!resp.contains("Access-Control-Allow-Origin"), "{resp}");
+        // A preflight without Origin (no browser's) is still answered.
+        let resp = http(
+            &addr,
+            "OPTIONS /file/download/x.nt HTTP/1.1\r\nConnection: close\r\n\r\n",
+        );
+        assert!(resp.contains("Access-Control-Allow-Methods: GET"), "{resp}");
+
+        // `cors_allow_origin = *` restores upstream's headers (the compat
+        // switch): every response, and every preflight, as before.
+        let star = HttpOptions {
+            cors_allow_origin: vec!["*".to_string()],
+            ..HttpOptions::default()
+        };
+        let (_srv3, addr, _serving3) = start_with(star);
         let resp = http(
             &addr,
             "OPTIONS /file/upload HTTP/1.1\r\nOrigin: http://w\r\nConnection: close\r\n\r\n",
@@ -3684,6 +4253,7 @@ mod tests {
         // With CORS off: no header, and OPTIONS reaches the router (405 here).
         let opts = HttpOptions {
             cors: false,
+            cors_allow_origin: vec!["*".to_string()],
             ..HttpOptions::default()
         };
         let (_srv2, addr2, _serving) = start_with(opts);

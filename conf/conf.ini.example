@@ -45,9 +45,47 @@ ip_deny_path="./conf/ipDeny.config"
 # accepted connections that may wait for a free worker thread before the
 # server stops accepting more (default 128)
 # queue_size=128
-# send CORS headers (Access-Control-Allow-Origin: *) and answer OPTIONS
-# preflight requests, values: on or off (default on)
+# CORS processing: answer OPTIONS preflight requests and send
+# Access-Control-Allow-Origin -- to the origins of cors_allow_origin only --
+# values: on or off (default on)
 # cors=on
+#
+# Browser-facing secure defaults. Each commented line below shows the
+# default; setting one of these switches restores an upstream behaviour, and
+# gserver then logs a startup warning "upstream-compat: <key>=<value>".
+#
+# origins (scheme://host[:port], separated by '|' or ',') whose web pages may
+# call this server from a browser: they get Access-Control-Allow-Origin, their
+# preflights are answered and their state-changing requests accepted. Empty
+# (the default): no foreign origin. '*' is upstream's
+# Access-Control-Allow-Origin: * -- any web page could then read the answers
+# and send writes through a visitor's browser.
+;cors_allow_origin=
+# host names a request arriving over loopback may name in its Host header,
+# besides IP addresses, localhost and names without a dot (a guard against
+# DNS rebinding: a web page whose own name is re-resolved to 127.0.0.1 is
+# refused). List the public name a reverse proxy passes on, if it passes the
+# client's Host. '*' turns the check off. Default: none.
+;allowed_hosts=
+# on: GET /sparql may run a SPARQL UPDATE and /update takes a body of any type
+# (text/plain included), as upstream; a web page can then change the data
+# with a mere <img> or form. off (the default): an update is POSTed to
+# /update as application/sparql-update or a form (SPARQL 1.1 Protocol).
+;allow_get_update=off
+# on: a loopback peer forwarding Forwarded / X-Forwarded-For / X-Real-IP
+# counts as a local client, as upstream. off (the default): it is a reverse
+# proxy speaking for remote clients, so it gets none of the privileges of a
+# local client (the unauthenticated single-database mode, root's default
+# password, the /api layer's trust_inner_localhost).
+;trust_proxy_headers=off
+# on: gserver starts the API server although root still has the default
+# password "123456" -- on a loopback address only, and the password is then
+# accepted from local clients only. off (the default): refused on every
+# address. Set root's password instead (--password-file, root_password below
+# for a new user store); to change an existing store's, start once with this
+# switch on 127.0.0.1, change it (gconsole setpswd, /api userPassword), then
+# remove the switch.
+;allow_default_root_password=off
 
 [system]
 # unit MB
@@ -67,7 +105,9 @@ resource_check=off
 
 # root username
 root_username="root"
-# root default password (used when the user store is first created)
+# root default password (used when the user store is first created; gserver
+# refuses to serve the API while root still has 123456 -- set your own, or see
+# allow_default_root_password in [server])
 root_password="123456"
 # system username for shutdown (its password is generated at every start and
 # written to the second line of the pid file)
