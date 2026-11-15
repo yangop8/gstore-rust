@@ -192,7 +192,7 @@ pub struct HttpOptions {
     /// `read_timeout`. `conf.ini`: `min_body_rate`.
     ///
     /// The same floor applies to a **streamed response** (a file download,
-    /// [`write_response_streamed`]) read by its client: after a grace of
+    /// `write_response_streamed`) read by its client: after a grace of
     /// [`write_timeout`](Self::write_timeout), the bytes the connection has
     /// taken so far must keep up this rate, or the connection is closed. A
     /// client draining a download a few bytes at a time cannot hold its
