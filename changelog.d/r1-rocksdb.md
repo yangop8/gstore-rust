@@ -27,9 +27,10 @@
   (gap-rocksdb-exec#4). Terms written new inside a transaction or a
   journaled statement are recorded in the journal in the same batch, so a
   crash between a term and its triple lets the next open free the term. A
-  rollback replays the journal but keeps it until the terms it leaves
-  unreferenced are deleted in the same batch as the journal; the open's
-  replay of a journal a crash left does the same. The journal record format
+  rollback replays the journal (without journaling its own writes) but
+  keeps it until the terms it leaves unreferenced are deleted in the same
+  batch as the journal; the open's replay of a journal a crash left does
+  the same. The journal record format
   stays readable by older binaries (a term record is a `-` record that an
   older binary replays as a no-op removal plus the same reclamation).
 - **`check_point` no longer flushes RocksDB's memtables on every write**
@@ -121,7 +122,8 @@ none
   its end (point deletes up to 1,024 records, else one range delete), so a
   very large `gadd` / `gsub` / `LOAD` on RocksDB temporarily stores a
   journal as large as its change set; its freed ids are held until its
-  end (`remove_sources` keeps only the dead ones between batches).
+  end (`remove_sources` keeps only the dead ones between batches, and
+  probes each candidate once when its batch is read and once at the end).
 - docs/REFACTOR_BACKLOG.md: (a) REST `/batchInsert` / `/batchRemove`
   (`http_api.rs` handle_batch) apply one `try_insert_triple` per triple,
   each its own RocksDB write: not crash-atomic as a whole on RocksDB until
@@ -180,7 +182,16 @@ no behaviour change).
   agreement test and the config-key test use new API and were not run on
   base. The review's panic test (`a_panicking_statement_is_ended_like_a_failed_one`)
   fails on the package's first version (`4aadce7`): "a statement after a
-  panicking one: rocksdb: a transaction is already being journaled".
+  panicking one: rocksdb: a transaction is already being journaled". So
+  do the review's two other tests on the commits before their fixes:
+  `a_rollback_keeping_its_journal_does_not_journal_its_replay` (the kept
+  journal held 7 records for a 4-record transaction: the replay had
+  journaled its own writes) and
+  `a_journaled_removal_probes_each_candidate_a_bounded_number_of_times`
+  (`remove_sources` of 400 statements in batches of 10: 17,240 reference
+  probes for 840 candidates — the dead ones kept by earlier batches were
+  probed again for every batch, quadratic in the batches of a large
+  `gsub` — against a bound of 3 probes per candidate).
 - **tests-a#1 cost.** The first version of the persistent failed-LOAD
   test (65,536 + 1,000 statements, each minting two terms) took 93 s for
   the three layouts; the committed one (50 minting statements + 257 x 257
@@ -202,7 +213,11 @@ no behaviour change).
   0.47 / 0.54, disk 0.46 / 0.46; WatDiv-like snapshot 0.13 / 0.14, disk
   0.13 / 0.13. Disk single-insert medians (1.17 vs 8.07 ms, LUBM-like)
   differ by the box's fsync load between the runs, not by the change
-  (the disk write path is untouched).
+  (the disk write path is untouched). The review's follow-up commits
+  (`1314a78`..) change the default-feature paths only by a direct call
+  (`rocks_statement_body` with nothing journaled) and an append of an
+  empty vector in `Candidates::take`; the smoke gate was not re-run for
+  them.
 
 ## Requests/Not yet
 
