@@ -31,7 +31,11 @@ Behaviour changes first:
   - credentials in the head that fail the check are answered `401` before the
     body is read, and count once towards the address's lockout (a locked-out
     or blocked address is not checked: its body is held to the
-    pre-authentication cap);
+    pre-authentication cap, also when it carries a valid session token);
+  - an upstream *inner* request (`inner=true`) is never checked before its
+    body (whether its password is checked at all is `verify`'s
+    `trust_inner_localhost` decision, and a failure counted here would lock
+    out 127.0.0.1): its body is held to the pre-authentication cap;
   - the check runs only for a body that may exceed the pre-authentication
     cap (a larger or a chunked one): ordinary requests pay nothing extra.
   Upstream clients put their credentials inside the body (the SDKs' `/api`
@@ -77,7 +81,9 @@ New API and files:
 - `gapi::params::MAX_JSON_VALUES`, `MAX_PARAMS`, `MAX_BOUNDARY_LEN`.
 - `memchr` is now a direct dependency (it was already built through `regex`).
 - Tests: `tests/http_preauth_limits.rs` (pre-body 413/401/100-continue on
-  both servers and under TLS, the lockout, the budget's 503, the bounded
+  both servers and under TLS, the lockout, no upload cap for a locked-out
+  address's session token, no pre-check of inner requests, the budget's 503,
+  the bounded
   peak of a chunked body, wide JSON, long boundaries, a 64-character boundary
   over megabytes), unit tests in `src/preauth.rs`, `src/gapi/params.rs` and
   `src/json.rs`.
@@ -107,6 +113,10 @@ none
   - Behaviour change to announce: a `401` (not the `/api` envelope's `1001`)
     for a wrong password sent in the URL query string with a body larger than
     the pre-authentication cap; `503` when the body budget is exhausted.
+    An upstream *inner* request (`inner=true`, honoured only with
+    `trust_inner_localhost`) is never authenticated from its head, so its
+    body is held to `preauth_max_body_size` (raise that key for larger
+    inner uploads).
 - **README.md** (configuration section, the `[upload]` keys and the
   `refreshconf` paragraph): list `preauth_max_body_size` and
   `request_body_budget` with their defaults; the sentence "the cap
@@ -172,6 +182,19 @@ and testing at the same time (load average 9-10 during the bench runs).
   window-by-window `find` (64-byte needle: 0.003 s) against 0.003 s on the
   branch; `to_redacted_json` of 32,000 parameters took 1.19 s on the base
   (4,000: 0.016 s), 16,000 took 0.017 s on the branch.
+- **Independent review** (spot-checks on the branch, each fix reverted in
+  place and the tests rerun): without the pre-body cap decision 9 of the 14
+  integration tests fail; without the budget
+  `the_body_budget_bounds_all_bodies_in_memory` fails; without the JSON value
+  bound, the RFC 2046 check and the linear search, the two wide-JSON tests,
+  the long-boundary integration test, `multipart_boundaries_follow_rfc_2046`
+  and `the_boundary_search_is_linear_in_the_boundary_and_the_body` fail.
+  `a_64_character_boundary_over_megabytes_parses_in_linear_time` passes on the
+  base as well: a fixed-length boundary was linear in the body there too, so
+  it is a guard; the scaling unit test is the one that fails before the fix.
+  The reviewer's two additional tests (locked-out session token, inner
+  request) fail without commit "preauth: no upload cap for a locked-out
+  address's token, no pre-check of inner requests".
 - **Bench smoke gate** (D9; the HTTP read path changed): release builds of
   `gbuild` + `gstore-bench`, base = 7bbf4ae (binaries built from its
   sources), branch = 4787f90, run back to back with the same data cache:
