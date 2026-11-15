@@ -262,6 +262,25 @@ fn present(dir: &Path, subjects: &[&str]) -> Vec<String> {
         .collect()
 }
 
+/// The `statusCode` of every query-log record (`<root>/logs/endpoint/`, the
+/// default `querylog_path`) of statement `sparql`.
+fn logged_status(root: &Path, sparql: &str) -> Vec<i64> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(root.join("logs").join("endpoint"))
+        .expect("the query log directory")
+        .flatten()
+    {
+        let text = std::fs::read_to_string(entry.path()).unwrap();
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            let rec = parse(line);
+            if rec.get("sparql").and_then(Json::as_str) == Some(sparql) {
+                out.push(int(&rec, "statusCode"));
+            }
+        }
+    }
+    out
+}
+
 /// A REST failure envelope of a write that is not durable.
 fn assert_rest_not_durable(what: &str, (st, body): (u16, String)) -> Json {
     assert_eq!(
@@ -511,6 +530,18 @@ fn api_mode_gserver_does_not_acknowledge_a_write_it_could_not_save() {
             assert!(text(&j, "warning").starts_with(NOT_DURABLE), "{j}");
         }
     }
+    // The query log records each write with the outcome it was answered
+    // with: the durable one as a success, a write that was not saved as the
+    // failure it was answered as — REST 500, `/api` 1005 — never as 0.
+    assert_eq!(logged_status(&root, &insert("acked")), [0]);
+    assert_eq!(logged_status(&root, &insert("acked_api")), [0]);
+    assert_eq!(logged_status(&root, &insert("r1")), [500], "REST /update");
+    assert_eq!(logged_status(&root, &insert("r2")), [500], "REST /sparql");
+    assert_eq!(
+        logged_status(&root, &insert("a1")),
+        [API_FAILED],
+        "/api query"
+    );
     failing.kill();
 
     // After SIGKILL exactly the acknowledged writes are there.

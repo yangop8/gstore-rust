@@ -7,6 +7,7 @@
   - The upstream `/api` protocol keeps HTTP 200, as for every `/api` answer. `query` updates, `commit` and `reasonManage` execute answer `StatusCode` 1005 (disable already saved its retraction itself and failed when that save failed), the code `batchInsert` already answered for a failed save.
   - An UPDATE that fails part-way and whose applied part cannot be saved is a persistence failure. It now answers REST 500 (was 400 with `{"error":…}`) and `/api` 1005 with the "not durable" message (was `"Query fail: …"`). This uses the new `OpErrorKind::Persist`.
   - The write stays applied in memory and is saved by the next successful save, `/checkpoint`, `/unload` or graceful shutdown, but it is lost if the process dies first.
+  - The REST query log records such a write with `statusCode` 500 (it recorded 0, a success); the `/api` query log already recorded the answer's 1005.
 - **Behaviour change: an unreadable `named.bin` fails the open** (db#1, robust#4, durability#3).
   - Before, every read error of a snapshot database's `named.bin` (truncation, decode error, EIO, EACCES, EMFILE, a dangling symlink) read as "no named graphs". The next check_point save or `gcompact --reclaim` then overwrote the graphs with an empty map and freed their terms.
   - Now `Database::open`/`load`/`read_copy` (and so `gserver` loads, every CLI tool and `gcompact --reclaim`) fail with an error naming the file.
@@ -28,7 +29,7 @@
 - Tests:
   - New test files:
     - `tests/snapshot_read_errors.rs`: truncated, undecodable, EISDIR, EACCES (skipped as root) and dangling-symlink `named.bin`; `gcompact --reclaim` refuses and leaves the file untouched; a missing `named.bin` still opens; the VS-tree is valid after reopen, also after `vstree.bin` damage; with the `rocksdb` feature, the legacy migration refuses. This is the named.bin part of db#24.
-    - `tests/save_failure_ack.rs`: `gserver` children with `RLIMIT_FSIZE` below the snapshot size (`SIGXFSZ` ignored), so every save fails with EFBIG. Every write path above answers non-success, and after SIGKILL and a restart exactly the acknowledged writes are present.
+    - `tests/save_failure_ack.rs`: `gserver` children with `RLIMIT_FSIZE` below the snapshot size (`SIGXFSZ` ignored), so every save fails with EFBIG. Every write path above answers non-success, the query logs record those writes as failures, and after SIGKILL and a restart exactly the acknowledged writes are present.
     - `tests/user_store_consistency.rs`: injected `users.db` save failures, a flooding user, and expired sessions swept on login.
     - `tests/sysdb_reconcile_read_errors.rs`: a dangling-symlink database across restarts.
     - `tests/ipmanage_round_trip.rs`: short IPv6 entries through save, reload and restart.
@@ -52,7 +53,7 @@ none
   - db#1 / robust#4 / durability#3 follow-up: record the quad count, or per-member checksums, in `meta.bin` behind a format feature bit (format registry, old binaries refuse cleanly). A `named.bin` that still decodes, for example an older copy restored beside a newer `meta.bin`, would then be detected too. This needs a format change (D7), so it was not done here.
   - db#24, the parts outside this package: malformed or huge-length redo.log/update.log input, and redo completeness after inference or a failed flush, go to r3-db-redo (db#9, db#3, db#2). VS-tree validity after CLEAR/DROP/inference goes to r4-db-graph (db#4). `mutation_count` after an empty rollback goes to r2-txn (db#7).
   - durability#18, the parts outside this package: an fsync-tracking (power-loss) fault layer goes to r5-test-audit (fsync audit). Torn redo/update-log tests go to r3-db-redo (log framing). This package covers the save-failure acknowledgement with `RLIMIT_FSIZE` children.
-  - gapi#7, the suggested extra guard: refusing an allow-list save that would lock out the calling address is not implemented. It needs the caller's address inside `IpFilter::save`, and the lockout logic is outside this package's scope. The silent-emptying cause is fixed.
+  - gapi#7, the suggested extra guard: refusing an allow-list save that would lock out the calling address is not implemented. Upstream `ipmanage` writes any valid list, so the guard is a new refusal that needs a policy decision (how a proxied or trusted-local caller counts, whether root may knowingly replace the list); the plan scoped this package to the save/load round trip of list entries. The silent-emptying cause is fixed, and an empty `ips` was already refused (1003).
 
 ## Measured numbers
 - No hot path changed (pager, RocksDB, engine, topk, string index, optimizer, gfun, HTTP read path), so the bench smoke gate was not run (convention 8). Only these changed: the write replies, the open path's `named.bin` read, startup reconcile, `UserStore` mutations and login, and `ipmanage`.
@@ -65,6 +66,7 @@ none
   - `src/gapi/ops_reason.rs` `reasonManage`: the success block that set a `"warning"` now sets `StatusCode` 1005 and `StatusMsg`. No R1 owner.
   - `src/gapi/ops_query.rs` `end()` (the `/api` commit/rollback answer): the `Ok(warning)` arm now answers 1005. No R1 owner.
   - `src/http_api.rs`:
+    - `execute_query_job` (no R1 owner; r2-limits-auth's in R2): the query-log outcome of a non-durable update is the `Persist` failure.
     - Two new items: `NOT_DURABLE` (a const before `warn_field`) and `Resp::write_outcome`, inside `impl Resp` right after `ok_warn`.
     - Doc comments of `end_txn` and `OpErrorKind`, and the module docs' Durability paragraph.
     - The tails of `handle_upload` and `handle_batch` (sanctioned).
@@ -76,6 +78,6 @@ none
   - `src/sysdb.rs` tests module: a thread-local failpoint and one unit test.
   - `tests/dt_cli.rs` and `tests/dt_cli_compat.rs`: the tests-a#11 sub-claims. No R1 owner; `dt_cli.rs` is r5-test-hygiene's in R5.
 - For r2-txn (M2's "applied but not durable" commit status): reuse `NOT_DURABLE` and `Resp::write_outcome`, so every not-durable answer has one shape.
-- For r3-rest-parity (R3 sole `http_api.rs` editor): `execute_query_job` still records a non-durable update in the REST query log as answered (`StatusCode` 0 with its changed count), although the reply is HTTP 500. The task registry also marks it ok.
+- For r3-rest-parity (R3 sole `http_api.rs` editor): `run_query_job` still ends the task of a non-durable update as succeeded (`TaskGuard::set_ok`). This is not visible on the wire today (`operationTaskList` reports both as finished, status 1); align it when the task state becomes visible.
 - Environment note for every agent using `CARGO_TARGET_DIR=/home/user/fix-campaign/target-rocks`: worktrees with the same layout get the same artifact hash for the `gstore` crate. A feature build can therefore silently link another worktree's `gstore` library when that one was built last. Touch one of your own source files before a feature build; one run here linked the unfixed library until `src/db/persist.rs` was touched.
 - Nothing of this package's ids is left open.

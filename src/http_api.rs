@@ -2974,12 +2974,22 @@ impl ApiInner {
     fn execute_query_job(&self, job: QueryJob, qlog: RestQueryLog) -> Resp {
         let fmt = job.fmt;
         let out = self.run_query_job(job);
+        // An update applied in memory but not saved is logged as the failure
+        // it is answered as (HTTP 500), not as a success (review
+        // durability#2).
+        let not_durable = match &out {
+            Ok(JobOutput::Updated {
+                warning: Some(w), ..
+            }) => Some(OpError::new(OpErrorKind::Persist, w.clone())),
+            _ => None,
+        };
         qlog.finish(
             self,
-            match &out {
-                Ok(JobOutput::Read(result)) => Ok(answer_count(result)),
-                Ok(JobOutput::Updated { changed, .. }) => Ok(*changed),
-                Err(e) => Err(e),
+            match (&out, &not_durable) {
+                (_, Some(e)) => Err(e),
+                (Ok(JobOutput::Read(result)), None) => Ok(answer_count(result)),
+                (Ok(JobOutput::Updated { changed, .. }), None) => Ok(*changed),
+                (Err(e), None) => Err(e),
             },
         );
         match out {
