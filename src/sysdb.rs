@@ -834,7 +834,16 @@ mod tests {
     /// one: registrations and grants survive (review gapi#9).
     #[test]
     fn an_unlistable_root_keeps_registrations_and_grants() {
+        /// Removes the root also when the test fails.
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                FAIL_LIST_ROOT.with(|f| f.set(false));
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
         let root = tmp_root("unlistable");
+        let _cleanup = Cleanup(root.clone());
         let (mut users, mut sys) = open_system(&root, "pw").unwrap();
         fs::create_dir_all(root.join("lubm.db")).unwrap();
         fs::write(root.join("lubm.db").join("meta.bin"), b"").unwrap();
@@ -862,7 +871,6 @@ mod tests {
         let (users, sys) = open_system(&root, "pw").unwrap();
         assert!(sys.names().is_empty());
         assert!(!users.has_priv_on("alice", Privilege::Update, "lubm"));
-        let _ = fs::remove_dir_all(&root);
     }
 
     fn tmp_root(tag: &str) -> PathBuf {
