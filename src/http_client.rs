@@ -63,6 +63,24 @@ pub fn sparql_post(url: &str, query: &str) -> io::Result<String> {
 
 /// [`sparql_post`] with explicit [`Limits`].
 pub fn sparql_post_with(url: &str, query: &str, limits: Limits) -> io::Result<String> {
+    sparql_post_opts(
+        url,
+        query,
+        &PostOptions {
+            limits,
+            ..PostOptions::default()
+        },
+    )
+}
+
+/// [`sparql_post`] under `opts`: its [`Limits`] and its
+/// [`refuse_local`](PostOptions::refuse_local) policy (`ca_file` is unused:
+/// `SERVICE` is `http://` only). A refused host-local address is a
+/// [`PermissionDenied`](io::ErrorKind::PermissionDenied) error that
+/// [`is_host_local_refusal`] recognises. The query engine calls this for
+/// `SERVICE`, refusing host-local addresses unless the database's
+/// [`LoadPolicy`](crate::db::LoadPolicy) allows them.
+pub fn sparql_post_opts(url: &str, query: &str, opts: &PostOptions) -> io::Result<String> {
     let (host, port, path) = parse_http_url(url)?;
     let request = format!(
         "POST {path} HTTP/1.1\r\n\
@@ -83,9 +101,9 @@ pub fn sparql_post_with(url: &str, query: &str, limits: Limits) -> io::Result<St
     let raw = exchange(
         &target,
         request.as_bytes(),
-        limits,
+        opts.limits,
         None,
-        false,
+        opts.refuse_local,
         "SERVICE endpoint",
     )?;
     let reply = parse_reply(&raw)?;
@@ -129,30 +147,96 @@ pub struct PostOptions {
     pub refuse_local: bool,
 }
 
-/// Whether `ip` reaches this host or its link rather than a network service
-/// a client may name: loopback, unspecified, link-local (cloud metadata
-/// endpoints live there), multicast and broadcast addresses — IPv4, IPv6,
-/// and IPv4 mapped into IPv6.
+/// Whether `ip` reaches this host, its link or the provider's
+/// infrastructure rather than a network service a client may name — an
+/// address a client must not make the server contact (`SERVICE` under a
+/// policy without host-local hosts, `remote=true` downloads, asynchronous
+/// callbacks):
+///
+/// * IPv4: this network `0.0.0.0/8` (unspecified included), loopback
+///   `127.0.0.0/8`, link-local `169.254.0.0/16` (cloud metadata endpoints
+///   live there), the shared address space `100.64.0.0/10` (RFC 6598; e.g.
+///   a cloud metadata service at `100.100.100.200`), benchmarking
+///   `198.18.0.0/15` (RFC 2544), multicast `224.0.0.0/4` and the reserved
+///   `240.0.0.0/4` (broadcast included);
+/// * IPv6: loopback, unspecified, link-local `fe80::/10`, site-local
+///   `fec0::/10` (deprecated), unique-local `fc00::/7` (an IPv6 cloud
+///   metadata endpoint lives at `fd00:ec2::254`) and multicast `ff00::/8`;
+/// * IPv4 embedded in IPv6: mapped `::ffff:a.b.c.d`, NAT64
+///   `64:ff9b::a.b.c.d` and 6to4 `2002:aabb:ccdd::/48` addresses whose IPv4
+///   address is one of the above, and the whole deprecated IPv4-compatible
+///   block `::/96` (never a public endpoint).
+///
+/// Other private networks (`10/8`, `172.16/12`, `192.168/16`) are not
+/// host-local: the outbound features reach internal hosts by design (see
+/// docs/DEPLOY.md).
 pub fn is_local_addr(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_unspecified()
+            let [a, b, ..] = v4.octets();
+            a == 0
+                || v4.is_loopback()
                 || v4.is_link_local()
-                || v4.is_multicast()
-                || v4.is_broadcast()
-                || v4.octets()[0] == 0
+                || (a == 100 && (b & 0xc0) == 64)
+                || (a == 198 && (b & 0xfe) == 18)
+                || a >= 224
         }
         IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            let embedded = |hi: u16, lo: u16| {
+                IpAddr::V4(std::net::Ipv4Addr::from(
+                    (u32::from(hi) << 16) | u32::from(lo),
+                ))
+            };
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return is_local_addr(&IpAddr::V4(v4));
             }
-            v6.is_loopback()
-                || v6.is_unspecified()
+            if seg[..6] == [0; 6] {
+                // `::/96`: unspecified, loopback and the IPv4-compatible block.
+                return true;
+            }
+            if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                return is_local_addr(&embedded(seg[6], seg[7]));
+            }
+            if seg[0] == 0x2002 {
+                return is_local_addr(&embedded(seg[1], seg[2]));
+            }
+            (seg[0] & 0xffc0) == 0xfe80
+                || (seg[0] & 0xffc0) == 0xfec0
+                || (seg[0] & 0xfe00) == 0xfc00
                 || v6.is_multicast()
-                || (v6.segments()[0] & 0xffc0) == 0xfe80
         }
     }
+}
+
+/// The error inside the [`io::Error`] of a connection refused because the
+/// address is host-local ([`PostOptions::refuse_local`]).
+#[derive(Debug)]
+struct HostLocalRefused {
+    what: String,
+    ip: IpAddr,
+}
+
+impl std::fmt::Display for HostLocalRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} address {} is host-local; refused",
+            self.what, self.ip
+        )
+    }
+}
+
+impl std::error::Error for HostLocalRefused {}
+
+/// Whether `e` is the refusal of a host-local address
+/// ([`PostOptions::refuse_local`], [`is_local_addr`]) — a policy decision,
+/// as opposed to the endpoint failing — for every address the host resolved
+/// to.
+pub fn is_host_local_refusal(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::PermissionDenied
+        && e.get_ref()
+            .is_some_and(|inner| inner.is::<HostLocalRefused>())
 }
 
 /// `POST` `body` (labelled `content_type`) to `url` with the default
@@ -429,7 +513,10 @@ fn exchange(
         if refuse_local && is_local_addr(&addr.ip()) {
             last_err = io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!("{what} address {} is host-local; refused", addr.ip()),
+                HostLocalRefused {
+                    what: what.to_string(),
+                    ip: addr.ip(),
+                },
             );
             continue;
         }
@@ -601,7 +688,18 @@ mod tls_client {
 }
 
 /// Split an `http://host[:port]/path` URL into `(host, port, path)`.
+///
+/// Whitespace and control characters are refused anywhere in the URL, as
+/// [`parse_url`] does: the host and path are written into the request line
+/// and the `Host:` header verbatim, and a SPARQL IRIREF can carry them
+/// (`\u000D\u000A` decodes to CR LF), which would inject request headers.
 fn parse_http_url(url: &str) -> io::Result<(String, u16, String)> {
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "malformed URL (whitespace or control characters)",
+        ));
+    }
     let rest = url
         .strip_prefix("http://")
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "only http:// is supported"))?;
@@ -830,6 +928,39 @@ mod tests {
             ("host".to_string(), 9, "/".to_string())
         );
         assert!(parse_http_url("https://secure/x").is_err());
+        // Whitespace / control characters would reach the request line or
+        // the Host header verbatim (review M8).
+        for bad in [
+            "http://h/a\r\nX: y",
+            "http://h/a b",
+            "http://h/a\tb",
+            "http://h\r\nX: y/a",
+            "http://h/a\u{7f}",
+        ] {
+            assert_eq!(
+                parse_http_url(bad).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput,
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// A refused host-local address is recognisable as a policy refusal.
+    #[test]
+    fn sparql_post_opts_refuses_host_local_addresses() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/sparql", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let opts = PostOptions {
+            refuse_local: true,
+            ..PostOptions::default()
+        };
+        let err = sparql_post_opts(&url, "ASK {}", &opts).unwrap_err();
+        assert!(is_host_local_refusal(&err), "{err}");
+        assert!(err.to_string().contains("is host-local"), "{err}");
+        assert!(listener.accept().is_err(), "nothing connected");
+        let other = io::Error::new(io::ErrorKind::PermissionDenied, "EACCES");
+        assert!(!is_host_local_refusal(&other));
     }
 
     #[test]
@@ -1024,16 +1155,14 @@ mIjSMKbBFgquUgIhAPHupNklmfNjoKbt7eKBPIKOTzsJbKSpBaMVuL/X4bNv
             "fe80::1",
             "::ffff:127.0.0.1",
             "::ffff:169.254.169.254",
+            // review sec#13: unique-local addresses (an IPv6 cloud metadata
+            // endpoint is fd00:ec2::254) are host-local too.
+            "fd00::1",
+            "100.100.100.200",
         ] {
             assert!(is_local_addr(&local.parse().unwrap()), "{local}");
         }
-        for remote in [
-            "10.0.0.1",
-            "192.168.1.2",
-            "8.8.8.8",
-            "2001:db8::1",
-            "fd00::1",
-        ] {
+        for remote in ["10.0.0.1", "192.168.1.2", "8.8.8.8", "2001:db8::1"] {
             assert!(!is_local_addr(&remote.parse().unwrap()), "{remote}");
         }
     }

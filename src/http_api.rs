@@ -512,10 +512,11 @@ pub(crate) struct ReadSnapshot {
     /// The database's Top-K / early-termination options at `/begin`.
     topk: TopKOptions,
     csr: CsrCache,
-    /// Whether `SERVICE` may contact remote endpoints: the database's load
-    /// policy at `/begin` (a server's restricted policy refuses it), so a
-    /// read inside a transaction cannot bypass the `SERVICE` ban.
-    allow_service: bool,
+    /// What `SERVICE` may contact: the database's load policy at `/begin`
+    /// (a server's restricted policy refuses it, `--allow-service` refuses
+    /// host-local endpoints), so a read inside a transaction cannot bypass
+    /// the `SERVICE` policy.
+    service_policy: crate::db::ServicePolicy,
     /// The database's graph-function output bound at `/begin`.
     gfun_max_output_bytes: usize,
     /// The database's PFN limits at `/begin`.
@@ -664,7 +665,7 @@ impl ReadSnapshot {
             csr: db
                 .cached_csr()
                 .map_or_else(CsrCache::new, |g| CsrCache::seeded(generation, g)),
-            allow_service: db.load_policy().allow_remote,
+            service_policy: db.load_policy().service_policy(),
             gfun_max_output_bytes: db.gfun_max_output_bytes(),
             pfn_limits: db.pfn_limits(),
             pfn: db.pfn_caller(),
@@ -778,7 +779,7 @@ impl ReadSnapshot {
         pfn: Option<&crate::pfn::PfnCaller>,
     ) -> Evaluator<'a, S> {
         let mut eval = eval
-            .with_service_allowed(self.allow_service)
+            .with_service_policy(self.service_policy)
             .with_csr_provider(csr)
             .with_integer_division(self.integer_division)
             .with_topk_options(self.topk)

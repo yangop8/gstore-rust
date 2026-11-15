@@ -499,9 +499,9 @@ pub struct Evaluator<'a, S: TripleSource = TripleStore> {
     /// probe or a page read. Shared with `GRAPH` sub-evaluators (same
     /// dictionary), so one byte budget bounds the whole query.
     memo: Rc<std::cell::RefCell<IdMemo>>,
-    /// Whether `SERVICE` may contact remote endpoints (see
-    /// [`with_service_allowed`](Self::with_service_allowed)).
-    allow_service: bool,
+    /// What `SERVICE` may contact (see
+    /// [`with_service_policy`](Self::with_service_policy)).
+    service_policy: crate::db::ServicePolicy,
     /// Set when a `SERVICE` was refused; like a cancel, it cuts evaluation
     /// short and is reported as an error. Shared with `GRAPH` sub-evaluators.
     service_denied: Rc<std::cell::Cell<bool>>,
@@ -580,7 +580,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             string_index_tried: std::cell::Cell::new(false),
             string_index_provider: None,
             memo: Rc::default(),
-            allow_service: true,
+            service_policy: crate::db::ServicePolicy::AnyHost,
             service_denied: Rc::new(std::cell::Cell::new(false)),
             failed: Rc::default(),
             csr_provider: None,
@@ -611,7 +611,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             string_index_tried: std::cell::Cell::new(false),
             string_index_provider: None,
             memo: Rc::default(),
-            allow_service: true,
+            service_policy: crate::db::ServicePolicy::AnyHost,
             service_denied: Rc::new(std::cell::Cell::new(false)),
             failed: Rc::default(),
             csr_provider: None,
@@ -665,11 +665,28 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// Allow or forbid federated `SERVICE` patterns (allowed by default). A
     /// server that must not make outbound requests on a client's behalf
     /// forbids them: a query using `SERVICE` then fails with an error — no
-    /// connection is attempted, `SILENT` or not. [`Database`](crate::Database)
-    /// sets this from its [`LoadPolicy`](crate::db::LoadPolicy)'s
-    /// `allow_remote`.
+    /// connection is attempted, `SILENT` or not. `true` allows any endpoint
+    /// (host-local addresses included, [`ServicePolicy::AnyHost`](crate::db::ServicePolicy::AnyHost));
+    /// see [`with_service_policy`](Self::with_service_policy) for the
+    /// policy [`Database`](crate::Database) applies.
     pub fn with_service_allowed(mut self, allowed: bool) -> Evaluator<'a, S> {
-        self.allow_service = allowed;
+        self.service_policy = if allowed {
+            crate::db::ServicePolicy::AnyHost
+        } else {
+            crate::db::ServicePolicy::Denied
+        };
+        self
+    }
+
+    /// What federated `SERVICE` patterns may contact (default
+    /// [`AnyHost`](crate::db::ServicePolicy::AnyHost)).
+    /// [`Database`](crate::Database) sets this from its
+    /// [`LoadPolicy`](crate::db::LoadPolicy)
+    /// ([`LoadPolicy::service_policy`](crate::db::LoadPolicy::service_policy)):
+    /// a server on the restricted policy denies `SERVICE`, and
+    /// `gserver --allow-service` allows it except to host-local addresses.
+    pub fn with_service_policy(mut self, policy: crate::db::ServicePolicy) -> Evaluator<'a, S> {
+        self.service_policy = policy;
         self
     }
 
@@ -2336,7 +2353,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// solutions). On any failure (variable endpoint, unserializable inner
     /// pattern, connection or parse error) a non-`SILENT` service yields no
     /// solutions, while a `SILENT` one yields the single identity solution so the
-    /// outer query still returns.
+    /// outer query still returns. A refusal by policy is the query's error
+    /// instead, `SILENT` or not: `SERVICE` denied altogether, or an endpoint
+    /// at a host-local address under [`ServicePolicy::RemoteHosts`](crate::db::ServicePolicy::RemoteHosts).
     fn eval_service(
         &self,
         endpoint: &ServiceRef,
@@ -2357,10 +2376,14 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
 
         // Refused outright when this evaluator may not contact remote
         // endpoints (reported as an error by `check_cancel`).
-        if !self.allow_service {
-            self.service_denied.set(true);
-            return Vec::new();
-        }
+        let refuse_local = match self.service_policy {
+            crate::db::ServicePolicy::Denied => {
+                self.service_denied.set(true);
+                return Vec::new();
+            }
+            crate::db::ServicePolicy::RemoteHosts => true,
+            crate::db::ServicePolicy::AnyHost => false,
+        };
 
         // Only constant-IRI endpoints are supported; a variable endpoint can't
         // be resolved without per-solution evaluation (uncommon — see backlog).
@@ -2374,11 +2397,29 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             return fail(silent);
         };
 
-        // Fetch + parse the remote SPARQL-results JSON.
-        let solutions = match crate::http_client::sparql_post(url, &query)
+        // Fetch + parse the remote SPARQL-results JSON (depth-limited: a
+        // hostile reply is an error, not a stack overflow).
+        let opts = crate::http_client::PostOptions {
+            refuse_local,
+            ..crate::http_client::PostOptions::default()
+        };
+        let solutions = match crate::http_client::sparql_post_opts(url, &query, &opts)
             .and_then(|body| crate::http_client::parse_sparql_json(&body))
         {
             Ok(sols) => sols,
+            Err(e) if crate::http_client::is_host_local_refusal(&e) => {
+                // A policy refusal, reported as the query's error (see
+                // `failed`) like a denied `SERVICE`, not as "no solution".
+                let mut failed = self.failed.borrow_mut();
+                if failed.is_none() {
+                    *failed = Some(GStoreError::Query(format!(
+                        "SERVICE <{url}>: {e} (this server does not contact loopback, \
+                         link-local or other host-local addresses on a client's behalf: its \
+                         load policy does not allow host-local hosts)"
+                    )));
+                }
+                return Vec::new();
+            }
             Err(_) => return fail(silent),
         };
 
@@ -2424,7 +2465,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             string_index_tried: std::cell::Cell::new(self.string_index_tried.get()),
             string_index_provider: self.string_index_provider,
             memo: Rc::clone(&self.memo),
-            allow_service: self.allow_service,
+            service_policy: self.service_policy,
             service_denied: Rc::clone(&self.service_denied),
             failed: Rc::clone(&self.failed),
             // Graph functions inside a GRAPH block run over that named graph:

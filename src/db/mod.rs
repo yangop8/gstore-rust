@@ -71,7 +71,7 @@ pub mod reclaim;
 mod review_tests;
 #[cfg(test)]
 mod stream_review_tests;
-pub use load_policy::{LoadPolicy, LoadSource};
+pub use load_policy::{LoadPolicy, LoadSource, ServicePolicy};
 mod query_cache;
 use named::NamedGraphs;
 use query_cache::QueryCache;
@@ -2066,7 +2066,7 @@ impl Database {
         // `SERVICE` makes outbound requests: only where remote sources
         // are allowed (not on a server's restricted policy).
         eval = eval
-            .with_service_allowed(self.load_policy.allow_remote)
+            .with_service_policy(self.load_policy.service_policy())
             .with_csr_provider(&csr)
             .with_string_index_provider(&string_index)
             .with_integer_division(self.integer_division)
@@ -2640,7 +2640,7 @@ impl Database {
             // and the request's cancel flag stops it (a graph function in a
             // sub-SELECT included), as in reads.
             let mut eval = eval
-                .with_service_allowed(db.load_policy.allow_remote)
+                .with_service_policy(db.load_policy.service_policy())
                 .with_integer_division(db.integer_division)
                 .with_topk_options(db.topk)
                 .with_gfun_max_output_bytes(db.gfun_max_output_bytes);
