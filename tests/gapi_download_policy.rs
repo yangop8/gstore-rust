@@ -1,6 +1,8 @@
 //! The policy of the upstream `/api` layer's file routes (`/file/download`)
-//! and of the files they serve (review gapi#4, robust#7, sec#11): a
-//! download is streamed (bounded memory), and only so many run at once.
+//! and of the files they serve (review gapi#4, robust#7, sec#11, gapi#11):
+//!
+//! * a download is streamed (bounded memory), and only so many run at once;
+//! * `format=file` results are written without a result tree in memory.
 //!
 //! Memory is measured with a counting global allocator, so the tests of this
 //! file run one at a time ([`serial`]).
@@ -17,7 +19,7 @@ use std::time::Duration;
 
 use gstore::config::GStoreConfig;
 use gstore::http_api::ApiServer;
-use gstore::json::Json;
+use gstore::json::{self, Json};
 
 // ---------------------------------------------------------------------------
 // A counting allocator: the bytes allocated now, and the peak since a reset
@@ -126,6 +128,17 @@ impl Srv {
     fn export_dir(&self) -> PathBuf {
         self.root.join("export")
     }
+    fn upload_dir(&self) -> PathBuf {
+        self.root.join("upload")
+    }
+    /// An RDF file put in the upload directory by the operator (no owner
+    /// record); its absolute path.
+    fn data_file(&self, name: &str, content: &str) -> String {
+        fs::create_dir_all(self.upload_dir()).unwrap();
+        let p = self.upload_dir().join(name);
+        fs::write(&p, content).unwrap();
+        p.to_string_lossy().into_owned()
+    }
 }
 
 impl Drop for Srv {
@@ -176,6 +189,9 @@ struct Reply {
 impl Reply {
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).into_owned()
+    }
+    fn json(&self) -> Json {
+        json::parse(&self.text()).unwrap_or_else(|e| panic!("not JSON ({e}): {}", self.text()))
     }
     fn header(&self, name: &str) -> Option<String> {
         self.head.lines().find_map(|l| {
@@ -257,6 +273,71 @@ fn password(user: &str) -> &'static str {
     } else {
         "pw"
     }
+}
+
+/// `POST /api` as `user` with `pairs`; the HTTP 200 JSON envelope.
+fn api_as(addr: &SocketAddr, user: &str, pairs: &[(&str, &str)]) -> Json {
+    let mut body = Json::obj()
+        .with("username", user)
+        .with("password", password(user));
+    for (k, v) in pairs {
+        body.set(*k, *v);
+    }
+    let r = send(
+        addr,
+        "POST",
+        "/api",
+        &[("Content-Type", "application/json")],
+        body.to_string().as_bytes(),
+    );
+    assert_eq!(r.status, 200, "{}", r.text());
+    r.json()
+}
+
+fn api(addr: &SocketAddr, pairs: &[(&str, &str)]) -> Json {
+    api_as(addr, "root", pairs)
+}
+
+fn code(j: &Json) -> i64 {
+    j.get("StatusCode")
+        .and_then(Json::as_i64)
+        .unwrap_or_else(|| panic!("no StatusCode in {j}"))
+}
+
+fn string(j: &Json, key: &str) -> String {
+    j.get(key)
+        .and_then(Json::as_str)
+        .unwrap_or_else(|| panic!("no string {key} in {j}"))
+        .to_string()
+}
+
+fn ok(j: &Json) {
+    assert_eq!(code(j), 0, "{j}");
+}
+
+/// Build and load `db` from `path` (as root).
+fn build_loaded(addr: &SocketAddr, db: &str, path: &str) {
+    ok(&api(
+        addr,
+        &[("operation", "build"), ("db_name", db), ("db_path", path)],
+    ));
+    ok(&api(addr, &[("operation", "load"), ("db_name", db)]));
+}
+
+/// A `format=file` query on `db` as `user`: the reported file name.
+fn query_file_as(addr: &SocketAddr, user: &str, db: &str, sparql: &str) -> String {
+    let j = api_as(
+        addr,
+        user,
+        &[
+            ("operation", "query"),
+            ("db_name", db),
+            ("format", "file"),
+            ("sparql", sparql),
+        ],
+    );
+    ok(&j);
+    string(&j, "FileName")
 }
 
 /// `POST /file/download` as `user`.
@@ -434,4 +515,48 @@ fn concurrent_downloads_are_capped() {
     assert_eq!(early.len() as u64 + rest, BIG as u64);
     let r = download_as(a, "root", "small.nt");
     assert_eq!((r.status, r.text()), (200, DATA_B.to_string()));
+}
+
+// ---------------------------------------------------------------------------
+// format=file results
+// ---------------------------------------------------------------------------
+
+/// gapi#11: a `format=file` result is written row by row — the request's
+/// peak heap stays near the result set itself, far below the JSON tree plus
+/// text the buffered writer built (about 8x the result set, review gapi#11).
+#[test]
+fn format_file_results_are_written_without_a_result_tree() {
+    let _g = serial();
+    let root = TempRoot::new("ffile");
+    let srv = start_at(&root.0, |c| set(c, "query_cache_size", "0"));
+    let a = &srv.addr;
+    let rows = 20_000;
+    let mut nt = String::new();
+    for i in 0..rows {
+        nt.push_str(&format!(
+            "<http://ex/s{i}> <http://ex/p> \"{} {i}\" .\n",
+            "long literal value ".repeat(4)
+        ));
+    }
+    let path = srv.data_file("big.nt", &nt);
+    drop(nt);
+    build_loaded(a, "big", &path);
+    let sparql = "SELECT ?s ?p ?o WHERE { ?s ?p ?o }";
+    // Warm up once (the first query compiles and caches what it can).
+    query_file_as(a, "root", "big", sparql);
+    let (name, peak) = peak_during(|| query_file_as(a, "root", "big", sparql));
+    let file = srv.export_dir().join(&name);
+    let size = fs::metadata(&file).unwrap().len() as usize;
+    eprintln!("format=file result of {size} bytes ({rows} rows): peak heap {peak} bytes");
+    let written = json::parse(&fs::read_to_string(&file).unwrap()).unwrap();
+    let bindings = written
+        .get("results")
+        .and_then(|r| r.get("bindings"))
+        .and_then(Json::as_array)
+        .unwrap();
+    assert_eq!(bindings.len(), rows);
+    assert!(
+        peak < 3 * size,
+        "a {size}-byte format=file result took {peak} bytes of heap at its peak"
+    );
 }

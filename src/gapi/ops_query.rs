@@ -11,8 +11,7 @@
 //! belongs to the user who began it.
 
 use std::fs;
-use std::io::Write;
-use std::path::PathBuf;
+use std::io::{self, BufWriter, Write};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -27,7 +26,7 @@ use crate::json::Json;
 use crate::parser::sparql::ast::Query;
 use crate::query::{QueryResult, ResultSet};
 use crate::sparql_results::{
-    self, upstream_ask_result, upstream_ntriple_json, upstream_select_json, upstream_tsv,
+    self, upstream_ask_result, upstream_binding, upstream_ntriple_json, upstream_select_json,
     ResultFormat,
 };
 
@@ -241,20 +240,24 @@ fn read_response(
         OutFormat::Json => (json(shown), None),
         OutFormat::NTriple => (upstream_ntriple_json(rs, shown), None),
         // File outputs are not capped (upstream resets the output limit).
+        // They are written row by row: no JSON tree, no text of the whole
+        // result in memory (review gapi#11).
         OutFormat::File => {
-            let text = json(None).into_sorted().to_string();
+            let write = |w: &mut dyn Write| match pfn.and_then(|p| p.results_json(rs, None)) {
+                Some(body) => w.write_all(body.into_sorted().to_string().as_bytes()),
+                None => write_upstream_select_json(rs, w),
+            };
             (
                 Json::obj(),
-                Some(write_result_file(ctx, db, thread_id, "json", &text)?),
+                Some(write_result_file(ctx, db, thread_id, "json", write)?),
             )
         }
-        OutFormat::NTripleFile => {
-            let text = upstream_tsv(rs);
-            (
-                Json::obj(),
-                Some(write_result_file(ctx, db, thread_id, "txt", &text)?),
-            )
-        }
+        OutFormat::NTripleFile => (
+            Json::obj(),
+            Some(write_result_file(ctx, db, thread_id, "txt", |w| {
+                write_upstream_tsv(rs, w)
+            })?),
+        ),
     };
     body.set("StatusCode", 0);
     body.set("StatusMsg", "success");
@@ -272,19 +275,19 @@ fn read_response(
     Ok(GResp::json(body))
 }
 
-/// Write a `format=file` / `n-triple-file` result into the export directory
-/// as `<db>_<threadId>_<YYYYmmddHHMMSS>.<ext>` (upstream's name; the time is
-/// UTC here, and a numeric suffix keeps two results of the same second
-/// apart). Returns the file name (relative to the export directory, which is
-/// where `/file/download` looks).
+/// Write a `format=file` / `n-triple-file` result (`write` streams it) into
+/// the export directory as `<db>_<threadId>_<YYYYmmddHHMMSS>.<ext>`
+/// (upstream's name; the time is UTC here, and a numeric suffix keeps two
+/// results of the same second apart). Returns the file name (relative to the
+/// export directory, which is where `/file/download` looks).
 fn write_result_file(
     ctx: &Ctx<'_>,
     db: &str,
     thread_id: &str,
     ext: &str,
-    text: &str,
+    write: impl FnOnce(&mut dyn Write) -> io::Result<()>,
 ) -> Result<String, GResp> {
-    let fail = |e: std::io::Error| {
+    let fail = |e: io::Error| {
         GResp::error(
             Status::OperationFailed,
             format!("Query fail: could not write the result file: {e}"),
@@ -293,27 +296,118 @@ fn write_result_file(
     let dir = ctx.export_dir();
     fs::create_dir_all(&dir).map_err(fail)?;
     let stem = format!("{db}_{thread_id}_{}", compact_utc_now());
-    for n in 0u32.. {
-        let name = if n == 0 {
-            format!("{stem}.{ext}")
-        } else {
-            format!("{stem}_{n}.{ext}")
-        };
-        let path: PathBuf = dir.join(&name);
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(mut f) => {
-                f.write_all(text.as_bytes()).map_err(fail)?;
-                return Ok(name);
+    let (file, name) = super::ops_file::create_unique(&dir, &stem, ext).map_err(fail)?;
+    let mut out = BufWriter::new(file);
+    if let Err(e) = write(&mut out).and_then(|()| out.flush()) {
+        drop(out);
+        let _ = fs::remove_file(dir.join(&name));
+        return Err(fail(e));
+    }
+    Ok(name)
+}
+
+/// [`upstream_select_json`] of every row, key-sorted
+/// (`upstream_select_json(rs, None).into_sorted().to_string()`, byte for
+/// byte), written one row at a time.
+fn write_upstream_select_json(rs: &ResultSet, w: &mut dyn Write) -> io::Result<()> {
+    let vars: Vec<Json> = rs.vars.iter().map(|v| Json::from(v.as_str())).collect();
+    let head = Json::obj()
+        .with("link", Json::arr())
+        .with("vars", Json::Arr(vars))
+        .into_sorted();
+    write!(w, "{{\"head\":{head},\"results\":{{\"bindings\":[")?;
+    let mut first = true;
+    for row in &rs.rows {
+        let mut b = Json::obj();
+        for (ci, cell) in row.iter().enumerate() {
+            if let (Some(val), Some(var)) = (cell, rs.vars.get(ci)) {
+                b.set(var.as_str(), upstream_binding(val));
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 1000 => continue,
-            Err(e) => return Err(fail(e)),
+        }
+        if b.as_object().is_none_or(|e| e.is_empty()) {
+            continue;
+        }
+        if !first {
+            w.write_all(b",")?;
+        }
+        first = false;
+        write!(w, "{}", b.into_sorted())?;
+    }
+    w.write_all(b"]}}")
+}
+
+/// [`sparql_results::upstream_tsv`], byte for byte, written one row at a
+/// time.
+fn write_upstream_tsv(rs: &ResultSet, w: &mut dyn Write) -> io::Result<()> {
+    if rs.rows.is_empty() {
+        return w.write_all(b"[empty result]\n");
+    }
+    let head: Vec<String> = rs.vars.iter().map(|v| format!("?{v}")).collect();
+    writeln!(w, "{}", head.join("\t"))?;
+    for row in &rs.rows {
+        let cells: Vec<&str> = row.iter().map(|c| c.as_deref().unwrap_or("")).collect();
+        writeln!(w, "{}", cells.join("\t"))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod result_file_tests {
+    use super::*;
+    use crate::sparql_results::upstream_tsv;
+
+    fn table(vars: &[&str], rows: &[&[Option<&str>]]) -> ResultSet {
+        let mut rs = ResultSet::new(vars.iter().map(|v| v.to_string()).collect());
+        for row in rows {
+            rs.rows
+                .push(row.iter().map(|c| c.map(str::to_string)).collect());
+        }
+        rs
+    }
+
+    /// The streamed file outputs are byte-identical to the documents they
+    /// replace (review gapi#11).
+    #[test]
+    fn streamed_result_files_match_the_buffered_documents() {
+        let tables = [
+            table(&["x"], &[]),
+            table(&[], &[&[]]),
+            table(
+                &["s", "o", "z"],
+                &[
+                    &[
+                        Some("<http://ex/a>"),
+                        Some("\"tab\\there \\\"q\\\" é\"@en"),
+                        None,
+                    ],
+                    &[None, None, None],
+                    &[
+                        Some("_:b0"),
+                        Some("\"5\"^^<http://www.w3.org/2001/XMLSchema#integer>"),
+                        Some("\"plain\""),
+                    ],
+                    &[Some("<http://ex/\u{1F600}>"), Some("not a term"), Some("")],
+                ],
+            ),
+            // A repeated variable name (the later cell wins, as in the tree).
+            table(
+                &["v", "v"],
+                &[&[Some("<http://ex/1>"), Some("<http://ex/2>")]],
+            ),
+        ];
+        for rs in &tables {
+            let mut json = Vec::new();
+            write_upstream_select_json(rs, &mut json).unwrap();
+            assert_eq!(
+                String::from_utf8(json).unwrap(),
+                upstream_select_json(rs, None).into_sorted().to_string(),
+                "{rs:?}"
+            );
+            let mut tsv = Vec::new();
+            write_upstream_tsv(rs, &mut tsv).unwrap();
+            assert_eq!(String::from_utf8(tsv).unwrap(), upstream_tsv(rs), "{rs:?}");
         }
     }
-    unreachable!("the suffix loop returns")
 }
 
 /// `begin` — open a transaction on `db_name` (`isolevel` 1, 2 or 3, default
