@@ -86,7 +86,7 @@ pub fn tokenize_with_spans(input: &str) -> Result<(Vec<Token>, Vec<Range<usize>>
     // byte_at[i] = byte offset of chars[i]; byte_at[chars.len()] = input.len().
     let mut byte_at: Vec<usize> = input.char_indices().map(|(b, _)| b).collect();
     byte_at.push(input.len());
-    let (tokens, char_spans) = Lexer { chars, pos: 0 }.run()?;
+    let (tokens, char_spans) = Lexer::new(chars).run()?;
     let spans = char_spans
         .into_iter()
         .map(|(a, b)| byte_at[a]..byte_at[b])
@@ -97,9 +97,27 @@ pub fn tokenize_with_spans(input: &str) -> Result<(Vec<Token>, Vec<Range<usize>>
 struct Lexer {
     chars: Vec<char>,
     pos: usize,
+    /// A run of `PN_CHARS` / `.` that [`lex_word_or_pname`](Self::lex_word_or_pname)
+    /// scanned for a prefix-ending `:` without finding one. Every later
+    /// start inside the run ends its scan at the same place, so the answer
+    /// is known there (review H-14: scanning again from each word of
+    /// `a-a-a-…` was quadratic).
+    no_prefix_run: Range<usize>,
+    /// Characters the prefix look-ahead has stepped over (a work counter
+    /// for the complexity tests).
+    lookahead_steps: usize,
 }
 
 impl Lexer {
+    fn new(chars: Vec<char>) -> Lexer {
+        Lexer {
+            chars,
+            pos: 0,
+            no_prefix_run: 0..0,
+            lookahead_steps: 0,
+        }
+    }
+
     fn err(&self, msg: impl Into<String>) -> GStoreError {
         GStoreError::SparqlParse(msg.into())
     }
@@ -120,7 +138,7 @@ impl Lexer {
 
     /// Lex the whole input into tokens plus their `[start, end)` char spans.
     #[allow(clippy::type_complexity)]
-    fn run(mut self) -> Result<(Vec<Token>, Vec<(usize, usize)>)> {
+    fn run(&mut self) -> Result<(Vec<Token>, Vec<(usize, usize)>)> {
         let mut out = Vec::new();
         let mut spans = Vec::new();
         loop {
@@ -485,15 +503,28 @@ impl Lexer {
     fn lex_word_or_pname(&mut self) -> Result<Token> {
         let mut head = String::new();
         // A PN_PREFIX with '-' / '.' inside is only a prefix when ':' follows.
-        let mut end = self.pos;
-        while self
-            .chars
-            .get(end)
-            .is_some_and(|&c| is_pn_char(c) || c == '.')
-        {
-            end += 1;
-        }
-        if end > self.pos && self.chars.get(end) == Some(&':') && self.chars[end - 1] != '.' {
+        // Inside a run already scanned without finding one, the scan would
+        // end at the same place with the same answer: skip it.
+        let is_prefix = if self.no_prefix_run.contains(&self.pos) {
+            None
+        } else {
+            let mut end = self.pos;
+            while self
+                .chars
+                .get(end)
+                .is_some_and(|&c| is_pn_char(c) || c == '.')
+            {
+                end += 1;
+            }
+            self.lookahead_steps += end - self.pos;
+            if end > self.pos && self.chars.get(end) == Some(&':') && self.chars[end - 1] != '.' {
+                Some(end)
+            } else {
+                self.no_prefix_run = self.pos..end;
+                None
+            }
+        };
+        if let Some(end) = is_prefix {
             head.extend(&self.chars[self.pos..end]);
             self.pos = end;
         } else {
@@ -590,6 +621,55 @@ mod tests {
 
     fn lex(s: &str) -> Vec<Token> {
         tokenize(s).unwrap()
+    }
+
+    /// Review H-14: the prefix look-ahead steps over each character of a
+    /// `:`-less name run once, so lexing is linear in the run's length
+    /// (before: each word of `a-a-a-…` scanned the rest of the run again —
+    /// about n²/4 steps), and the tokens are unchanged.
+    #[test]
+    fn prefix_lookahead_is_linear_in_the_run_length() {
+        for (sep, unit) in [
+            ("-", [Token::Word("a".into()), Token::Minus]),
+            (".", [Token::Word("a".into()), Token::Dot]),
+            ("_-", [Token::Word("a_".into()), Token::Minus]),
+        ] {
+            for n in [1_000usize, 2_000, 4_000] {
+                let src = format!("ASK {{ FILTER(?x = {}a) }}", format!("a{sep}").repeat(n));
+                let mut lx = Lexer::new(src.chars().collect());
+                let toks = lx.run().unwrap().0;
+                assert!(
+                    lx.lookahead_steps <= src.len(),
+                    "sep {sep:?} n {n}: {} steps",
+                    lx.lookahead_steps
+                );
+                let mut expected = lex("ASK { FILTER(?x = ");
+                expected.pop(); // Eof
+                for _ in 0..n {
+                    expected.extend(unit.iter().cloned());
+                }
+                expected.extend([
+                    Token::Word("a".into()),
+                    Token::RParen,
+                    Token::RBrace,
+                    Token::Eof,
+                ]);
+                assert_eq!(toks, expected, "sep {sep:?} n {n}");
+            }
+        }
+        // A run that ends in a prefix is still one prefixed name, and a run
+        // after it is scanned afresh.
+        let toks = lex("a-b.c:d e-f.g:h i-j");
+        assert_eq!(
+            &toks[..5],
+            &[
+                Token::PName("a-b.c".into(), "d".into()),
+                Token::PName("e-f.g".into(), "h".into()),
+                Token::Word("i".into()),
+                Token::Minus,
+                Token::Word("j".into()),
+            ]
+        );
     }
 
     #[test]

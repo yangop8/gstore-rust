@@ -248,10 +248,10 @@ pub struct Snapshot {
     /// was published.
     topk: TopKOptions,
     csr: CsrCache,
-    /// Whether `SERVICE` may contact remote endpoints: the database's
-    /// [`LoadPolicy::allow_remote`](crate::db::LoadPolicy::allow_remote), so
-    /// snapshot reads follow the same policy as [`Database::query`].
-    allow_service: bool,
+    /// What `SERVICE` may contact: the database's
+    /// [`LoadPolicy::service_policy`](crate::db::LoadPolicy::service_policy),
+    /// so snapshot reads follow the same policy as [`Database::query`].
+    service_policy: crate::db::ServicePolicy,
     /// The database's graph-function output bound when the snapshot was
     /// published.
     gfun_max_output_bytes: usize,
@@ -304,7 +304,7 @@ impl Snapshot {
             csr: db
                 .cached_csr()
                 .map_or_else(CsrCache::new, |g| CsrCache::seeded(0, g)),
-            allow_service: db.load_policy().allow_remote,
+            service_policy: db.load_policy().service_policy(),
             gfun_max_output_bytes: db.gfun_max_output_bytes(),
             pfn: db.pfn_caller(),
             capture_error,
@@ -364,7 +364,7 @@ impl Snapshot {
         // The snapshot never changes: one CSR generation for its lifetime.
         let csr = || self.csr.get_or_build(0, || CsrGraph::build(&self.store));
         let mut eval = Evaluator::new(&self.dict, &self.store)
-            .with_service_allowed(self.allow_service)
+            .with_service_policy(self.service_policy)
             .with_csr_provider(&csr)
             .with_integer_division(self.integer_division)
             .with_topk_options(self.topk)
@@ -1185,7 +1185,7 @@ impl VersionView<'_> {
         let latest = self.db.snapshot();
         let functions = latest.functions.clone();
         let mut eval = Evaluator::new(&dict, &store)
-            .with_service_allowed(latest.allow_service)
+            .with_service_policy(latest.service_policy)
             .with_integer_division(latest.integer_division)
             .with_topk_options(latest.topk)
             .with_gfun_max_output_bytes(latest.gfun_max_output_bytes);

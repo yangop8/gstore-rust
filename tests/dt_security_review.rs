@@ -612,10 +612,31 @@ fn service_cannot_reach_other_hosts_from_a_restricted_server() {
         "no connection may reach the internal host"
     );
 
-    // An operator who opts in (`gserver --allow-service`) gets federation.
+    // An operator who opts in (`gserver --allow-service`) gets federation —
+    // but not to a host-local address such as this loopback listener.
+    // review tests-b#1: this block used to assert that `allow_remote` alone
+    // reached the loopback endpoint (and returned its data), pinning the
+    // SSRF to loopback / link-local hosts that remote downloads refuse.
     let mut policy = LoadPolicy::restricted();
     policy.allow_remote = true;
-    let api = Api::start("ssrf_opt_in", Some(policy));
+    let api = Api::start("ssrf_opt_in", Some(policy.clone()));
+    assert_eq!(api.root("POST", "/build?db_name=d", DATA).0, 200);
+    for q in &queries {
+        let (s, b) = api.root("POST", "/sparql?db_name=d", q);
+        assert_eq!(s, 400, "{q}: {b}");
+        assert!(
+            b.contains("host-local") && !b.contains("internal-secret"),
+            "{b}"
+        );
+    }
+    assert!(
+        !hit.load(Ordering::SeqCst),
+        "no connection may reach the host-local endpoint"
+    );
+    // Host-local hosts allowed too (`--allow-service --allow-local-hosts`):
+    // the loopback endpoint is reached.
+    policy.allow_local_hosts = true;
+    let api = Api::start("ssrf_opt_in_local", Some(policy));
     assert_eq!(api.root("POST", "/build?db_name=d", DATA).0, 200);
     let (s, b) = api.root("POST", "/sparql?db_name=d", &queries[0]);
     assert_eq!(s, 200, "{b}");

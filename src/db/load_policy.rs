@@ -16,7 +16,8 @@
 //!
 //! The policy also covers the other ways a client can make the server reach
 //! outside its own data: federated `SERVICE` patterns (outbound HTTP) follow
-//! [`LoadPolicy::allow_remote`], and the HTTP API's `/build?db_path=` and
+//! [`LoadPolicy::allow_remote`] and [`LoadPolicy::allow_local_hosts`] (see
+//! [`LoadPolicy::service_policy`]), and the HTTP API's `/build?db_path=` and
 //! `/restore` sources follow its local-file rules.
 //!
 //! When a policy lists allowed directories, a local source is
@@ -59,13 +60,38 @@ pub struct LoadPolicy {
     /// server on [`restricted`](Self::restricted) cannot be made to contact
     /// internal hosts on a client's behalf.
     pub allow_remote: bool,
-    /// Whether a download the bulk loaders make on a client's behalf (`/api`
-    /// `build` / `batchInsert` / `batchRemove` with `remote=true`) may reach
-    /// a host-local address — loopback, link-local (cloud metadata), …, see
+    /// Whether an outbound request made on a client's behalf may reach a
+    /// host-local address — loopback, link-local (cloud metadata), …, see
     /// [`crate::http_client::is_local_addr`] — as asynchronous callbacks may
-    /// not either. Allowed on [`permissive`](Self::permissive), refused on
-    /// [`restricted`](Self::restricted), whatever `allow_remote` says.
+    /// not either: a federated `SERVICE` endpoint, and a download the bulk
+    /// loaders make (`/api` `build` / `batchInsert` / `batchRemove` with
+    /// `remote=true`). Only meaningful with `allow_remote`. Allowed on
+    /// [`permissive`](Self::permissive), refused on
+    /// [`restricted`](Self::restricted), whatever `allow_remote` says:
+    /// `gserver --allow-service` keeps it off unless `--allow-local-hosts`
+    /// is given too.
     pub allow_local_hosts: bool,
+}
+
+/// What federated SPARQL `SERVICE` patterns may contact — a
+/// [`LoadPolicy`]'s `allow_remote` and `allow_local_hosts`, as
+/// [`LoadPolicy::service_policy`] derives it for the query evaluator
+/// ([`Evaluator::with_service_policy`](crate::query::Evaluator::with_service_policy)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServicePolicy {
+    /// No outbound request: a query using `SERVICE` fails, `SILENT` or not
+    /// (`allow_remote` off — the restricted server policy).
+    Denied,
+    /// Remote endpoints, except at a host-local address
+    /// ([`crate::http_client::is_local_addr`], checked on every address the
+    /// host resolves to): a query naming one fails with an error, `SILENT`
+    /// or not (`allow_remote` on, `allow_local_hosts` off —
+    /// `gserver --allow-service`).
+    RemoteHosts,
+    /// Any endpoint, host-local addresses included (`allow_remote` and
+    /// `allow_local_hosts` — [`LoadPolicy::permissive`], the library
+    /// default, or `gserver --allow-service --allow-local-hosts`).
+    AnyHost,
 }
 
 impl Default for LoadPolicy {
@@ -117,6 +143,15 @@ impl LoadPolicy {
             .get_or_insert_with(Vec::new)
             .push(dir.into());
         self
+    }
+
+    /// What `SERVICE` patterns may contact under this policy.
+    pub fn service_policy(&self) -> ServicePolicy {
+        match (self.allow_remote, self.allow_local_hosts) {
+            (false, _) => ServicePolicy::Denied,
+            (true, false) => ServicePolicy::RemoteHosts,
+            (true, true) => ServicePolicy::AnyHost,
+        }
     }
 
     /// Check `source` (the IRI of a `LOAD`) against the policy, returning where
@@ -274,6 +309,26 @@ mod tests {
             p.resolve("http://e.org/x").unwrap(),
             LoadSource::Remote("http://e.org/x".into())
         );
+    }
+
+    #[test]
+    fn service_policy_follows_remote_and_local_hosts() {
+        assert_eq!(
+            LoadPolicy::permissive().service_policy(),
+            ServicePolicy::AnyHost
+        );
+        assert_eq!(
+            LoadPolicy::restricted().service_policy(),
+            ServicePolicy::Denied
+        );
+        // What `gserver --allow-service` sets up.
+        let mut p = LoadPolicy::restricted();
+        p.allow_remote = true;
+        assert_eq!(p.service_policy(), ServicePolicy::RemoteHosts);
+        p.allow_local_hosts = true;
+        assert_eq!(p.service_policy(), ServicePolicy::AnyHost);
+        p.allow_remote = false;
+        assert_eq!(p.service_policy(), ServicePolicy::Denied);
     }
 
     #[test]

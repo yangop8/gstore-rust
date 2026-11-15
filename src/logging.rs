@@ -725,7 +725,13 @@ pub fn rolled_files(path: &Path) -> Vec<(PathBuf, Date)> {
         let Some(rest) = fname.strip_prefix(&prefix) else {
             continue;
         };
-        let (date, tail) = rest.split_at(rest.len().min(10));
+        // `YYYY-MM-DD` is ten ASCII bytes: a name whose tenth byte is not a
+        // character boundary (any other file an operator left there) is
+        // not a rolled file — skipped, never split mid-character (review
+        // M15: `split_at` panicked and gserver could not start).
+        let (Some(date), Some(tail)) = (rest.get(..10), rest.get(10..)) else {
+            continue;
+        };
         let Some(day) = Date::parse_iso(date) else {
             continue;
         };
@@ -743,6 +749,18 @@ pub fn rolled_files(path: &Path) -> Vec<(PathBuf, Date)> {
 
 fn append(path: &Path) -> io::Result<File> {
     fs::OpenOptions::new().create(true).append(true).open(path)
+}
+
+/// Append `line` and a newline to the plain-text log `path` (created as
+/// needed) with a single `write(2)` on an `O_APPEND` file, so lines that
+/// concurrent writers append never interleave (the servers' `access.log`,
+/// `query.log` and `txn.log`; review conc#6 — formatting the line and its
+/// newline as two writes let another writer's line land between them).
+pub fn append_line(path: &Path, line: &str) -> io::Result<()> {
+    let mut buf = String::with_capacity(line.len() + 1);
+    buf.push_str(line);
+    buf.push('\n');
+    append(path)?.write_all(buf.as_bytes())
 }
 
 /// Whether `path` is (still) the file `f` has open.

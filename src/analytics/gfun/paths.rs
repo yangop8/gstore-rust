@@ -946,10 +946,35 @@ struct CountScratch {
     tcnt: Dense<i32>,
     sd: Dense<i32>,
     td: Dense<i32>,
+    /// The largest frontier (`next`) any round built since the scratch was
+    /// made: at most the vertex count (each side enqueues a vertex once).
+    peak_frontier: usize,
+}
+
+impl CountScratch {
+    fn new(n: usize) -> CountScratch {
+        CountScratch {
+            scnt: Dense::new(n),
+            tcnt: Dense::new(n),
+            sd: Dense::new(n),
+            td: Dense::new(n),
+            peak_frontier: 0,
+        }
+    }
 }
 
 /// `PathQueryHandler::shortestPathCount` (shortestPathCount.cpp:15-163) on CSR
 /// nodes; C `int` arithmetic (wrapping).
+///
+/// "Reached" and "reached by the other side" are the maps' stamps
+/// ([`Dense::has`]), not upstream's `cnt[n] == 0` / `!= 0` (review H-8): a
+/// count can wrap to exactly 0 (2^32 paths), and upstream then takes the
+/// vertex for a fresh one — enqueued again for every in-edge, the frontier
+/// doubling each level until the allocation fails — and misses the meet.
+/// Where no count wraps to 0 the two tests agree, so the output is
+/// upstream's. The counts stay C `int`: no control decision reads them, and
+/// a wider accumulator truncated on output would print the same bytes
+/// (wrapping `+`/`*` modulo 2^64 reduce to the same value modulo 2^32).
 fn shortest_path_count_nodes(
     g: &CsrGraph,
     sc: &mut CountScratch,
@@ -959,10 +984,17 @@ fn shortest_path_count_nodes(
     directed: bool,
     preds: &PredFilter,
 ) -> Result<i32> {
-    let CountScratch { scnt, tcnt, sd, td } = sc;
+    let CountScratch {
+        scnt,
+        tcnt,
+        sd,
+        td,
+        peak_frontier,
+    } = sc;
     for d in [&mut *scnt, &mut *tcnt, &mut *sd, &mut *td] {
         d.reset();
     }
+    let num_nodes = g.num_nodes();
     scnt.set(s, 1);
     tcnt.set(t, 1);
     sd.set(s, 0);
@@ -986,8 +1018,8 @@ fn shortest_path_count_nodes(
             let vd = dep.get_or_zero(v);
             // source side: (in, then) out; target side: (out, then) in
             for_each_two_pass(g, v, preds, directed, source_side, |n| {
-                if cnt.get_or_zero(n) == 0 {
-                    if other.get_or_zero(n) != 0 {
+                if !cnt.has(n) {
+                    if other.has(n) {
                         meet = true;
                         joint.push(n);
                     }
@@ -1000,7 +1032,16 @@ fn shortest_path_count_nodes(
                     cnt.set(n, cnt.get_or_zero(n).wrapping_add(vcnt));
                 }
             });
+            // A vertex enters `next` only when first reached, so this cannot
+            // happen; a guard against the frontier blow-up of review H-8.
+            if next.len() > num_nodes {
+                return Err(GStoreError::Query(
+                    "shortestPathCount: internal error: the search frontier outgrew the graph"
+                        .into(),
+                ));
+            }
         }
+        *peak_frontier = (*peak_frontier).max(next.len());
         *front = next;
     }
     if !meet {
@@ -1046,13 +1087,7 @@ fn shortest_path_count_nodes(
 /// **Missing `u` / `v`:** upstream indexes its arrays with `-1` (undefined
 /// behaviour) → no entry. **Isolated** → `count` 0.
 pub fn shortest_path_count(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
-    let n = ctx.csr.num_nodes();
-    let mut sc = CountScratch {
-        scnt: Dense::new(n),
-        tcnt: Dense::new(n),
-        sd: Dense::new(n),
-        td: Dense::new(n),
-    };
+    let mut sc = CountScratch::new(ctx.csr.num_nodes());
     let mut poll = Poll::new(ctx);
     let mut guard = OutputGuard::bytes(ctx, GFnKind::ShortestPathCount);
     let mut list = JsonList::new();
@@ -2674,6 +2709,55 @@ mod tests {
         v.clear();
         for_each_two_pass(&g, 0, &f, true, false, |n| v.push(n));
         assert_eq!(v, vec![4, 3]);
+    }
+
+    /// Review H-8: on a 2-wide ladder of 100 levels (`s → {a1, b1}`,
+    /// `{ai, bi} → {ai+1, bi+1}`, `{a100, b100} → t`, 2^100 shortest paths)
+    /// the counts wrap to exactly 0 mod 2^32 after 32 levels. The search
+    /// still enqueues each vertex once — the frontier stays at the ladder's
+    /// width — and prints the C `int` count 2^100 mod 2^32 = 0 (+ 1 with an
+    /// extra chain of the same length). Before the fix the frontier doubled
+    /// every level past the wrap.
+    #[test]
+    fn shortest_path_count_frontier_stays_bounded_when_counts_wrap() {
+        let levels = 100u32;
+        let (s, t) = (0u32, 1u32);
+        let a = |i: u32| 2 * i; // a_i, b_i = 2i, 2i + 1 (i >= 1)
+        let mut edges = vec![(s, 0, a(1)), (s, 0, a(1) + 1)];
+        for i in 1..levels {
+            for x in [a(i), a(i) + 1] {
+                edges.push((x, 0, a(i + 1)));
+                edges.push((x, 0, a(i + 1) + 1));
+            }
+        }
+        edges.push((a(levels), 0, t));
+        edges.push((a(levels) + 1, 0, t));
+        let preds = PredFilter::from_ids([0]);
+        for chain in [false, true] {
+            let mut e = edges.clone();
+            if chain {
+                let c = |i: u32| 2 * levels + 1 + i; // c_1 .. c_L
+                e.push((s, 0, c(1)));
+                for i in 1..levels {
+                    e.push((c(i), 0, c(i + 1)));
+                }
+                e.push((c(levels), 0, t));
+            }
+            let g = graph(&e);
+            let d = crate::dict::Dictionary::new();
+            let ctx = GFunCtx::new(&g, &d);
+            let mut poll = Poll::new(&ctx);
+            let mut sc = CountScratch::new(g.num_nodes());
+            let (ns, nt) = (g.node_of(s).unwrap(), g.node_of(t).unwrap());
+            let count =
+                shortest_path_count_nodes(&g, &mut sc, &mut poll, ns, nt, true, &preds).unwrap();
+            assert_eq!(count, i32::from(chain), "chain {chain}");
+            assert!(
+                sc.peak_frontier <= 2 + usize::from(chain),
+                "chain {chain}: frontier {}",
+                sc.peak_frontier
+            );
+        }
     }
 
     #[test]

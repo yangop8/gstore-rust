@@ -81,8 +81,12 @@
 //!   endpoints (off by default: a client could otherwise make the server send
 //!   requests to internal hosts). It also lets `/api` `build` / `batchInsert`
 //!   / `batchRemove` with `remote=true` (update privilege) download
-//!   `http(s)://` sources — never from a loopback, link-local or other
-//!   host-local address.
+//!   `http(s)://` sources. Neither reaches a loopback, link-local or other
+//!   host-local address ([`gstore::http_client::is_local_addr`]).
+//! - `--allow-local-hosts`: with `--allow-service`, let `SERVICE` and those
+//!   downloads reach host-local addresses too (unsafe on a shared server: a
+//!   client can then make it contact services listening on loopback, or a
+//!   cloud metadata endpoint).
 //! - `--allow-unauthenticated`: let the single-database mode (`DIR` without
 //!   `--api`), which has no authentication, listen beyond loopback; without
 //!   it, that mode refuses to start on any other address.
@@ -203,7 +207,10 @@ fn print_help() {
          \t--load-dir DIR\t\tLet LOAD, /build, /restore read files under DIR (repeatable).\n\
          \t--allow-service\t\tLet SPARQL SERVICE contact remote endpoints, and\n\
          \t\t\t\t/api build/batchInsert/batchRemove with remote=true download\n\
-         \t\t\t\thttp(s) sources (never from loopback or link-local hosts).\n\
+         \t\t\t\thttp(s) sources (never loopback, link-local or other\n\
+         \t\t\t\thost-local addresses).\n\
+         \t--allow-local-hosts\tWith --allow-service: let SERVICE and those downloads\n\
+         \t\t\t\treach host-local addresses too (unsafe on a shared server).\n\
          \t--allow-unauthenticated\tLet the single-database mode (no authentication) listen\n\
          \t\t\t\tbeyond loopback.\n\
          \t--pid-file FILE\t\tPid file (default <db_home>/gserver.pid).\n\
@@ -251,6 +258,9 @@ struct Cli {
     no_checkpoint: bool,
     load_dirs: Vec<String>,
     allow_service: bool,
+    /// `--allow-local-hosts`: with `--allow-service`, outbound requests may
+    /// reach host-local addresses (`LoadPolicy::allow_local_hosts`).
+    allow_local_hosts: bool,
     /// `--allow-unauthenticated`: the single-database mode, which has no
     /// authentication, may listen beyond loopback.
     allow_unauthenticated: bool,
@@ -336,6 +346,7 @@ impl Cli {
                     .load_dirs
                     .push(value(&mut i, &arg)?.to_string_lossy().into_owned()),
                 "--allow-service" => cli.allow_service = true,
+                "--allow-local-hosts" => cli.allow_local_hosts = true,
                 "--allow-unauthenticated" => cli.allow_unauthenticated = true,
                 "--pid-file" => cli.pid_file = Some(value(&mut i, &arg)?.into()),
                 "--log-file" => cli.log_file = Some(value(&mut i, &arg)?.into()),
@@ -1106,7 +1117,7 @@ fn supervise(cli: &Cli) -> u8 {
 /// (or, for `/restart`, re-execute in place) and exit.
 fn serve(cli: &Cli, cfg: &GStoreConfig, target: &Target, supervisor: u32) -> u8 {
     install_open_options(cfg);
-    let load_policy = load_policy_for(&cli.load_dirs, cli.allow_service);
+    let load_policy = load_policy_for(&cli.load_dirs, cli.allow_service, cli.allow_local_hosts);
     let background = std::env::var_os(ENV_BACKGROUND).is_some();
     let addr = (cfg.listen_addr.as_str(), cfg.port);
     let (report, handle) = match &target.kind {
@@ -1450,12 +1461,22 @@ fn print_report(report: &ShutdownReport) -> bool {
 
 /// The `LOAD` policy for the served databases: nothing may be loaded, except
 /// files inside the `--load-dir` directories; `SERVICE` may contact remote
-/// endpoints only with `--allow-service`.
-fn load_policy_for(dirs: &[String], allow_service: bool) -> LoadPolicy {
+/// endpoints only with `--allow-service`, and host-local addresses only with
+/// `--allow-local-hosts` too.
+fn load_policy_for(dirs: &[String], allow_service: bool, allow_local_hosts: bool) -> LoadPolicy {
     let mut policy = LoadPolicy::restricted();
     if allow_service {
         policy.allow_remote = true;
         gs_announce!("gserver: SPARQL SERVICE may contact remote endpoints");
+        if allow_local_hosts {
+            policy.allow_local_hosts = true;
+            gs_warn!(
+                "gserver: SPARQL SERVICE and remote downloads may reach loopback, link-local \
+                 and other host-local addresses (--allow-local-hosts)"
+            );
+        }
+    } else if allow_local_hosts {
+        gs_warn!("--allow-local-hosts has no effect without --allow-service");
     }
     for d in dirs {
         if !Path::new(d).is_dir() {
@@ -1672,6 +1693,27 @@ mod tests {
             assert!(cli(&bad).is_err(), "{bad:?}");
         }
         assert!(cli(&["--thread-num"]).is_err());
+    }
+
+    /// Review M8: `--allow-service` lets `SERVICE` and remote downloads out,
+    /// but not to host-local addresses unless `--allow-local-hosts` is
+    /// given too (which means nothing on its own).
+    #[test]
+    fn allow_local_hosts_extends_allow_service() {
+        let c = cli(&["--allow-service", "--allow-local-hosts"]).unwrap();
+        assert!(c.allow_service && c.allow_local_hosts);
+        assert_eq!(
+            c.start_args(),
+            ["--allow-service", "--allow-local-hosts", "-s"].map(OsString::from)
+        );
+        assert!(!cli(&["--allow-service"]).unwrap().allow_local_hosts);
+        let service = |remote, local| load_policy_for(&[], remote, local).service_policy();
+        assert_eq!(service(false, false), gstore::db::ServicePolicy::Denied);
+        assert_eq!(service(true, false), gstore::db::ServicePolicy::RemoteHosts);
+        assert_eq!(service(true, true), gstore::db::ServicePolicy::AnyHost);
+        assert_eq!(service(false, true), gstore::db::ServicePolicy::Denied);
+        assert!(!load_policy_for(&[], true, false).allow_local_hosts);
+        assert!(!load_policy_for(&[], false, true).allow_local_hosts);
     }
 
     #[test]

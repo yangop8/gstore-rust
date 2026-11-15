@@ -9,8 +9,10 @@
 //!
 //! Scope (mirroring `server.rs`): `http://` (and, for [`post_with`] with the
 //! optional `tls` feature, `https://`; `SERVICE` stays `http://` only),
-//! `Connection: close` one-shot requests, and a hand-rolled JSON reader
-//! covering the result shape SPARQL endpoints emit. The body is read to EOF
+//! `Connection: close` one-shot requests, and SPARQL-results JSON read with
+//! the crate's depth-limited [`crate::json`] parser (a hostile endpoint's
+//! reply is untrusted input: nesting it absurdly deep is a parse error, not
+//! a stack overflow that aborts the process). The body is read to EOF
 //! after the headers, so it assumes a `Content-Length` / connection-close
 //! response — `Transfer-Encoding: chunked` and `gzip` are NOT decoded (works
 //! against this crate's own `server.rs`; some public endpoints chunk). Auth
@@ -21,6 +23,7 @@ use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::json::Json;
 use crate::model::Term;
 
 /// A single returned solution: each bound variable mapped to its RDF term.
@@ -60,10 +63,35 @@ pub fn sparql_post(url: &str, query: &str) -> io::Result<String> {
 
 /// [`sparql_post`] with explicit [`Limits`].
 pub fn sparql_post_with(url: &str, query: &str, limits: Limits) -> io::Result<String> {
+    sparql_post_opts(
+        url,
+        query,
+        &PostOptions {
+            limits,
+            ..PostOptions::default()
+        },
+    )
+}
+
+/// [`sparql_post`] under `opts`: its [`Limits`] and its
+/// [`refuse_local`](PostOptions::refuse_local) policy (`ca_file` is unused:
+/// `SERVICE` is `http://` only). A refused host-local address is a
+/// [`PermissionDenied`](io::ErrorKind::PermissionDenied) error that
+/// [`is_host_local_refusal`] recognises. The query engine calls this for
+/// `SERVICE`, refusing host-local addresses unless the database's
+/// [`LoadPolicy`](crate::db::LoadPolicy) allows them.
+pub fn sparql_post_opts(url: &str, query: &str, opts: &PostOptions) -> io::Result<String> {
     let (host, port, path) = parse_http_url(url)?;
+    // RFC 9112: the port is part of `Host` unless it is the default (the
+    // host is as written in the URL, an IPv6 literal with its brackets).
+    let host_header = if port == 80 {
+        host.clone()
+    } else {
+        format!("{host}:{port}")
+    };
     let request = format!(
         "POST {path} HTTP/1.1\r\n\
-         Host: {host}\r\n\
+         Host: {host_header}\r\n\
          User-Agent: gstore-rust/0.1\r\n\
          Accept: application/sparql-results+json\r\n\
          Content-Type: application/sparql-query\r\n\
@@ -80,9 +108,9 @@ pub fn sparql_post_with(url: &str, query: &str, limits: Limits) -> io::Result<St
     let raw = exchange(
         &target,
         request.as_bytes(),
-        limits,
+        opts.limits,
         None,
-        false,
+        opts.refuse_local,
         "SERVICE endpoint",
     )?;
     let reply = parse_reply(&raw)?;
@@ -126,30 +154,96 @@ pub struct PostOptions {
     pub refuse_local: bool,
 }
 
-/// Whether `ip` reaches this host or its link rather than a network service
-/// a client may name: loopback, unspecified, link-local (cloud metadata
-/// endpoints live there), multicast and broadcast addresses — IPv4, IPv6,
-/// and IPv4 mapped into IPv6.
+/// Whether `ip` reaches this host, its link or the provider's
+/// infrastructure rather than a network service a client may name — an
+/// address a client must not make the server contact (`SERVICE` under a
+/// policy without host-local hosts, `remote=true` downloads, asynchronous
+/// callbacks):
+///
+/// * IPv4: this network `0.0.0.0/8` (unspecified included), loopback
+///   `127.0.0.0/8`, link-local `169.254.0.0/16` (cloud metadata endpoints
+///   live there), the shared address space `100.64.0.0/10` (RFC 6598; e.g.
+///   a cloud metadata service at `100.100.100.200`), benchmarking
+///   `198.18.0.0/15` (RFC 2544), multicast `224.0.0.0/4` and the reserved
+///   `240.0.0.0/4` (broadcast included);
+/// * IPv6: loopback, unspecified, link-local `fe80::/10`, site-local
+///   `fec0::/10` (deprecated), unique-local `fc00::/7` (an IPv6 cloud
+///   metadata endpoint lives at `fd00:ec2::254`) and multicast `ff00::/8`;
+/// * IPv4 embedded in IPv6: mapped `::ffff:a.b.c.d`, NAT64
+///   `64:ff9b::a.b.c.d` and 6to4 `2002:aabb:ccdd::/48` addresses whose IPv4
+///   address is one of the above, and the whole deprecated IPv4-compatible
+///   block `::/96` (never a public endpoint).
+///
+/// Other private networks (`10/8`, `172.16/12`, `192.168/16`) are not
+/// host-local: the outbound features reach internal hosts by design (see
+/// docs/DEPLOY.md).
 pub fn is_local_addr(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_unspecified()
+            let [a, b, ..] = v4.octets();
+            a == 0
+                || v4.is_loopback()
                 || v4.is_link_local()
-                || v4.is_multicast()
-                || v4.is_broadcast()
-                || v4.octets()[0] == 0
+                || (a == 100 && (b & 0xc0) == 64)
+                || (a == 198 && (b & 0xfe) == 18)
+                || a >= 224
         }
         IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            let embedded = |hi: u16, lo: u16| {
+                IpAddr::V4(std::net::Ipv4Addr::from(
+                    (u32::from(hi) << 16) | u32::from(lo),
+                ))
+            };
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return is_local_addr(&IpAddr::V4(v4));
             }
-            v6.is_loopback()
-                || v6.is_unspecified()
+            if seg[..6] == [0; 6] {
+                // `::/96`: unspecified, loopback and the IPv4-compatible block.
+                return true;
+            }
+            if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                return is_local_addr(&embedded(seg[6], seg[7]));
+            }
+            if seg[0] == 0x2002 {
+                return is_local_addr(&embedded(seg[1], seg[2]));
+            }
+            (seg[0] & 0xffc0) == 0xfe80
+                || (seg[0] & 0xffc0) == 0xfec0
+                || (seg[0] & 0xfe00) == 0xfc00
                 || v6.is_multicast()
-                || (v6.segments()[0] & 0xffc0) == 0xfe80
         }
     }
+}
+
+/// The error inside the [`io::Error`] of a connection refused because the
+/// address is host-local ([`PostOptions::refuse_local`]).
+#[derive(Debug)]
+struct HostLocalRefused {
+    what: String,
+    ip: IpAddr,
+}
+
+impl std::fmt::Display for HostLocalRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} address {} is host-local; refused",
+            self.what, self.ip
+        )
+    }
+}
+
+impl std::error::Error for HostLocalRefused {}
+
+/// Whether `e` is the refusal of a host-local address
+/// ([`PostOptions::refuse_local`], [`is_local_addr`]) — a policy decision,
+/// as opposed to the endpoint failing — for every address the host resolved
+/// to.
+pub fn is_host_local_refusal(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::PermissionDenied
+        && e.get_ref()
+            .is_some_and(|inner| inner.is::<HostLocalRefused>())
 }
 
 /// `POST` `body` (labelled `content_type`) to `url` with the default
@@ -426,7 +520,10 @@ fn exchange(
         if refuse_local && is_local_addr(&addr.ip()) {
             last_err = io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!("{what} address {} is host-local; refused", addr.ip()),
+                HostLocalRefused {
+                    what: what.to_string(),
+                    ip: addr.ip(),
+                },
             );
             continue;
         }
@@ -598,7 +695,18 @@ mod tls_client {
 }
 
 /// Split an `http://host[:port]/path` URL into `(host, port, path)`.
+///
+/// Whitespace and control characters are refused anywhere in the URL, as
+/// [`parse_url`] does: the host and path are written into the request line
+/// and the `Host:` header verbatim, and a SPARQL IRIREF can carry them
+/// (`\u000D\u000A` decodes to CR LF), which would inject request headers.
 fn parse_http_url(url: &str) -> io::Result<(String, u16, String)> {
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "malformed URL (whitespace or control characters)",
+        ));
+    }
     let rest = url
         .strip_prefix("http://")
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "only http:// is supported"))?;
@@ -626,8 +734,14 @@ fn parse_http_url(url: &str) -> io::Result<(String, u16, String)> {
 /// Expects the standard envelope
 /// `{"head":{"vars":[…]},"results":{"bindings":[ {var: {type,value,…}}, … ]}}`
 /// and decodes each binding object into an RDF [`Term`].
+///
+/// The body is untrusted (any endpoint a query names): it is read with the
+/// crate's [`crate::json::parse`] — byte-based, nesting limited to
+/// [`crate::json::MAX_DEPTH`], surrogate-pair escapes combined (a lone
+/// surrogate is malformed) — so a hostile reply is an
+/// [`InvalidData`](io::ErrorKind::InvalidData) error, never a stack overflow.
 pub fn parse_sparql_json(body: &str) -> io::Result<Vec<ServiceSolution>> {
-    let json = Json::parse(body)
+    let json = crate::json::parse(body)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad JSON: {e}")))?;
     let bindings = json
         .get("results")
@@ -681,237 +795,6 @@ fn rdf_term_from_json(cell: &Json) -> io::Result<Term> {
             }
         }
     })
-}
-
-// --- a tiny JSON reader ------------------------------------------------------
-
-/// A minimal JSON value, sufficient to navigate SPARQL results.
-#[derive(Debug, Clone, PartialEq)]
-enum Json {
-    Null,
-    Bool(bool),
-    Num(f64),
-    Str(String),
-    Arr(Vec<Json>),
-    Obj(Vec<(String, Json)>),
-}
-
-impl Json {
-    fn parse(s: &str) -> Result<Json, String> {
-        let mut p = JsonParser {
-            chars: s.chars().collect(),
-            pos: 0,
-        };
-        p.skip_ws();
-        let v = p.value()?;
-        p.skip_ws();
-        if p.pos != p.chars.len() {
-            return Err("trailing characters after JSON value".into());
-        }
-        Ok(v)
-    }
-
-    /// Object-field lookup (no-op for non-objects).
-    fn get(&self, key: &str) -> Option<&Json> {
-        match self {
-            Json::Obj(fields) => fields.iter().find(|(k, _)| k == key).map(|(_, v)| v),
-            _ => None,
-        }
-    }
-
-    fn as_array(&self) -> Option<&[Json]> {
-        match self {
-            Json::Arr(a) => Some(a),
-            _ => None,
-        }
-    }
-
-    fn as_object(&self) -> Option<&[(String, Json)]> {
-        match self {
-            Json::Obj(o) => Some(o),
-            _ => None,
-        }
-    }
-
-    fn as_str(&self) -> Option<&str> {
-        match self {
-            Json::Str(s) => Some(s),
-            _ => None,
-        }
-    }
-}
-
-struct JsonParser {
-    chars: Vec<char>,
-    pos: usize,
-}
-
-impl JsonParser {
-    fn peek(&self) -> Option<char> {
-        self.chars.get(self.pos).copied()
-    }
-
-    fn bump(&mut self) -> Option<char> {
-        let c = self.peek();
-        if c.is_some() {
-            self.pos += 1;
-        }
-        c
-    }
-
-    fn skip_ws(&mut self) {
-        while matches!(self.peek(), Some(' ' | '\t' | '\n' | '\r')) {
-            self.pos += 1;
-        }
-    }
-
-    fn value(&mut self) -> Result<Json, String> {
-        self.skip_ws();
-        match self.peek() {
-            Some('{') => self.object(),
-            Some('[') => self.array(),
-            Some('"') => Ok(Json::Str(self.string()?)),
-            Some('t') | Some('f') => self.boolean(),
-            Some('n') => self.null(),
-            Some(c) if c == '-' || c.is_ascii_digit() => self.number(),
-            other => Err(format!("unexpected token {other:?}")),
-        }
-    }
-
-    fn object(&mut self) -> Result<Json, String> {
-        self.expect('{')?;
-        let mut fields = Vec::new();
-        self.skip_ws();
-        if self.peek() == Some('}') {
-            self.bump();
-            return Ok(Json::Obj(fields));
-        }
-        loop {
-            self.skip_ws();
-            let key = self.string()?;
-            self.skip_ws();
-            self.expect(':')?;
-            let val = self.value()?;
-            fields.push((key, val));
-            self.skip_ws();
-            match self.bump() {
-                Some(',') => continue,
-                Some('}') => break,
-                other => return Err(format!("expected ',' or '}}', found {other:?}")),
-            }
-        }
-        Ok(Json::Obj(fields))
-    }
-
-    fn array(&mut self) -> Result<Json, String> {
-        self.expect('[')?;
-        let mut items = Vec::new();
-        self.skip_ws();
-        if self.peek() == Some(']') {
-            self.bump();
-            return Ok(Json::Arr(items));
-        }
-        loop {
-            let val = self.value()?;
-            items.push(val);
-            self.skip_ws();
-            match self.bump() {
-                Some(',') => continue,
-                Some(']') => break,
-                other => return Err(format!("expected ',' or ']', found {other:?}")),
-            }
-        }
-        Ok(Json::Arr(items))
-    }
-
-    fn string(&mut self) -> Result<String, String> {
-        self.expect('"')?;
-        let mut out = String::new();
-        loop {
-            match self.bump() {
-                Some('"') => break,
-                Some('\\') => match self.bump() {
-                    Some('"') => out.push('"'),
-                    Some('\\') => out.push('\\'),
-                    Some('/') => out.push('/'),
-                    Some('n') => out.push('\n'),
-                    Some('t') => out.push('\t'),
-                    Some('r') => out.push('\r'),
-                    Some('b') => out.push('\u{0008}'),
-                    Some('f') => out.push('\u{000C}'),
-                    Some('u') => {
-                        let mut code = 0u32;
-                        for _ in 0..4 {
-                            let c = self
-                                .bump()
-                                .ok_or_else(|| "unterminated \\u escape".to_string())?;
-                            let d = c
-                                .to_digit(16)
-                                .ok_or_else(|| format!("bad hex digit {c:?}"))?;
-                            code = code * 16 + d;
-                        }
-                        out.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
-                    }
-                    other => return Err(format!("bad escape {other:?}")),
-                },
-                Some(c) => out.push(c),
-                None => return Err("unterminated string".into()),
-            }
-        }
-        Ok(out)
-    }
-
-    fn number(&mut self) -> Result<Json, String> {
-        let start = self.pos;
-        while let Some(c) = self.peek() {
-            if c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E' || c.is_ascii_digit() {
-                self.pos += 1;
-            } else {
-                break;
-            }
-        }
-        let s: String = self.chars[start..self.pos].iter().collect();
-        s.parse::<f64>()
-            .map(Json::Num)
-            .map_err(|_| format!("bad number '{s}'"))
-    }
-
-    fn boolean(&mut self) -> Result<Json, String> {
-        if self.consume_word("true") {
-            Ok(Json::Bool(true))
-        } else if self.consume_word("false") {
-            Ok(Json::Bool(false))
-        } else {
-            Err("invalid literal".into())
-        }
-    }
-
-    fn null(&mut self) -> Result<Json, String> {
-        if self.consume_word("null") {
-            Ok(Json::Null)
-        } else {
-            Err("invalid literal".into())
-        }
-    }
-
-    fn consume_word(&mut self, word: &str) -> bool {
-        let end = self.pos + word.len();
-        if end <= self.chars.len() && self.chars[self.pos..end].iter().collect::<String>() == word {
-            self.pos = end;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn expect(&mut self, c: char) -> Result<(), String> {
-        if self.peek() == Some(c) {
-            self.pos += 1;
-            Ok(())
-        } else {
-            Err(format!("expected {c:?}, found {:?}", self.peek()))
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1052,6 +935,39 @@ mod tests {
             ("host".to_string(), 9, "/".to_string())
         );
         assert!(parse_http_url("https://secure/x").is_err());
+        // Whitespace / control characters would reach the request line or
+        // the Host header verbatim (review M8).
+        for bad in [
+            "http://h/a\r\nX: y",
+            "http://h/a b",
+            "http://h/a\tb",
+            "http://h\r\nX: y/a",
+            "http://h/a\u{7f}",
+        ] {
+            assert_eq!(
+                parse_http_url(bad).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput,
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// A refused host-local address is recognisable as a policy refusal.
+    #[test]
+    fn sparql_post_opts_refuses_host_local_addresses() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/sparql", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let opts = PostOptions {
+            refuse_local: true,
+            ..PostOptions::default()
+        };
+        let err = sparql_post_opts(&url, "ASK {}", &opts).unwrap_err();
+        assert!(is_host_local_refusal(&err), "{err}");
+        assert!(err.to_string().contains("is host-local"), "{err}");
+        assert!(listener.accept().is_err(), "nothing connected");
+        let other = io::Error::new(io::ErrorKind::PermissionDenied, "EACCES");
+        assert!(!is_host_local_refusal(&other));
     }
 
     #[test]
@@ -1246,16 +1162,14 @@ mIjSMKbBFgquUgIhAPHupNklmfNjoKbt7eKBPIKOTzsJbKSpBaMVuL/X4bNv
             "fe80::1",
             "::ffff:127.0.0.1",
             "::ffff:169.254.169.254",
+            // review sec#13: unique-local addresses (an IPv6 cloud metadata
+            // endpoint is fd00:ec2::254) are host-local too.
+            "fd00::1",
+            "100.100.100.200",
         ] {
             assert!(is_local_addr(&local.parse().unwrap()), "{local}");
         }
-        for remote in [
-            "10.0.0.1",
-            "192.168.1.2",
-            "8.8.8.8",
-            "2001:db8::1",
-            "fd00::1",
-        ] {
+        for remote in ["10.0.0.1", "192.168.1.2", "8.8.8.8", "2001:db8::1"] {
             assert!(!is_local_addr(&remote.parse().unwrap()), "{remote}");
         }
     }
