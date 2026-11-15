@@ -82,9 +82,16 @@ pub fn sparql_post_with(url: &str, query: &str, limits: Limits) -> io::Result<St
 /// [`LoadPolicy`](crate::db::LoadPolicy) allows them.
 pub fn sparql_post_opts(url: &str, query: &str, opts: &PostOptions) -> io::Result<String> {
     let (host, port, path) = parse_http_url(url)?;
+    // RFC 9112: the port is part of `Host` unless it is the default (the
+    // host is as written in the URL, an IPv6 literal with its brackets).
+    let host_header = if port == 80 {
+        host.clone()
+    } else {
+        format!("{host}:{port}")
+    };
     let request = format!(
         "POST {path} HTTP/1.1\r\n\
-         Host: {host}\r\n\
+         Host: {host_header}\r\n\
          User-Agent: gstore-rust/0.1\r\n\
          Accept: application/sparql-results+json\r\n\
          Content-Type: application/sparql-query\r\n\

@@ -188,9 +188,14 @@ fn a_service_endpoint_replying_100k_nested_brackets_does_not_abort() {
         Err(e) => assert!(!e.to_string().is_empty()),
         Ok(rs) => assert!(rs.rows.is_empty(), "{:?}", rs.rows),
     }
-    // The endpoint was asked (the policy allows loopback in the library).
+    // The endpoint was asked (the policy allows loopback in the library),
+    // naming its port in `Host` (it is not the default one).
     let req = requests.recv_timeout(Duration::from_secs(30)).unwrap();
     assert!(req.starts_with("POST /sparql HTTP/1.1\r\n"), "{req}");
+    assert!(
+        req.contains(&format!("\r\nHost: 127.0.0.1:{}\r\n", addr.port())),
+        "{req}"
+    );
 }
 
 /// The JSON escape pair D83D DE00 is one non-BMP character (U+1F600), not
