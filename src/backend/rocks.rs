@@ -966,6 +966,13 @@ impl RocksStore {
         if !self.journaling() {
             return Ok(());
         }
+        // No longer recording while it replays: the replay's own writes
+        // must not append records to the journal they undo (a crash replays
+        // that journal again from its start anyway).
+        *self.journal_state() = Journal::Stale {
+            replay: true,
+            why: "being rolled back".into(),
+        };
         let res = self.replay_records_on_disk();
         let mut j = self.journal_state();
         match res {
@@ -2709,6 +2716,58 @@ mod tests {
             let w = warning.unwrap_or_else(|| panic!("{bad} was taken silently"));
             assert!(w.contains(BLOCK_CACHE_ENV) && w.contains(bad), "{w}");
         }
+    }
+
+    /// A rollback that keeps its journal (for the batch that deletes it
+    /// with the terms it frees) does not journal its own replay: the journal
+    /// it leaves holds the transaction's records only — not one more record
+    /// per undone change, which doubled the journal and the work of the
+    /// next open's replay after a crash.
+    #[test]
+    fn a_rollback_keeping_its_journal_does_not_journal_its_replay() {
+        struct Gone(std::path::PathBuf);
+        impl Drop for Gone {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Gone(scratch("rollback_keeping"));
+        let mut store = RocksStore::open_with(&dir.0, &RocksTuning::rocksdb_defaults()).unwrap();
+        let (kept, added, quad) = (
+            IdTriple::new(1, 1, 2),
+            IdTriple::new(3, 1, 4),
+            IdTriple::new(5, 1, 6),
+        );
+        assert!(store.insert(kept));
+        store.begin_journal().unwrap();
+        assert!(store.insert(added));
+        assert!(store.remove(kept));
+        assert!(store.insert_quad(9, quad).unwrap());
+        store
+            .put_new_terms(&[(TermSpace::Entity, 7, "<http://ex/t>")])
+            .unwrap();
+        assert_eq!(store.journal_records().unwrap().len(), 4);
+
+        store.rollback_keeping_journal().unwrap();
+        assert_eq!(
+            store.journal_records().unwrap().len(),
+            4,
+            "the rollback journaled its own replay"
+        );
+        assert_eq!(store.contains(kept), Ok(true));
+        assert_eq!(store.contains(added), Ok(false));
+        assert!(store.quads().unwrap().is_empty());
+        assert!(store.journal_error().is_some(), "kept until deleted");
+        let mut freed = store.take_replayed();
+        freed.sort_by_key(|(space, id)| (space.tag(), *id));
+        assert!(freed.contains(&(TermSpace::Entity, 7)), "{freed:?}");
+
+        store
+            .commit_journal_with(&[(TermSpace::Entity, 7)])
+            .unwrap();
+        assert!(store.journal_records().unwrap().is_empty());
+        assert!(store.journal_error().is_none());
+        assert!(store.load_terms().unwrap().is_empty());
     }
 
     /// A predicate on the seek path of `so_by_p` (many objects per subject)
