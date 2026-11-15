@@ -57,7 +57,11 @@
 //! `<root>/tasks/<opt_id>.json` instead of being held in memory; the file is
 //! removed when the task is dropped from retention. (Upstream writes it to
 //! its export directory, which anyone may download from; here only
-//! `checkOperationState`, with its owner check, reads it.)
+//! `checkOperationState`, with its owner check, reads it.) Tasks live in
+//! memory only, so the results an earlier run of the server spilled belong
+//! to no task once it restarts: [`TaskManager::remove_orphan_results`]
+//! removes them (the `/api` layer's lazy file sweep calls it; review
+//! gapi#13).
 //!
 //! # Callbacks
 //!
@@ -90,7 +94,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -597,6 +601,43 @@ impl Inner {
 fn remove_files(files: Vec<PathBuf>) {
     for f in files {
         let _ = fs::remove_file(f);
+    }
+}
+
+impl TaskManager {
+    /// Remove the spilled results in `dir` (`<opt_id>.json`, see the module
+    /// docs) that belong to no task of this manager — left behind by an
+    /// earlier run of the server (review gapi#13). The results of this
+    /// manager's tasks, running ones included, stay: a task is registered
+    /// before its result is written, and a result leaves with its task.
+    /// Returns how many files were removed.
+    pub fn remove_orphan_results(&self, dir: &Path) -> usize {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return 0;
+        };
+        let spilled: Vec<(u64, PathBuf)> = entries
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .filter_map(|e| {
+                let name = e.file_name();
+                let id = name.to_str()?.strip_suffix(".json")?;
+                if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                Some((id.parse().ok()?, e.path()))
+            })
+            .collect();
+        let orphans: Vec<PathBuf> = {
+            let st = self.shared.lock();
+            spilled
+                .into_iter()
+                .filter(|(id, _)| !st.tasks.contains_key(id))
+                .map(|(_, path)| path)
+                .collect()
+        };
+        let removed = orphans.len();
+        remove_files(orphans);
+        removed
     }
 }
 
@@ -1136,6 +1177,8 @@ pub fn check_callback_url(url: &str, allow_local: bool) -> Result<(), String> {
 /// becomes the task's result. Answers `{"StatusCode":0,"StatusMsg":"Operation
 /// Success.","opt_id":"…"}` at once.
 pub(crate) fn run_async(ctx: &mut Ctx<'_>, spec: &OpSpec, params: &Params) -> GResp {
+    // Results an earlier run left under <root>/tasks (review gapi#13).
+    super::ops_file::sweep_files(ctx);
     let callback = params.non_empty("callback");
     if let Some(url) = &callback {
         let allow_local = ctx.inner.tasks.config().callback_allow_local;

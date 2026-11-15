@@ -530,7 +530,15 @@ fn asynchronous_query_results_are_not_publicly_downloadable() {
     ] {
         let (s, _, body) = send(&srv.addr, "GET", &target, &[], "");
         assert!(!body.contains("TOPSECRET"), "{target}: {body}");
-        assert_eq!((s, code(&parse(&body))), (200, 11), "{target}: {body}");
+        // review sec#4: an anonymous download is refused before anything is
+        // resolved (HTTP 401, 1001), no longer answered "file not found" —
+        // which an authenticated download (root's) still is: the task
+        // results are in no directory a download reaches.
+        assert_eq!((s, code(&parse(&body))), (401, 1001), "{target}: {body}");
+        let authed = format!("{target}?username=root&password=root");
+        let (s, _, body) = send(&srv.addr, "GET", &authed, &[], "");
+        assert!(!body.contains("TOPSECRET"), "{authed}: {body}");
+        assert_eq!((s, code(&parse(&body))), (200, 11), "{authed}: {body}");
     }
     let j = as_user(
         &srv.addr,

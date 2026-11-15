@@ -235,9 +235,9 @@ use crate::reason::rules::RULE_DIR;
 use crate::reason::store::RuleStore;
 use crate::server::{
     err_json, locked, ntriples_body, parse_basic_auth, run_accept_loop, serve_connection,
-    unix_millis, write_response_ext, write_response_maybe_gzip, BadRequest, ConnMeta,
-    CounterSnapshot, DbCounters, HttpOptions, Lifecycle, Request, ShutdownHandle, ShutdownReport,
-    DEFAULT_SHUTDOWN_GRACE, PANIC_MSG,
+    unix_millis, write_response_ext, write_response_maybe_gzip, write_response_streamed,
+    BadRequest, ConnMeta, CounterSnapshot, DbCounters, HttpOptions, Lifecycle, Request,
+    ShutdownHandle, ShutdownReport, DEFAULT_SHUTDOWN_GRACE, PANIC_MSG,
 };
 use crate::sparql_results::{self, json_str, ResultFormat};
 use crate::store::read_scope::ReadScope;
@@ -346,6 +346,9 @@ struct Resp {
     ctype: String,
     body: Vec<u8>,
     extra: Vec<(String, String)>,
+    /// A body streamed from a file instead of `body` (a download): copied
+    /// to the connection in bounded chunks by [`ApiInner::handle`].
+    stream: Option<crate::gapi::envelope::FileBody>,
 }
 
 impl Resp {
@@ -355,6 +358,7 @@ impl Resp {
             ctype: ctype.to_string(),
             body,
             extra: Vec::new(),
+            stream: None,
         }
     }
 
@@ -398,15 +402,32 @@ impl Resp {
 
 impl From<crate::gapi::GResp> for Resp {
     /// An `/api` response: a JSON envelope is always HTTP 200 (see
-    /// [`crate::gapi::envelope`]).
+    /// [`crate::gapi::envelope`]); a file download stays streamed.
     fn from(g: crate::gapi::GResp) -> Resp {
-        let (status, ctype, body, extra) = g.into_parts();
-        Resp {
-            status,
-            ctype,
-            body,
-            extra,
-        }
+        use crate::gapi::envelope::HttpBody;
+        let (status, ctype, body, extra) = g.into_http();
+        let mut resp = match body {
+            HttpBody::Bytes(body) => Resp {
+                status,
+                ctype,
+                body,
+                extra: Vec::new(),
+                stream: None,
+            },
+            HttpBody::File(file) => Resp::stream(status, &ctype, file),
+        };
+        resp.extra = extra;
+        resp
+    }
+}
+
+impl Resp {
+    /// A response whose body is streamed from `file` (its `stream` field):
+    /// a download, sent in bounded chunks.
+    fn stream(status: u16, ctype: &str, file: crate::gapi::envelope::FileBody) -> Resp {
+        let mut resp = Resp::new(status, ctype, Vec::new());
+        resp.stream = Some(file);
+        resp
     }
 }
 
@@ -2926,6 +2947,29 @@ impl ApiInner {
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
         let headers = meta.headers(&extra);
+        if let Some(file) = &resp.stream {
+            // A download: copied in bounded chunks, never buffered (review
+            // gapi#4). A file that cannot be positioned is answered as
+            // upstream's `FileReadError`; one that ends early cuts the
+            // connection (its `Content-Length` cannot be met).
+            match file.reader() {
+                Ok(reader) => write_response_streamed(
+                    stream,
+                    resp.status,
+                    &resp.ctype,
+                    &headers,
+                    reader,
+                    file.len(),
+                )?,
+                Err(_) => {
+                    let (status, ctype, body, _) =
+                        crate::gapi::GResp::error(crate::gapi::Status::FileReadError, "")
+                            .into_parts();
+                    write_response_ext(stream, status, &ctype, &meta.headers(&[]), &body)?;
+                }
+            }
+            return Ok(true);
+        }
         write_response_maybe_gzip(stream, resp.status, &resp.ctype, &headers, &resp.body, enc)?;
         Ok(true)
     }

@@ -1260,8 +1260,12 @@ fn backups_rotate_list_and_restore_the_newest() {
 // export / download / upload
 // ---------------------------------------------------------------------------
 
+// review sec#4 / gapi#2: this test was `..._downloads_without_credentials`
+// and pinned upstream's anonymous download of exports; a download now needs
+// credentials (`anonymous_download=on` restores upstream's behaviour, see
+// tests/gapi_download_policy.rs), so it downloads as root.
 #[test]
-fn export_writes_a_file_that_downloads_without_credentials() {
+fn export_writes_a_file_that_downloads_with_credentials() {
     let srv = start("export");
     let a = &srv.addr;
     let lubm = srv.data_file("lubm.nt", LUBM);
@@ -1288,8 +1292,19 @@ fn export_writes_a_file_that_downloads_without_credentials() {
     let content = fs::read_to_string(&file).unwrap();
     assert_eq!(content.lines().count(), 5);
 
-    // The upstream script's download: GET /file/download/<filepath>.
+    // The upstream script's download: GET /file/download/<filepath> —
+    // refused without credentials (review sec#4), served to root (HTTP Basic
+    // "root:root").
     let r = send(a, "GET", &format!("/file/download/{filepath}"), &[], b"");
+    assert_eq!(r.status, 401, "{}", r.text());
+    let auth = ("Authorization", "Basic cm9vdDpyb290");
+    let r = send(
+        a,
+        "GET",
+        &format!("/file/download/{filepath}"),
+        &[auth],
+        b"",
+    );
     assert_eq!(r.status, 200);
     assert_eq!(r.text(), content);
     assert_eq!(
@@ -1298,13 +1313,13 @@ fn export_writes_a_file_that_downloads_without_credentials() {
     );
     assert!(r.header("Content-Disposition").unwrap().contains(&fname));
     // A name relative to the export directory, by GET and by POST.
-    let r = send(a, "GET", &format!("/file/download/{fname}"), &[], b"");
+    let r = send(a, "GET", &format!("/file/download/{fname}"), &[auth], b"");
     assert_eq!((r.status, r.text()), (200, content.clone()));
     let r = send(
         a,
         "GET",
         &format!("/file/download/export/{fname}"),
-        &[],
+        &[auth],
         b"",
     );
     assert_eq!(
@@ -1316,7 +1331,7 @@ fn export_writes_a_file_that_downloads_without_credentials() {
         a,
         "POST",
         "/file/download",
-        &[("Content-Type", "application/x-www-form-urlencoded")],
+        &[("Content-Type", "application/x-www-form-urlencoded"), auth],
         format!("filepath={fname}").as_bytes(),
     );
     assert_eq!((r.status, r.text()), (200, content.clone()));
@@ -1325,7 +1340,7 @@ fn export_writes_a_file_that_downloads_without_credentials() {
         a,
         "GET",
         &format!("/file/download/{fname}"),
-        &[("Range", "bytes=0-9")],
+        &[("Range", "bytes=0-9"), auth],
         b"",
     );
     assert_eq!(r.status, 206);
@@ -1338,7 +1353,7 @@ fn export_writes_a_file_that_downloads_without_credentials() {
         a,
         "GET",
         &format!("/file/download/{fname}"),
-        &[("Range", "bytes=99999-")],
+        &[("Range", "bytes=99999-"), auth],
         b"",
     );
     assert_eq!(r.status, 416);
@@ -1408,8 +1423,16 @@ fn downloads_are_confined_to_their_roots() {
         assert_eq!(r.status, 200, "{}", r.text());
         assert_eq!(code(&r.json()), 11, "{}", r.text());
     };
-    // Nothing outside the export directory without credentials: the user
-    // table, an upload, a database file, traversal.
+    // review sec#4: without credentials nothing at all is served — the
+    // anonymous requests below were answered `FileNotFound` (the export
+    // directory alone was public); they are now refused with HTTP 401
+    // before anything is resolved.
+    let refused = |r: &Reply| {
+        assert_eq!(r.status, 401, "{}", r.text());
+        assert_eq!(code(&r.json()), 1001, "{}", r.text());
+    };
+    // Nothing without credentials: the user table, an upload, a database
+    // file; traversal is refused before that.
     let dbfile = fs::read_dir(srv.db_dir("lubm"))
         .unwrap()
         .flatten()
@@ -1424,7 +1447,7 @@ fn downloads_are_confined_to_their_roots() {
         "users.db".to_string(),
     ] {
         let r = send(a, "GET", &format!("/file/download/{target}"), &[], b"");
-        not_found(&r);
+        refused(&r);
         let r = send(
             a,
             "POST",
@@ -1435,14 +1458,16 @@ fn downloads_are_confined_to_their_roots() {
                 .to_string()
                 .as_bytes(),
         );
-        not_found(&r);
+        refused(&r);
     }
     for trav in ["../users.db", "export/../../users.db", "%2e%2e/users.db"] {
         let r = send(a, "GET", &format!("/file/download/{trav}"), &[], b"");
         assert_eq!(code(&r.json()), 1003, "{trav}: {}", r.text());
     }
-    // With credentials: uploads for any user; database files for root only;
-    // the user table never.
+    // With credentials: an upload for its uploader and root only (review
+    // gapi#14: this file, put in the upload directory by the operator, was
+    // readable by any user); database files for root only; the user table
+    // never.
     add_user(a, "bob");
     let with = |user: &str, target: &str| {
         let pass = if user == "root" { "root" } else { "pw" };
@@ -1459,9 +1484,11 @@ fn downloads_are_confined_to_their_roots() {
                 .as_bytes(),
         )
     };
-    let r = with("bob", &lubm);
+    not_found(&with("bob", &lubm));
+    not_found(&with("bob", "lubm.nt"));
+    let r = with("root", &lubm);
     assert_eq!((r.status, r.text()), (200, LUBM.to_string()));
-    let r = with("bob", "lubm.nt");
+    let r = with("root", "lubm.nt");
     assert_eq!((r.status, r.text()), (200, LUBM.to_string()), "by name");
     not_found(&with("bob", dbfile.to_str().unwrap()));
     let r = with("root", dbfile.to_str().unwrap());
@@ -2017,9 +2044,14 @@ fn the_upstream_api_test_script_runs_unmodified() {
     // The script's data file, relative to the server's working directory
     // (here the crate root), readable through the load policy.
     let rdf = "testdata/lubm/lubm.nt";
+    // review sec#4: the script downloads its export anonymously (wget), which
+    // needs the upstream-compat switch now, as in scripts/conformance.sh.
     let srv = start_with(
         "apitest",
-        |c| c,
+        |mut c| {
+            c.set("anonymous_download", "on").unwrap();
+            c
+        },
         |s| s.with_load_policy(LoadPolicy::restricted().with_allowed_dir("testdata")),
     );
     let a = &srv.addr;

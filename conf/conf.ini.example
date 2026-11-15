@@ -231,6 +231,20 @@ upload_allow_compress_packages = "zip"
 # entries, and the bytes its files unpack to in all (zip-bomb guard).
 unzip_max_entries = 10000
 unzip_max_size = 10737418240
+# (gstore-rust extension) /file/download. By default a download needs a valid
+# username / password, and a user reads a file only with the matching
+# privilege on the database it came from (export / query) or when he uploaded
+# it. Upstream serves the export directory (exports, format=file results) to
+# anyone; the upstream-compat switch below restores that (a risk: anyone who
+# guesses a file name reads it; gserver warns at startup while it is on).
+;anonymous_download=off
+# downloads streamed at once (more are answered 503); 0 = no limit
+download_max_concurrent = 8
+# hours after which uploads, exports and format=file results the server wrote
+# are removed (files an operator put there are kept); 0 = keep them forever
+file_retention_hours = 168
+# bytes of uploads each user may keep (an upload beyond is refused); 0 = no quota
+upload_user_quota = 0
 
 # ---- gstore-rust extension (not in upstream conf.ini) ----
 # How every database the server serves evaluates queries. gserver applies

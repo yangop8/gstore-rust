@@ -98,6 +98,7 @@ check_compat_switches() { # after the server started: every switch must be repor
     done
 }
 compat_switch server allow_default_root_password on
+compat_switch upload anonymous_download on
 for b in "$BIN_DIR"/g*; do
     [ -x "$b" ] && [ -f "$b" ] && ln -s "$b" "$GHOME/bin/$(basename "$b")"
 done

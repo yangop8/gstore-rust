@@ -22,6 +22,17 @@
 //! **Compression.** The envelope is a buffered body; the HTTP layer
 //! (`ApiInner::handle`) gzip/deflate-compresses it when the client's
 //! `Accept-Encoding` allows and the `gzip` feature is enabled.
+//!
+//! **Streamed bodies.** A file download ([`GBody::File`], a [`FileBody`])
+//! is never read into memory: the HTTP layer copies the file region to the
+//! connection in bounded chunks, with a `Content-Length` and without
+//! compression (review gapi#4, robust#7, sec#11).
+
+use std::any::Any;
+use std::fmt;
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom};
+use std::sync::Arc;
 
 use crate::json::Json;
 
@@ -190,18 +201,120 @@ const ALL: [Status; 29] = {
     ]
 };
 
+/// A region of an open file sent as a response body in bounded chunks —
+/// never read into memory as a whole (see [`reader`](Self::reader)). Cloning
+/// shares the open file and the [permit](Self::with_permit).
+#[derive(Clone)]
+pub struct FileBody {
+    file: Arc<File>,
+    start: u64,
+    len: u64,
+    permit: Option<Arc<dyn Any + Send + Sync>>,
+}
+
+impl FileBody {
+    /// The `len` bytes of `file` from offset `start`.
+    pub fn new(file: File, start: u64, len: u64) -> FileBody {
+        FileBody {
+            file: Arc::new(file),
+            start,
+            len,
+            permit: None,
+        }
+    }
+
+    /// Keep `permit` alive as long as this body (and its clones) — a
+    /// concurrency slot, say, released once the body has been sent.
+    pub fn with_permit(mut self, permit: impl Any + Send + Sync) -> FileBody {
+        self.permit = Some(Arc::new(permit));
+        self
+    }
+
+    /// The offset of the region in the file.
+    pub fn start(&self) -> u64 {
+        self.start
+    }
+
+    /// The length of the region (the `Content-Length`).
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Whether the region is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// A reader over the region: the file positioned at its start, limited
+    /// to its length. (Clones share the file's position: read one body's
+    /// clones one after the other.)
+    pub fn reader(&self) -> io::Result<impl Read + '_> {
+        let mut f: &File = &self.file;
+        f.seek(SeekFrom::Start(self.start))?;
+        Ok(f.take(self.len))
+    }
+
+    /// The whole region in memory — for [`GResp::into_parts`] only, which
+    /// predates streamed bodies; the HTTP layer streams through
+    /// [`reader`](Self::reader).
+    pub fn read_all(&self) -> io::Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(usize::try_from(self.len).unwrap_or(0));
+        self.reader()?.read_to_end(&mut out)?;
+        if (out.len() as u64) < self.len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "the file is shorter than its announced length",
+            ));
+        }
+        Ok(out)
+    }
+}
+
+impl PartialEq for FileBody {
+    /// The same open file and region.
+    fn eq(&self, other: &FileBody) -> bool {
+        Arc::ptr_eq(&self.file, &other.file) && self.start == other.start && self.len == other.len
+    }
+}
+
+impl fmt::Debug for FileBody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FileBody")
+            .field("start", &self.start)
+            .field("len", &self.len)
+            .field("permit", &self.permit.is_some())
+            .finish()
+    }
+}
+
 /// The body of a [`GResp`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum GBody {
     /// A JSON envelope (an object with `StatusCode` / `StatusMsg`), always
     /// sent as HTTP 200 `application/json`.
     Json(Json),
-    /// A non-envelope response, e.g. a file download.
+    /// A non-envelope response, e.g. a short error page.
     Raw {
         status: u16,
         content_type: String,
         bytes: Vec<u8>,
     },
+    /// A non-envelope response streamed from a file (a download).
+    File {
+        status: u16,
+        content_type: String,
+        body: FileBody,
+    },
+}
+
+/// The body of a [`GResp`] as the HTTP layer sends it
+/// ([`GResp::into_http`]).
+#[derive(Debug)]
+pub enum HttpBody {
+    /// Bytes in memory (an envelope, a raw response).
+    Bytes(Vec<u8>),
+    /// A file region, copied to the connection in bounded chunks.
+    File(FileBody),
 }
 
 /// The response of one `/api` operation.
@@ -271,6 +384,19 @@ impl GResp {
         }
     }
 
+    /// A non-envelope response streamed from `body` (status, content type);
+    /// see [`FileBody`].
+    pub fn file(status: u16, content_type: impl Into<String>, body: FileBody) -> GResp {
+        GResp {
+            body: GBody::File {
+                status,
+                content_type: content_type.into(),
+                body,
+            },
+            headers: Vec::new(),
+        }
+    }
+
     /// Add a response header.
     pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> GResp {
         self.headers.push((name.into(), value.into()));
@@ -296,8 +422,12 @@ impl GResp {
     pub fn status_code(&self) -> i64 {
         match &self.body {
             GBody::Json(body) => body.get("StatusCode").and_then(Json::as_i64).unwrap_or(0),
-            GBody::Raw { status, .. } if (200..300).contains(status) => 0,
-            GBody::Raw { .. } => Status::OperationFailed.code(),
+            GBody::Raw { status, .. } | GBody::File { status, .. }
+                if (200..300).contains(status) =>
+            {
+                0
+            }
+            GBody::Raw { .. } | GBody::File { .. } => Status::OperationFailed.code(),
         }
     }
 
@@ -309,7 +439,7 @@ impl GResp {
                 .and_then(Json::as_str)
                 .unwrap_or_default()
                 .to_string(),
-            GBody::Raw { .. } => String::new(),
+            GBody::Raw { .. } | GBody::File { .. } => String::new(),
         }
     }
 
@@ -322,7 +452,7 @@ impl GResp {
     pub fn body_json(&self) -> Option<&Json> {
         match &self.body {
             GBody::Json(body) => Some(body),
-            GBody::Raw { .. } => None,
+            GBody::Raw { .. } | GBody::File { .. } => None,
         }
     }
 
@@ -338,20 +468,40 @@ impl GResp {
 
     /// The HTTP rendering: `(status, content type, body, headers)`. A JSON
     /// envelope is HTTP 200 `application/json`, serialized compactly with
-    /// upstream's key order (see the module docs).
+    /// upstream's key order (see the module docs). A [`GBody::File`] is read
+    /// into memory here (a read failure becomes upstream's `FileReadError`
+    /// envelope); [`into_http`](Self::into_http) keeps it streamed.
     pub fn into_parts(self) -> (u16, String, Vec<u8>, Vec<(String, String)>) {
+        match self.into_http() {
+            (status, ctype, HttpBody::Bytes(bytes), headers) => (status, ctype, bytes, headers),
+            (status, ctype, HttpBody::File(body), headers) => match body.read_all() {
+                Ok(bytes) => (status, ctype, bytes, headers),
+                Err(_) => GResp::error(Status::FileReadError, "").into_parts(),
+            },
+        }
+    }
+
+    /// The HTTP rendering with a streamed body kept streamed: `(status,
+    /// content type, body, headers)`, as [`into_parts`](Self::into_parts)
+    /// otherwise.
+    pub fn into_http(self) -> (u16, String, HttpBody, Vec<(String, String)>) {
         match self.body {
             GBody::Json(body) => (
                 200,
                 "application/json".to_string(),
-                body.into_sorted().to_string().into_bytes(),
+                HttpBody::Bytes(body.into_sorted().to_string().into_bytes()),
                 self.headers,
             ),
             GBody::Raw {
                 status,
                 content_type,
                 bytes,
-            } => (status, content_type, bytes, self.headers),
+            } => (status, content_type, HttpBody::Bytes(bytes), self.headers),
+            GBody::File {
+                status,
+                content_type,
+                body,
+            } => (status, content_type, HttpBody::File(body), self.headers),
         }
     }
 }
@@ -413,5 +563,63 @@ mod tests {
         );
         assert_eq!(headers.len(), 1);
         assert_eq!(GResp::raw(404, "text/plain", vec![]).status_code(), 1005);
+    }
+
+    #[test]
+    fn file_bodies_stay_streamed_and_release_their_permit() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("gstore_envelope_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _cleanup = Cleanup(dir.clone());
+        let path = dir.join("f.bin");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"0123456789")
+            .unwrap();
+        struct Permit(Arc<AtomicUsize>);
+        impl Drop for Permit {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let released = Arc::new(AtomicUsize::new(0));
+        let body = FileBody::new(File::open(&path).unwrap(), 2, 5)
+            .with_permit(Permit(Arc::clone(&released)));
+        let r = GResp::file(206, "application/octet-stream", body.clone());
+        assert!(r.is_ok());
+        assert!(r.body_json().is_none());
+        assert_eq!(r.clone(), r);
+        let (status, _, http, _) = r.into_http();
+        let HttpBody::File(streamed) = http else {
+            panic!("a file body is streamed");
+        };
+        assert_eq!((status, streamed.start(), streamed.len()), (206, 2, 5));
+        let mut got = Vec::new();
+        streamed.reader().unwrap().read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"23456");
+        drop(streamed);
+        assert_eq!(released.load(Ordering::SeqCst), 0, "a clone is alive");
+        // into_parts reads the region (the pre-streaming rendering).
+        let (_, _, bytes, _) = GResp::file(200, "x", body).into_parts();
+        assert_eq!(bytes, b"23456");
+        assert_eq!(
+            released.load(Ordering::SeqCst),
+            1,
+            "released with the last clone"
+        );
+        // A file shorter than announced is a read error, not a short body.
+        let short = FileBody::new(File::open(&path).unwrap(), 8, 5);
+        let (_, ctype, bytes, _) = GResp::file(200, "x", short).into_parts();
+        assert_eq!(ctype, "application/json");
+        assert!(String::from_utf8(bytes)
+            .unwrap()
+            .contains("\"StatusCode\":9"));
     }
 }
