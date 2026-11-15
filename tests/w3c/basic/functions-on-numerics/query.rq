@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §17.4.4 Functions on Numerics (ABS, CEIL, FLOOR, ROUND keep the
+# argument's type: xsd:integer stays xsd:integer)
+SELECT (ABS(-3) AS ?abs) (CEIL(7) AS ?ceil) (FLOOR(-7) AS ?floor) (ROUND(5) AS ?round)
+WHERE {}

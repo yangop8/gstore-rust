@@ -1,0 +1,8 @@
+# spec: SPARQL 1.1 Query §17.4.3 Functions on Strings (STRLEN, SUBSTR, UCASE, LCASE,
+# STRSTARTS, STRENDS, CONTAINS, STRBEFORE, STRAFTER, CONCAT)
+SELECT (STRLEN("chat") AS ?len) (SUBSTR("foobar", 4) AS ?sub) (SUBSTR("foobar", 4, 1) AS ?sub1)
+       (UCASE("foo") AS ?u) (LCASE("BAR") AS ?l)
+       (STRSTARTS("foobar", "foo") AS ?st) (STRENDS("foobar", "bar") AS ?en)
+       (CONTAINS("foobar", "bar") AS ?con) (STRBEFORE("abc", "b") AS ?bef)
+       (STRAFTER("abc", "b") AS ?aft) (CONCAT("foo", "bar") AS ?cat)
+WHERE {}

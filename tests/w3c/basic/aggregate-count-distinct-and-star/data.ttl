@@ -1,0 +1,4 @@
+@prefix : <http://example.org/> .
+:alice :dept :d1 .
+:bob :dept :d1 .
+:carol :dept :d2 .

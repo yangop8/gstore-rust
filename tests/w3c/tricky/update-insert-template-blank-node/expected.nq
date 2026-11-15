@@ -1,0 +1,6 @@
+<http://example.com/a> <http://example.com/q> "1"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<http://example.com/b> <http://example.com/q> "2"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<http://example.com/a> <http://example.com/p> _:n1 .
+_:n1 <http://example.com/v> "1"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<http://example.com/b> <http://example.com/p> _:n2 .
+_:n2 <http://example.com/v> "2"^^<http://www.w3.org/2001/XMLSchema#integer> .

@@ -1,0 +1,7 @@
+# spec: SPARQL 1.1 Query §17.4.3 Functions on Strings: SUBSTR, UCASE, STRBEFORE, STRAFTER
+# and CONCAT keep the language tag of their (compatible) arguments; CONCAT of a tagged
+# and an untagged string is a simple literal (§17.4.3.12)
+SELECT (SUBSTR("foobar"@en, 4) AS ?sub) (UCASE("foo"@en) AS ?u)
+       (STRBEFORE("abc"@en, "b") AS ?bef) (STRAFTER("abc"@en, "b"@en) AS ?aft)
+       (CONCAT("foo"@en, "bar"@en) AS ?same) (CONCAT("foo"@en, "bar") AS ?mixed)
+WHERE {}

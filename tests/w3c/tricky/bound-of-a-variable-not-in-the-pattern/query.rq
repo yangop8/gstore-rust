@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §17.4.1.1 BOUND: false for a variable with no value (here one
+# the pattern never mentions)
+PREFIX : <http://example.com/>
+SELECT ?s WHERE { ?s :p :o FILTER(!BOUND(?z)) }

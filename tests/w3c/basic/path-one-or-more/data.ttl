@@ -1,0 +1,4 @@
+@prefix : <http://example/> .
+:a :knows :b .
+:b :knows :c .
+:c :knows :d .

@@ -1,0 +1,6 @@
+{
+  "head": {"vars": ["abs", "ceil", "floor", "round"]},
+  "results": {"bindings": [
+    {"abs": {"type": "literal", "value": "3", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}, "ceil": {"type": "literal", "value": "7", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}, "floor": {"type": "literal", "value": "-7", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}, "round": {"type": "literal", "value": "5", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}}
+  ]}
+}

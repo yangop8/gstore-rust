@@ -1,0 +1,5 @@
+# spec: SPARQL 1.1 Query §8.1 and §18.6 (evaluation of EXISTS: the pattern is evaluated
+# with the current solution's bindings): for ?s = :x, VALUES ?s { :a } has no compatible
+# solution, so only :a passes
+PREFIX : <http://example.com/>
+SELECT ?s WHERE { ?s :p ?o FILTER EXISTS { VALUES ?s { :a } } }

@@ -1,0 +1,4 @@
+<http://example.com/g1> <http://example.com/created> "2020" <http://example.com/g1> .
+<http://example.com/doc7> <http://example.com/created> "1999" <http://example.com/g1> .
+<http://example.com/doc8> <http://example.com/created> "2001" <http://example.com/g2> .
+<http://example.com/g1> <http://example.com/meta> "2020" .

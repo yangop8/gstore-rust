@@ -1,0 +1,4 @@
+query#5
+New divergence found by this harness, same mechanism as query#5 (instantiate_template):
+a labelled template blank node (_:v) is copied verbatim instead of being a fresh blank
+node for every solution, so both solutions share one _:v.

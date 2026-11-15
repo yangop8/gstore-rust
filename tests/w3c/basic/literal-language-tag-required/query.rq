@@ -1,0 +1,3 @@
+# spec: SPARQL 1.1 Query §2.3.1 Matching Literals with Language Tags
+# "cat" (a simple literal) is not the same RDF term as "cat"@en: no match.
+SELECT ?v WHERE { ?v ?p "cat" }

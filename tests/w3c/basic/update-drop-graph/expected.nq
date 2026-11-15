@@ -1,0 +1,2 @@
+<http://example.org/x> <http://example.org/p> "default" .
+<http://example.org/b> <http://example.org/p> "two" <http://example.org/g2> .

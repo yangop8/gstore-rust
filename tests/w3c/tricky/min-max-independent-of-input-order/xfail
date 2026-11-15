@@ -1,0 +1,2 @@
+sparqlconf#7
+MIN/MAX over mixed kinds depend on the order of the input.

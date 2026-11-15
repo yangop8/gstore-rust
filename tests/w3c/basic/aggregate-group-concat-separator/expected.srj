@@ -1,0 +1,6 @@
+{
+  "head": {"vars": ["all"]},
+  "results": {"bindings": [
+    {"all": {"type": "literal", "value": "a|a"}}
+  ]}
+}

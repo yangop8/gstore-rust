@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §17.4.3.14 REGEX with XPath fn:matches flags (s, m, x, q)
+SELECT (REGEX("a\nb", "a.b", "s") AS ?s) (REGEX("a\nb", "^b", "m") AS ?m)
+       (REGEX("ab", "a b", "x") AS ?x) (REGEX("abc", ".", "q") AS ?q)
+WHERE {}

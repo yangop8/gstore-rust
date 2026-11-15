@@ -1,0 +1,7 @@
+{
+  "head": {"vars": ["name", "age"]},
+  "results": {"bindings": [
+    {"name": {"type": "literal", "value": "Carol"}, "age": {"type": "literal", "value": "30", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}},
+    {"name": {"type": "literal", "value": "Alice"}, "age": {"type": "literal", "value": "25", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}}
+  ]}
+}

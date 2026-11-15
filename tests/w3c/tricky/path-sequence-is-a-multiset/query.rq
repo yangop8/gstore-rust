@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §9.3 Property Paths and Equivalent Patterns and §18.2.2.4: a
+# sequence path is a join through a fresh variable, so two routes give two solutions
+PREFIX : <http://example.com/>
+SELECT ?y { :x :p/:q ?y }

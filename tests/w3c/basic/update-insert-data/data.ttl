@@ -1,0 +1,2 @@
+@prefix ns: <http://example.org/ns#> .
+<http://example/book1> ns:price 42 .

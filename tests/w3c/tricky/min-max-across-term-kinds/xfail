@@ -1,0 +1,2 @@
+query#8
+MIN/MAX keep whichever value comes first when IRI and literal do not compare.

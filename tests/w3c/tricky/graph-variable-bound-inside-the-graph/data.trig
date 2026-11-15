@@ -1,0 +1,3 @@
+@prefix : <http://example.com/> .
+:G { :G :mod "d1" .
+     :H :mod "d2" . }

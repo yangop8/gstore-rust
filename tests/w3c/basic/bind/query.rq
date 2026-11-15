@@ -1,0 +1,11 @@
+# spec: SPARQL 1.1 Query §10.1 BIND: Assigning to Variables (the section's example)
+# 23 * (1 - 0.25) = 17.25 (xsd:decimal); 42 * (1 - 0.2) = 33.6 is filtered out.
+PREFIX dc: <http://purl.org/dc/elements/1.1/>
+PREFIX ns: <http://example.org/ns#>
+SELECT ?title ?price
+{ ?x ns:price ?p .
+  ?x ns:discount ?discount
+  BIND (?p*(1-?discount) AS ?price)
+  FILTER(?price < 20)
+  ?x dc:title ?title .
+}

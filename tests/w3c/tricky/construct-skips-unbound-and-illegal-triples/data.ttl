@@ -1,0 +1,3 @@
+@prefix : <http://example.com/> .
+:a :name "Alice" .
+:b :name "Bob" ; :mbox <mailto:b@example.com> .

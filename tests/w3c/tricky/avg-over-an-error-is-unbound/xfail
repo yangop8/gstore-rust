@@ -1,0 +1,2 @@
+query#7
+AVG skips the non-numeric value but still counts it in the divisor (5.0).

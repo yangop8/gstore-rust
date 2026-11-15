@@ -1,0 +1,2 @@
+@prefix dc: <http://purl.org/dc/elements/1.1/> .
+<http://example/bookStore> { <http://example/book1> dc:title "Fundamentals of Compiler Design" . }

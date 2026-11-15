@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §9.1 Property Path Syntax (elt1 / elt2) and §9.3
+# One route a -> b -> c, so one solution.
+PREFIX : <http://example/>
+SELECT ?x { :a :knows/:knows ?x }

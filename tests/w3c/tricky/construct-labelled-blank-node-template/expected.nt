@@ -1,0 +1,6 @@
+_:x <http://www.w3.org/2001/vcard-rdf/3.0#N> _:v1 .
+_:v1 <http://www.w3.org/2001/vcard-rdf/3.0#givenName> "Alice" .
+_:v1 <http://www.w3.org/2001/vcard-rdf/3.0#familyName> "Hacker" .
+_:z <http://www.w3.org/2001/vcard-rdf/3.0#N> _:v2 .
+_:v2 <http://www.w3.org/2001/vcard-rdf/3.0#givenName> "Bob" .
+_:v2 <http://www.w3.org/2001/vcard-rdf/3.0#familyName> "Hacker" .

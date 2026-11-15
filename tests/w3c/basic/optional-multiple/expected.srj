@@ -1,0 +1,7 @@
+{
+  "head": {"vars": ["name", "mbox", "hpage"]},
+  "results": {"bindings": [
+    {"name": {"type": "literal", "value": "Alice"}, "hpage": {"type": "uri", "value": "http://work.example.org/alice/"}},
+    {"name": {"type": "literal", "value": "Bob"}, "mbox": {"type": "uri", "value": "mailto:bob@work.example"}}
+  ]}
+}

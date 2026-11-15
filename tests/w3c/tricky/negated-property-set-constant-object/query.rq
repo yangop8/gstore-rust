@@ -1,0 +1,5 @@
+# spec: SPARQL 1.1 Query §9.1 Property Path Syntax (!iri) and §18.4 Property Path
+# Patterns (NegatedPropertySet): ?x !:p :o matches the triples into :o whose predicate
+# is not :p
+PREFIX : <http://example.com/>
+SELECT ?x { ?x !:p :o }

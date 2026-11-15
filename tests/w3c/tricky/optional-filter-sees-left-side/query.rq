@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §6.2 and §18.2.2.5 (LeftJoin(P1, P2, F)): a FILTER directly in
+# OPTIONAL is the left join's condition and sees the variables of the left side
+PREFIX : <http://example.com/>
+SELECT ?x ?m WHERE { ?x :p ?n OPTIONAL { ?x :q ?m FILTER(?m > ?n) } }

@@ -1,0 +1,2 @@
+sparqlconf#3
+Inverse members of a negated property set never walk reversed edges.

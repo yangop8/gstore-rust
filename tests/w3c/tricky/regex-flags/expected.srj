@@ -1,0 +1,6 @@
+{
+  "head": {"vars": ["s", "m", "x", "q"]},
+  "results": {"bindings": [
+    {"s": {"type": "literal", "value": "true", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"}, "m": {"type": "literal", "value": "true", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"}, "x": {"type": "literal", "value": "true", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"}, "q": {"type": "literal", "value": "false", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"}}
+  ]}
+}

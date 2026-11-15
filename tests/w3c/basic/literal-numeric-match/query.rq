@@ -1,0 +1,2 @@
+# spec: SPARQL 1.1 Query §2.3.2 Matching Literals with Numeric Types
+SELECT ?v WHERE { ?v ?p 42 }

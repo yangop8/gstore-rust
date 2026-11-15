@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §10.1 BIND and §18.6 Extend: an expression that is an error
+# (integer division by zero, XPath op:numeric-divide) leaves the variable unbound
+PREFIX : <http://example.com/>
+SELECT ?s ?x WHERE { ?s :p ?o BIND(?o / 0 AS ?x) }

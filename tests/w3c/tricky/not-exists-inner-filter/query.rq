@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §8.3.3 Example: Inner FILTERs
+# NOT EXISTS sees ?n: :a has :q 1 = 1 and is removed.
+PREFIX : <http://example.com/>
+SELECT * WHERE { ?x :p ?n FILTER NOT EXISTS { ?x :q ?m . FILTER(?n = ?m) } }

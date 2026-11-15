@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §9.4 Arbitrary Length Path Matching: cycles are followed once,
+# each node is a solution once
+PREFIX : <http://example/>
+SELECT ?x { :a :p+ ?x }

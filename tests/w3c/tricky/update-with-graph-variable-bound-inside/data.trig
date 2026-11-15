@@ -1,0 +1,4 @@
+@prefix : <http://example.com/> .
+:g1 { :g1 :created "2020" .
+      :doc7 :created "1999" . }
+:g2 { :doc8 :created "2001" . }

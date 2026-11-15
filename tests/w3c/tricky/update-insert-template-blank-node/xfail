@@ -1,0 +1,4 @@
+query#5
+New divergence found by this harness, same mechanism as query#5 (instantiate_template):
+the labelled template blank node _:n is stored verbatim, so both solutions write the same
+node (and every later request reuses it).

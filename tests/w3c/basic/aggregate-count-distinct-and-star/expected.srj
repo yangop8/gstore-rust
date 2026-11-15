@@ -1,0 +1,6 @@
+{
+  "head": {"vars": ["depts", "rows"]},
+  "results": {"bindings": [
+    {"depts": {"type": "literal", "value": "2", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}, "rows": {"type": "literal", "value": "3", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}}
+  ]}
+}

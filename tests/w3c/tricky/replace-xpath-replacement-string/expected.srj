@@ -1,0 +1,6 @@
+{
+  "head": {"vars": ["r"]},
+  "results": {"bindings": [
+    {"r": {"type": "literal", "value": "abxc"}}
+  ]}
+}

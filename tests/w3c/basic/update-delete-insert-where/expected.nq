@@ -1,0 +1,6 @@
+<http://example/president25> <http://xmlns.com/foaf/0.1/givenName> "William" .
+<http://example/president25> <http://xmlns.com/foaf/0.1/familyName> "McKinley" .
+<http://example/president27> <http://xmlns.com/foaf/0.1/givenName> "William" .
+<http://example/president27> <http://xmlns.com/foaf/0.1/familyName> "Taft" .
+<http://example/president42> <http://xmlns.com/foaf/0.1/givenName> "William" .
+<http://example/president42> <http://xmlns.com/foaf/0.1/familyName> "Clinton" .

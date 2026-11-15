@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §9.3 Property Paths and Equivalent Patterns and §18.2.2.4: an
+# alternative path is a UNION, so :m1 is a solution once per alternative
+PREFIX : <http://example.com/>
+SELECT ?z { :a :p|:r ?z }

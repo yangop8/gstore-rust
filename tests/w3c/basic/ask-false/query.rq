@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §16.3 ASK (the section's second example)
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+ASK { ?x foaf:name "Alice" ;
+         foaf:mbox <mailto:alice@work.example> }

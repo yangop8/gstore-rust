@@ -1,0 +1,2 @@
+query#6
+Without ORDER BY a SELECT expression cannot see an earlier alias.

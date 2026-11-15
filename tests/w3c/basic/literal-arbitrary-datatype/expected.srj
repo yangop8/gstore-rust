@@ -1,0 +1,6 @@
+{
+  "head": {"vars": ["v"]},
+  "results": {"bindings": [
+    {"v": {"type": "uri", "value": "http://example.org/ns#z"}}
+  ]}
+}

@@ -11,6 +11,22 @@
 //! random `BufReader` window. Results must be equal up to blank-node renaming
 //! (anonymous nodes were `g~<n>`, now `genid-<n>`) and, for TriG, up to the
 //! order of graphs (the old reader emitted the default graph first).
+//!
+//! # What this oracle can and cannot catch
+//!
+//! The reference here is a frozen copy of this crate's own earlier readers,
+//! so these tests check **self-consistency**: the streaming rewrite changed
+//! nothing. A bug the old and new readers share — valid input rejected,
+//! invalid input accepted, a wrong term — passes them by construction
+//! (review parser#18). Semantic expectations live elsewhere and are written
+//! independently of the implementation: SPARQL behaviour in the
+//! hand-authored W3C-style cases under `tests/w3c/` (data, query and the
+//! answer the SPARQL 1.1 recommendations require, run by
+//! `tests/w3c_subset.rs` on every storage layout and executor), and reader
+//! behaviour in the readers' own unit tests and `tests/dt_rdf_import.rs`.
+//! Keep this module for what it does well — streaming edge cases (chunk
+//! boundaries, buffer windows) — and add a spec-derived case, not a
+//! differential one, for a new semantic rule.
 
 mod legacy_trig;
 mod legacy_turtle;

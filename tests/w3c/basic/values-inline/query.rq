@@ -1,0 +1,9 @@
+# spec: SPARQL 1.1 Query §10.2.2 VALUES Examples (inline data in the pattern)
+PREFIX dc: <http://purl.org/dc/elements/1.1/>
+PREFIX : <http://example.org/book/>
+PREFIX ns: <http://example.org/ns#>
+SELECT * WHERE {
+   VALUES ?book { :book1 :book3 }
+   ?book dc:title ?title ;
+         ns:price ?price .
+}

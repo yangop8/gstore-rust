@@ -1,0 +1,2 @@
+query#14
+BOUND of a variable outside the pattern layout is an error, so the FILTER drops every row.

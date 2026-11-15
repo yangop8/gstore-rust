@@ -1,0 +1,6 @@
+# spec: SPARQL 1.1 Query §17.4.1.7 RDFterm-equal / numeric =, §17.4.1.8 sameTerm:
+# = compares numeric values, sameTerm compares RDF terms
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT (1 = 1.0 AS ?eq) (sameTerm(1, 1.0) AS ?same)
+       ("01"^^xsd:integer = 1 AS ?eqLex) (sameTerm("01"^^xsd:integer, 1) AS ?sameLex)
+WHERE {}
