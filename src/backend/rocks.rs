@@ -52,24 +52,54 @@
 //! CF holds every dictionary term (`E`/`L`/`P` space tag + 4-byte big-endian
 //! id → the term's dictionary key) and the `gspo` CF holds the named-graph
 //! quads. New terms are written *before* the first triple that references them
-//! (an orphan term is harmless; a triple whose term is missing is not), so the
-//! state RocksDB recovers after a crash is always self-consistent and nothing
-//! depends on a separately-saved `dict.bin`.
+//! (a triple whose term is missing would be damage), so the state RocksDB
+//! recovers after a crash is always self-consistent and nothing depends on a
+//! separately-saved `dict.bin`. While a journal records (below), the new
+//! terms are journaled too, so a crash between a term and its triple does
+//! not leave the term behind as an orphan.
 //!
-//! ## Transactions: the undo journal
+//! ## Transactions and statements: the undo journal
 //!
 //! A `Database` transaction writes straight through to RocksDB (queries inside
 //! it read their own writes), so to keep it crash-atomic every mutation made
 //! while one is open ([`begin_journal`](RocksStore::begin_journal)) carries, *in
 //! the same atomic write batch*, an undo record in the `meta` CF: the inverse
-//! operation, keyed by a sequence number. Commit deletes the whole journal in
-//! one batch; rollback replays it newest-first and then deletes it. If the
-//! process dies with a journal present (an uncommitted transaction, or a
-//! rollback cut short), [`RocksStore::open`] replays and deletes it before
-//! anything else — so after a crash no uncommitted write survives. Replaying is
-//! idempotent (each record sets one key present or absent), so a replay cut
-//! short is simply repeated. Dictionary terms written during the transaction
-//! are not journaled: a term without a triple is harmless.
+//! operation, keyed by a sequence number. The `Database` journals every
+//! auto-commit statement the same way — a SPARQL UPDATE request (`LOAD`,
+//! `CLEAR`, `DROP`, `COPY`, `MOVE`, `ADD` included) and an `insert_sources` /
+//! `remove_sources` import (`gadd`, `gsub`, `/api batchInsert` /
+//! `batchRemove`) — so that a statement is crash-atomic like on the disk
+//! layout, whose commit point writes it as one: never a prefix of it (half
+//! of a DELETE/INSERT rename). A failed statement's journal is committed
+//! too: what it applied before failing stays applied, as documented.
+//!
+//! Commit deletes the whole journal in one batch, together with the
+//! dictionary terms the transaction or statement freed
+//! ([`commit_journal_with`](RocksStore::commit_journal_with)); until then a
+//! freed id is neither deleted nor reused (the `Database` defers its frees),
+//! since the triples a replay restores may still name it. Rollback replays
+//! it newest-first and deletes it in one batch with the terms that are
+//! unreferenced afterwards ([`rollback_keeping_journal`](RocksStore::rollback_keeping_journal)).
+//! If the process dies with a journal present (an uncommitted transaction or
+//! statement, or a rollback cut short), the next open replays it before
+//! anything else — so after a crash no uncommitted write survives — and the
+//! `Database` deletes it with the terms the replay left unreferenced
+//! (`RocksStore::open_keeping_journal`; [`RocksStore::open`] alone deletes
+//! it at once). Replaying is idempotent
+//! (each record sets one key present or absent), so a replay cut short is
+//! simply repeated. Each step of a crash recovery is therefore complete or
+//! repeated: no window leaves an orphan term.
+//!
+//! A record is 18 bytes: the undo op (`+` re-insert, `-` remove), a kind
+//! byte, 4 bytes, then the triple's three ids. Kind `0` is a default-graph
+//! triple, `1` a quad of the graph whose id the 4 bytes hold, `2` a
+//! dictionary term written new (its space tag in the first of the 4 bytes,
+//! its id three times). A term record replays as nothing but a reclamation
+//! candidate ([`take_replayed`](RocksStore::take_replayed)); it is a `-`
+//! record, so a binary that predates term records replays it as the
+//! removal of the triple `(id, id, id)` — which cannot be stored at that
+//! point of the history, its term being new — and frees the term the same
+//! way: the journal format stays readable by every earlier binary.
 //!
 //! If the journal cannot be deleted or replayed (a write error), the store
 //! refuses further triple and quad writes until a retry succeeds — a stale
@@ -164,6 +194,22 @@ const JOURNAL_END: &[u8] = b"\x00txn-undo\x01";
 /// Journal record op: undo by re-inserting / by removing.
 const UNDO_INSERT: u8 = b'+';
 const UNDO_REMOVE: u8 = b'-';
+/// The kind byte of a journal record: a default-graph triple, a named-graph
+/// quad, or a dictionary term written new (see the module docs).
+const REC_TRIPLE: u8 = 0;
+const REC_QUAD: u8 = 1;
+const REC_TERM: u8 = 2;
+/// Up to this many records, clearing a journal deletes them one by one
+/// (their keys are written again by the next journal, so the deletes
+/// collapse in the memtable); a longer one is cleared with one range delete.
+const POINT_CLEAR_MAX: u64 = 1024;
+
+/// The key of journal record `seq`.
+fn journal_key(seq: u64) -> Vec<u8> {
+    let mut key = JOURNAL_PREFIX.to_vec();
+    key.extend_from_slice(&seq.to_be_bytes());
+    key
+}
 
 /// The length of a triple-ordering key (`spo`, `pos`, `osp`): three ids.
 const KEY3_LEN: usize = 12;
@@ -532,6 +578,21 @@ impl RocksStore {
 
     /// [`open`](Self::open) with explicit read-side tuning.
     pub fn open_with<P: AsRef<Path>>(path: P, tuning: &RocksTuning) -> Result<RocksStore> {
+        RocksStore::open_inner(path.as_ref(), tuning, false)
+    }
+
+    /// [`open_with`](Self::open_with), but a journal left behind (by a
+    /// process that died in a transaction or statement) is only replayed:
+    /// it stays on disk, to be deleted by
+    /// [`commit_journal_with`](Self::commit_journal_with) in the same batch
+    /// as the dictionary terms the replay left unreferenced — what a
+    /// `Database` does once it has checked them, so that no crash leaves
+    /// them behind as orphans. Triple and quad writes are refused until then.
+    pub(crate) fn open_keeping_journal(path: &Path, tuning: &RocksTuning) -> Result<RocksStore> {
+        RocksStore::open_inner(path, tuning, true)
+    }
+
+    fn open_inner(path: &Path, tuning: &RocksTuning, keep_journal: bool) -> Result<RocksStore> {
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
@@ -560,10 +621,19 @@ impl RocksStore {
             failpoints: Failpoints::default(),
         };
         store.load_counters()?;
-        // A journal left behind is an uncommitted transaction (or a rollback
-        // cut short) of a process that died: undo it before anything reads.
-        // The replay reloads the counters once it has run.
-        store.replay_journal()?;
+        // A journal left behind is an uncommitted transaction or statement
+        // (or a rollback cut short) of a process that died: undo it before
+        // anything reads. The replay reloads the counters once it has run.
+        if keep_journal {
+            if store.replay_records_on_disk()? {
+                *store.journal_state() = Journal::Stale {
+                    replay: false,
+                    why: "replayed at open; not deleted yet".into(),
+                };
+            }
+        } else {
+            store.replay_journal()?;
+        }
         store.sync_wal()?;
         Ok(store)
     }
@@ -734,9 +804,10 @@ impl RocksStore {
         self.journal.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Start journaling mutations for a transaction (see the module docs).
-    /// Fails if one is already being journaled, or if the journal of an earlier
-    /// transaction is still stale and cannot be cleaned up now.
+    /// Start journaling mutations for a transaction or an auto-commit
+    /// statement (see the module docs). Fails if one is already being
+    /// journaled, or if the journal of an earlier one is still stale and
+    /// cannot be cleaned up now.
     pub fn begin_journal(&mut self) -> Result<()> {
         self.heal_journal()?;
         let mut j = self.journal_state();
@@ -766,48 +837,50 @@ impl RocksStore {
     /// as the journal: either the transaction is committed with its frees or
     /// (a crash before the batch) it is undone at the next open with its
     /// terms still stored. Without a journal the terms are deleted alone.
+    ///
+    /// The same call finishes a journal that was replayed but kept — by
+    /// [`rollback_keeping_journal`](Self::rollback_keeping_journal) or an
+    /// `open_keeping_journal` — deleting it
+    /// with `frees`, the terms the replay left unreferenced.
     pub fn commit_journal_with(&mut self, frees: &[(TermSpace, u32)]) -> Result<()> {
-        if !self.journaling() {
-            return self.delete_terms(frees);
-        }
-        if !frees.is_empty() {
-            #[cfg(test)]
-            Failpoints::hit(&self.failpoints.journal_clear, "journal")?;
-            let mut wb = WriteBatch::default();
-            wb.delete_range_cf(self.cf(CF_META), JOURNAL_PREFIX, JOURNAL_END);
-            let cf = self.cf(CF_DICT);
-            for (space, id) in frees {
-                wb.delete_cf(cf, tag1(space.tag(), *id));
+        let records = match &*self.journal_state() {
+            Journal::Off => None,
+            Journal::Recording(n) => Some(Some(*n)),
+            Journal::Stale { replay: false, .. } => Some(None),
+            Journal::Stale { replay: true, why } => {
+                return Err(GStoreError::Database(format!(
+                    "rocksdb: a rolled-back transaction's undo journal must be replayed first \
+                     ({why})"
+                )))
             }
-            match self.write(wb) {
-                Ok(()) => {
-                    *self.journal_state() = Journal::Off;
-                    return Ok(());
-                }
-                Err(e) => {
-                    // As a failed journal clear: stale until a retry deletes
-                    // it (the frees are then not made; the terms stay as
-                    // orphans).
-                    *self.journal_state() = Journal::Stale {
-                        replay: false,
-                        why: e.to_string(),
-                    };
-                    return Err(GStoreError::Database(format!(
-                        "rocksdb: a transaction's undo journal could not be cleared: {e}"
-                    )));
-                }
-            }
-        }
-        *self.journal_state() = Journal::Stale {
-            replay: false,
-            why: String::new(),
         };
-        self.heal_journal()
+        let Some(records) = records else {
+            return self.delete_terms(frees);
+        };
+        match self.clear_journal_with(records, frees) {
+            Ok(()) => {
+                *self.journal_state() = Journal::Off;
+                Ok(())
+            }
+            Err(e) => {
+                // Stale until a retry deletes it (the frees are then not
+                // made; the terms stay as orphans).
+                let why = e.to_string();
+                *self.journal_state() = Journal::Stale {
+                    replay: false,
+                    why: why.clone(),
+                };
+                Err(GStoreError::Database(format!(
+                    "rocksdb: a transaction's undo journal could not be cleared: {why}"
+                )))
+            }
+        }
     }
 
     /// The dictionary ids completed journal replays left possibly
-    /// unreferenced — the terms of the triples and quads they removed — since
-    /// the last call: the replay at open (an interrupted transaction undone),
+    /// unreferenced — the terms of the triples and quads they removed, and
+    /// the terms the journal recorded as written new — since the last call:
+    /// the replay at open (an interrupted transaction or statement undone),
     /// a rollback, or the retry that finished a replay cut short. The
     /// database takes them at open, after every statement and at every
     /// commit, and frees the ones nothing references.
@@ -832,6 +905,43 @@ impl RocksStore {
         self.heal_journal()
     }
 
+    /// [`rollback_journal`](Self::rollback_journal), but the replayed
+    /// journal stays on disk until
+    /// [`commit_journal_with`](Self::commit_journal_with) deletes it in one
+    /// batch with the terms the rollback leaves unreferenced (its
+    /// [`take_replayed`](Self::take_replayed) terms that nothing references
+    /// any more): a crash before that batch replays the journal again at the
+    /// next open — which frees those terms then — so no crash leaves them
+    /// behind as orphans. Triple and quad writes are refused in between. If
+    /// the replay fails, the journal stays stale as after a failed
+    /// [`rollback_journal`](Self::rollback_journal).
+    pub fn rollback_keeping_journal(&mut self) -> Result<()> {
+        if !self.journaling() {
+            return Ok(());
+        }
+        let res = self.replay_records_on_disk();
+        let mut j = self.journal_state();
+        match res {
+            Ok(_) => {
+                *j = Journal::Stale {
+                    replay: false,
+                    why: "rolled back; not deleted yet".into(),
+                };
+                Ok(())
+            }
+            Err(e) => {
+                let why = e.to_string();
+                *j = Journal::Stale {
+                    replay: true,
+                    why: why.clone(),
+                };
+                Err(GStoreError::Database(format!(
+                    "rocksdb: a transaction's undo journal could not be replayed: {why}"
+                )))
+            }
+        }
+    }
+
     /// Retry the cleanup of a stale journal — one whose deletion (after a
     /// commit) or replay (after a rollback) failed; a no-op otherwise. Errs,
     /// keeping it stale, if the retry fails too.
@@ -843,7 +953,7 @@ impl RocksStore {
         let res = if replay {
             self.replay_journal()
         } else {
-            self.clear_journal()
+            self.clear_journal_with(None, &[])
         };
         let mut j = self.journal_state();
         match res {
@@ -877,25 +987,33 @@ impl RocksStore {
         }
     }
 
+    /// The next journal key while a journal is recording (advancing its
+    /// sequence number), else `None`.
+    fn next_journal_key(&self) -> Option<Vec<u8>> {
+        let mut j = self.journal_state();
+        let Journal::Recording(seq) = &mut *j else {
+            return None;
+        };
+        let key = journal_key(*seq);
+        *seq += 1;
+        Some(key)
+    }
+
     /// Append the undo record of a mutation to `wb` when a transaction is being
     /// journaled. `undo` is the op that reverses it.
     fn journal_into(&self, wb: &mut WriteBatch, undo: u8, graph: Option<u32>, t: IdTriple) {
-        let mut j = self.journal_state();
-        let Journal::Recording(seq) = &mut *j else {
+        let Some(key) = self.next_journal_key() else {
             return;
         };
-        let mut key = JOURNAL_PREFIX.to_vec();
-        key.extend_from_slice(&seq.to_be_bytes());
-        *seq += 1;
         let mut val = Vec::with_capacity(18);
         val.push(undo);
         match graph {
             Some(g) => {
-                val.push(1);
+                val.push(REC_QUAD);
                 val.extend_from_slice(&be(g));
             }
             None => {
-                val.push(0);
+                val.push(REC_TRIPLE);
                 val.extend_from_slice(&[0; 4]);
             }
         }
@@ -903,17 +1021,54 @@ impl RocksStore {
         wb.put_cf(self.cf(CF_META), key, val);
     }
 
-    /// Every journal record `(undo op, graph, triple)`, oldest first.
-    fn journal_records(&self) -> Result<Vec<(u8, Option<u32>, IdTriple)>> {
+    /// Append the record of a dictionary term written new to `wb` when a
+    /// journal is recording, so that a replay hands the term over as a
+    /// reclamation candidate (see the module docs). The record is an
+    /// `UNDO_REMOVE` of the triple `(id, id, id)` with kind [`REC_TERM`]: a
+    /// binary that predates term records replays it as the removal of a
+    /// triple that cannot be stored at that point of the history (its term
+    /// is new) — a no-op — and frees the term the same way.
+    fn journal_term_into(&self, wb: &mut WriteBatch, space: TermSpace, id: u32) {
+        let Some(key) = self.next_journal_key() else {
+            return;
+        };
+        let mut val = Vec::with_capacity(18);
+        val.push(UNDO_REMOVE);
+        val.push(REC_TERM);
+        val.extend_from_slice(&[space.tag(), 0, 0, 0]);
+        val.extend_from_slice(&key3(id, id, id));
+        wb.put_cf(self.cf(CF_META), key, val);
+    }
+
+    /// Every journal record `(undo op, kind, graph or term tag, triple)`,
+    /// oldest first.
+    #[allow(clippy::type_complexity)]
+    fn journal_records(&self) -> Result<Vec<(u8, u8, u32, IdTriple)>> {
         let mut out = Vec::new();
         self.try_scan(CF_META, JOURNAL_PREFIX, |_, v| {
-            if v.len() != 18 || !matches!(v[0], UNDO_INSERT | UNDO_REMOVE) {
+            let valid = v.len() == 18
+                && matches!(v[0], UNDO_INSERT | UNDO_REMOVE)
+                && match v[1] {
+                    REC_TERM => v[0] == UNDO_REMOVE && TermSpace::from_tag(v[2]).is_some(),
+                    _ => true,
+                };
+            if !valid {
                 return Err("corrupt rocksdb undo journal record".to_string());
             }
-            let graph = (v[1] == 1).then(|| de(&v[2..6]));
+            // Kind byte 1 is a quad; any other but a term record is a
+            // default-graph triple (as every earlier binary read it).
+            let kind = match v[1] {
+                REC_QUAD | REC_TERM => v[1],
+                _ => REC_TRIPLE,
+            };
+            let tag = match kind {
+                REC_TERM => u32::from(v[2]),
+                _ => de(&v[2..6]),
+            };
             out.push((
                 v[0],
-                graph,
+                kind,
+                tag,
                 IdTriple::new(de(&v[6..10]), de(&v[10..14]), de(&v[14..18])),
             ));
             Ok(true)
@@ -927,24 +1082,41 @@ impl RocksStore {
     /// cached counters and the mirror are reloaded from the `stats` CF after
     /// the replay, whatever it got through.
     fn replay_journal(&mut self) -> Result<()> {
+        if self.replay_records_on_disk()? {
+            self.clear_journal_with(None, &[])?;
+        }
+        Ok(())
+    }
+
+    /// Undo every journaled mutation (newest first), keeping the journal;
+    /// `Ok(false)` when there is none. The cached counters and the mirror
+    /// are reloaded from the `stats` CF after the replay, whatever it got
+    /// through.
+    fn replay_records_on_disk(&mut self) -> Result<bool> {
         let records = self.journal_records()?;
         if records.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let replayed = self.replay_records(records);
         let reloaded = self.load_counters();
         replayed?;
         reloaded?;
-        self.clear_journal()
+        Ok(true)
     }
 
-    fn replay_records(&mut self, records: Vec<(u8, Option<u32>, IdTriple)>) -> Result<()> {
-        // Undoing an insert may leave its terms unreferenced. They are handed
-        // over (`take_replayed`) only once the whole replay has run: a replay
-        // cut short adds nothing, and the retry that completes it adds them
-        // once.
+    fn replay_records(&mut self, records: Vec<(u8, u8, u32, IdTriple)>) -> Result<()> {
+        // Undoing an insert may leave its terms unreferenced, and so may
+        // a term written new. They are handed over (`take_replayed`) only
+        // once the whole replay has run: a replay cut short adds nothing,
+        // and the retry that completes it adds them once.
         let mut terms = Vec::new();
-        for (op, graph, t) in &records {
+        for (op, kind, tag, t) in &records {
+            if *kind == REC_TERM {
+                if let Some(space) = TermSpace::from_tag(*tag as u8) {
+                    terms.push((space, t.sub));
+                }
+                continue;
+            }
             if *op == UNDO_REMOVE {
                 let obj = if is_literal_id(t.obj) {
                     TermSpace::Literal
@@ -954,15 +1126,19 @@ impl RocksStore {
                 terms.push((TermSpace::Entity, t.sub));
                 terms.push((TermSpace::Predicate, t.pred));
                 terms.push((obj, t.obj));
-                if let Some(g) = graph {
-                    terms.push((TermSpace::Entity, *g));
+                if *kind == REC_QUAD {
+                    terms.push((TermSpace::Entity, *tag));
                 }
             }
         }
-        for (op, graph, t) in records.into_iter().rev() {
+        for (op, kind, tag, t) in records.into_iter().rev() {
             let insert = op == UNDO_INSERT;
-            match graph {
-                None => {
+            match kind {
+                REC_TERM => {}
+                REC_QUAD => {
+                    self.quad_write(tag, t, insert)?;
+                }
+                _ => {
                     let res = if insert {
                         self.write_insert(t)
                     } else {
@@ -971,9 +1147,6 @@ impl RocksStore {
                     res.map_err(|e| {
                         GStoreError::Database(format!("rocksdb write (journal replay): {e}"))
                     })?;
-                }
-                Some(g) => {
-                    self.quad_write(g, t, insert)?;
                 }
             }
         }
@@ -984,12 +1157,29 @@ impl RocksStore {
         Ok(())
     }
 
-    /// Delete the whole journal in one atomic batch.
-    fn clear_journal(&self) -> Result<()> {
+    /// Delete the journal — the `Some(n)` records a recording journal wrote,
+    /// or (`None`) whatever is on disk — and the dictionary terms `frees` in
+    /// one atomic batch. Nothing is written when there is nothing to delete.
+    fn clear_journal_with(&self, records: Option<u64>, frees: &[(TermSpace, u32)]) -> Result<()> {
         #[cfg(test)]
         Failpoints::hit(&self.failpoints.journal_clear, "journal")?;
         let mut wb = WriteBatch::default();
-        wb.delete_range_cf(self.cf(CF_META), JOURNAL_PREFIX, JOURNAL_END);
+        let meta = self.cf(CF_META);
+        match records {
+            Some(n) if n <= POINT_CLEAR_MAX => {
+                for seq in 0..n {
+                    wb.delete_cf(meta, journal_key(seq));
+                }
+            }
+            _ => wb.delete_range_cf(meta, JOURNAL_PREFIX, JOURNAL_END),
+        }
+        let dict = self.cf(CF_DICT);
+        for (space, id) in frees {
+            wb.delete_cf(dict, tag1(space.tag(), *id));
+        }
+        if wb.is_empty() {
+            return Ok(());
+        }
         self.write(wb)
             .map_err(|e| GStoreError::Database(format!("rocksdb write (journal): {e}")))
     }
@@ -1008,6 +1198,20 @@ impl RocksStore {
     /// Persist dictionary terms `(space, id, key)` in one atomic batch
     /// (overwriting any previous term stored under the same id).
     pub fn put_terms(&self, terms: &[(TermSpace, u32, &str)]) -> Result<()> {
+        self.write_terms(terms, false)
+    }
+
+    /// [`put_terms`](Self::put_terms) for terms that are **new** to the
+    /// store — no stored triple or quad uses their ids — written before the
+    /// first triple that uses them. While a journal is recording, each one
+    /// is journaled in the same batch (see the module docs), so a crash
+    /// before the triple that would use it lets the next open free it
+    /// instead of leaving it behind as an orphan.
+    pub fn put_new_terms(&self, terms: &[(TermSpace, u32, &str)]) -> Result<()> {
+        self.write_terms(terms, true)
+    }
+
+    fn write_terms(&self, terms: &[(TermSpace, u32, &str)], new: bool) -> Result<()> {
         if terms.is_empty() {
             return Ok(());
         }
@@ -1017,6 +1221,9 @@ impl RocksStore {
         let mut wb = WriteBatch::default();
         for (space, id, key) in terms {
             wb.put_cf(cf, tag1(space.tag(), *id), key.as_bytes());
+            if new {
+                self.journal_term_into(&mut wb, *space, *id);
+            }
         }
         self.write(wb)
             .map_err(|e| GStoreError::Database(format!("rocksdb write (dictionary): {e}")))

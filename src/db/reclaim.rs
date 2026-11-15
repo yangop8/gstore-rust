@@ -396,9 +396,12 @@ impl Database {
 
     /// The end of a deleting statement: outside a transaction, free the
     /// candidates nothing references any more (inside one they wait for the
-    /// commit). A persistence failure is reported at the next commit point.
+    /// commit, and inside a journaled RocksDB statement for its end: an id
+    /// freed — and maybe reused — before the journal is deleted would be
+    /// named again by the triples a crash's replay restores). A persistence
+    /// failure is reported at the next commit point.
     pub(super) fn flush_reclaim(&mut self) {
-        if self.txn.is_some() {
+        if self.txn.is_some() || self.rocks_journaling() {
             return;
         }
         self.note_rocks_replayed();
@@ -414,6 +417,23 @@ impl Database {
         let ready = self.ready_frees(cands);
         let dead = self.dead_or_requeue(ready);
         self.free_dead(dead, false);
+    }
+
+    /// Inside a journaled RocksDB statement that only removes
+    /// (`remove_sources`), whose frees wait for its end: keep only the
+    /// candidates nothing references now (and those a read error left
+    /// undecided) — a removal never makes a term referenced again — so that
+    /// a long import holds the ids it will free, not every term it touched.
+    /// A no-op otherwise.
+    pub(super) fn keep_dead_candidates(&mut self) {
+        if self.txn.is_some() || !self.rocks_journaling() || self.reclaim.is_empty() {
+            return;
+        }
+        let cands = self.reclaim.take();
+        let check = self.dead_of(&cands);
+        for t in check.dead.into_iter().chain(check.failed) {
+            self.reclaim.note(t);
+        }
     }
 
     /// At commit (the transaction just closed): the transaction's candidates

@@ -47,7 +47,9 @@ thread_local! {
 }
 
 fn tmp(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("gstore_rocks_ut_{tag}"));
+    // review gap-rocksdb-exec#8: with the pid, two runs on one machine
+    // (parallel worktrees, runners) do not delete each other's stores.
+    let dir = std::env::temp_dir().join(format!("gstore_rocks_ut_{tag}_{}", std::process::id()));
     TMP_DIRS.with(|t| t.0.borrow_mut().push(dir.clone()));
     let _ = std::fs::remove_dir_all(&dir);
     dir
