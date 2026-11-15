@@ -119,8 +119,8 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use rocksdb::{
     checkpoint::Checkpoint, BlockBasedOptions, Cache, ColumnFamilyDescriptor, DBCompressionType,
@@ -405,10 +405,19 @@ pub struct RocksStore {
     replayed: Mutex<Vec<(TermSpace, u32)>>,
     /// Every read fails (see [`RocksStore::debug_fail_reads`]).
     fail_reads: AtomicBool,
+    /// The write batches written since a write hook was installed, and the
+    /// hook (see [`RocksStore::debug_set_write_hook`]).
+    writes: AtomicU64,
+    write_hook: Mutex<Option<WriteHook>>,
     /// Test-only failpoints (see [`RocksStore::inject_failures`]).
     #[cfg(test)]
     failpoints: Failpoints,
 }
+
+/// A hook run after each write batch a store writes, with the number of
+/// batches written since it was installed (see
+/// [`RocksStore::debug_set_write_hook`]).
+pub type WriteHook = Arc<dyn Fn(u64) + Send + Sync>;
 
 /// Test-only write-failure injection, standing in for e.g. `ENOSPC`.
 #[cfg(test)]
@@ -517,6 +526,8 @@ impl RocksStore {
             journal: Mutex::new(Journal::Off),
             replayed: Mutex::new(Vec::new()),
             fail_reads: AtomicBool::new(false),
+            writes: AtomicU64::new(0),
+            write_hook: Mutex::new(None),
             #[cfg(test)]
             failpoints: Failpoints::default(),
         };
@@ -658,6 +669,37 @@ impl RocksStore {
             .then(|| "injected read failure (Input/output error)".to_string())
     }
 
+    /// A test hook for crash tests: run `hook` after every write batch this
+    /// store writes from now on (each triple or quad change, dictionary
+    /// batch and journal deletion is one), with the number written since
+    /// the call — so a test child can stop at an exact point of a statement
+    /// (and be killed there). `None` removes it. Only the batch counter is
+    /// touched when no hook is installed.
+    #[doc(hidden)]
+    pub fn debug_set_write_hook(&self, hook: Option<WriteHook>) {
+        self.writes.store(0, Ordering::SeqCst);
+        *self
+            .write_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = hook;
+    }
+
+    /// Write `wb` atomically (every write of this store goes through here),
+    /// then run the write hook, if one is installed.
+    fn write(&self, wb: WriteBatch) -> std::result::Result<(), rocksdb::Error> {
+        self.db.write(wb)?;
+        let n = self.writes.fetch_add(1, Ordering::SeqCst) + 1;
+        let hook = self
+            .write_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook(n);
+        }
+        Ok(())
+    }
+
     // ---- transaction undo journal (meta CF) -----------------------------
 
     fn journal_state(&self) -> std::sync::MutexGuard<'_, Journal> {
@@ -709,7 +751,7 @@ impl RocksStore {
             for (space, id) in frees {
                 wb.delete_cf(cf, tag1(space.tag(), *id));
             }
-            match self.db.write(wb) {
+            match self.write(wb) {
                 Ok(()) => {
                     *self.journal_state() = Journal::Off;
                     return Ok(());
@@ -920,8 +962,7 @@ impl RocksStore {
         Failpoints::hit(&self.failpoints.journal_clear, "journal")?;
         let mut wb = WriteBatch::default();
         wb.delete_range_cf(self.cf(CF_META), JOURNAL_PREFIX, JOURNAL_END);
-        self.db
-            .write(wb)
+        self.write(wb)
             .map_err(|e| GStoreError::Database(format!("rocksdb write (journal): {e}")))
     }
 
@@ -949,8 +990,7 @@ impl RocksStore {
         for (space, id, key) in terms {
             wb.put_cf(cf, tag1(space.tag(), *id), key.as_bytes());
         }
-        self.db
-            .write(wb)
+        self.write(wb)
             .map_err(|e| GStoreError::Database(format!("rocksdb write (dictionary): {e}")))
     }
 
@@ -969,8 +1009,7 @@ impl RocksStore {
         for (space, id) in terms {
             wb.delete_cf(cf, tag1(space.tag(), *id));
         }
-        self.db
-            .write(wb)
+        self.write(wb)
             .map_err(|e| GStoreError::Database(format!("rocksdb write (dictionary): {e}")))
     }
 
@@ -987,8 +1026,7 @@ impl RocksStore {
         for (space, id, key) in terms {
             wb.put_cf(cf, tag1(space.tag(), id), key.as_bytes());
         }
-        self.db
-            .write(wb)
+        self.write(wb)
             .map_err(|e| GStoreError::Database(format!("rocksdb write (dictionary): {e}")))
     }
 
@@ -1052,8 +1090,7 @@ impl RocksStore {
             wb.delete_cf(cf, key);
             self.journal_into(&mut wb, UNDO_INSERT, Some(g), t);
         }
-        self.db
-            .write(wb)
+        self.write(wb)
             .map_err(|e| GStoreError::Database(format!("rocksdb write (quad): {e}")))?;
         Ok(true)
     }
@@ -1336,7 +1373,7 @@ impl RocksStore {
         }
         self.journal_into(&mut wb, UNDO_REMOVE, None, t);
 
-        self.db.write(wb).map_err(|e| e.into_string())?;
+        self.write(wb).map_err(|e| e.into_string())?;
         self.triple_count = triples;
         self.num_predicates = preds;
         self.distinct_subjects = subjects;
@@ -1385,7 +1422,7 @@ impl RocksStore {
         }
         self.journal_into(&mut wb, UNDO_INSERT, None, t);
 
-        self.db.write(wb).map_err(|e| e.into_string())?;
+        self.write(wb).map_err(|e| e.into_string())?;
         self.triple_count = triples;
         self.num_predicates = preds;
         self.distinct_subjects = subjects;
