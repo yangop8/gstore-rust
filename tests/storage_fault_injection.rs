@@ -467,3 +467,33 @@ fn gserver_materialize_two_enospc_updates_and_kill_leave_an_openable_database() 
 fn gserver_stream_two_enospc_updates_and_kill_leave_an_openable_database() {
     server_scenario("stream");
 }
+
+// ---- an unreadable write-ahead log fails the open (review disk#2, durability#7,
+// ---- robust#12) --------------------------------------------------------------
+
+/// A log that exists but cannot be read may hold a committed batch the file
+/// still needs: the open fails instead of serving a possibly half-applied
+/// file (and a later commit overwriting the log for good). Only a missing
+/// log means "no log". A directory in the log's place reads with an error
+/// other than "not found" (as `EIO` or `EACCES` would), with no privileges
+/// needed.
+#[test]
+fn an_unreadable_write_ahead_log_fails_the_open_in_both_modes() {
+    let tmp = TmpDir::new("wal_unreadable");
+    let dir = tmp.0.join("t.db");
+    build_base(&tmp.0, &dir);
+    let wal = dir.join("kvstore.kv.wal");
+    fs::create_dir(&wal).unwrap();
+    for mode in [DiskQueryMode::Materialize, DiskQueryMode::Stream] {
+        let e = Database::open_with(&dir, &options(mode))
+            .err()
+            .unwrap_or_else(|| panic!("the open must fail ({mode:?})"));
+        assert!(e.to_string().contains("write-ahead log"), "({mode:?}) {e}");
+        assert!(wal.is_dir(), "the log is left alone");
+    }
+    fs::remove_dir(&wal).unwrap();
+    for mode in [DiskQueryMode::Materialize, DiskQueryMode::Stream] {
+        let mut db = Database::open_with(&dir, &options(mode)).unwrap();
+        assert_eq!(count(&mut db, "?s ?p ?o"), BASE as u64);
+    }
+}
