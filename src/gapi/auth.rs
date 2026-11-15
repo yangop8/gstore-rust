@@ -184,13 +184,33 @@ pub fn verify(
         note_auth_failure(ctx);
         return Err(wrong());
     }
-    if ctx.config.trust_inner_localhost && creds.inner && ctx.remote_ip == "127.0.0.1" {
+    // Only a local client: a reverse proxy on this machine (a loopback peer
+    // forwarding Forwarded / X-Forwarded-For / X-Real-IP) speaks for remote
+    // ones unless `trust_proxy_headers` (review sec#9 / gapi#22).
+    if ctx.config.trust_inner_localhost
+        && creds.inner
+        && ctx.remote_ip == "127.0.0.1"
+        && ctx.local_trusted
+    {
         if !ctx.state().users.exists(&username) {
             return Err(wrong());
         }
         ctx.inner_request = true;
         ctx.user = Some(username.clone());
         return Ok(username);
+    }
+    // Root's default password is a loopback privilege: refused from a
+    // client that is not local, whether or not root still has it (a constant
+    // comparison: nothing about root's actual password is revealed, so it is
+    // not counted towards the lockout either — against a proxy's address
+    // that would lock out every client behind it).
+    if !ctx.local_trusted && username == crate::http_users::ROOT_USER && is_default_password(creds)
+    {
+        return Err(GResp::error(
+            Status::AuthenticationFailed,
+            "the default root password is accepted only from a local client (not from a remote \
+             one, nor through a proxy): change root's password",
+        ));
     }
     let form = if creds.md5 {
         PasswordForm::Md5Hex
@@ -223,6 +243,20 @@ pub fn verify(
                  password (without encryption=1) to migrate it, then retry"
             ),
         )),
+    }
+}
+
+/// Whether `creds` present upstream's default root password (as such, or
+/// with `encryption=1` as its MD5 hex digest).
+fn is_default_password(creds: &Credentials) -> bool {
+    let default = crate::config::DEFAULT_ROOT_PASSWORD;
+    if creds.md5 {
+        ct_eq(
+            creds.password.trim().to_ascii_lowercase().as_bytes(),
+            md5_hex(default).as_bytes(),
+        )
+    } else {
+        ct_eq(creds.password.as_bytes(), default.as_bytes())
     }
 }
 

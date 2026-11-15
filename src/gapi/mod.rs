@@ -139,6 +139,13 @@ pub struct Ctx<'a> {
     pub(crate) req: &'a Request,
     /// The client's IP address (`"unknown"` when the transport has none).
     pub remote_ip: String,
+    /// Whether the client counts as local
+    /// ([`peer_is_trusted_local`](crate::server::peer_is_trusted_local): a
+    /// loopback peer that is not a reverse proxy, unless `conf.ini`'s
+    /// `trust_proxy_headers`): the loopback privileges — upstream's *inner*
+    /// requests ([`GapiConfig::trust_inner_localhost`]) and root's default
+    /// password — are granted to it only.
+    pub local_trusted: bool,
     /// The operation being served (for a path route: its registered name).
     pub op: String,
     /// The authenticated user (`None` before authentication, or for a public
@@ -438,9 +445,15 @@ fn requote_query(q: &str) -> String {
     out
 }
 
-/// Serve one `/api` request (no lock held). Returns the response and the
-/// caller's display name for the access log.
-pub(crate) fn serve(inner: &ApiInner, req: &Request, peer: Option<SocketAddr>) -> (GResp, String) {
+/// Serve one `/api` request (no lock held). `local_trusted`: whether the
+/// client counts as local (see [`Ctx::local_trusted`]). Returns the response
+/// and the caller's display name for the access log.
+pub(crate) fn serve(
+    inner: &ApiInner,
+    req: &Request,
+    peer: Option<SocketAddr>,
+    local_trusted: bool,
+) -> (GResp, String) {
     let config = {
         let mut st = locked(&inner.state);
         st.requests += 1;
@@ -450,6 +463,7 @@ pub(crate) fn serve(inner: &ApiInner, req: &Request, peer: Option<SocketAddr>) -
         inner,
         req,
         remote_ip: peer.map_or_else(|| "unknown".to_string(), |a| a.ip().to_string()),
+        local_trusted,
         op: String::new(),
         user: None,
         db_name: None,

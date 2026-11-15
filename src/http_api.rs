@@ -2821,7 +2821,7 @@ impl ApiInner {
         let peer = crate::server::current_peer();
 
         let started = Instant::now();
-        let (resp, user_disp) = catch_unwind(AssertUnwindSafe(|| self.respond(&req, peer)))
+        let (resp, user_disp) = catch_unwind(AssertUnwindSafe(|| self.respond(&req, peer, meta)))
             .unwrap_or_else(|_| {
                 crate::gs_error!("request handler panicked: {} {}", req.method, req.path);
                 // The upstream protocol answers every outcome with HTTP 200.
@@ -2877,13 +2877,30 @@ impl ApiInner {
     }
 
     /// Route and execute one request, returning the response and the caller's
-    /// display name for the access log.
-    fn respond(&self, req: &Request, peer: Option<SocketAddr>) -> (Resp, String) {
+    /// display name for the access log. `meta` carries the verdict of the
+    /// connection's browser policy ([`HttpOptions`]): a refused `Host` /
+    /// `Origin`, whether the client counts as local, `allow_get_update`.
+    fn respond(&self, req: &Request, peer: Option<SocketAddr>, meta: &ConnMeta) -> (Resp, String) {
+        let upstream = crate::gapi::wants(req);
+        // A foreign Host on a loopback connection (DNS rebinding) or a
+        // foreign Origin on a state-changing request (CSRF), refused before
+        // anything else — `/api` the upstream way (HTTP 200, 1101).
+        if let Some(why) = meta.refusal() {
+            let resp = if upstream {
+                Resp::from(crate::gapi::GResp::error(
+                    crate::gapi::Status::IpBlocked,
+                    why,
+                ))
+            } else {
+                Resp::fail(403, why)
+            };
+            return (resp, "-".to_string());
+        }
         // The upstream-compatible `/api` protocol (`/api`, `POST /`,
         // `GET /?operation=…`, its path routes): per-request credentials and a
         // JSON envelope, served by `crate::gapi` with no lock held.
-        if crate::gapi::wants(req) {
-            let (resp, user_disp) = crate::gapi::serve(self, req, peer);
+        if upstream {
+            let (resp, user_disp) = crate::gapi::serve(self, req, peer, meta.local_trusted());
             return (Resp::from(resp), user_disp);
         }
         // The IP checks of the `/api` layer hold for every endpoint on this
@@ -2901,6 +2918,40 @@ impl ApiInner {
                 Resp::fail(403, crate::gapi::ipfilter::LOCKED_MSG),
                 "-".to_string(),
             );
+        }
+        // Root's default password is a loopback privilege: refused from any
+        // client that is not local (a remote one, or one forwarded by a
+        // reverse proxy on this machine), whether or not root still has it.
+        // Not a failed login for the lockout: the fixed refusal reveals
+        // nothing, and counting it against a proxy's address would lock out
+        // every client behind the proxy.
+        if !meta.local_trusted() && presents_default_root_password(req) {
+            return (Resp::fail(401, DEFAULT_PASSWORD_REFUSED), "-".to_string());
+        }
+        // The SPARQL Protocol's method and body rules (see
+        // `HttpOptions::allow_get_update`): an UPDATE over `GET /sparql` —
+        // classified by a parse of the (request-line sized) statement, before
+        // anything runs — and an `/update` body of another type.
+        if !meta.allow_get_update() {
+            if req.method == "GET" && req.path == "/sparql" {
+                let get_update = req
+                    .param("sparql")
+                    .or_else(|| req.query_string())
+                    .is_some_and(|q| Statement::parse(&q).is_ok_and(|s| s.is_update()));
+                if get_update {
+                    return (
+                        Resp::fail(400, crate::server::GET_UPDATE_REFUSED),
+                        "-".to_string(),
+                    );
+                }
+            }
+            if req.method == "POST" && req.path == "/update" {
+                if let Err((status, msg)) = req.update_text(false) {
+                    if status == 415 {
+                        return (Resp::fail(415, msg), "-".to_string());
+                    }
+                }
+            }
         }
         // Basic credentials are checked with the state lock held only to look
         // the user up: the deliberately slow password hash runs with no lock
@@ -3392,9 +3443,14 @@ impl ApiInner {
     /// lock released ([`Dispatch::Deferred`]); the lock is then taken briefly
     /// to check the privilege and register the task.
     fn handle_query(&self, req: &Request, user: &str) -> Dispatch {
+        // `sparql=` / `query=` of the URL or a form body, else a raw body
+        // (never parameters read out of one, see `Request`).
         let Some(sparql) = req.param("sparql").or_else(|| req.query_string()) else {
             return Dispatch::Done(Resp::fail(400, "missing sparql/query parameter"));
         };
+        if let Some(p) = req.first_param_of(crate::server::QUERY_DATASET_PARAMS) {
+            return Dispatch::Done(Resp::fail(400, &crate::server::dataset_param_refusal(p)));
+        }
         let db = db_param(req);
         let fmt = ResultFormat::negotiate(req.param("format").as_deref(), req.header("accept"));
         let user = user.to_string();
@@ -3436,10 +3492,13 @@ impl ApiInner {
         let Some(sparql) = req
             .param("sparql")
             .or_else(|| req.param("update"))
-            .or_else(|| Some(req.body_str()).filter(|s| !s.trim().is_empty()))
+            .or_else(|| req.raw_statement())
         else {
             return Dispatch::Done(Resp::fail(400, "missing update statement"));
         };
+        if let Some(p) = req.first_param_of(crate::server::UPDATE_DATASET_PARAMS) {
+            return Dispatch::Done(Resp::fail(400, &crate::server::dataset_param_refusal(p)));
+        }
         let Some(name) = self.pick_db(st, req) else {
             return Dispatch::Done(Resp::fail(400, "missing or ambiguous db parameter"));
         };
@@ -5859,6 +5918,24 @@ fn pick_db_name(st: &ApiState, param: Option<String>) -> Option<String> {
         return st.dbs.keys().next().cloned();
     }
     None
+}
+
+/// The answer to root's default password from a client that is not local.
+const DEFAULT_PASSWORD_REFUSED: &str = "the default root password is accepted only from a \
+     local client (not from a remote one, nor through a proxy): change root's password";
+
+/// Whether `req` authenticates as root with the default password, in Basic
+/// credentials or as `/login`'s `username` / `password` parameters. A
+/// constant comparison: the stored hash is not consulted, so the check costs
+/// nothing and tells nothing about root's actual password.
+fn presents_default_root_password(req: &Request) -> bool {
+    let default = crate::config::DEFAULT_ROOT_PASSWORD;
+    if parse_basic_auth(req).is_some_and(|(u, p)| u == ROOT_USER && p == default) {
+        return true;
+    }
+    req.path == "/login"
+        && req.param("username").as_deref() == Some(ROOT_USER)
+        && req.param("password").as_deref() == Some(default)
 }
 
 /// Render a [`QueryResult`] into an HTTP response using the negotiated format.
