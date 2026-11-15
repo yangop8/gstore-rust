@@ -968,6 +968,30 @@ impl BadRequest {
         status: 400,
         message: "bad request: the request did not arrive in time",
     };
+    /// A header line that is not `name: value` with a token name right before
+    /// the colon (RFC 9112 §5.1), e.g. whitespace before the colon or an
+    /// obs-fold continuation line (§5.2).
+    const BAD_FIELD: BadRequest = BadRequest {
+        status: 400,
+        message: "bad request: malformed header field",
+    };
+    /// A control character (other than HTAB) in the request line, a header
+    /// line, a chunk-size line or a trailer — a bare CR or a NUL included
+    /// (RFC 9112 §2.2, RFC 9110 §5.5).
+    const BAD_CONTROL: BadRequest = BadRequest {
+        status: 400,
+        message: "bad request: control character in a request line, header or chunk line",
+    };
+    /// A body length that cannot be determined unambiguously (RFC 9112 §6):
+    /// `Content-Length` and `Transfer-Encoding` together, differing or
+    /// non-decimal `Content-Length` values, a transfer coding other than
+    /// exactly `chunked`, or a malformed chunk size.
+    const BAD_FRAMING: BadRequest = BadRequest {
+        status: 400,
+        message: "bad request: ambiguous or unsupported message framing \
+                  (Content-Length / Transfer-Encoding)",
+    };
+
     /// A failed read: a timeout ([`TIMED_OUT`](Self::TIMED_OUT)) or else a
     /// malformed or truncated request.
     fn from_read(e: &io::Error) -> BadRequest {
@@ -1671,7 +1695,10 @@ fn read_request<S: Read + Write>(
 }
 
 /// Read one bounded CRLF/LF-terminated line (without the terminator).
-/// `Ok(None)` at EOF before any byte.
+/// `Ok(None)` at EOF before any byte. A line holding a control character
+/// other than HTAB — a bare CR (RFC 9112 §2.2), a NUL, … — is refused: as a
+/// header value it could otherwise be reflected into a response header
+/// (review robust#14).
 fn read_line_bounded<R: BufRead>(r: &mut R) -> Result<Option<String>, BadRequest> {
     let mut buf = Vec::new();
     let n = r
@@ -1685,10 +1712,68 @@ fn read_line_bounded<R: BufRead>(r: &mut R) -> Result<Option<String>, BadRequest
     if buf.last() != Some(&b'\n') {
         return Err(BadRequest::MALFORMED); // over-long line, or EOF mid-line
     }
-    let line = String::from_utf8(buf).map_err(|_| BadRequest::MALFORMED)?;
-    Ok(Some(line.trim_end_matches(['\r', '\n']).to_string()))
+    buf.pop();
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    if buf.iter().any(|&b| (b < 0x20 && b != b'\t') || b == 0x7f) {
+        return Err(BadRequest::BAD_CONTROL);
+    }
+    String::from_utf8(buf)
+        .map(Some)
+        .map_err(|_| BadRequest::MALFORMED)
 }
 
+/// An RFC 9110 `tchar`: what a header field name is made of.
+fn is_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+}
+
+/// Split a header line into name and value (RFC 9112 §5): the name is a
+/// token directly followed by the colon — whitespace before it (§5.1), an
+/// obs-fold continuation line (§5.2) or a line without a colon is refused —
+/// and the value loses the optional whitespace around it.
+fn split_field(line: &str) -> Result<(&str, &str), BadRequest> {
+    let (name, value) = line.split_once(':').ok_or(BadRequest::BAD_FIELD)?;
+    if name.is_empty() || !name.bytes().all(is_tchar) {
+        return Err(BadRequest::BAD_FIELD);
+    }
+    Ok((name, value.trim_matches([' ', '\t'])))
+}
+
+/// A `Content-Length` value: decimal digits only (RFC 9110 §8.6 — no sign,
+/// no list). Digits too many for a `usize` are an absurd length: too large.
+fn content_length_value(v: &str) -> Result<usize, BadRequest> {
+    if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(BadRequest::BAD_FRAMING);
+    }
+    v.parse().map_err(|_| BadRequest::TOO_LARGE)
+}
+
+/// The size of a chunk from its chunk-size line (RFC 9112 §7.1): hex digits
+/// — no sign, prefix or leading whitespace — optionally followed by
+/// whitespace and `;` extensions, which are ignored.
+fn chunk_size(line: &str) -> Result<usize, BadRequest> {
+    let size = line
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches([' ', '\t']);
+    if size.is_empty() || !size.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(BadRequest::BAD_FRAMING);
+    }
+    usize::from_str_radix(size, 16).map_err(|_| BadRequest::TOO_LARGE)
+}
+
+/// Read a request line and its header fields. The body's framing must be
+/// unambiguous (RFC 9112 §6; review sec#16, http#14) — a front end that
+/// framed the request differently could otherwise make this server read part
+/// of one request as the next one — so these are refused (`400`, and the
+/// connection is closed): `Content-Length` together with
+/// `Transfer-Encoding`; `Content-Length` values that differ or are not plain
+/// decimal digits; a `Transfer-Encoding` other than exactly `chunked` (the
+/// only coding implemented), or in an HTTP/1.0 request; malformed header
+/// lines (see [`split_field`]).
 fn read_head<R: BufRead>(r: &mut R, max_body: usize) -> Result<Option<Head>, BadRequest> {
     let Some(line) = read_line_bounded(r)? else {
         return Ok(None);
@@ -1703,8 +1788,9 @@ fn read_head<R: BufRead>(r: &mut R, max_body: usize) -> Result<Option<Head>, Bad
         None => (target, None),
     };
 
-    let mut content_length = 0usize;
-    let mut chunked = false;
+    let mut content_length: Option<usize> = None;
+    // The transfer codings of every `Transfer-Encoding` line, in order.
+    let mut codings: Option<Vec<String>> = None;
     let mut expect_continue = false;
     let mut headers = Vec::new();
     // EOF also ends the headers.
@@ -1715,27 +1801,36 @@ fn read_head<R: BufRead>(r: &mut R, max_body: usize) -> Result<Option<Head>, Bad
         if headers.len() >= MAX_HEADERS {
             return Err(BadRequest::MALFORMED);
         }
-        if let Some((k, v)) = h.split_once(':') {
-            let k = k.trim();
-            let v = v.trim();
-            if k.eq_ignore_ascii_case("content-length") {
-                // An absurd value (e.g. u64::MAX) overflows: refuse it as too
-                // large; anything else unparsable is malformed.
-                content_length = v.parse().map_err(|e: std::num::ParseIntError| {
-                    if *e.kind() == std::num::IntErrorKind::PosOverflow {
-                        BadRequest::TOO_LARGE
-                    } else {
-                        BadRequest::MALFORMED
-                    }
-                })?;
-            } else if k.eq_ignore_ascii_case("transfer-encoding") {
-                chunked = !v.eq_ignore_ascii_case("identity");
-            } else if k.eq_ignore_ascii_case("expect") {
-                expect_continue = v.eq_ignore_ascii_case("100-continue");
+        let (k, v) = split_field(&h)?;
+        if k.eq_ignore_ascii_case("content-length") {
+            let n = content_length_value(v)?;
+            if content_length.is_some_and(|m| m != n) {
+                return Err(BadRequest::BAD_FRAMING);
             }
-            headers.push((k.to_ascii_lowercase(), v.to_string()));
+            content_length = Some(n);
+        } else if k.eq_ignore_ascii_case("transfer-encoding") {
+            // A list; empty elements do not count (RFC 9110 §5.6.1).
+            codings.get_or_insert_with(Vec::new).extend(
+                v.split(',')
+                    .map(|c| c.trim_matches([' ', '\t']))
+                    .filter(|c| !c.is_empty())
+                    .map(str::to_ascii_lowercase),
+            );
+        } else if k.eq_ignore_ascii_case("expect") {
+            expect_continue = v.eq_ignore_ascii_case("100-continue");
         }
+        headers.push((k.to_ascii_lowercase(), v.to_string()));
     }
+    let chunked = match codings {
+        None => false,
+        Some(codings) => {
+            if content_length.is_some() || http10 || codings != ["chunked"] {
+                return Err(BadRequest::BAD_FRAMING);
+            }
+            true
+        }
+    };
+    let content_length = content_length.unwrap_or(0);
 
     // Refuse an oversized Content-Length BEFORE allocating, so a client cannot
     // make the server reserve arbitrary memory with a single header — this runs
@@ -1776,8 +1871,8 @@ fn read_body<R: BufRead>(r: &mut R, len: usize) -> Result<Vec<u8>, BadRequest> {
 }
 
 /// Decode a `Transfer-Encoding: chunked` request body (RFC 9112 §7.1), at most
-/// `max_body` bytes in total; chunk extensions and trailers are ignored. On a
-/// connection it must keep up
+/// `max_body` bytes in total; chunk extensions and trailers are ignored, a
+/// malformed chunk size is refused. On a connection it must keep up
 /// [`HttpOptions::min_body_rate`] on average: from here, `read_timeout` plus
 /// the bytes received so far at that rate ([`ConnSocket`]).
 fn read_chunked_body<R: BufRead>(r: &mut R, max_body: usize) -> Result<Vec<u8>, BadRequest> {
@@ -1785,8 +1880,7 @@ fn read_chunked_body<R: BufRead>(r: &mut R, max_body: usize) -> Result<Vec<u8>, 
     let mut body = Vec::new();
     loop {
         let line = read_line_bounded(r)?.ok_or(BadRequest::MALFORMED)?;
-        let size_hex = line.split(';').next().unwrap_or("").trim();
-        let size = usize::from_str_radix(size_hex, 16).map_err(|_| BadRequest::MALFORMED)?;
+        let size = chunk_size(&line)?;
         if size == 0 {
             break;
         }

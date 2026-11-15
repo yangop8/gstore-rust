@@ -1,6 +1,7 @@
 //! The HTTP connection layer against adversarial clients (review H-1 and the
 //! framing findings): what one client may make a worker of the bounded pool
-//! wait for and how many connections one address may hold.
+//! wait for, how many connections one address may hold, and which request
+//! framings are refused.
 //!
 //! * **Deadlines** (sec#3, http#1, robust#3, http#3): a request body must
 //!   arrive within `read_timeout + len / min_body_rate` (a chunked one at
@@ -12,6 +13,12 @@
 //! * **Per-address cap** (sec#3, http#1): `max_conns_per_ip` connections from
 //!   one address at most; a further one is closed while other addresses are
 //!   served.
+//! * **Framing** (sec#16, http#14; RFC 9112 §5, §6, §7.1): conflicting or
+//!   unsupported `Content-Length` / `Transfer-Encoding`, malformed header
+//!   lines and chunk sizes are answered `400` and the connection is closed.
+//! * **Control characters** (robust#14): a header line with a bare CR, NUL or
+//!   another control character (HTAB excepted) is refused, so it can never be
+//!   reflected into a response header.
 //!
 //! The only timeout is [`HANG_GUARD`]; no assertion depends on elapsed time.
 
@@ -426,6 +433,152 @@ fn the_per_address_cap_refuses_only_the_address_over_it() {
         "127.0.0.1 may connect again: {resp:?}"
     );
     drop(held);
+}
+
+// --- framing (RFC 9112) ---------------------------------------------------------
+
+/// A request the next one is appended to, as a front end that frames the
+/// first one differently would forward it on a shared connection.
+const SMUGGLED: &str = "GET /status HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+fn responses(resp: &str) -> usize {
+    resp.matches("HTTP/1.1 ").count()
+}
+
+/// sec#16 / http#14: every ambiguous or unsupported framing is answered with
+/// one `400` and the connection is closed — nothing after it (a smuggled
+/// request) is served.
+#[test]
+fn ambiguous_framing_is_refused_and_the_connection_closed() {
+    let srv = serve(HttpOptions::default());
+    let p =
+        "POST /sparql HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/sparql-query\r\n";
+    let cases: Vec<(&str, String)> = vec![
+        // Content-Length and Transfer-Encoding together (RFC 9112 §6.1).
+        ("CL+TE", format!("{p}Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n{SMUGGLED}")),
+        ("TE+CL", format!("{p}Transfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n0\r\n\r\n{SMUGGLED}")),
+        ("TE xchunked+CL", format!(
+            "{p}Content-Length: {}\r\nTransfer-Encoding: xchunked\r\n\r\n0\r\n\r\n{SMUGGLED}",
+            5 + SMUGGLED.len()
+        )),
+        // Differing Content-Length values (RFC 9110 §8.6).
+        ("dup CL", format!("{p}Content-Length: {}\r\nContent-Length: 0\r\n\r\n{SMUGGLED}", SMUGGLED.len())),
+        ("CL list", format!("{p}Content-Length: 5, 6\r\n\r\nASK{{}}")),
+        ("CL list of equal values", format!("{p}Content-Length: 5, 5\r\n\r\nASK{{}}")),
+        // A Content-Length that is not plain decimal digits.
+        ("CL +5", format!("{p}Content-Length: +5\r\n\r\nASK{{}}")),
+        ("CL -5", format!("{p}Content-Length: -5\r\n\r\nASK{{}}")),
+        ("CL 0x5", format!("{p}Content-Length: 0x5\r\n\r\nASK{{}}")),
+        ("CL 5abc", format!("{p}Content-Length: 5abc\r\n\r\nASK{{}}")),
+        ("CL empty", format!("{p}Content-Length: \r\n\r\nASK{{}}")),
+        // A transfer coding other than exactly `chunked` (RFC 9112 §6.1, §6.3).
+        ("TE gzip", format!("{p}Transfer-Encoding: gzip\r\n\r\n5\r\nASK{{}}\r\n0\r\n\r\n")),
+        ("TE gzip, chunked", format!("{p}Transfer-Encoding: gzip, chunked\r\n\r\n5\r\nASK{{}}\r\n0\r\n\r\n")),
+        ("TE chunked, gzip", format!("{p}Transfer-Encoding: chunked, gzip\r\n\r\n5\r\nASK{{}}\r\n0\r\n\r\n")),
+        ("TE chunked twice", format!("{p}Transfer-Encoding: chunked, chunked\r\n\r\n5\r\nASK{{}}\r\n0\r\n\r\n")),
+        ("TE identity", format!("{p}Transfer-Encoding: identity\r\n\r\n")),
+        ("TE chunked + TE identity", format!(
+            "{p}Transfer-Encoding: chunked\r\nTransfer-Encoding: identity\r\n\r\n5\r\nASK{{}}\r\n0\r\n\r\n"
+        )),
+        ("TE in HTTP/1.0", "POST /sparql HTTP/1.0\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nASK{}\r\n0\r\n\r\n".to_string()),
+        // Chunk sizes that are not bare hex digits (RFC 9112 §7.1).
+        ("chunk +5", format!("{p}Transfer-Encoding: chunked\r\n\r\n+5\r\nASK{{}}\r\n0\r\n\r\n")),
+        ("chunk -5", format!("{p}Transfer-Encoding: chunked\r\n\r\n-5\r\nASK{{}}\r\n0\r\n\r\n")),
+        ("chunk 0x5", format!("{p}Transfer-Encoding: chunked\r\n\r\n0x5\r\nASK{{}}\r\n0\r\n\r\n")),
+        ("chunk ' 5'", format!("{p}Transfer-Encoding: chunked\r\n\r\n 5\r\nASK{{}}\r\n0\r\n\r\n")),
+        ("chunk empty", format!("{p}Transfer-Encoding: chunked\r\n\r\n;x\r\nASK{{}}\r\n0\r\n\r\n")),
+        // Malformed header lines (RFC 9112 §5.1, §5.2).
+        ("space before colon", format!("{p}Content-Length : 5\r\n\r\nASK{{}}")),
+        ("tab before colon", format!("{p}Content-Length\t: 5\r\n\r\nASK{{}}")),
+        ("no colon", format!("{p}X-Flag\r\nContent-Length: 5\r\n\r\nASK{{}}")),
+        ("empty name", format!("{p}: x\r\nContent-Length: 5\r\n\r\nASK{{}}")),
+        ("space in name", format!("{p}X Flag: 1\r\nContent-Length: 5\r\n\r\nASK{{}}")),
+        ("obs-fold", format!(
+            "{p}Content-Length: {}\r\n Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n{SMUGGLED}",
+            5 + SMUGGLED.len()
+        )),
+    ];
+    for (name, raw) in &cases {
+        let resp = http(srv.addr, raw.as_bytes());
+        assert!(resp.starts_with("HTTP/1.1 400"), "{name}: {resp:?}");
+        assert_eq!(
+            responses(&resp),
+            1,
+            "{name}: one response, then closed: {resp:?}"
+        );
+    }
+}
+
+/// The legitimate neighbours of the refused framings are still served.
+#[test]
+fn well_formed_framing_is_served() {
+    let srv = serve(HttpOptions::default());
+    let p =
+        "POST /sparql HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/sparql-query\r\n\
+             Connection: close\r\n";
+    let cases: Vec<(&str, String)> = vec![
+        ("CL", format!("{p}Content-Length: 5\r\n\r\nASK{{}}")),
+        ("identical dup CL", format!("{p}Content-Length: 5\r\nContent-Length: 5\r\n\r\nASK{{}}")),
+        ("TE chunked", format!("{p}Transfer-Encoding: chunked\r\n\r\n5\r\nASK{{}}\r\n0\r\n\r\n")),
+        ("TE Chunked", format!("{p}Transfer-Encoding: Chunked\r\n\r\n5\r\nASK{{}}\r\n0\r\n\r\n")),
+        ("TE chunked,", format!("{p}Transfer-Encoding: chunked, \r\n\r\n5\r\nASK{{}}\r\n0\r\n\r\n")),
+        ("chunk extensions", format!(
+            "{p}Transfer-Encoding: chunked\r\n\r\n2;a=1\r\nAS\r\n003 ;b\r\nK{{}}\r\n0\r\nX-T: t\r\n\r\n"
+        )),
+        ("upper-case hex", format!("{p}Transfer-Encoding: chunked\r\n\r\nA\r\nASK{{}}     \r\n0\r\n\r\n")),
+        ("LF line ends", "POST /sparql HTTP/1.1\nHost: localhost\nContent-Type: application/sparql-query\n\
+                          Connection: close\nContent-Length: 5\n\nASK{}"
+            .to_string()),
+        ("HTAB in a value", format!("{p}X-Note: a\tb\r\nContent-Length: 5\r\n\r\nASK{{}}")),
+        ("no space after colon", format!("{p}Content-Length:5\r\n\r\nASK{{}}")),
+    ];
+    for (name, raw) in &cases {
+        let resp = http(srv.addr, raw.as_bytes());
+        assert!(resp.starts_with("HTTP/1.1 200"), "{name}: {resp:?}");
+        assert!(
+            resp.contains("\"boolean\""),
+            "{name}: the ASK ran: {resp:?}"
+        );
+    }
+}
+
+// --- control characters in header lines (robust#14) ------------------------------
+
+/// A header line with a bare CR, NUL or another control character (HTAB
+/// excepted) is refused with `400`, the response carries no bare CR, and
+/// the connection is closed.
+#[test]
+fn control_characters_in_header_lines_are_refused() {
+    let srv = serve(HttpOptions::default());
+    let cases: Vec<(&str, &[u8])> = vec![
+        // A CORS preflight used to reflect this value into a response header.
+        ("bare CR (preflight)", b"OPTIONS /sparql HTTP/1.1\r\nHost: localhost\r\nOrigin: http://w\r\n\
+           Access-Control-Request-Method: POST\r\nAccess-Control-Request-Headers: a\rX-Evil: 1\r\n\r\n"),
+        ("bare CR", b"GET /status HTTP/1.1\r\nHost: localhost\r\nX-A: a\rb\r\n\r\n"),
+        ("CR CR LF", b"GET /status HTTP/1.1\r\nHost: localhost\r\nX-A: a\r\r\n\r\n"),
+        ("NUL", b"GET /status HTTP/1.1\r\nHost: localhost\r\nX-A: a\0b\r\n\r\n"),
+        ("SOH", b"GET /status HTTP/1.1\r\nHost: localhost\r\nX-A: a\x01b\r\n\r\n"),
+        ("ESC", b"GET /status HTTP/1.1\r\nHost: localhost\r\nX-A: a\x1b[31mb\r\n\r\n"),
+        ("DEL", b"GET /status HTTP/1.1\r\nHost: localhost\r\nX-A: a\x7fb\r\n\r\n"),
+        ("NUL in a name", b"GET /status HTTP/1.1\r\nHost: localhost\r\nX\0A: b\r\n\r\n"),
+        ("bare CR in the request line", b"GET /status\rX HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+        ("NUL in a trailer", b"POST /sparql HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/sparql-query\r\n\
+           Transfer-Encoding: chunked\r\n\r\n5\r\nASK{}\r\n0\r\nX-T: a\0b\r\n\r\n"),
+    ];
+    for (name, raw) in &cases {
+        let resp = http(srv.addr, raw);
+        assert!(resp.starts_with("HTTP/1.1 400"), "{name}: {resp:?}");
+        assert_eq!(
+            responses(&resp),
+            1,
+            "{name}: one response, then closed: {resp:?}"
+        );
+        let bare_cr = resp
+            .as_bytes()
+            .windows(2)
+            .any(|w| w[0] == b'\r' && w[1] != b'\n');
+        assert!(!bare_cr, "{name}: no bare CR in the response: {resp:?}");
+    }
 }
 
 // --- TLS: the handshake and the head under the head deadline (http#3) -----------
