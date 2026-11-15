@@ -83,15 +83,29 @@
 //! since the triples a replay restores may still name it. Rollback replays
 //! it newest-first and deletes it in one batch with the terms that are
 //! unreferenced afterwards ([`rollback_keeping_journal`](RocksStore::rollback_keeping_journal)).
+//!
 //! If the process dies with a journal present (an uncommitted transaction or
-//! statement, or a rollback cut short), the next open replays it before
-//! anything else — so after a crash no uncommitted write survives — and the
-//! `Database` deletes it with the terms the replay left unreferenced
-//! (`RocksStore::open_keeping_journal`; [`RocksStore::open`] alone deletes
-//! it at once). Replaying is idempotent
-//! (each record sets one key present or absent), so a replay cut short is
-//! simply repeated. Each step of a crash recovery is therefore complete or
-//! repeated: no window leaves an orphan term.
+//! statement, or a rollback cut short), the next open undoes it before
+//! anything else — so after a crash no uncommitted write survives — in
+//! bounded chunks: the newest 65,536 records (`REPLAY_CHUNK`) at a time, read with a
+//! reverse iterator, are undone, then deleted from the journal in one batch
+//! that also writes their reclamation candidates (the terms of the triples
+//! and quads they removed, and the terms recorded as written new) to the
+//! pending range of the `meta` CF (`\0reclaim-pending\0` ‖ space tag ‖
+//! be32(id), one key per term). The journal left on disk is thus always an
+//! older prefix, and the open holds one chunk of records at a time however
+//! long the journal is (an auto-commit `gadd` journals a record per triple
+//! and per new term). Replaying is idempotent (each record sets one key
+//! present or absent), so a chunk cut short is simply repeated. The
+//! `Database` then checks the pending candidates in bounded batches and
+//! deletes each batch from the range in one batch with the terms of it
+//! nothing references ([`pending_reclaim`](RocksStore::pending_reclaim),
+//! [`settle_pending`](RocksStore::settle_pending)) before it serves the
+//! database. Each step of a crash recovery is therefore complete or
+//! repeated: no window leaves an orphan term. (A binary that predates the
+//! pending range ignores it: the candidates then stay allocated until
+//! `gcompact --reclaim`.) The recovery costs about one write batch per
+//! record, as the statement did.
 //!
 //! A record is 18 bytes: the undo op (`+` re-insert, `-` remove), a kind
 //! byte, 4 bytes, then the triple's three ids. Kind `0` is a default-graph
@@ -223,6 +237,100 @@ const REC_TERM: u8 = 2;
 /// (their keys are written again by the next journal, so the deletes
 /// collapse in the memtable); a longer one is cleared with one range delete.
 const POINT_CLEAR_MAX: u64 = 1024;
+/// `meta` CF key prefix of the reclamation candidates a journal replay at
+/// open has left (see the module docs): `PENDING_PREFIX ‖ space tag ‖
+/// be32(id)`, with an empty value — one key per term, however many records
+/// named it.
+const PENDING_PREFIX: &[u8] = b"\x00reclaim-pending\x00";
+/// The journal records a replay at open holds and undoes at once: each
+/// such chunk, newest first, is deleted from the journal in one batch with
+/// its reclamation candidates (see the module docs).
+const REPLAY_CHUNK: usize = 65_536;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: the [`REPLAY_CHUNK`] of replays on this thread (0: the
+    /// constant).
+    pub(crate) static REPLAY_CHUNK_FOR_TEST: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    /// Test-only: the most journal records a replay at open on this thread
+    /// held at once.
+    pub(crate) static REPLAY_MAX_HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Test-only failpoint: a replay at open on this thread stops (as if the
+    /// process died) after this many chunks.
+    pub(crate) static REPLAY_STOP_AFTER_CHUNKS: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The key of the pending reclamation candidate `(space, id)`.
+fn pending_key(space: TermSpace, id: u32) -> Vec<u8> {
+    let mut key = PENDING_PREFIX.to_vec();
+    key.push(space.tag());
+    key.extend_from_slice(&id.to_be_bytes());
+    key
+}
+
+/// One journal record `(undo op, kind, graph or term tag, triple)` decoded
+/// from its value (see the module docs).
+fn decode_record(v: &[u8]) -> std::result::Result<(u8, u8, u32, IdTriple), String> {
+    let valid = v.len() == 18
+        && matches!(v[0], UNDO_INSERT | UNDO_REMOVE)
+        && match v[1] {
+            REC_TERM => v[0] == UNDO_REMOVE && TermSpace::from_tag(v[2]).is_some(),
+            _ => true,
+        };
+    if !valid {
+        return Err("corrupt rocksdb undo journal record".to_string());
+    }
+    // Kind byte 1 is a quad; any other but a term record is a default-graph
+    // triple (as every earlier binary read it).
+    let kind = match v[1] {
+        REC_QUAD | REC_TERM => v[1],
+        _ => REC_TRIPLE,
+    };
+    let tag = match kind {
+        REC_TERM => u32::from(v[2]),
+        _ => de(&v[2..6]),
+    };
+    Ok((
+        v[0],
+        kind,
+        tag,
+        IdTriple::new(de(&v[6..10]), de(&v[10..14]), de(&v[14..18])),
+    ))
+}
+
+/// The dictionary terms undoing record `(op, kind, tag, t)` may leave
+/// unreferenced: those of an undone insert, and a term written new.
+fn record_candidates(
+    op: u8,
+    kind: u8,
+    tag: u32,
+    t: IdTriple,
+    out: &mut impl Extend<(TermSpace, u32)>,
+) {
+    if kind == REC_TERM {
+        if let Some(space) = TermSpace::from_tag(tag as u8) {
+            out.extend([(space, t.sub)]);
+        }
+        return;
+    }
+    if op == UNDO_REMOVE {
+        let obj = if is_literal_id(t.obj) {
+            TermSpace::Literal
+        } else {
+            TermSpace::Entity
+        };
+        out.extend([
+            (TermSpace::Entity, t.sub),
+            (TermSpace::Predicate, t.pred),
+            (obj, t.obj),
+        ]);
+        if kind == REC_QUAD {
+            out.extend([(TermSpace::Entity, tag)]);
+        }
+    }
+}
 
 /// The key of journal record `seq`.
 fn journal_key(seq: u64) -> Vec<u8> {
@@ -520,6 +628,10 @@ pub struct RocksStore {
     /// Terms of the triples and quads a journal replay removed (see
     /// [`take_replayed`](Self::take_replayed)).
     replayed: Mutex<Vec<(TermSpace, u32)>>,
+    /// Whether the `meta` CF may hold pending reclamation candidates (left
+    /// by a journal replay at open; see
+    /// [`pending_reclaim`](Self::pending_reclaim)).
+    pending: AtomicBool,
     /// Every read fails (see [`RocksStore::debug_fail_reads`]).
     fail_reads: AtomicBool,
     /// The write batches written since a write hook was installed, and the
@@ -620,22 +732,19 @@ impl RocksStore {
     }
 
     /// [`open`](Self::open) with explicit tuning.
+    ///
+    /// A journal left behind (by a process that died in a transaction or
+    /// statement) is undone first, in bounded chunks; the dictionary terms
+    /// the undo may have left unreferenced are kept in the pending range
+    /// until they are checked and freed ([`pending_reclaim`](Self::pending_reclaim),
+    /// [`settle_pending`](Self::settle_pending), or
+    /// [`take_replayed`](Self::take_replayed)), so no crash leaves them
+    /// behind as orphans (see the module docs).
     pub fn open_with<P: AsRef<Path>>(path: P, tuning: &RocksTuning) -> Result<RocksStore> {
-        RocksStore::open_inner(path.as_ref(), tuning, false)
+        RocksStore::open_inner(path.as_ref(), tuning)
     }
 
-    /// [`open_with`](Self::open_with), but a journal left behind (by a
-    /// process that died in a transaction or statement) is only replayed:
-    /// it stays on disk, to be deleted by
-    /// [`commit_journal_with`](Self::commit_journal_with) in the same batch
-    /// as the dictionary terms the replay left unreferenced — what a
-    /// `Database` does once it has checked them, so that no crash leaves
-    /// them behind as orphans. Triple and quad writes are refused until then.
-    pub(crate) fn open_keeping_journal(path: &Path, tuning: &RocksTuning) -> Result<RocksStore> {
-        RocksStore::open_inner(path, tuning, true)
-    }
-
-    fn open_inner(path: &Path, tuning: &RocksTuning, keep_journal: bool) -> Result<RocksStore> {
+    fn open_inner(path: &Path, tuning: &RocksTuning) -> Result<RocksStore> {
         let mut db_opts = Options::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
@@ -663,6 +772,7 @@ impl RocksStore {
             error: Mutex::new(None),
             journal: Mutex::new(Journal::Off),
             replayed: Mutex::new(Vec::new()),
+            pending: AtomicBool::new(true),
             fail_reads: AtomicBool::new(false),
             writes: AtomicU64::new(0),
             write_hook: Mutex::new(None),
@@ -672,17 +782,12 @@ impl RocksStore {
         store.load_counters()?;
         // A journal left behind is an uncommitted transaction or statement
         // (or a rollback cut short) of a process that died: undo it before
-        // anything reads. The replay reloads the counters once it has run.
-        if keep_journal {
-            if store.replay_records_on_disk()? {
-                *store.journal_state() = Journal::Stale {
-                    replay: false,
-                    why: "replayed at open; not deleted yet".into(),
-                };
-            }
-        } else {
-            store.replay_journal()?;
-        }
+        // anything reads, in bounded chunks whose candidates are kept in the
+        // pending range (see the module docs). The replay reloads the
+        // counters once it has run.
+        store.recover_journal()?;
+        let pending = store.pending_reclaim(1)?;
+        store.pending.store(!pending.is_empty(), Ordering::SeqCst);
         store.sync_wal()?;
         Ok(store)
     }
@@ -888,9 +993,10 @@ impl RocksStore {
     /// terms still stored. Without a journal the terms are deleted alone.
     ///
     /// The same call finishes a journal that was replayed but kept — by
-    /// [`rollback_keeping_journal`](Self::rollback_keeping_journal) or an
-    /// `open_keeping_journal` — deleting it
-    /// with `frees`, the terms the replay left unreferenced.
+    /// [`rollback_keeping_journal`](Self::rollback_keeping_journal) —
+    /// deleting it with `frees`, the terms the replay left unreferenced.
+    /// (A journal recovered at open is deleted chunk by chunk by the open
+    /// itself, its candidates kept in the pending range.)
     pub fn commit_journal_with(&mut self, frees: &[(TermSpace, u32)]) -> Result<()> {
         let records = match &*self.journal_state() {
             Journal::Off => None,
@@ -933,8 +1039,72 @@ impl RocksStore {
     /// a rollback, or the retry that finished a replay cut short. The
     /// database takes them at open, after every statement and at every
     /// commit, and frees the ones nothing references.
+    ///
+    /// The candidates a replay at open left in the pending range are handed
+    /// over too — all of them at once, deleted from the range here: a
+    /// `Database` takes them in bounded batches instead, deleted with the
+    /// terms it frees ([`pending_reclaim`](Self::pending_reclaim),
+    /// [`settle_pending`](Self::settle_pending)). An error reading or
+    /// deleting them leaves them pending.
     pub fn take_replayed(&self) -> Vec<(TermSpace, u32)> {
-        std::mem::take(&mut *self.replayed.lock().unwrap_or_else(PoisonError::into_inner))
+        let mut out =
+            std::mem::take(&mut *self.replayed.lock().unwrap_or_else(PoisonError::into_inner));
+        if self.pending.load(Ordering::SeqCst) {
+            if let Ok(pending) = self.pending_reclaim(usize::MAX) {
+                if self.settle_pending(&pending, &[]).is_ok() {
+                    out.extend(pending);
+                }
+            }
+        }
+        out
+    }
+
+    /// The first `limit` reclamation candidates (sorted by space tag, then
+    /// id) a journal replay at open left in the pending range: the terms of
+    /// the triples and quads it removed, and the terms the journal recorded
+    /// as written new. They stay pending — a crash keeps them for the next
+    /// open — until [`settle_pending`](Self::settle_pending) deletes them.
+    pub fn pending_reclaim(&self, limit: usize) -> Result<Vec<(TermSpace, u32)>> {
+        let mut out = Vec::new();
+        if limit == 0 {
+            return Ok(out);
+        }
+        self.try_scan(CF_META, PENDING_PREFIX, |k, _| {
+            let rest = &k[PENDING_PREFIX.len()..];
+            let space = (rest.len() == 5)
+                .then(|| TermSpace::from_tag(rest[0]))
+                .flatten()
+                .ok_or_else(|| "corrupt rocksdb pending reclamation key".to_string())?;
+            out.push((space, de(&rest[1..5])));
+            Ok(out.len() < limit)
+        })
+        .map_err(|e| e.into_error("pending reclamation"))?;
+        Ok(out)
+    }
+
+    /// Delete the pending reclamation candidates `taken` (from
+    /// [`pending_reclaim`](Self::pending_reclaim)) and the dictionary terms
+    /// `frees` (those of them nothing references) in one atomic batch: a
+    /// crash before it leaves both as they were, to be checked again.
+    pub fn settle_pending(
+        &self,
+        taken: &[(TermSpace, u32)],
+        frees: &[(TermSpace, u32)],
+    ) -> Result<()> {
+        let mut wb = WriteBatch::default();
+        let meta = self.cf(CF_META);
+        for (space, id) in taken {
+            wb.delete_cf(meta, pending_key(*space, *id));
+        }
+        let dict = self.cf(CF_DICT);
+        for (space, id) in frees {
+            wb.delete_cf(dict, tag1(space.tag(), *id));
+        }
+        if wb.is_empty() {
+            return Ok(());
+        }
+        self.write(wb)
+            .map_err(|e| GStoreError::Database(format!("rocksdb write (pending reclamation): {e}")))
     }
 
     /// Roll back the journaled transaction: replay its undo journal newest
@@ -1102,35 +1272,115 @@ impl RocksStore {
     fn journal_records(&self) -> Result<Vec<(u8, u8, u32, IdTriple)>> {
         let mut out = Vec::new();
         self.try_scan(CF_META, JOURNAL_PREFIX, |_, v| {
-            let valid = v.len() == 18
-                && matches!(v[0], UNDO_INSERT | UNDO_REMOVE)
-                && match v[1] {
-                    REC_TERM => v[0] == UNDO_REMOVE && TermSpace::from_tag(v[2]).is_some(),
-                    _ => true,
-                };
-            if !valid {
-                return Err("corrupt rocksdb undo journal record".to_string());
-            }
-            // Kind byte 1 is a quad; any other but a term record is a
-            // default-graph triple (as every earlier binary read it).
-            let kind = match v[1] {
-                REC_QUAD | REC_TERM => v[1],
-                _ => REC_TRIPLE,
-            };
-            let tag = match kind {
-                REC_TERM => u32::from(v[2]),
-                _ => de(&v[2..6]),
-            };
-            out.push((
-                v[0],
-                kind,
-                tag,
-                IdTriple::new(de(&v[6..10]), de(&v[10..14]), de(&v[14..18])),
-            ));
+            out.push(decode_record(v)?);
             Ok(true)
         })
         .map_err(|e| e.into_error("journal"))?;
         Ok(out)
+    }
+
+    /// Recover the journal a process that died left behind (at open):
+    /// undo it newest first in chunks of [`REPLAY_CHUNK`] records, read
+    /// with a reverse iterator below the previous chunk. Each chunk's
+    /// records are deleted, once undone, in one batch with its reclamation
+    /// candidates (written to the pending range, one key per term), so the
+    /// journal left on disk is always an older prefix: a crash during the
+    /// recovery resumes where it stopped, and the replay holds one chunk of
+    /// records at a time, whatever the journal's length (a `gadd` of
+    /// millions of triples journals a record per triple and per new term).
+    /// The counters are reloaded afterwards, whatever it got through.
+    fn recover_journal(&mut self) -> Result<()> {
+        let recovered = self.recover_journal_chunks();
+        let reloaded = self.load_counters();
+        recovered?;
+        reloaded
+    }
+
+    fn recover_journal_chunks(&mut self) -> Result<()> {
+        #[cfg(test)]
+        let chunk_len = match REPLAY_CHUNK_FOR_TEST.with(std::cell::Cell::get) {
+            0 => REPLAY_CHUNK,
+            n => n,
+        };
+        #[cfg(not(test))]
+        let chunk_len = REPLAY_CHUNK;
+        let mut upper = JOURNAL_END.to_vec();
+        #[cfg(test)]
+        let mut chunks = 0usize;
+        loop {
+            // The newest records below `upper`, newest first.
+            let mut records: Vec<(Vec<u8>, (u8, u8, u32, IdTriple))> = Vec::new();
+            {
+                let mut it = self.raw_iter(CF_META, Some(upper.clone()));
+                it.seek_to_last();
+                while records.len() < chunk_len {
+                    let Some((k, v)) = it.item() else { break };
+                    if !k.starts_with(JOURNAL_PREFIX) {
+                        break;
+                    }
+                    let rec = decode_record(v).map_err(GStoreError::Database)?;
+                    records.push((k.to_vec(), rec));
+                    it.prev();
+                }
+                it.status().map_err(|e| {
+                    GStoreError::Database(format!("rocksdb read (journal): {}", e.into_string()))
+                })?;
+            }
+            let Some((oldest, _)) = records.last() else {
+                return Ok(());
+            };
+            let oldest = oldest.clone();
+            #[cfg(test)]
+            REPLAY_MAX_HELD.with(|m| m.set(m.get().max(records.len())));
+            let mut candidates = std::collections::HashSet::new();
+            for (_, (op, kind, tag, t)) in records {
+                record_candidates(op, kind, tag, t, &mut candidates);
+                self.apply_undo(op, kind, tag, t)?;
+            }
+            #[cfg(test)]
+            {
+                chunks += 1;
+                if REPLAY_STOP_AFTER_CHUNKS.with(std::cell::Cell::get) == Some(chunks - 1) {
+                    return Err(GStoreError::Database(
+                        "rocksdb journal recovery: injected stop".into(),
+                    ));
+                }
+            }
+            let mut wb = WriteBatch::default();
+            let meta = self.cf(CF_META);
+            wb.delete_range_cf(meta, &oldest, &upper);
+            for (space, id) in candidates {
+                wb.put_cf(meta, pending_key(space, id), b"");
+            }
+            self.write(wb).map_err(|e| {
+                GStoreError::Database(format!("rocksdb write (journal recovery): {e}"))
+            })?;
+            self.pending.store(true, Ordering::SeqCst);
+            upper = oldest;
+        }
+    }
+
+    /// Undo one journal record `(op, kind, tag, t)` (idempotent: it sets one
+    /// key present or absent).
+    fn apply_undo(&mut self, op: u8, kind: u8, tag: u32, t: IdTriple) -> Result<()> {
+        let insert = op == UNDO_INSERT;
+        match kind {
+            REC_TERM => {}
+            REC_QUAD => {
+                self.quad_write(tag, t, insert)?;
+            }
+            _ => {
+                let res = if insert {
+                    self.write_insert(t)
+                } else {
+                    self.write_remove(t)
+                };
+                res.map_err(|e| {
+                    GStoreError::Database(format!("rocksdb write (journal replay): {e}"))
+                })?;
+            }
+        }
+        Ok(())
     }
 
     /// Undo every journaled mutation (newest first), then delete the journal.
@@ -1167,44 +1417,10 @@ impl RocksStore {
         // and the retry that completes it adds them once.
         let mut terms = Vec::new();
         for (op, kind, tag, t) in &records {
-            if *kind == REC_TERM {
-                if let Some(space) = TermSpace::from_tag(*tag as u8) {
-                    terms.push((space, t.sub));
-                }
-                continue;
-            }
-            if *op == UNDO_REMOVE {
-                let obj = if is_literal_id(t.obj) {
-                    TermSpace::Literal
-                } else {
-                    TermSpace::Entity
-                };
-                terms.push((TermSpace::Entity, t.sub));
-                terms.push((TermSpace::Predicate, t.pred));
-                terms.push((obj, t.obj));
-                if *kind == REC_QUAD {
-                    terms.push((TermSpace::Entity, *tag));
-                }
-            }
+            record_candidates(*op, *kind, *tag, *t, &mut terms);
         }
         for (op, kind, tag, t) in records.into_iter().rev() {
-            let insert = op == UNDO_INSERT;
-            match kind {
-                REC_TERM => {}
-                REC_QUAD => {
-                    self.quad_write(tag, t, insert)?;
-                }
-                _ => {
-                    let res = if insert {
-                        self.write_insert(t)
-                    } else {
-                        self.write_remove(t)
-                    };
-                    res.map_err(|e| {
-                        GStoreError::Database(format!("rocksdb write (journal replay): {e}"))
-                    })?;
-                }
-            }
+            self.apply_undo(op, kind, tag, t)?;
         }
         self.replayed
             .lock()
@@ -2718,6 +2934,110 @@ mod tests {
             let w = warning.unwrap_or_else(|| panic!("{bad} was taken silently"));
             assert!(w.contains(BLOCK_CACHE_ENV) && w.contains(bad), "{w}");
         }
+    }
+
+    /// The store at `dir` with a statement journaled but never ended (the
+    /// process died): `n` triples inserted, each with a new subject term.
+    /// Returns the triples.
+    fn crashed_statement(dir: &std::path::Path, n: u32) -> Vec<IdTriple> {
+        let mut store = RocksStore::open_with(dir, &RocksTuning::rocksdb_defaults()).unwrap();
+        assert!(store.insert(IdTriple::new(1, 1, 2)), "a committed triple");
+        store.begin_journal().unwrap();
+        let mut added = Vec::new();
+        for i in 0..n {
+            let t = IdTriple::new(100 + i, 1, 2);
+            store
+                .put_new_terms(&[(TermSpace::Entity, 100 + i, "<http://ex/new>")])
+                .unwrap();
+            assert!(store.insert(t));
+            added.push(t);
+        }
+        assert_eq!(store.journal_records().unwrap().len(), 2 * n as usize);
+        added
+    }
+
+    /// A journal a crash left is recovered at open in chunks (review of
+    /// round 1: the open read the whole journal into memory, collected
+    /// three or four candidates per record, and deleted the journal only
+    /// after the whole replay): at most one chunk of records is held at a
+    /// time, the journal is gone afterwards, and the candidates — one per
+    /// term — wait in the pending range until they are settled.
+    #[test]
+    fn a_long_journal_is_recovered_in_bounded_chunks() {
+        struct Gone(std::path::PathBuf);
+        impl Drop for Gone {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Gone(scratch("bounded_recovery"));
+        let n = 1000u32;
+        let added = crashed_statement(&dir.0, n);
+        REPLAY_CHUNK_FOR_TEST.with(|c| c.set(64));
+        REPLAY_MAX_HELD.with(|m| m.set(0));
+        let store = RocksStore::open_with(&dir.0, &RocksTuning::rocksdb_defaults()).unwrap();
+        REPLAY_CHUNK_FOR_TEST.with(|c| c.set(0));
+        let held = REPLAY_MAX_HELD.with(std::cell::Cell::get);
+        assert!(
+            (1..=64).contains(&held),
+            "the recovery held {held} records at once (journal: {})",
+            2 * n
+        );
+        assert!(store.journal_records().unwrap().is_empty());
+        assert!(store.journal_error().is_none());
+        assert_eq!(store.triple_count, 1, "the statement is undone");
+        assert!(added.iter().all(|t| store.contains(*t) == Ok(false)));
+        let pending = store.pending_reclaim(usize::MAX).unwrap();
+        // Each new subject once, and the predicate and object of the
+        // undone inserts once each.
+        assert_eq!(pending.len(), n as usize + 2, "{:?}", &pending[..4]);
+        assert!(pending.contains(&(TermSpace::Entity, 100)));
+        assert!(pending.contains(&(TermSpace::Predicate, 1)));
+        // Settled in batches: gone from the range with the terms freed.
+        let first = store.pending_reclaim(10).unwrap();
+        assert_eq!(first.len(), 10);
+        store.settle_pending(&first, &first).unwrap();
+        assert_eq!(
+            store.pending_reclaim(usize::MAX).unwrap().len(),
+            n as usize - 8
+        );
+        let rest = store.take_replayed();
+        assert_eq!(rest.len(), n as usize - 8);
+        assert!(store.pending_reclaim(usize::MAX).unwrap().is_empty());
+    }
+
+    /// A recovery cut short (the process died again) resumes where it
+    /// stopped: the journal left is an older prefix of the original, the
+    /// pending range keeps the candidates of the chunks already undone, and
+    /// the next open finishes with the same result as an uninterrupted one.
+    #[test]
+    fn a_recovery_cut_short_resumes_where_it_stopped() {
+        struct Gone(std::path::PathBuf);
+        impl Drop for Gone {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Gone(scratch("resumed_recovery"));
+        let n = 500u32;
+        let added = crashed_statement(&dir.0, n);
+        REPLAY_CHUNK_FOR_TEST.with(|c| c.set(100));
+        REPLAY_STOP_AFTER_CHUNKS.with(|c| c.set(Some(3)));
+        let failed = RocksStore::open_with(&dir.0, &RocksTuning::rocksdb_defaults());
+        REPLAY_STOP_AFTER_CHUNKS.with(|c| c.set(None));
+        assert!(failed.is_err(), "the injected stop");
+        drop(failed);
+        {
+            // Three chunks were undone and deleted; the fourth was undone
+            // but not deleted (it is replayed again).
+            let store = RocksStore::open_with(&dir.0, &RocksTuning::rocksdb_defaults()).unwrap();
+            assert!(store.journal_records().unwrap().is_empty());
+            assert_eq!(store.triple_count, 1);
+            assert!(added.iter().all(|t| store.contains(*t) == Ok(false)));
+            let pending = store.pending_reclaim(usize::MAX).unwrap();
+            assert_eq!(pending.len(), n as usize + 2);
+        }
+        REPLAY_CHUNK_FOR_TEST.with(|c| c.set(0));
     }
 
     /// A rollback that keeps its journal (for the batch that deletes it

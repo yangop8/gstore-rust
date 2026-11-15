@@ -118,6 +118,10 @@ const LEGACY_SUFFIX: &str = ".legacy";
 /// The lock file beside a database directory that a restore creating the
 /// database holds ([`Database::lock_restore_target`]).
 const RESTORE_LOCK_SUFFIX: &str = ".restore-lock";
+/// The reclamation candidates [`Database::drain_rocks_pending`] checks and
+/// frees per batch.
+#[cfg(feature = "rocksdb")]
+const PENDING_BATCH: usize = 65_536;
 
 /// What a restore holds from before it stages a backup until the staged copy
 /// is installed ([`Database::lock_restore_target`]): the target directory's
@@ -1391,12 +1395,11 @@ impl Database {
                 rocks_dir.display()
             )));
         }
-        // A journal a crash left behind is replayed but kept: it is deleted
-        // below, in one batch with the terms the replay left unreferenced.
-        let rocks = RocksStore::open_keeping_journal(
-            &rocks_dir,
-            &crate::backend::rocks::RocksTuning::default(),
-        )?;
+        // A journal a crash left behind is undone by the open, in bounded
+        // chunks; the terms the undo may have left unreferenced wait in the
+        // store's pending range (see `drain_rocks_pending` below).
+        let rocks =
+            RocksStore::open_with(&rocks_dir, &crate::backend::rocks::RocksTuning::default())?;
         let (dict, named, name) = if rocks.get_meta(rocks_layout::LAYOUT_KEY)?.is_some() {
             let dict = rocks_layout::dictionary_from_terms(rocks.load_terms()?)?;
             let named = rocks_layout::named_from_quads(rocks.quads()?);
@@ -1416,13 +1419,12 @@ impl Database {
         db.dir_lock = Some(lock);
         // A transaction or statement a crash interrupted was undone by the
         // open: the terms of what it had inserted (and the terms it wrote
-        // new) are reclamation candidates. The unreferenced ones leave the
-        // `dict` CF in the batch that deletes the journal — a crash before
-        // it replays the journal again — so none is left as an orphan.
-        db.note_rocks_replayed();
-        let dead = db.committed_dead();
-        db.rocks_commit_journal_with(&dead)?;
-        db.free_dead(dead, true);
+        // new) are reclamation candidates, kept in the store's pending
+        // range. They are checked in bounded batches, each deleted from the
+        // range in one batch with the `dict` CF entries of its unreferenced
+        // terms — a crash before it keeps them pending — so none is left as
+        // an orphan.
+        db.drain_rocks_pending()?;
         db.commit_point()?;
         // The VS-tree is not rebuilt at open (it walks every entity's edges
         // in RocksDB): queries evaluate without it until `rebuild_index()`.
@@ -2291,6 +2293,61 @@ impl Database {
                     });
                 }
             }
+        }
+    }
+
+    /// RocksDB: check the reclamation candidates a journal replay at open
+    /// left in the store's pending range, [`PENDING_BATCH`] at a time, and
+    /// free the ones nothing references: each batch leaves the range in one
+    /// atomic batch with the `dict` CF entries of its dead terms
+    /// (`RocksStore::settle_pending`), then the dictionary retires them.
+    /// Bounded memory however many candidates a long journal left; a crash
+    /// part-way keeps the rest pending for the next open. Called before the
+    /// database serves anything (no transaction, no statement), so no write
+    /// can re-reference a term between its check and its free. Without id
+    /// reclamation the candidates are only dropped; one whose reference
+    /// check fails stays allocated (`gcompact --reclaim` frees it).
+    #[cfg(feature = "rocksdb")]
+    pub(super) fn drain_rocks_pending(&mut self) -> Result<()> {
+        loop {
+            let Some(rocks) = self.store.as_rocks() else {
+                return Ok(());
+            };
+            let batch = rocks.pending_reclaim(PENDING_BATCH)?;
+            if batch.is_empty() {
+                return Ok(());
+            }
+            let mut cands: Vec<crate::dict::TermId> = batch
+                .iter()
+                .map(|&(space, id)| crate::dict::TermId {
+                    space: rocks_layout::dict_space(space),
+                    id,
+                })
+                .collect();
+            cands.sort_unstable();
+            cands.dedup();
+            let dead = if self.reclaims_ids() {
+                let check = self.dead_of(&cands);
+                if !check.failed.is_empty() {
+                    crate::gs_warn!(
+                        "id reclamation: the reference check of {} term(s) a journal replay left \
+                         failed ({}); their ids stay allocated until `gcompact --reclaim`",
+                        check.failed.len(),
+                        check.error.as_deref().unwrap_or("a read error")
+                    );
+                }
+                check.dead
+            } else {
+                Vec::new()
+            };
+            let frees: Vec<_> = dead
+                .iter()
+                .map(|t| (rocks_layout::term_space(t.space), t.id))
+                .collect();
+            if let Some(rocks) = self.store.as_rocks() {
+                rocks.settle_pending(&batch, &frees)?;
+            }
+            self.free_dead(dead, true);
         }
     }
 

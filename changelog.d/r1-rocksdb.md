@@ -36,10 +36,39 @@
   crash between a term and its triple lets the next open free the term. A
   rollback replays the journal (without journaling its own writes) but
   keeps it until the terms it leaves unreferenced are deleted in the same
-  batch as the journal; the open's replay of a journal a crash left does
-  the same. The journal record format
+  batch as the journal. The open's recovery of a journal a crash left
+  keeps those terms in a pending range of the `meta` CF instead (next
+  bullet). The journal record format
   stays readable by older binaries (a term record is a `-` record that an
   older binary replays as a no-op removal plus the same reclamation).
+- **Crash recovery of a long RocksDB journal is bounded and resumable**
+  (round-1 review fix). Journaling every auto-commit import means a crash
+  in a large `gadd` / `batchInsert` / `LOAD` leaves a journal of a record
+  per changed triple plus one per new term. The open used to read the
+  whole journal into memory, collect three or four reclamation candidates
+  per record in two more in-memory lists, replay newest-first, and delete
+  the journal only after the whole replay and term check — so an open
+  that ran out of memory (or was killed) on a 90M-record journal did so
+  again at every open, after redoing all its work. Now the open replays
+  the newest 65,536 records at a time (a reverse iterator below the
+  previous chunk) and, once a chunk is undone, deletes exactly its records
+  in one batch with its candidates, written to a pending range in the
+  `meta` CF (`\0reclaim-pending\0` ‖ space tag ‖ be32(id), one key per
+  term). The journal on disk is always an older prefix: a crash during
+  the recovery resumes where it stopped. The `Database` then checks the
+  pending candidates in batches of 65,536 and deletes each batch from the
+  range together with the `dict` CF entries of its unreferenced terms
+  before it serves the database, so no crash window leaves an orphan term
+  (`RocksStore::pending_reclaim`, `RocksStore::settle_pending`;
+  `RocksStore::take_replayed` hands the pending candidates over too, all
+  at once, for low-level users; the crate-internal `open_keeping_journal`
+  is gone: `open_with` recovers this way). The recovery still costs about
+  one write batch per record, like the statement it undoes. Tests: unit
+  tests `a_long_journal_is_recovered_in_bounded_chunks` and
+  `a_recovery_cut_short_resumes_where_it_stopped` in `src/backend/rocks.rs`
+  (thread-local test knobs for the chunk size, a held-records counter and
+  a stop failpoint), `src/db/rocks_recovery_tests.rs` (a crashed
+  transaction recovered across an interrupted open, no orphan term).
 - **`check_point` no longer flushes RocksDB's memtables on every write**
   (review H-12, gap-rocksdb-exec#2). A save at a RocksDB database's home —
   the servers' `check_point` save after every acknowledged write — is now a
@@ -130,7 +159,18 @@ none
   very large `gadd` / `gsub` / `LOAD` on RocksDB temporarily stores a
   journal as large as its change set; its freed ids are held until its
   end (`remove_sources` keeps only the dead ones between batches, and
-  probes each candidate once when its batch is read and once at the end).
+  probes each candidate once when its batch is read and once at the end);
+  (7) crash recovery at open: the newest 65,536 journal records at a time
+  are undone and deleted in one batch with their reclamation candidates,
+  which go to the new pending range of the `meta` CF
+  (`\0reclaim-pending\0` ‖ space tag ‖ be32(id), empty value); the
+  `Database` settles it in batches of 65,536 before serving. Format
+  registry: an additive `meta` CF key range, no feature bit,
+  `LAYOUT_VERSION` stays `"1"`; a binary that predates it ignores the
+  range, so candidates a crash recovery left there stay allocated until
+  `gcompact --reclaim` (no damage). Cost: memory bounded by the chunk (our
+  buffers) plus RocksDB's memtables; time about one write batch per
+  record, as the statement took; a recovery cut short resumes.
 - docs/REFACTOR_BACKLOG.md: (a) REST `/batchInsert` / `/batchRemove`
   (`http_api.rs` handle_batch) and REST `/upload` into a loaded database
   (`handle_upload`) apply one `try_insert_triple` per triple, each its own
@@ -140,7 +180,12 @@ none
   `rocks_end_statement`, as `insert_sources` does; H-11 asks for every
   auto-commit statement to be journaled; gap-rocksdb-exec#1 follow-up;
   `http_api.rs` is r3-rest-parity's in R3, which should take both
-  handlers). (b) Direct-API
+  handlers). (e) A live rollback of a very large transaction
+  (`rollback_keeping_journal`, and the retry of a failed one) still reads
+  its whole journal into memory and keeps it until its terms are checked;
+  the bounded, resumable chunked replay covers the recovery at open only
+  (round-1 review of the r1-rocksdb journal; the same chunking with the
+  pending range would apply). (b) Direct-API
   multi-triple calls (`insert_data`, `materialize_rdfs`, …) stay atomic
   per triple, and can leave an orphan term if a crash falls between a new
   term and its triple (gap-rocksdb-exec#4 residue; `gcompact --reclaim`
@@ -230,6 +275,23 @@ no behaviour change).
   (`rocks_statement_body` with nothing journaled) and an append of an
   empty vector in `Candidates::take`; the smoke gate was not re-run for
   them.
+
+- **Crash recovery of a long journal (round-1 review fix).** A temporary
+  probe (not committed; test profile, `rocksdb` feature, the box shared
+  with other builds): a `RocksStore` journaling `n` inserts with a new
+  term each (`2n` records), flushed and dropped mid-journal, reopened in a
+  fresh process; open time and the process's peak RSS (`VmHWM`) after the
+  open, base (the in-memory replay) vs branch (the chunked recovery):
+  `n` = 100,000: 2.03 s / 71.6 MB vs 2.45 s / 74.2 MB; `n` = 400,000:
+  9.14 s / 189.5 MB vs 9.71 s / 187.3 MB. At these sizes the peak is
+  dominated by RocksDB's memtables (bounded by its configuration, then
+  flushed), not by the replay's own lists (about 30 MB at 400,000 on
+  base, growing with the journal; one chunk of at most 65,536 records on
+  the branch, checked by the unit test's held-records counter: 64 with a
+  64-record chunk for a 2,000-record journal, 2,000 with the replay
+  unbounded). Time stays linear, about 12 µs per record here. A recovery
+  stopped after three of five chunks resumes and ends in the same state
+  (unit test).
 
 ## Requests/Not yet
 

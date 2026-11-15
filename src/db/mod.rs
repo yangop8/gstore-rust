@@ -69,6 +69,8 @@ mod r4_review_tests;
 pub mod reclaim;
 #[cfg(test)]
 mod review_tests;
+#[cfg(all(test, feature = "rocksdb"))]
+mod rocks_recovery_tests;
 #[cfg(test)]
 mod stream_review_tests;
 pub use load_policy::{LoadPolicy, LoadSource, ServicePolicy};
