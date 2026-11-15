@@ -270,9 +270,11 @@ fn pending_key(space: TermSpace, id: u32) -> Vec<u8> {
     key
 }
 
-/// One journal record `(undo op, kind, graph or term tag, triple)` decoded
-/// from its value (see the module docs).
-fn decode_record(v: &[u8]) -> std::result::Result<(u8, u8, u32, IdTriple), String> {
+/// A decoded journal record: `(undo op, kind, graph or term tag, triple)`.
+type JournalRecord = (u8, u8, u32, IdTriple);
+
+/// One journal record decoded from its value (see the module docs).
+fn decode_record(v: &[u8]) -> std::result::Result<JournalRecord, String> {
     let valid = v.len() == 18
         && matches!(v[0], UNDO_INSERT | UNDO_REMOVE)
         && match v[1] {
@@ -1309,7 +1311,7 @@ impl RocksStore {
         let mut chunks = 0usize;
         loop {
             // The newest records below `upper`, newest first.
-            let mut records: Vec<(Vec<u8>, (u8, u8, u32, IdTriple))> = Vec::new();
+            let mut records: Vec<(Vec<u8>, JournalRecord)> = Vec::new();
             {
                 let mut it = self.raw_iter(CF_META, Some(upper.clone()));
                 it.seek_to_last();
