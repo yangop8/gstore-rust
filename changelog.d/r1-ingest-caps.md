@@ -110,9 +110,14 @@ none
     upload cap (1 GiB) before authentication. Risk of raising it: every
     unauthenticated client may make the server buffer that much per request
     (bounded in total by `request_body_budget`). Upstream behaviour: set it
-    equal to `upload_max_body_size`. Clients that send their credentials in
-    the URL query string (`/file/upload?username=…&password=…`) or an
-    `Authorization` header keep the full upload cap without raising it.
+    equal to `upload_max_body_size`. Clients keep the full upload cap
+    without raising it when their head carries credentials the route reads
+    there: upstream routes (`/file/upload`, `/api`) only `username` /
+    `password` in the URL query string (`/file/upload?username=…&password=…`;
+    an `Authorization` header does not count), the REST payload routes only
+    HTTP Basic or a session token (`Authorization: Bearer`,
+    `X-Session-Token`, `session=` / `token=` in the URL; URL `username=` /
+    `password=` do not count).
   - `upload_max_body_size` — default and shipped value lowered from 1 GiB to
     256 MiB; raise it for larger uploads (and `request_body_budget` with it),
     or use the server-side `build` / `batchInsert` paths or `gbuild` / `gadd`.
@@ -133,9 +138,10 @@ none
   `upload_max_body_size` puts on every HTTP request body need a restart"
   becomes "the HTTP body caps (`upload_max_body_size`,
   `preauth_max_body_size`) and `request_body_budget` need a restart"; note
-  that a large upload must carry its credentials in the URL query string or
-  an `Authorization` header (the SDKs' JSON / form credentials only reach
-  64 MiB).
+  that a large upload must carry its credentials in its head — in the URL
+  query string for `/file/upload` and `/api` (an `Authorization` header does
+  not count there), as HTTP Basic or a session token for the REST payload
+  routes — the SDKs' JSON / form credentials only reach 64 MiB.
 - **docs/REFACTOR_BACKLOG.md**:
   - C-2 (sec#1, gapi#1) remainder — stream a multipart upload to a temporary
     file under `upload_path` once its request is authenticated, instead of

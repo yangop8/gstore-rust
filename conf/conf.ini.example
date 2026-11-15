@@ -215,11 +215,14 @@ upload_path = "./upload/"
 # max body size, 256 MB = 262144 KB(1M=1024KB) = 268435456 B(1KB=1024B)
 # (upstream ships 1 GB = 1073741824). gstore-rust caps every HTTP request body
 # at this size, and lets a request carry this much only when it is
-# authenticated before its body is read: an upload (/file/upload, an /api
-# query, the REST /upload, /update, /build, ...) whose credentials are in the
-# URL query string (username=, password=) or an Authorization header (Basic,
-# or a REST session token). refreshconf applies a new value to the upload
-# operation; the HTTP caps below need a restart.
+# authenticated before its body is read: an upstream upload (/file/upload, an
+# /api query) whose credentials are in the URL query string (username=,
+# password=; an Authorization header does not count there), or a REST upload
+# (/upload, /update, /build, /tquery, /batchInsert, /batchRemove) with HTTP
+# Basic or a session token (Authorization: Bearer, X-Session-Token, or
+# session= / token= in the URL; username= / password= do not count there).
+# refreshconf applies a new value to the upload operation; the HTTP caps
+# below need a restart.
 upload_max_body_size = 268435456
 # (gstore-rust extension) the largest body a request may have before it is
 # authenticated, on every route (64 MB; at most upload_max_body_size). An
