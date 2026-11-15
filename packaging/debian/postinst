@@ -20,6 +20,35 @@ if [ "$1" = "configure" ]; then
         chmod 0750 /var/lib/gstore
         [ -e /var/lib/gstore/conf ] || ln -s /etc/gstore /var/lib/gstore/conf
     fi
+    # >>> first-start root password (tests/packaging_first_start.rs runs
+    # this block). A fresh install gets its own random root password instead
+    # of upstream's shared default 123456, which gserver refuses to serve
+    # (conf.ini's allow_default_root_password): it seeds the user store at the
+    # first start. An upgrade, or a server that already has a user store,
+    # keeps its configuration as it is. The paths can be overridden for tests.
+    GSTORE_PKG_CONF=${GSTORE_PKG_CONF:-/etc/gstore/conf.ini}
+    GSTORE_PKG_DATA=${GSTORE_PKG_DATA:-/var/lib/gstore}
+    if [ -z "$2" ] && [ ! -e "$GSTORE_PKG_DATA/dbhome/users.db" ] \
+        && grep -q '^[[:space:]]*root_password[[:space:]]*=[[:space:]]*"\{0,1\}123456"\{0,1\}[[:space:]]*$' \
+            "$GSTORE_PKG_CONF"; then
+        gstore_pw=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+        if [ ${#gstore_pw} -eq 32 ] && ( umask 077
+            sed "s/^\([[:space:]]*root_password[[:space:]]*=\).*\$/\1\"$gstore_pw\"/" \
+                "$GSTORE_PKG_CONF" >"$GSTORE_PKG_CONF.gstore-new" ); then
+            # Rewritten in place (cat keeps the file's owner and mode); the
+            # copy is private while it exists.
+            cat "$GSTORE_PKG_CONF.gstore-new" >"$GSTORE_PKG_CONF"
+            echo "gstore: root's initial password is a random one, set as root_password in" \
+                "$GSTORE_PKG_CONF (readable by root and the gstore group); change it after" \
+                "the first start (gconsole setpswd, or the /api userPassword operation)."
+        else
+            echo "gstore: could not set a random root password: set root_password in" \
+                "$GSTORE_PKG_CONF before the first start" >&2
+        fi
+        rm -f "$GSTORE_PKG_CONF.gstore-new"
+        unset gstore_pw
+    fi
+    # <<< first-start root password
     chgrp gstore /etc/gstore /etc/gstore/conf.ini
     chmod 0750 /etc/gstore
     chmod 0640 /etc/gstore/conf.ini
