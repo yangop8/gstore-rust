@@ -79,11 +79,14 @@ fn gquery_update_persists_to_disk() {
     remove_when_done(&dir);
     let _ = std::fs::remove_dir_all(&dir);
 
-    Command::new(env!("CARGO_BIN_EXE_gbuild"))
+    // review tests-a#11: gbuild's exit status was ignored (a failed build then
+    // surfaced only as a puzzling gquery failure).
+    let build = Command::new(env!("CARGO_BIN_EXE_gbuild"))
         .arg(&name)
         .arg(small_nt())
         .output()
         .expect("gbuild");
+    assert!(build.status.success(), "gbuild failed: {build:?}");
 
     // Apply an INSERT DATA update.
     let upd = Command::new(env!("CARGO_BIN_EXE_gquery"))
@@ -211,13 +214,29 @@ fn a_closed_stdout_pipe_ends_the_output_quietly() {
         ),
     );
     // The output is gone, but the work was done: a mutating tool finished.
+    // review tests-a#11: gadd used to re-add small.nt itself (0 new triples),
+    // so "the work was done" was never checked; it adds two new triples now
+    // and the database must hold them.
+    let before = gstore::Database::open(&db).unwrap().triple_num();
+    let add = work.join("add.nt");
+    std::fs::write(
+        &add,
+        "<http://ex/epipe1> <http://ex/p> <http://ex/o> .\n\
+         <http://ex/epipe2> <http://ex/p> <http://ex/o> .\n",
+    )
+    .unwrap();
     quiet(
         "gadd",
         run_with_closed_stdout(
             Command::new(env!("CARGO_BIN_EXE_gadd"))
                 .arg(&name)
-                .arg(small_nt()),
+                .arg(&add),
         ),
+    );
+    assert_eq!(
+        gstore::Database::open(&db).unwrap().triple_num(),
+        before + 2,
+        "gadd with a closed stdout did not add its triples"
     );
     let _ = std::fs::remove_dir_all(&work);
 }
