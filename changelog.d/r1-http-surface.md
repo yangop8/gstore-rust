@@ -26,7 +26,11 @@ at startup for every switch that is on):
   `token=` URL parameter. A token in the body is no longer looked for, so
   authentication never scans (or copies) an unauthenticated body; form
   lookups scan a form body once, without copying it, and never look into a
-  raw body.
+  raw body. REST `/login` reads its `username` / `password` with the
+  server-wide state lock released (it used to scan the body with the lock
+  held; a `Basic` header on `/login` is not looked at), and the `415`
+  check of `/update` decides by the `Content-Type` alone, before
+  authentication, without copying the body.
 - **Dataset parameters are refused** (gap-doc-claims#2): `/sparql` with
   `default-graph-uri` / `named-graph-uri`, and `/update` with
   `using-graph-uri` / `using-named-graph-uri`, answer `400 … dataset
@@ -143,7 +147,7 @@ the query text are still skipped by the parser (unchanged known gap).
   | `allowed_hosts` | empty (IP literals, localhost, dotless names, listen_addr) | `*` (no check) | DNS rebinding reaches a loopback server | no |
   | `allow_get_update` | off | on | `<img src=…/sparql?query=DROP ALL>` / a text/plain form wipes data | no |
   | `trust_proxy_headers` | off | on | a same-host reverse proxy hands loopback privileges (no-auth single-db, default password, trust_inner_localhost) to the internet | no |
-  | `allow_default_root_password` | off | on (upstream accepts 123456 anywhere; here loopback + local clients only) | anyone who can reach the server as a local client is root | **yes** (upstream scripts log in as root/123456) |
+  | `allow_default_root_password` | off | on (upstream accepts 123456 anywhere; here loopback + local clients only) | anyone who can reach the server as a local client is root — including any web page open in a browser on that machine, since `/api` `GET` operations carry the credentials in the URL and the Origin guard covers state-changing methods only | **yes** (upstream scripts log in as root/123456) |
 - docs/DEPLOY.md — a "Browser-facing defaults" paragraph: what each guard
   stops (CSRF via GET/text-plain/foreign Origin, DNS rebinding, CORS
   reads), that clients without `Origin` (scripts, SDKs) are unaffected, and
@@ -163,6 +167,9 @@ the query text are still skipped by the parser (unchanged known gap).
   supply parameters, dataset parameters are refused, GET never updates.
 - README.md / CHANGELOG.md — REST session tokens: header or URL only
   (no longer a `session=` body parameter).
+- docs/PFN.md (r4-ext-docs owns it) — its `curl … /api` examples log in
+  as root/123456, which a gserver now serves only with
+  `allow_default_root_password=on`: use a placeholder password there.
 - CHANGELOG.md — the Changelog bullets above, behaviour changes first, with
   the upgrade note.
 - docs/REFACTOR_BACKLOG.md — (D3) the single-database server, REST and
@@ -177,6 +184,15 @@ the query text are still skipped by the parser (unchanged known gap).
   lists and the lockout still key on the TCP peer (a same-host proxy's
   127.0.0.1); trusting `X-Forwarded-For` contents for them is not done
   (it needs a trusted-proxy list) — r2-limits-auth owns the lockout.
+- docs/REFACTOR_BACKLOG.md — (D1 residue, infra#3) the upstream `/api`
+  protocol keeps its state-changing `GET` operations with credentials in
+  the URL (`GET /api?operation=drop&username=…&password=…`): the Origin
+  guard covers state-changing methods only, so a web page that knows a
+  password can still drive `/api` through a visitor's browser with an
+  `<img>`. Not changed for wire compatibility; it matters with
+  `allow_default_root_password=on` (the password is known). A later
+  package could refuse state-changing `/api` operations over `GET` behind
+  a compat switch.
 
 ## Measured numbers
 
@@ -226,7 +242,9 @@ the query text are still skipped by the parser (unchanged known gap).
     meta)` (respond needs the policy verdict). Private helpers
     `DEFAULT_PASSWORD_REFUSED` and `presents_default_root_password` after
     `pick_db_name`. `respond` itself: the refusal / default-password /
-    GET-update / 415 checks (the ipfilter lines untouched).
+    GET-update / 415 checks (the ipfilter lines untouched), and `/login`
+    served before the locked section (it calls `handle_login`, unchanged,
+    with no lock held; `dispatch`'s `/login` arm is left as it was).
   - `src/gapi/auth.rs` `verify()`: besides the `trust_inner_localhost`
     condition, a refusal of root's default password from non-local clients
     (a few lines before the user-store check) and a private

@@ -1396,9 +1396,7 @@ fn nonempty(v: &str) -> Option<&str> {
     (!v.is_empty()).then_some(v)
 }
 
-/// Split a `|`-separated list (upstream `getline(ss, item, '|')`), dropping
-/// empty items and surrounding whitespace.
-/// A list separated by `|`, `,` or whitespace.
+/// A list separated by `|`, `,` or whitespace, dropping empty items.
 fn split_words(v: &str) -> Vec<String> {
     v.split(|c: char| c == '|' || c == ',' || c.is_whitespace())
         .filter(|s| !s.is_empty())
@@ -1406,6 +1404,8 @@ fn split_words(v: &str) -> Vec<String> {
         .collect()
 }
 
+/// Split a `|`-separated list (upstream `getline(ss, item, '|')`), dropping
+/// empty items and surrounding whitespace.
 fn split_list(v: &str) -> Vec<String> {
     v.split('|')
         .map(str::trim)

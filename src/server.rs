@@ -1115,6 +1115,12 @@ pub(crate) const GET_UPDATE_REFUSED: &str = "a SPARQL UPDATE is not run over GET
      Protocol): POST it to /update (set [server] allow_get_update=on to restore the upstream \
      behaviour)";
 
+/// Message of a refused `/update` body type (`415`; see
+/// [`HttpOptions::allow_get_update`] and [`BodyKind::Simple`]).
+pub(crate) const UPDATE_BODY_REFUSED: &str = "/update takes an application/sparql-update or \
+     application/x-www-form-urlencoded body, not text/plain or multipart/form-data (set \
+     [server] allow_get_update=on to accept them, as upstream does)";
+
 /// Whether the SPARQL text `q` is an UPDATE, by a parse alone (nothing
 /// runs). A text holding none of the keywords an update starts with
 /// (`INSERT`, `DELETE`, `LOAD`, `CLEAR`, `DROP`, `CREATE`, `WITH`, `ADD`,
@@ -2554,12 +2560,7 @@ impl Request {
         const MISSING: (u16, &str) = (400, "missing update statement");
         match self.body_kind() {
             BodyKind::Form | BodyKind::Empty => self.param("update").ok_or(MISSING),
-            BodyKind::Simple if !any_body => Err((
-                415,
-                "/update takes an application/sparql-update or \
-                 application/x-www-form-urlencoded body, not text/plain or multipart/form-data \
-                 (set [server] allow_get_update=on to accept them, as upstream does)",
-            )),
+            BodyKind::Simple if !any_body => Err((415, UPDATE_BODY_REFUSED)),
             BodyKind::SparqlUpdate
             | BodyKind::Untyped
             | BodyKind::SparqlQuery

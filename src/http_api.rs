@@ -2947,13 +2947,29 @@ impl ApiInner {
                     );
                 }
             }
-            if req.method == "POST" && req.path == "/update" {
-                if let Err((status, msg)) = req.update_text(false) {
-                    if status == 415 {
-                        return (Resp::fail(415, msg), "-".to_string());
-                    }
-                }
+            // By the body's type alone: the body of a caller who is not
+            // authenticated yet is not copied (`update_text` would copy it).
+            if req.method == "POST"
+                && req.path == "/update"
+                && req.body_kind() == crate::server::BodyKind::Simple
+            {
+                return (
+                    Resp::fail(415, crate::server::UPDATE_BODY_REFUSED),
+                    "-".to_string(),
+                );
             }
+        }
+        // `/login` is public and reads its credentials from a body nobody has
+        // authenticated yet: its parameter lookups run with no `ApiState` lock
+        // held (http#4), and its own credentials are all it takes (a Basic
+        // header on it is not looked at).
+        if req.path == "/login" {
+            locked(&self.state).requests += 1;
+            let resp = match self.handle_login(req) {
+                Dispatch::Done(r) => r,
+                Dispatch::Deferred(f) => f(self),
+            };
+            return (resp, "-".to_string());
         }
         // Basic credentials are checked with the state lock held only to look
         // the user up: the deliberately slow password hash runs with no lock
