@@ -374,6 +374,102 @@ fn wrong_head_credentials_are_refused_before_the_body_and_count_towards_the_lock
     assert_eq!(st, 413, "{body}");
 }
 
+/// Root's REST session token (`POST /login`).
+fn login_token(addr: SocketAddr) -> String {
+    let (st, body) = request(
+        addr,
+        "POST",
+        "/login",
+        &[("Content-Type", "application/x-www-form-urlencoded")],
+        format!("username=root&password={PW}").as_bytes(),
+    );
+    assert_eq!(st, 200, "{body}");
+    json::parse(&body)
+        .unwrap()
+        .get("session")
+        .and_then(Json::as_str)
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn a_session_token_from_a_locked_out_address_gets_no_upload_cap() {
+    // review sec#1 (reviewer): the pre-body check honours the IP lists and
+    // the lockout for a session token too, not only for a password — a
+    // locked-out address is answered `403` by every REST handler, so it must
+    // not get to send the upload cap's worth of body first.
+    let api = start_api("tokenlock", small_caps());
+    let token = login_token(api.addr);
+    let upload = || {
+        send_head(
+            api.addr,
+            &head_with_body(
+                "POST",
+                "/upload",
+                &[
+                    ("X-Session-Token", token.as_str()),
+                    ("Expect", "100-continue"),
+                ],
+                100 << 10,
+            ),
+        )
+    };
+    let (st, head, _) = upload();
+    assert_eq!(st, 100, "{head}");
+    // Five failures lock the address out (`ipfilter::MAX_AUTH_FAILURES`).
+    let wrong = head_with_body(
+        "POST",
+        "/file/upload?username=root&password=wrong",
+        &[("Content-Type", "multipart/form-data; boundary=XyZ")],
+        100 << 10,
+    );
+    for i in 0..5 {
+        let (st, _, body) = send_head(api.addr, &wrong);
+        assert_eq!(st, 401, "attempt {i}: {body}");
+    }
+    // The token is still valid, but its address is locked out: the body is
+    // held to the pre-authentication cap.
+    let (st, head, _) = upload();
+    assert_eq!(st, 413, "{head}");
+}
+
+#[test]
+fn an_inner_request_is_not_checked_before_its_body() {
+    // review sec#1 (reviewer): with `trust_inner_localhost` an upstream
+    // *inner* request from 127.0.0.1 is let in without its password
+    // (`gapi::auth::verify`); the pre-body check must neither refuse it with
+    // `401` nor count it towards the lockout — that would lock out every
+    // local tool. It is not checked at all: its body is held to the
+    // pre-authentication cap.
+    let api = start_api("inner", small_caps());
+    api.server.set_gapi_config(gstore::gapi::GapiConfig {
+        trust_inner_localhost: true,
+        ..api.server.gapi_config()
+    });
+    let inner = head_with_body(
+        "POST",
+        "/file/upload?username=root&password=not-checked&inner=true",
+        &[
+            ("Content-Type", "multipart/form-data; boundary=XyZ"),
+            ("Expect", "100-continue"),
+        ],
+        100 << 10,
+    );
+    for i in 0..5 {
+        let (st, head, _) = send_head(api.addr, &inner);
+        assert_eq!(st, 413, "attempt {i}: {head}");
+    }
+    // The address is not locked out.
+    let (st, body) = request(
+        api.addr,
+        "GET",
+        &format!("/api?operation=show&username=root&password={PW}"),
+        &[],
+        b"",
+    );
+    assert_eq!((st, status_code(&body)), (200, 0), "{body}");
+}
+
 #[test]
 fn rest_payload_routes_authenticate_from_the_head() {
     let api = start_api("rest", big_upload_cap());

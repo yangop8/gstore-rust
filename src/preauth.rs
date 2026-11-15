@@ -505,6 +505,12 @@ fn api_admission(inner: &ApiInner, head: &HeadView<'_>) -> Admission {
         return Admission::PreAuth;
     };
     let ip = peer_ip(current_peer());
+    // A blocked or locked-out address is not checked at all (its handler
+    // answers it `403`): the body is held to the pre-authentication cap,
+    // whatever the head carries — a session token included.
+    if !inner.ipfilter.permits(&ip) || inner.ipfilter.locked_out(&ip) {
+        return Admission::PreAuth;
+    }
     let verdict = match route {
         PayloadRoute::Upstream => match auth::credentials_in_query(head.query) {
             Some(creds) => auth::check_before_body(inner, &ip, &creds),

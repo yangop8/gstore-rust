@@ -131,26 +131,31 @@ pub(crate) enum PreAuth {
     Valid,
     /// They are not (counted towards the address's lockout).
     Invalid,
-    /// Not checked: the address is blocked or locked out, or the stored
-    /// password can only be checked by a plaintext login (the request is
-    /// then served as unauthenticated, and its handler answers it).
+    /// Not checked: the address is blocked or locked out, the request is an
+    /// upstream *inner* request, or the stored password can only be checked
+    /// by a plaintext login (the request is then served as unauthenticated,
+    /// and its handler answers it).
     Unchecked,
 }
 
-/// Check `creds` (`md5`: the password is its MD5 hex digest; `inner` is not
-/// honoured) against the user store before the request's body is read — the
-/// pre-body hook's check of credentials in a request head (see
-/// `crate::preauth`) — under the same IP rules as [`authenticate`]: a
-/// blocked or locked-out address is not checked at all, and a wrong
-/// password counts towards the lockout ([`note_auth_failure`]). A success
-/// does not reset the failure count (only a `login` does) and records no
-/// user: the request's handler authenticates it again.
+/// Check `creds` (`md5`: the password is its MD5 hex digest) against the
+/// user store before the request's body is read — the pre-body hook's check
+/// of credentials in a request head (see `crate::preauth`) — under the same
+/// IP rules as [`authenticate`]: a blocked or locked-out address is not
+/// checked at all, and a wrong password counts towards the lockout
+/// ([`note_auth_failure`]). A success does not reset the failure count (only
+/// a `login` does) and records no user: the request's handler authenticates
+/// it again. An upstream *inner* request (`creds.inner`) is not checked
+/// either: whether its password is checked at all is [`verify`]'s decision
+/// (`trust_inner_localhost`), and a failure counted here could lock out the
+/// local tools that send it.
 pub(crate) fn check_before_body(
     inner: &crate::http_api::ApiInner,
     remote_ip: &str,
     creds: &Credentials,
 ) -> PreAuth {
     if creds.username.is_empty()
+        || creds.inner
         || !inner.ipfilter.permits(remote_ip)
         || inner.ipfilter.locked_out(remote_ip)
     {
