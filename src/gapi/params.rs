@@ -18,9 +18,46 @@
 //! (the last occurrence wins in general). Values keep their JSON type
 //! ([`Json`]) — `"tid": 1` and `"tid": "1"` both read as `"1"` through
 //! [`Params::str`] — and form / query values are strings.
+//!
+//! # Bounds
+//!
+//! The body is parsed **before the caller is authenticated** (the
+//! credentials may be in it), so what a body may make the parser allocate is
+//! bounded, not just its size (review C-2: a parsed value costs many times
+//! its text):
+//!
+//! * a JSON body holds at most [`MAX_JSON_VALUES`] values (every scalar,
+//!   array and object; [`json::parse_with_limits`]) — a wider one is refused
+//!   before more of its tree is built;
+//! * a URL query or form body holds at most [`MAX_PARAMS`] `name=value`
+//!   pairs, and a multipart body at most [`MAX_PARAMS`] parts — counted
+//!   before anything is decoded;
+//! * a multipart boundary must follow RFC 2046 (1 to 70 characters of its
+//!   `bchars` set, not ending in a space), and the boundary search is linear
+//!   in the body (review H-2).
 
 use crate::json::{self, Json};
 use crate::server::Request;
+
+/// The most values (every scalar, array and object, at any depth) a JSON
+/// request body may hold. Upstream's requests carry a few parameters, a list
+/// of files at most; the bound keeps what an unauthenticated body can make
+/// the parser allocate to a few MiB.
+pub const MAX_JSON_VALUES: usize = 65_536;
+
+/// The most `name=value` pairs a URL query string or a form body may hold,
+/// and the most parts of a multipart body.
+pub const MAX_PARAMS: usize = 65_536;
+
+/// The bounds a JSON request body is parsed with ([`MAX_JSON_VALUES`],
+/// [`json::MAX_DEPTH`]).
+const BODY_JSON_LIMITS: json::Limits = json::Limits {
+    max_depth: json::MAX_DEPTH,
+    max_values: MAX_JSON_VALUES,
+};
+
+/// The longest multipart boundary RFC 2046 allows.
+pub const MAX_BOUNDARY_LEN: usize = 70;
 
 /// A file sent in a `multipart/form-data` body.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +99,7 @@ impl Params {
     ) -> Result<Params, String> {
         let mut p = Params::new();
         if let Some(q) = query {
+            check_form_size(q, "the URL query string")?;
             for (k, v) in parse_form(q) {
                 p.set(k, v);
             }
@@ -105,7 +143,7 @@ impl Params {
         if trimmed.is_empty() {
             // No body parameters.
         } else if media == "application/json" || trimmed.starts_with('{') {
-            match json::parse(trimmed) {
+            match json::parse_with_limits(trimmed, &BODY_JSON_LIMITS) {
                 Ok(Json::Obj(entries)) => {
                     for (k, v) in entries {
                         p.set(k, v);
@@ -115,6 +153,7 @@ impl Params {
                 Err(e) => return Err(format!("the request body is not valid JSON ({e})")),
             }
         } else if media == "application/x-www-form-urlencoded" || trimmed.contains('=') {
+            check_form_size(trimmed, "the form body")?;
             for (k, v) in parse_form(trimmed) {
                 p.set(k, v);
             }
@@ -238,19 +277,41 @@ impl Params {
         self.entries.iter().map(|(k, _)| k.as_str())
     }
 
-    /// The parameters as one JSON object (last value per name), with any
-    /// `password` value redacted — for logging.
+    /// The parameters as one JSON object (last value per name, at the
+    /// position of the name's first occurrence), with any `password` /
+    /// `op_password` value redacted — for logging. Linear in the number of
+    /// parameters (review gapi#19: it used to search the object it was
+    /// building for every parameter).
     pub fn to_redacted_json(&self) -> Json {
-        let mut out = Json::obj();
+        let mut index: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::with_capacity(self.entries.len());
+        let mut out: Vec<(String, Json)> = Vec::with_capacity(self.entries.len());
         for (k, v) in &self.entries {
-            if k == "password" || k == "op_password" {
-                out.set(k.clone(), "***");
+            let v = if k == "password" || k == "op_password" {
+                Json::from("***")
             } else {
-                out.set(k.clone(), v.clone());
+                v.clone()
+            };
+            match index.get(k.as_str()) {
+                Some(&i) => out[i].1 = v,
+                None => {
+                    index.insert(k.as_str(), out.len());
+                    out.push((k.clone(), v));
+                }
             }
         }
-        out
+        Json::Obj(out)
     }
+}
+
+/// Refuse a URL query string / form body (`what`) of more than
+/// [`MAX_PARAMS`] pairs — counted without decoding anything.
+fn check_form_size(s: &str, what: &str) -> Result<(), String> {
+    let pairs = s.split('&').filter(|pair| !pair.is_empty()).count();
+    if pairs > MAX_PARAMS {
+        return Err(format!("{what} holds more than {MAX_PARAMS} parameters"));
+    }
+    Ok(())
 }
 
 /// Decode an `application/x-www-form-urlencoded` string (also a URL query):
@@ -315,17 +376,25 @@ fn parse_multipart(content_type: &str, body: &[u8]) -> Result<MultipartParts, St
         .map(|(_, v)| v.trim().trim_matches('"').to_string())
         .filter(|b| !b.is_empty())
         .ok_or_else(|| "multipart/form-data without a boundary".to_string())?;
+    check_boundary(&boundary)?;
     let delim = format!("--{boundary}").into_bytes();
+    let finder = memchr::memmem::Finder::new(&delim);
+    let find_delim = |from: usize| finder.find(&body[from..]).map(|i| i + from);
     let mut fields = Vec::new();
     let mut files = Vec::new();
-    let mut pos = find(body, &delim, 0).ok_or("multipart body without its boundary")? + delim.len();
+    let mut pos = find_delim(0).ok_or("multipart body without its boundary")? + delim.len();
     loop {
         // After a delimiter: `--` ends the body, otherwise CRLF and a part.
         if body[pos..].starts_with(b"--") {
             break;
         }
+        if fields.len() + files.len() >= MAX_PARAMS {
+            return Err(format!(
+                "the multipart body holds more than {MAX_PARAMS} parts"
+            ));
+        }
         pos = skip_line_end(body, pos);
-        let next = find(body, &delim, pos).ok_or("unterminated multipart part")?;
+        let next = find_delim(pos).ok_or("unterminated multipart part")?;
         // The part's content ends with the CRLF preceding the delimiter.
         let mut end = next;
         if end >= 2 && &body[end - 2..end] == b"\r\n" {
@@ -376,6 +445,23 @@ fn parse_multipart(content_type: &str, body: &[u8]) -> Result<MultipartParts, St
     Ok((fields, files))
 }
 
+/// Check a multipart boundary against RFC 2046 §5.1.1: 1 to
+/// [`MAX_BOUNDARY_LEN`] characters, each a digit, a letter, a space or one
+/// of `'()+_,-./:=?`, the last not a space. (A longer boundary made the
+/// boundary search — which runs before authentication — that much slower.)
+fn check_boundary(boundary: &str) -> Result<(), String> {
+    if boundary.len() > MAX_BOUNDARY_LEN {
+        return Err(format!(
+            "the multipart boundary is longer than {MAX_BOUNDARY_LEN} characters (RFC 2046)"
+        ));
+    }
+    let bchar = |c: u8| c.is_ascii_alphanumeric() || b"'()+_,-./:=? ".contains(&c);
+    if !boundary.bytes().all(bchar) || boundary.ends_with(' ') {
+        return Err("the multipart boundary holds a character RFC 2046 does not allow".to_string());
+    }
+    Ok(())
+}
+
 /// Split one multipart part into its header block (text) and its content.
 fn split_part(part: &[u8]) -> Result<(String, &[u8]), String> {
     if let Some(i) = find(part, b"\r\n\r\n", 0) {
@@ -407,15 +493,14 @@ fn skip_line_end(body: &[u8], mut pos: usize) -> usize {
     }
 }
 
-/// The first index of `needle` in `hay` at or after `from`.
+/// The first index of `needle` in `hay` at or after `from`, in time linear
+/// in `hay[from..]` and `needle` (`memchr`'s two-way search; review H-2: a
+/// window-by-window comparison cost `hay` × `needle`).
 fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     if needle.is_empty() || from > hay.len() {
         return None;
     }
-    hay[from..]
-        .windows(needle.len())
-        .position(|w| w == needle)
-        .map(|i| i + from)
+    memchr::memmem::find(&hay[from..], needle).map(|i| i + from)
 }
 
 #[cfg(test)]
@@ -554,6 +639,197 @@ mod tests {
         body.extend_from_slice(b"\r\n--B--\r\n");
         let p = Params::from_parts(None, Some("multipart/form-data; boundary=B"), &body).unwrap();
         assert_eq!(p.file("file").unwrap().data, [0xff; 16]);
+    }
+
+    // ---- bounds (review C-2 / H-2) -------------------------------------
+
+    #[test]
+    fn a_wide_json_body_is_refused_before_its_tree_is_built() {
+        // {"operation":"check","a":[0,0,…]}: the object, two members and the
+        // array's elements.
+        let body = |n: usize| {
+            let mut b = String::from(r#"{"operation":"check","a":["#);
+            b.push_str(&"0,".repeat(n - 1));
+            b.push_str("0]}");
+            b
+        };
+        let fits = body(MAX_JSON_VALUES - 3);
+        let p = Params::from_parts(None, Some("application/json"), fits.as_bytes()).unwrap();
+        assert_eq!(p.str("operation").as_deref(), Some("check"));
+        let wide = body(MAX_JSON_VALUES - 2);
+        let e = Params::from_parts(None, Some("application/json"), wide.as_bytes()).unwrap_err();
+        assert!(e.contains("too many JSON values"), "{e}");
+        // Detected without a Content-Type too.
+        assert!(Params::from_parts(None, None, wide.as_bytes()).is_err());
+        // Deep nesting stays refused.
+        let deep = format!(r#"{{"a":{}}}"#, "[".repeat(json::MAX_DEPTH + 1));
+        assert!(Params::from_parts(None, Some("application/json"), deep.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn form_bodies_and_query_strings_have_a_bounded_number_of_pairs() {
+        let pairs = |n: usize| vec!["a=1"; n].join("&");
+        let ok = pairs(MAX_PARAMS);
+        let p = Params::from_parts(
+            None,
+            Some("application/x-www-form-urlencoded"),
+            ok.as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(p.keys().count(), MAX_PARAMS);
+        let many = pairs(MAX_PARAMS + 1);
+        let e = Params::from_parts(
+            None,
+            Some("application/x-www-form-urlencoded"),
+            many.as_bytes(),
+        )
+        .unwrap_err();
+        assert!(e.contains("more than"), "{e}");
+        // Empty pairs (`&&`) are not parameters and do not count.
+        let sparse = format!("{}{}", "&".repeat(MAX_PARAMS * 2), ok);
+        assert!(Params::from_parts(None, None, sparse.as_bytes()).is_ok());
+        let e = Params::from_parts(Some(&many), None, b"").unwrap_err();
+        assert!(e.contains("URL query string"), "{e}");
+    }
+
+    #[test]
+    fn multipart_parts_are_bounded() {
+        let part = "--B\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n";
+        let body = |n: usize| format!("{}--B--\r\n", part.repeat(n));
+        let ct = Some("multipart/form-data; boundary=B");
+        let p = Params::from_parts(None, ct, body(MAX_PARAMS).as_bytes()).unwrap();
+        assert_eq!(p.keys().count(), MAX_PARAMS);
+        let e = Params::from_parts(None, ct, body(MAX_PARAMS + 1).as_bytes()).unwrap_err();
+        assert!(e.contains("parts"), "{e}");
+    }
+
+    #[test]
+    fn multipart_boundaries_follow_rfc_2046() {
+        let body_for = |b: &str| {
+            format!(
+                "--{b}\r\nContent-Disposition: form-data; name=\"username\"\r\n\r\nroot\r\n--{b}--\r\n"
+            )
+        };
+        let parse =
+            |ct: String, b: &str| Params::from_parts(None, Some(&ct), body_for(b).as_bytes());
+        // The longest boundary allowed, every special bchar, a quoted space.
+        let longest = "x".repeat(MAX_BOUNDARY_LEN);
+        let p = parse(format!("multipart/form-data; boundary={longest}"), &longest).unwrap();
+        assert_eq!(p.str("username").as_deref(), Some("root"));
+        let special = "a'()+_,-./:=?b";
+        assert!(parse(
+            format!("multipart/form-data; boundary=\"{special}\""),
+            special
+        )
+        .is_ok());
+        assert!(parse("multipart/form-data; boundary=\"a b\"".into(), "a b").is_ok());
+        // Too long, a character outside bchars, a trailing space.
+        let long = "x".repeat(MAX_BOUNDARY_LEN + 1);
+        let e = parse(format!("multipart/form-data; boundary={long}"), &long).unwrap_err();
+        assert!(e.contains("longer than 70"), "{e}");
+        for bad in ["a*b", "a\\b", "a%b", "é", "a\u{1}b"] {
+            let e = parse(format!("multipart/form-data; boundary=\"{bad}\""), bad).unwrap_err();
+            assert!(e.contains("RFC 2046"), "{bad}: {e}");
+        }
+        let e = parse("multipart/form-data; boundary=\"ab \"".into(), "ab ").unwrap_err();
+        assert!(e.contains("RFC 2046"), "{e}");
+    }
+
+    /// The fastest of `runs` timings of `f`, in seconds.
+    fn best_of(runs: usize, mut f: impl FnMut()) -> f64 {
+        (0..runs)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                f();
+                t.elapsed().as_secs_f64()
+            })
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    #[test]
+    fn the_boundary_search_is_linear_in_the_boundary_and_the_body() {
+        // The search's worst case for a window-by-window comparison: every
+        // window of the body matches the needle up to its last byte. That
+        // cost body × needle (review H-2: a 60,000-byte boundary made one
+        // 8 MiB request take 11 s); a linear search costs body + needle,
+        // whatever the needle's length.
+        let hay = vec![b'-'; 1 << 20];
+        let needle = |m: usize| {
+            let mut n = vec![b'-'; m - 1];
+            n.push(b'B');
+            n
+        };
+        let (short, long) = (needle(64), needle(60_000));
+        let t_short = best_of(5, || assert_eq!(find(&hay, &short, 0), None));
+        let t_long = best_of(5, || assert_eq!(find(&hay, &long, 0), None));
+        // A window-by-window search is hundreds of times slower with the
+        // long needle (over a second here); a linear one takes a few
+        // milliseconds either way. (The floor keeps a sub-millisecond short
+        // search from making the bound meaninglessly tight.)
+        assert!(
+            t_long < 50.0 * t_short.max(5e-3),
+            "a 60,000-byte needle took {t_long:.4} s, a 64-byte one {t_short:.4} s"
+        );
+        // Linear in the body: doubling it about doubles the time.
+        let hay2 = vec![b'-'; 2 << 20];
+        let t_double = best_of(5, || assert_eq!(find(&hay2, &long, 0), None));
+        assert!(
+            t_double < 6.0 * t_long.max(1e-2),
+            "2 MiB took {t_double:.4} s, 1 MiB {t_long:.4} s"
+        );
+        // And it finds what it should.
+        let mut hay3 = hay.clone();
+        hay3.extend_from_slice(&short);
+        assert_eq!(find(&hay3, &short, 0), Some(hay.len()));
+        assert_eq!(find(&hay3, &short, hay.len() + 1), None);
+        assert_eq!(find(b"abc", b"", 0), None);
+        assert_eq!(find(b"abc", b"c", 4), None);
+    }
+
+    #[test]
+    fn redacted_json_keeps_the_last_value_at_the_first_position() {
+        let mut p = Params::new();
+        p.set("a", 1);
+        p.set("password", "secret");
+        p.set("b", "x");
+        p.set("a", 2);
+        p.set("op_password", "s2");
+        assert_eq!(
+            p.to_redacted_json().to_string(),
+            r#"{"a":2,"password":"***","b":"x","op_password":"***"}"#
+        );
+    }
+
+    #[test]
+    fn redacted_json_is_linear_in_the_number_of_parameters() {
+        // review gapi#19: building the object with `Json::set` searched it
+        // for every parameter (quadratic: 8 times the parameters cost 64
+        // times the time).
+        let params = |n: usize| {
+            let mut p = Params::new();
+            for i in 0..n {
+                p.set(format!("k{i}"), i as u64);
+            }
+            p
+        };
+        let (small, large) = (params(4_000), params(32_000));
+        let t_small = best_of(5, || {
+            assert!(small.to_redacted_json().as_object().is_some())
+        });
+        let t_large = best_of(5, || {
+            assert_eq!(
+                large.to_redacted_json().as_object().map(<[_]>::len),
+                Some(32_000)
+            )
+        });
+        // Linear: tens of milliseconds for the large set (allocation and
+        // cache effects make it more than 8 times the small one); quadratic:
+        // seconds. (The floor keeps a fast small run from making the bound
+        // meaninglessly tight.)
+        assert!(
+            t_large < 40.0 * t_small.max(5e-3),
+            "32,000 parameters took {t_large:.4} s, 4,000 took {t_small:.4} s"
+        );
     }
 
     #[test]

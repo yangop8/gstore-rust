@@ -20,6 +20,9 @@ serde = { version = "1", features = ["derive"] }
 bincode = "1"
 # Used only by the SPARQL REGEX builtin and string/replace functions.
 regex = "1"
+# Linear-time substring search (the `/api` layer's multipart boundary search).
+# Already a dependency of `regex`, so it adds no crate to the build.
+memchr = "2"
 # Optional persistent storage backend. OFF by default (keeps the build
 # dependency-light and avoids compiling bundled librocksdb C++). Enable with
 # `--features rocksdb` to get the `RocksStore` / Rocks-backed `Database`.

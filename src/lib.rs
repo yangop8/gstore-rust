@@ -47,6 +47,9 @@ pub mod model;
 pub mod parser;
 // PFN: per-user graph functions run as sandboxed WebAssembly (`pfn-wasm`).
 pub mod pfn;
+// What a request may make the HTTP servers buffer before it is
+// authenticated: body caps by route class, the body budget, the pre-body hook.
+pub mod preauth;
 pub mod query;
 pub mod reason;
 pub mod rpc;

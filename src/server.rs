@@ -62,9 +62,13 @@
 //! * **CORS**: with [`HttpOptions::cors`] (the default) every response carries
 //!   `Access-Control-Allow-Origin: *` and `OPTIONS` preflights are answered
 //!   directly (as upstream does for `/file/upload` and `/file/download`);
-//! * a **request body cap** ([`HttpOptions::max_body`]): a larger
-//!   `Content-Length` is refused with `413` before anything is allocated, and
-//!   `Expect: 100-continue` is honoured.
+//! * **request body caps** ([`HttpOptions::preauth_max_body`] before
+//!   authentication, [`HttpOptions::max_body`] for a payload route whose
+//!   request is authenticated from its head) and a **body budget** shared by
+//!   all connections ([`HttpOptions::body_budget`]; see [`crate::preauth`]):
+//!   a larger `Content-Length` is refused with `413` before anything is
+//!   allocated, a request finding the budget exhausted gets `503`, and
+//!   `Expect: 100-continue` is honoured only after the caps are decided.
 //!
 //! Beyond the base protocol this endpoint adds:
 //!
@@ -126,8 +130,9 @@ const SPARQL_JSON: &str = "application/sparql-results+json";
 /// of [`HttpOptions::max_body`]. Bounds the pre-auth allocation in request
 /// parsing so a single header can't make the server reserve arbitrary memory or
 /// panic on capacity overflow. Shared by the simple server and the multi-DB
-/// `http_api` server. (`gserver` raises it to `conf.ini`'s
-/// `upload_max_body_size`, 1 GiB by default.)
+/// `http_api` server. (`gserver` sets it to `conf.ini`'s
+/// `upload_max_body_size`, 256 MiB by default; a request not authenticated
+/// from its head is held to [`HttpOptions::preauth_max_body`].)
 pub const MAX_REQUEST_BODY: usize = 256 * 1024 * 1024; // 256 MiB
 
 /// Connection-handling settings shared by [`Server`] and
@@ -158,8 +163,24 @@ pub struct HttpOptions {
     /// cannot pin a worker forever.
     pub write_timeout: Duration,
     /// Maximum request body in bytes (default [`MAX_REQUEST_BODY`]); larger
-    /// requests are answered `413` without reading the body.
+    /// requests are answered `413` without reading the body. Only a request
+    /// authenticated from its head, on a route that carries payloads, may
+    /// carry this much: every other one is held to
+    /// [`preauth_max_body`](Self::preauth_max_body) (see [`crate::preauth`]).
+    /// `gserver`: `upload_max_body_size`.
     pub max_body: usize,
+    /// The body cap of a request before it is authenticated (default
+    /// [`PREAUTH_MAX_BODY`](crate::preauth::PREAUTH_MAX_BODY), 64 MiB;
+    /// never more than [`max_body`](Self::max_body)): every route, every
+    /// client whose request head carries no valid credentials. `gserver`:
+    /// `preauth_max_body_size`.
+    pub preauth_max_body: usize,
+    /// The request-body bytes all connections may hold in memory at once
+    /// (default [`DEFAULT_BODY_BUDGET`](crate::preauth::DEFAULT_BODY_BUDGET),
+    /// 512 MiB; never less than [`max_body`](Self::max_body)), charged as
+    /// they arrive: a request that would exceed it is answered `503`.
+    /// `gserver`: `request_body_budget`.
+    pub body_budget: usize,
     /// Add `Access-Control-Allow-Origin: *` to every response and answer
     /// `OPTIONS` preflight requests (default on).
     pub cors: bool,
@@ -178,6 +199,8 @@ impl Default for HttpOptions {
             read_timeout: CONN_READ_TIMEOUT,
             write_timeout: CONN_READ_TIMEOUT,
             max_body: MAX_REQUEST_BODY,
+            preauth_max_body: crate::preauth::PREAUTH_MAX_BODY,
+            body_budget: crate::preauth::DEFAULT_BODY_BUDGET,
             cors: true,
         }
     }
@@ -468,8 +491,13 @@ impl Server {
     /// grace period to finish (statements still running then are cancelled),
     /// unsaved changes are saved, and a [`ShutdownReport`] is returned.
     pub fn serve_forever(&self) -> ShutdownReport {
+        // The body caps, budget and pre-body hook of this run (see
+        // `crate::preauth`).
+        let ingest = crate::preauth::single_db_ingest(&self.http, &self.inner.auth, self.addr);
         let drained = run_accept_loop(&self.listener, &self.life, self.grace, &self.http, |acc| {
             let inner = Arc::clone(&self.inner);
+            let mut acc = acc;
+            acc.env.ingest = Arc::clone(&ingest);
             Box::new(move || {
                 let ctl = acc.stream.try_clone().ok();
                 serve_connection(
@@ -490,9 +518,14 @@ impl Server {
     /// from `config` (see [`load_tls_config`]). Requires the `tls` feature.
     #[cfg(feature = "tls")]
     pub fn serve_forever_tls(&self, config: Arc<rustls::ServerConfig>) -> ShutdownReport {
+        // The body caps, budget and pre-body hook of this run (see
+        // `crate::preauth`).
+        let ingest = crate::preauth::single_db_ingest(&self.http, &self.inner.auth, self.addr);
         let drained = run_accept_loop(&self.listener, &self.life, self.grace, &self.http, |acc| {
             let inner = Arc::clone(&self.inner);
             let config = Arc::clone(&config);
+            let mut acc = acc;
+            acc.env.ingest = Arc::clone(&ingest);
             Box::new(move || {
                 let Ok(conn) = rustls::ServerConnection::new(config) else {
                     return;
@@ -730,6 +763,9 @@ pub(crate) struct Accepted {
 pub(crate) struct ConnEnv {
     life: Arc<Lifecycle>,
     opts: Arc<HttpOptions>,
+    /// The body caps, the body budget and the pre-body hook (see
+    /// [`crate::preauth`]); a server's `serve_forever` installs its own.
+    pub(crate) ingest: Arc<crate::preauth::Ingest>,
     /// Connections accepted but not yet picked up by a worker.
     waiting: Arc<AtomicUsize>,
 }
@@ -840,6 +876,7 @@ pub(crate) fn run_accept_loop(
         let env = ConnEnv {
             life: Arc::clone(life),
             opts: Arc::new(opts.clone()),
+            ingest: Arc::new(crate::preauth::Ingest::new(opts, None)),
             waiting: Arc::clone(&waiting),
         };
         let pool = WorkerPool::start(opts.threads, opts.queue_len, waiting);
@@ -1032,7 +1069,9 @@ pub(crate) fn serve_connection<S: Read + Write>(
                 g
             }
         };
-        let (req, info) = match read_request(&mut reader, opts.max_body, opts.read_timeout) {
+        // `_body` keeps the body's share of the budget until the response is
+        // written (the end of the iteration).
+        let (req, info, _body) = match read_request(&mut reader, &env.ingest, opts.read_timeout) {
             Ok(None) => return, // closed before sending anything
             Ok(Some(r)) => r,
             Err(bad) => {
@@ -1271,18 +1310,26 @@ struct Head {
     expect_continue: bool,
 }
 
-/// Read one request from a connection, answering `Expect: 100-continue`
-/// before the body is read. The request line and headers must arrive within
-/// `read_timeout` in total; the body only must not stall for longer than that
-/// between reads (a large upload may take longer overall). `Ok(None)` when the
-/// client closed the connection before sending anything.
+/// Read one request from a connection. The request line and headers must
+/// arrive within `read_timeout` in total; the body only must not stall for
+/// longer than that between reads (a large upload may take longer overall).
+/// `Ok(None)` when the client closed the connection before sending anything.
+///
+/// Between the head and the body, `ingest` decides the body's cap (see
+/// [`crate::preauth`]: the pre-authentication cap, or the upload cap for a
+/// request its server's pre-body hook authenticates from the head) — a
+/// larger `Content-Length` is answered `413` before a body byte is read, and
+/// `Expect: 100-continue` is answered only after that. The body is charged
+/// to the server's body budget as it arrives (`503` when it has no room);
+/// the returned [`BodyHold`](crate::preauth::BodyHold) keeps that charge
+/// until it is dropped.
 fn read_request<S: Read + Write>(
     reader: &mut BufReader<Timed<'_, S>>,
-    max_body: usize,
+    ingest: &crate::preauth::Ingest,
     read_timeout: Duration,
-) -> Result<Option<(Request, RequestInfo)>, BadRequest> {
+) -> Result<Option<(Request, RequestInfo, crate::preauth::BodyHold)>, BadRequest> {
     reader.get_mut().deadline = Some(Instant::now() + read_timeout);
-    let head = read_head(reader, max_body);
+    let head = read_head(reader, ingest.largest_body());
     reader.get_mut().deadline = None;
     if let Some(ctl) = reader.get_ref().ctl {
         let _ = ctl.set_read_timeout(Some(read_timeout));
@@ -1290,16 +1337,48 @@ fn read_request<S: Read + Write>(
     let Some(head) = head? else {
         return Ok(None);
     };
-    if head.expect_continue && (head.chunked || head.content_length > 0) {
-        let w = &mut reader.get_mut().inner;
-        w.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
-            .and_then(|_| w.flush())
-            .map_err(|_| BadRequest::MALFORMED)?;
-    }
-    let body = if head.chunked {
-        read_chunked_body(reader, max_body)?
+    let mut hold = ingest.hold();
+    let has_body = head.chunked || head.content_length > 0;
+    let body = if has_body {
+        let view = crate::preauth::HeadView {
+            method: &head.method,
+            path: &head.path,
+            query: head.query.as_deref(),
+            headers: &head.headers,
+        };
+        let declared = (!head.chunked).then_some(head.content_length);
+        let cap = ingest.body_cap(&view, declared)?;
+        if let Some(n) = declared {
+            if n > cap.max {
+                return Err(cap.too_large);
+            }
+            ingest.admit(n)?;
+        }
+        if head.expect_continue {
+            let w = &mut reader.get_mut().inner;
+            w.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+                .and_then(|_| w.flush())
+                .map_err(|_| BadRequest::MALFORMED)?;
+        }
+        let read = {
+            let mut budgeted = crate::preauth::Budgeted::new(reader, &mut hold);
+            if head.chunked {
+                read_chunked_body(&mut budgeted, cap.max)
+            } else {
+                read_body(&mut budgeted, head.content_length)
+            }
+        };
+        read.map_err(|e| {
+            if hold.exhausted() {
+                crate::preauth::Ingest::budget_exhausted()
+            } else if e == BadRequest::TOO_LARGE {
+                cap.too_large
+            } else {
+                e
+            }
+        })?
     } else {
-        read_body(reader, head.content_length)?
+        Vec::new()
     };
     Ok(Some((
         Request {
@@ -1310,6 +1389,7 @@ fn read_request<S: Read + Write>(
             body,
         },
         head.info,
+        hold,
     )))
 }
 
@@ -2408,7 +2488,7 @@ pub(crate) fn parse_basic_auth(req: &Request) -> Option<(String, String)> {
 
 /// Strip a case-insensitive `Basic ` scheme prefix from an `Authorization`
 /// header value, returning the credentials token.
-fn strip_basic_prefix(h: &str) -> Option<&str> {
+pub(crate) fn strip_basic_prefix(h: &str) -> Option<&str> {
     let h = h.trim_start();
     // `get` (not byte slicing): a multi-byte character across the prefix
     // boundary must not panic.
@@ -2421,7 +2501,7 @@ fn strip_basic_prefix(h: &str) -> Option<&str> {
 
 /// Decode standard (RFC 4648) base64, ignoring ASCII whitespace and stopping at
 /// padding. Returns `None` on an invalid alphabet character.
-fn base64_decode(s: &str) -> Option<Vec<u8>> {
+pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(s.len() / 4 * 3 + 3);
     let mut acc = 0u32;
     let mut bits = 0u32;

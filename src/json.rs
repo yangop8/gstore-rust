@@ -15,6 +15,12 @@
 //!   raw control characters inside strings are accepted as-is. Nesting deeper
 //!   than [`MAX_DEPTH`] is refused (guards the recursive reader and the
 //!   recursive drop against stack exhaustion on adversarial input).
+//!   [`parse_with_limits`] also bounds the number of values ([`Limits`]): a
+//!   parsed value costs several times its text (a 32-byte [`Json`] per
+//!   scalar, plus its heap string), so a reader of untrusted documents — the
+//!   `/api` layer parses request bodies before it authenticates them — caps
+//!   what a document may make it allocate, and refuses a wider one before
+//!   building more of its tree.
 //! * `Json::to_string` / [`Display`](std::fmt::Display) serialize compactly
 //!   (no whitespace, like `nlohmann::json::dump()`), escaping `"`, `\` and the
 //!   control characters (`\b \f \n \r \t`, others as `\u00XX`); everything else
@@ -374,12 +380,45 @@ pub fn write_str(s: &str, out: &mut String) {
     out.push('"');
 }
 
+/// Bounds [`parse_with_limits`] holds a document to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// Deepest nesting of arrays / objects accepted (at most [`MAX_DEPTH`],
+    /// which a larger value is lowered to).
+    pub max_depth: usize,
+    /// Most values the document may hold in all: every scalar, array and
+    /// object counts once (an object's keys do not count on their own: each
+    /// comes with its value). The parse stops with an error at the first
+    /// value past it, before that value is built.
+    pub max_values: usize,
+}
+
+impl Limits {
+    /// No bound beyond [`MAX_DEPTH`] (what [`parse`] applies).
+    pub const NONE: Limits = Limits {
+        max_depth: MAX_DEPTH,
+        max_values: usize::MAX,
+    };
+}
+
 /// Parse one JSON document.
 pub fn parse(text: &str) -> Result<Json, JsonError> {
+    parse_with_limits(text, &Limits::NONE)
+}
+
+/// [`parse`], holding the document to `limits`: one nested deeper than
+/// `limits.max_depth`, or holding more than `limits.max_values` values, is
+/// refused with an error saying which bound it broke — as soon as the
+/// parser reaches the offending value, so a refused document never costs
+/// more than the bounds allow.
+pub fn parse_with_limits(text: &str, limits: &Limits) -> Result<Json, JsonError> {
     let mut p = Parser {
         src: text,
         b: text.as_bytes(),
         pos: 0,
+        max_depth: limits.max_depth.min(MAX_DEPTH),
+        values_left: limits.max_values,
+        max_values: limits.max_values,
     };
     if text.starts_with('\u{FEFF}') {
         p.pos = '\u{FEFF}'.len_utf8();
@@ -397,6 +436,11 @@ struct Parser<'a> {
     src: &'a str,
     b: &'a [u8],
     pos: usize,
+    /// [`Limits::max_depth`], at most [`MAX_DEPTH`].
+    max_depth: usize,
+    /// How many more values the document may hold ([`Limits::max_values`]).
+    values_left: usize,
+    max_values: usize,
 }
 
 impl Parser<'_> {
@@ -420,9 +464,16 @@ impl Parser<'_> {
     }
 
     fn value(&mut self, depth: usize) -> Result<Json, JsonError> {
-        if depth > MAX_DEPTH {
+        if depth > self.max_depth {
             return Err(self.err("JSON nesting too deep"));
         }
+        if self.values_left == 0 {
+            return Err(self.err(format!(
+                "too many JSON values (more than {})",
+                self.max_values
+            )));
+        }
+        self.values_left -= 1;
         self.skip_ws();
         match self.peek() {
             Some(b'{') => self.object(depth),
@@ -674,6 +725,36 @@ mod tests {
         assert!(parse("[1,]").is_err());
         assert!(parse(&"[".repeat(MAX_DEPTH + 2)).is_err());
         assert!(parse(&format!("{}{}", "[".repeat(100), "]".repeat(100))).is_ok());
+    }
+
+    #[test]
+    fn limits_bound_values_and_depth() {
+        let few = Limits {
+            max_depth: MAX_DEPTH,
+            max_values: 4,
+        };
+        // An object and three members: four values.
+        assert!(parse_with_limits(r#"{"a":1,"b":[]}"#, &few).is_ok());
+        assert!(parse_with_limits(r#"{"a":1,"b":[2]}"#, &few).is_ok());
+        let e = parse_with_limits(r#"{"a":1,"b":[2,3]}"#, &few).unwrap_err();
+        assert!(e.msg.contains("too many JSON values"), "{e}");
+        // A wide array is refused at the first value past the bound.
+        let wide = format!("[{}0]", "0,".repeat(1000));
+        assert!(parse_with_limits(&wide, &few).is_err());
+        assert!(parse(&wide).is_ok(), "parse itself has no value bound");
+        let shallow = Limits {
+            max_depth: 2,
+            max_values: usize::MAX,
+        };
+        assert!(parse_with_limits("[[1]]", &shallow).is_ok());
+        assert!(parse_with_limits("[[[1]]]", &shallow).is_err());
+        // A depth beyond MAX_DEPTH is lowered to it.
+        let deep = Limits {
+            max_depth: usize::MAX,
+            max_values: usize::MAX,
+        };
+        assert!(parse_with_limits(&"[".repeat(MAX_DEPTH + 2), &deep).is_err());
+        assert_eq!(Limits::NONE.max_depth, MAX_DEPTH);
     }
 
     #[test]

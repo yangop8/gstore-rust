@@ -160,10 +160,25 @@ max_backups=3
 
 [upload]
 upload_path = "./upload/"
-# max body size, 1 GB = 1024 MB = 1048576 KB(1M=1024KB) = 1073741824 B(1KB=1024B)
-# (gstore-rust also caps every HTTP request body at this size; refreshconf
-# applies a new value to the upload operation, the HTTP cap needs a restart)
-upload_max_body_size = 1073741824
+# max body size, 256 MB = 262144 KB(1M=1024KB) = 268435456 B(1KB=1024B)
+# (upstream ships 1 GB = 1073741824). gstore-rust caps every HTTP request body
+# at this size, and lets a request carry this much only when it is
+# authenticated before its body is read: an upload (/file/upload, an /api
+# query, the REST /upload, /update, /build, ...) whose credentials are in the
+# URL query string (username=, password=) or an Authorization header (Basic,
+# or a REST session token). refreshconf applies a new value to the upload
+# operation; the HTTP caps below need a restart.
+upload_max_body_size = 268435456
+# (gstore-rust extension) the largest body a request may have before it is
+# authenticated, on every route (64 MB; at most upload_max_body_size). An
+# upstream client sends its credentials inside the body (an /api JSON body,
+# the /file/upload form), so this is also the most it can upload: set it to
+# upload_max_body_size to restore upstream's limit.
+preauth_max_body_size = 67108864
+# (gstore-rust extension) the request-body bytes all connections may hold in
+# memory at once (512 MB; at least upload_max_body_size): a request that would
+# exceed it is answered 503 (retry later).
+request_body_budget = 536870912
 # allow extensions (also of build / batchInsert / batchRemove sources; with
 # the `gzip` feature `x.nt.gz` counts as `nt`). gstore-rust adds the quad
 # formats to upstream's "nt|ttl|n3|rdf|txt": export writes N-Quads (.nq) for
