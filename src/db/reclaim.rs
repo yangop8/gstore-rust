@@ -146,6 +146,11 @@ pub(crate) struct Candidates {
     /// The key each position of [`note_triple`](Self::note_triple) pushed
     /// last ([`NO_KEY`] when none since the last `take` / `clear`).
     last: [u64; 4],
+    /// Candidates already found unreferenced while their frees wait (a
+    /// journaled RocksDB statement that only removes, see
+    /// [`Database::keep_dead_candidates`]): not checked again before the
+    /// end; [`take`](Self::take) returns them with the others.
+    dead: Vec<u64>,
 }
 
 /// No candidate: above every [`pack`]ed key.
@@ -179,6 +184,7 @@ impl Default for Candidates {
         Candidates {
             keys: Vec::new(),
             last: [NO_KEY; 4],
+            dead: Vec::new(),
         }
     }
 }
@@ -210,22 +216,39 @@ impl Candidates {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.keys.is_empty()
+        self.keys.is_empty() && self.dead.is_empty()
     }
 
     /// Forget every candidate.
     pub(crate) fn clear(&mut self) {
         self.keys.clear();
         self.last = [NO_KEY; 4];
+        self.dead.clear();
     }
 
     /// Take the candidates, sorted and de-duplicated.
     pub(crate) fn take(&mut self) -> Vec<TermId> {
         let mut keys = std::mem::take(&mut self.keys);
+        keys.append(&mut self.dead);
         self.last = [NO_KEY; 4];
         keys.sort_unstable();
         keys.dedup();
         keys.into_iter().map(unpack).collect()
+    }
+
+    /// [`take`](Self::take) the candidates not yet found unreferenced,
+    /// leaving the ones that were ([`keep_dead`](Self::keep_dead)).
+    fn take_unchecked(&mut self) -> Vec<TermId> {
+        let dead = std::mem::take(&mut self.dead);
+        let unchecked = self.take();
+        self.dead = dead;
+        unchecked
+    }
+
+    /// Keep `dead`, candidates just found unreferenced, without checking
+    /// them again before [`take`](Self::take).
+    fn keep_dead(&mut self, dead: Vec<TermId>) {
+        self.dead.extend(dead.into_iter().map(pack));
     }
 }
 
@@ -424,14 +447,18 @@ impl Database {
     /// candidates nothing references now (and those a read error left
     /// undecided) — a removal never makes a term referenced again — so that
     /// a long import holds the ids it will free, not every term it touched.
+    /// Only the batch's new candidates are checked: the ones kept by
+    /// earlier batches are not probed again until the statement's end (once
+    /// per batch, a large `gsub` probed them a quadratic number of times).
     /// A no-op otherwise.
     pub(super) fn keep_dead_candidates(&mut self) {
         if self.txn.is_some() || !self.rocks_journaling() || self.reclaim.is_empty() {
             return;
         }
-        let cands = self.reclaim.take();
+        let cands = self.reclaim.take_unchecked();
         let check = self.dead_of(&cands);
-        for t in check.dead.into_iter().chain(check.failed) {
+        self.reclaim.keep_dead(check.dead);
+        for t in check.failed {
             self.reclaim.note(t);
         }
     }
@@ -944,5 +971,94 @@ mod tests {
                 assert_eq!(pack(a).cmp(&pack(b)), a.cmp(&b), "{a:?} {b:?}");
             }
         }
+    }
+
+    /// Candidates kept as found unreferenced are not handed out again as
+    /// unchecked, and `take` returns them with the others.
+    #[test]
+    fn kept_dead_candidates_are_taken_once_with_the_others() {
+        let mut c = Candidates::default();
+        c.note_triple(None, IdTriple::new(1, 2, 3));
+        let first = c.take_unchecked();
+        assert_eq!(first.len(), 3);
+        c.keep_dead(vec![TermId::node(1), TermId::node(3)]);
+        assert!(!c.is_empty());
+        assert!(c.take_unchecked().is_empty(), "kept ones are checked");
+        c.note_triple(None, IdTriple::new(4, 2, 3));
+        assert_eq!(c.take_unchecked().len(), 3);
+        c.note(TermId::node(4));
+        let all = c.take();
+        assert_eq!(all, vec![TermId::node(1), TermId::node(3), TermId::node(4)]);
+        assert!(c.is_empty());
+        c.keep_dead(vec![TermId::node(9)]);
+        c.clear();
+        assert!(c.is_empty());
+    }
+
+    /// `remove_sources` on RocksDB — one journaled statement, whose frees
+    /// wait for its end — probes each candidate a bounded number of times
+    /// however many batches it reads: the dead ones kept by earlier batches
+    /// are not probed again per batch (a quadratic number of RocksDB reads
+    /// for a large `gsub`).
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn a_journaled_removal_probes_each_candidate_a_bounded_number_of_times() {
+        use crate::parser::import::{sources_from_paths, ImportOptions};
+
+        struct Gone(std::path::PathBuf);
+        impl Drop for Gone {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let tmp = Gone(
+            std::env::temp_dir().join(format!("gstore_ut_reclaim_probes_{}", std::process::id())),
+        );
+        let _ = std::fs::remove_dir_all(&tmp.0);
+        std::fs::create_dir_all(&tmp.0).unwrap();
+        // N statements, each with a subject and an object of its own (two
+        // dead terms once removed), read in batches of 10; the predicate
+        // stays used by the kept statement.
+        const N: u64 = 400;
+        const BATCH: u64 = 10;
+        let mut text = String::from("<http://ex/keep> <http://ex/p> \"keep\" .\n");
+        let mut removed = String::new();
+        for i in 0..N {
+            let line = format!("<http://ex/s{i}> <http://ex/p> \"o{i}\" .\n");
+            text.push_str(&line);
+            removed.push_str(&line);
+        }
+        let file = tmp.0.join("remove.nt");
+        std::fs::write(&file, &removed).unwrap();
+        let mut db = Database::build_rocksdb_from_str("probes", tmp.0.join("db"), &text).unwrap();
+        let opts = ImportOptions {
+            batch_size: BATCH as usize,
+            ..ImportOptions::strict().for_removal()
+        };
+        let before = test_hooks::probes();
+        let mut applied = 0;
+        db.remove_sources(
+            &sources_from_paths(&[&file]).unwrap(),
+            &opts,
+            &mut (),
+            &mut applied,
+        )
+        .unwrap();
+        let probes = test_hooks::probes() - before;
+        assert_eq!(applied, N);
+        // About 2N + N/BATCH candidates, each probed when its batch is read
+        // and once more at the end (probing the kept ones per batch: ~17k).
+        let candidates = 2 * N + N / BATCH;
+        assert!(
+            probes <= 3 * candidates,
+            "{probes} reference probes for {candidates} candidates"
+        );
+        assert_eq!(db.triple_num(), 1);
+        assert_eq!(
+            db.entity_num() + db.literal_num() + db.predicate_num(),
+            3,
+            "every removed statement's own terms are freed"
+        );
+        db.verify_integrity().unwrap();
     }
 }
