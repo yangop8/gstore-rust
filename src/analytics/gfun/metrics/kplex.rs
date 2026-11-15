@@ -2723,6 +2723,14 @@ pub(super) fn maximum_kplex(ctx: &GFunCtx<'_>, f: &PredFilter, k: i32) -> Result
     if 2 * i64::from(k) - 2 > MAX_FAKE_KPLEX {
         return Err(kerr(format!("maximumKplex: k too large ({k})")));
     }
+    if ctx.csr.num_nodes() == 0 {
+        // No vertex at all (an empty or literal-only database): the empty
+        // answer for every k. Upstream's heuristic indexes `head[0]` of an
+        // empty array here (k <= 2: a panic), and its `2k - 2` fake
+        // solution would name vertex 0, which does not exist (review
+        // gap-gfun-fuzz#1).
+        return Ok(Vec::new());
+    }
     let ctx = *ctx;
     with_big_stack(move || {
         let mut g = Graph::new(ctx, k);
