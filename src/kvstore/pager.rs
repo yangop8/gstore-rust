@@ -29,6 +29,31 @@
 //! unwinding through it) is rolled back: every page it wrote returns to its
 //! previous contents and the header (page count, free list, root slots) to its
 //! state at `begin_op`, so a failed operation leaves no trace at all.
+//!
+//! ## Commit, write-ahead log and the failed state
+//! A [`flush`](Pager::flush) stages the batch (header + dirty pages) in
+//! `<file>.wal.tmp`, fsyncs it, renames it to `<file>.wal` and fsyncs the
+//! directory — a log is never truncated or rewritten in place, so a log the
+//! file still needs can only be replaced, atomically, by a complete newer
+//! one. Then the batch is applied to the file, the file fsynced, the log
+//! removed and the directory fsynced again.
+//!
+//! A failure before the rename leaves the file and the directory as they
+//! were: the flush can simply be retried. Once the log has its name, it may
+//! be durable, and any later error (applying a page, the fsyncs, removing the
+//! log) leaves the file possibly half-applied: the pager becomes **failed**
+//! ([`failure`](Pager::failure)). A failed pager refuses every write, page
+//! allocation and commit with [`GStoreError::StorageFailed`] — reads still
+//! work, every page of the batch is resident and dirty — and it never writes
+//! the file again (it has no `Drop` flush either). Reopening replays the
+//! complete log, so the file holds exactly the last batch whose log was
+//! complete, never a mix. A store built on the pager may also mark it failed
+//! when it finds itself out of step with it
+//! ([`mark_failed`](Pager::mark_failed)).
+//!
+//! [`open`](Pager::open) replays a complete log and discards a torn one; a
+//! log that exists but cannot be read fails the open (only "not found" means
+//! "no log"), and so does a file shorter than its header's page count.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -36,7 +61,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::error::{GStoreError, Result};
 
@@ -58,6 +83,10 @@ const COMMIT_MAGIC: &[u8; 8] = b"GSTORECM";
 
 /// A page index into the file. Page 0 is the header; 0 also means "null".
 pub type PageId = u32;
+
+/// The sticky failed state of a [`Pager`] (see the module docs), shareable
+/// without the pager's lock: set once with the reason, never cleared.
+pub type FailureFlag = Arc<OnceLock<String>>;
 
 /// A cache frame: one resident page.
 struct Frame {
@@ -255,6 +284,10 @@ pub struct Pager {
     /// rollback): what a reader holding a copy of a page checks before it
     /// trusts the copy ([`write_generation`](Self::write_generation)).
     write_gen: u64,
+    /// Set once a commit failed after its log got its name (or a store on
+    /// this pager found itself out of step with it): every write and commit
+    /// is refused from then on (see the module docs).
+    failed: FailureFlag,
     /// Number of committed flushes (tests assert when commits happen).
     #[cfg(test)]
     flushes: u64,
@@ -276,6 +309,7 @@ impl Pager {
             .open(path)?;
         // Crash recovery: replay a fully-committed WAL into the main file (redo),
         // discard a torn one, then clear the log — before reading the header.
+        // A log that exists but cannot be read fails the open.
         recover_wal(&mut file, &wal_path)?;
         let len = file.metadata()?.len();
         let capacity = capacity.max(8);
@@ -295,6 +329,7 @@ impl Pager {
             op_header: None,
             op_failed: false,
             write_gen: 0,
+            failed: Arc::new(OnceLock::new()),
             #[cfg(test)]
             flushes: 0,
         };
@@ -314,8 +349,49 @@ impl Pager {
                 *r = u64::from_le_bytes(hdr[off..off + 8].try_into().unwrap());
             }
             format::check_header(&hdr[0..8], p.features(), format::SUPPORTED_FEATURES)?;
+            // Every committed batch writes all pages below its page count, so
+            // a shorter file is truncated or torn: refuse it rather than fail
+            // (or invent zero pages) on some later read.
+            let need = u64::from(p.page_count) * PAGE_SIZE as u64;
+            if len < need {
+                return Err(GStoreError::Database(format!(
+                    "'{}' is torn or truncated: {len} bytes, but its header counts {} pages \
+                     ({need} bytes)",
+                    path.display(),
+                    p.page_count
+                )));
+            }
         }
         Ok(p)
+    }
+
+    /// Why this pager refuses every write and commit, if it does: a commit
+    /// failed after its write-ahead log got its name, or a store built on the
+    /// pager marked it failed (see the module docs). Reopen to recover.
+    pub fn failure(&self) -> Option<&str> {
+        self.failed.get().map(String::as_str)
+    }
+
+    /// The flag behind [`failure`](Self::failure), for a store sharing this
+    /// pager that checks (or sets) it without taking the pager's lock.
+    pub fn failure_flag(&self) -> FailureFlag {
+        Arc::clone(&self.failed)
+    }
+
+    /// Mark the pager failed (the first reason wins): from now on it refuses
+    /// every write and commit, so nothing a store above it can no longer
+    /// vouch for reaches the file. Reopening clears the state.
+    pub fn mark_failed(&self, why: impl Into<String>) {
+        let _ = self.failed.set(why.into());
+    }
+
+    /// `Err(StorageFailed)` once the pager failed.
+    #[inline]
+    fn check_writable(&self) -> Result<()> {
+        match self.failed.get() {
+            Some(why) => Err(GStoreError::StorageFailed(why.clone())),
+            None => Ok(()),
+        }
     }
 
     /// A header root slot (higher layers store tree roots etc. here).
@@ -454,6 +530,7 @@ impl Pager {
                 "page 0 is reserved for header".into(),
             ));
         }
+        self.check_writable()?;
         self.write_gen += 1;
         let gen = (self.op_depth > 0).then_some(self.op_gen);
         // `&mut self` ⇒ exclusive access; reach the cache without locking.
@@ -530,6 +607,7 @@ impl Pager {
 
     /// Allocate a fresh page (reusing the free list when possible).
     pub fn alloc(&mut self) -> Result<PageId> {
+        self.check_writable()?;
         if self.free_head != 0 {
             let id = self.free_head;
             // The first 4 bytes of a free page hold the next free page id.
@@ -556,6 +634,7 @@ impl Pager {
                 "page 0 is reserved for header".into(),
             ));
         }
+        self.check_writable()?;
         let mut page = [0u8; PAGE_SIZE];
         page[0..4].copy_from_slice(&self.free_head.to_le_bytes());
         self.write_page(id, &page)?;
@@ -564,13 +643,22 @@ impl Pager {
     }
 
     /// Commit: durably persist the header and every dirty page as one atomic
-    /// batch. The batch is first written (with a checksum + commit marker) to the
-    /// write-ahead log and fsynced, then applied to the main file and fsynced,
-    /// then the log is cleared. A crash at any point leaves either the old state
-    /// (log torn/absent) or the new state (log replayed on next open) — never a
-    /// partial mix *of this page batch*. Refused while an operation bracket is
-    /// open, so a batch never holds part of an operation.
+    /// batch. The batch is first written (with a checksum + commit marker) to
+    /// the write-ahead log — staged under a temporary name, fsynced, renamed
+    /// into place, the directory fsynced — then applied to the main file and
+    /// fsynced, then the log is removed (and the directory fsynced). A crash
+    /// at any point leaves either the old state (log torn/absent) or the new
+    /// state (log replayed on next open) — never a partial mix *of this page
+    /// batch*. Refused while an operation bracket is open, so a batch never
+    /// holds part of an operation.
+    ///
+    /// An error before the log got its name changes nothing on disk (the
+    /// pages stay dirty; the flush may be retried). An error after it leaves
+    /// the pager **failed** and returns [`GStoreError::StorageFailed`]: the
+    /// log holds the batch, the next open replays it, and until then nothing
+    /// is written (see the module docs).
     pub fn flush(&mut self) -> Result<()> {
+        self.check_writable()?;
         if self.op_depth > 0 {
             return Err(GStoreError::Database(
                 "cannot commit the page cache inside an open operation".into(),
@@ -590,17 +678,23 @@ impl Pager {
             );
         }
 
-        // 1. Write-ahead: log the batch, then fsync the log.
+        // 1. Write-ahead: stage the log under a temporary name and fsync it,
+        //    then give it its name. Nothing on disk changed if this fails.
         write_wal(&self.wal_path, &batch)?;
-        // 2. Apply the batch to the main file, then fsync it.
-        for (id, data) in &batch {
-            self.file
-                .seek(SeekFrom::Start(*id as u64 * PAGE_SIZE as u64))?;
-            self.file.write_all(&data[..])?;
+        // From here the log may be durable: an error leaves the file possibly
+        // half-applied, which only a replay of the log can finish.
+        if let Err(e) = self.apply_committed(&batch) {
+            let why = format!(
+                "a committed page batch could not be applied to '{}' ({e}); it stays in the \
+                 write-ahead log '{}', which the next open replays",
+                self.wal_path.with_extension("").display(),
+                self.wal_path.display()
+            );
+            self.mark_failed(why.clone());
+            return Err(GStoreError::StorageFailed(
+                self.failure().map_or(why, str::to_string),
+            ));
         }
-        self.file.sync_all()?;
-        // 3. Drop the log: the main file is now the durable state.
-        let _ = std::fs::remove_file(&self.wal_path);
         drop(batch);
 
         // Every cached page is clean now; return to capacity.
@@ -615,6 +709,23 @@ impl Pager {
             self.flushes += 1;
         }
         Ok(())
+    }
+
+    /// Steps 2 and 3 of a flush, once the batch's log has its name: make the
+    /// name durable, apply the batch to the main file and fsync it, remove
+    /// the log and make the removal durable.
+    fn apply_committed(&mut self, batch: &[(PageId, Arc<Page>)]) -> Result<()> {
+        sync_parent_dir(&self.wal_path)?;
+        for (_i, (id, data)) in batch.iter().enumerate() {
+            #[cfg(test)]
+            failpoints::apply(_i)?;
+            self.file
+                .seek(SeekFrom::Start(*id as u64 * PAGE_SIZE as u64))?;
+            self.file.write_all(&data[..])?;
+        }
+        self.file.sync_all()?;
+        remove_wal(&self.wal_path)?;
+        sync_parent_dir(&self.wal_path)
     }
 
     /// Number of allocated pages (including the header).
@@ -812,9 +923,58 @@ fn wal_path_for(path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Serialize and durably write a committed batch to the WAL (truncating any
-/// previous one), fsyncing before returning so the log is on disk before the
-/// main file is touched.
+/// The staging name of a WAL (`<file>.wal.tmp`): a log is written here and
+/// renamed into place, never rewritten in place. A staged log is not a commit
+/// (open removes a leftover one).
+fn wal_tmp_path(wal: &Path) -> PathBuf {
+    let mut s = wal.as_os_str().to_owned();
+    s.push(".tmp");
+    PathBuf::from(s)
+}
+
+/// `fsync` the directory holding `path`, so a rename or removal inside it is
+/// durable. A no-op off unix, where directories cannot be opened for syncing.
+fn sync_parent_dir(path: &Path) -> Result<()> {
+    #[cfg(test)]
+    failpoints::count_dir_sync();
+    #[cfg(unix)]
+    {
+        let dir = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        File::open(dir)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+/// Remove a WAL; "not found" counts as removed.
+fn remove_wal(path: &Path) -> Result<()> {
+    #[cfg(test)]
+    failpoints::wal_delete()?;
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Read a WAL (`NotFound` when there is none).
+fn read_wal(path: &Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(test)]
+    failpoints::wal_read(path)?;
+    std::fs::read(path)
+}
+
+/// Serialize a committed batch and give it the WAL's name durably-ready:
+/// written and fsynced under [`wal_tmp_path`], then renamed over `path` (an
+/// existing log is replaced atomically, never truncated). The caller fsyncs
+/// the directory before it touches the main file. On an error the staged
+/// file is removed and `path` is as it was.
 fn write_wal<P: Deref<Target = Page>>(path: &Path, batch: &[(PageId, P)]) -> Result<()> {
     let mut buf = Vec::with_capacity(8 + 4 + batch.len() * (4 + PAGE_SIZE) + 12);
     buf.extend_from_slice(WAL_MAGIC);
@@ -828,23 +988,51 @@ fn write_wal<P: Deref<Target = Page>>(path: &Path, batch: &[(PageId, P)]) -> Res
     buf.extend_from_slice(&crc.to_le_bytes());
     buf.extend_from_slice(COMMIT_MAGIC);
 
-    let mut f = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)?;
-    f.write_all(&buf)?;
-    f.sync_all()?;
-    Ok(())
+    let tmp = wal_tmp_path(path);
+    let staged = (|| -> Result<()> {
+        // The staging file is never a log anyone replays, so truncating a
+        // leftover one is harmless.
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+        #[cfg(test)]
+        failpoints::wal_write(&mut f, &buf)?;
+        f.write_all(&buf)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if staged.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    staged
 }
 
-/// Replay a committed WAL into the main file, then remove the log. A missing,
-/// torn, or checksum-mismatched log is discarded (the main file is already the
-/// last consistent state).
+/// Replay a committed WAL into the main file, then remove the log (durably).
+/// A torn or checksum-mismatched log is discarded (the main file is already
+/// the last consistent state). Only a log that does not exist means "nothing
+/// to recover": one that exists but cannot be read may hold a batch the file
+/// needs, so the error is returned (and the open fails) rather than opening a
+/// file that may be half-applied. A leftover staged log is not a commit and
+/// is removed.
 fn recover_wal(file: &mut File, path: &Path) -> Result<()> {
-    let data = match std::fs::read(path) {
+    let _ = std::fs::remove_file(wal_tmp_path(path));
+    let data = match read_wal(path) {
         Ok(d) => d,
-        Err(_) => return Ok(()), // no log ⇒ nothing to recover
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(GStoreError::Io(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "cannot read the write-ahead log '{}' ({e}); it may hold a committed batch \
+                     the file still needs, so the file is not opened without it",
+                    path.display()
+                ),
+            )))
+        }
     };
     if let Some(batch) = parse_wal(&data) {
         for (id, page) in batch {
@@ -853,8 +1041,8 @@ fn recover_wal(file: &mut File, path: &Path) -> Result<()> {
         }
         file.sync_all()?;
     }
-    let _ = std::fs::remove_file(path);
-    Ok(())
+    remove_wal(path)?;
+    sync_parent_dir(path)
 }
 
 /// Parse a WAL buffer, returning the batch only if it is a complete, intact,
@@ -900,6 +1088,112 @@ fn crc32(data: &[u8]) -> u32 {
         }
     }
     !crc
+}
+
+/// Test-only failpoints of the commit path and of recovery, standing in for
+/// `ENOSPC` / `EIO` at exact steps. Per thread (a test arms them on the
+/// thread that drives the pager) and cleared when the [`Armed`] guard is
+/// dropped, also when the test fails.
+#[cfg(test)]
+pub(crate) mod failpoints {
+    use std::cell::Cell;
+    use std::fs::File;
+    use std::io::{self, Write};
+    use std::path::Path;
+
+    thread_local! {
+        static APPLY_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
+        static WAL_WRITE_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
+        static WAL_DELETE: Cell<bool> = const { Cell::new(false) };
+        static WAL_UNREADABLE: Cell<bool> = const { Cell::new(false) };
+        static DIR_SYNCS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    fn injected(what: &str) -> io::Error {
+        io::Error::other(format!("injected failure: {what} (No space left on device)"))
+    }
+
+    /// Clears every failpoint of this thread when dropped.
+    #[must_use]
+    pub(crate) struct Armed;
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            APPLY_AFTER.with(|c| c.set(None));
+            WAL_WRITE_AFTER.with(|c| c.set(None));
+            WAL_DELETE.with(|c| c.set(false));
+            WAL_UNREADABLE.with(|c| c.set(false));
+        }
+    }
+
+    /// Applying a batch writes its first `k` pages (the header is page 0 of
+    /// the batch), then fails.
+    pub(crate) fn fail_apply_after(k: usize) -> Armed {
+        APPLY_AFTER.with(|c| c.set(Some(k)));
+        Armed
+    }
+
+    /// Staging a WAL writes its first `n` bytes, then fails.
+    pub(crate) fn fail_wal_write_after(n: usize) -> Armed {
+        WAL_WRITE_AFTER.with(|c| c.set(Some(n)));
+        Armed
+    }
+
+    /// Removing a WAL fails.
+    pub(crate) fn fail_wal_delete() -> Armed {
+        WAL_DELETE.with(|c| c.set(true));
+        Armed
+    }
+
+    /// Reading an existing WAL fails with `PermissionDenied`.
+    pub(crate) fn wal_unreadable() -> Armed {
+        WAL_UNREADABLE.with(|c| c.set(true));
+        Armed
+    }
+
+    /// Directory fsyncs this thread made so far.
+    pub(crate) fn dir_syncs() -> u64 {
+        DIR_SYNCS.with(Cell::get)
+    }
+
+    pub(super) fn count_dir_sync() {
+        DIR_SYNCS.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(super) fn apply(i: usize) -> io::Result<()> {
+        match APPLY_AFTER.with(Cell::get) {
+            Some(k) if i >= k => Err(injected("applying a page")),
+            _ => Ok(()),
+        }
+    }
+
+    pub(super) fn wal_write(f: &mut File, buf: &[u8]) -> io::Result<()> {
+        match WAL_WRITE_AFTER.with(Cell::get) {
+            Some(n) => {
+                f.write_all(&buf[..n.min(buf.len())])?;
+                f.sync_all()?;
+                Err(injected("writing the write-ahead log"))
+            }
+            None => Ok(()),
+        }
+    }
+
+    pub(super) fn wal_delete() -> io::Result<()> {
+        if WAL_DELETE.with(Cell::get) {
+            return Err(injected("removing the write-ahead log"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn wal_read(path: &Path) -> io::Result<()> {
+        if WAL_UNREADABLE.with(Cell::get) && path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected failure: Permission denied",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1575,6 +1869,315 @@ mod tests {
             Pager::open(&path, 16).is_err(),
             "this binary refuses the new feature"
         );
+        cleanup(&path);
+    }
+
+    // ---- review C-1 / M1 (durability#1, disk#1, disk#2, durability#7,
+    // ---- robust#12, durability#8, disk#12, durability#16): the failed state
+
+    fn is_storage_failed(r: &Result<impl std::fmt::Debug>) -> bool {
+        matches!(r, Err(GStoreError::StorageFailed(_)))
+    }
+
+    /// 100 committed pages tagged with their index; their ids.
+    fn committed_pages(pg: &mut Pager, n: u32) -> Vec<PageId> {
+        let ids = big_op(pg, n, 0);
+        pg.flush().unwrap();
+        ids
+    }
+
+    /// Batch N: pages `ids[0]`, `ids[1]`, `ids[59]` rewritten (tags 1000+)
+    /// and 20 fresh pages (tags 2000+); returns the fresh ids.
+    fn dirty_batch(pg: &mut Pager, ids: &[PageId]) -> Vec<PageId> {
+        pg.write_page(ids[0], &page_with(1000)).unwrap();
+        pg.write_page(ids[1], &page_with(1001)).unwrap();
+        pg.write_page(ids[59], &page_with(1002)).unwrap();
+        big_op(pg, 20, 2000)
+    }
+
+    /// The pages of batch N, as a reopened pager must see them.
+    fn assert_batch_applied(pg: &Pager, ids: &[PageId], fresh: &[PageId]) {
+        assert_eq!(tag_of(&pg.read_page(ids[0]).unwrap()), 1000);
+        assert_eq!(tag_of(&pg.read_page(ids[1]).unwrap()), 1001);
+        assert_eq!(tag_of(&pg.read_page(ids[59]).unwrap()), 1002);
+        for (i, &id) in ids.iter().enumerate().skip(2).filter(|&(i, _)| i != 59) {
+            assert_eq!(tag_of(&pg.read_page(id).unwrap()), i as u32);
+        }
+        for (i, &id) in fresh.iter().enumerate() {
+            assert_eq!(tag_of(&pg.read_page(id).unwrap()), 2000 + i as u32);
+        }
+        assert_eq!(pg.page_count(), 1 + ids.len() as u32 + fresh.len() as u32);
+    }
+
+    #[test]
+    fn a_failed_apply_fails_the_pager_and_a_reopen_replays_the_whole_batch() {
+        let path = tmp("fail_apply");
+        let wal = wal_path_for(&path);
+        let (ids, fresh) = {
+            let mut pg = Pager::open(&path, 256).unwrap();
+            let ids = committed_pages(&mut pg, 100);
+            let fresh = dirty_batch(&mut pg, &ids);
+            {
+                // The header and two pages reach the file, then ENOSPC.
+                let _fp = failpoints::fail_apply_after(3);
+                let r = pg.flush();
+                assert!(is_storage_failed(&r), "{r:?}");
+            }
+            let why = pg.failure().expect("the pager is failed").to_string();
+            assert!(why.contains("write-ahead log"), "{why}");
+            let log = std::fs::read(&wal).expect("the committed log stays");
+            assert!(parse_wal(&log).is_some(), "and it is complete");
+            let file = std::fs::read(&path).unwrap();
+            // Every write and every commit is refused from now on.
+            assert!(is_storage_failed(&pg.write_page(ids[3], &page_with(7))));
+            assert!(is_storage_failed(&pg.alloc()));
+            assert!(is_storage_failed(&pg.free(ids[4])));
+            assert!(is_storage_failed(&pg.flush()));
+            {
+                let mut op = PagerOp::begin(&mut pg);
+                assert!(is_storage_failed(&op.write_page(ids[5], &page_with(8))));
+            }
+            // Reads still answer batch N (its pages are resident and dirty).
+            assert_eq!(tag_of(&pg.read_page(ids[59]).unwrap()), 1002);
+            assert_eq!(std::fs::read(&wal).unwrap(), log, "the log is never rewritten");
+            assert_eq!(std::fs::read(&path).unwrap(), file, "nor the file");
+            drop(pg); // a clean drop writes nothing either
+            assert_eq!(std::fs::read(&wal).unwrap(), log);
+            assert_eq!(std::fs::read(&path).unwrap(), file);
+            (ids, fresh)
+        };
+        // The reopen replays the complete log: batch N whole, never a mix.
+        let pg = Pager::open(&path, 16).unwrap();
+        assert!(pg.failure().is_none(), "a reopen clears the failed state");
+        assert!(!wal.exists());
+        assert_batch_applied(&pg, &ids, &fresh);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_retry_after_a_failed_apply_can_never_tear_the_log() {
+        // The review's sequence (durability#16): flush #1 fails mid-apply,
+        // the session writes on and flushes again, then exits cleanly. Before
+        // the fix the retry truncated the only complete log and failed while
+        // rewriting it, so the reopen found a torn log, a half-applied header
+        // and missing pages.
+        let path = tmp("fail_retry");
+        let (ids, fresh) = {
+            let mut pg = Pager::open(&path, 256).unwrap();
+            let ids = committed_pages(&mut pg, 100);
+            let fresh = dirty_batch(&mut pg, &ids);
+            {
+                let _fp = failpoints::fail_apply_after(2);
+                assert!(pg.flush().is_err());
+            }
+            for &id in &ids[2..] {
+                assert!(is_storage_failed(&pg.write_page(id, &page_with(3000))));
+            }
+            assert!(is_storage_failed(&pg.flush()));
+            (ids, fresh)
+        };
+        let pg = Pager::open(&path, 16).unwrap();
+        assert_batch_applied(&pg, &ids, &fresh);
+        for id in 1..pg.page_count() {
+            pg.read_page(id).expect("every page below the page count reads");
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_failed_wal_removal_fails_the_pager_and_a_reopen_is_consistent() {
+        let path = tmp("fail_wal_rm");
+        let wal = wal_path_for(&path);
+        let (ids, fresh) = {
+            let mut pg = Pager::open(&path, 256).unwrap();
+            let ids = committed_pages(&mut pg, 100);
+            let fresh = dirty_batch(&mut pg, &ids);
+            {
+                let _fp = failpoints::fail_wal_delete();
+                assert!(is_storage_failed(&pg.flush()));
+            }
+            assert!(wal.exists(), "the log could not be removed");
+            assert!(pg.failure().is_some());
+            assert!(is_storage_failed(&pg.write_page(ids[3], &page_with(9))));
+            assert!(is_storage_failed(&pg.flush()));
+            (ids, fresh)
+        };
+        let pg = Pager::open(&path, 16).unwrap();
+        assert!(!wal.exists(), "the reopen replays and removes it");
+        assert_batch_applied(&pg, &ids, &fresh);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_failed_wal_write_changes_nothing_and_the_flush_can_be_retried() {
+        let path = tmp("fail_wal_write");
+        let wal = wal_path_for(&path);
+        // A cache that holds the whole batch: no commit before the failpoint.
+        let mut pg = Pager::open(&path, 256).unwrap();
+        let ids = committed_pages(&mut pg, 100);
+        let before = std::fs::read(&path).unwrap();
+        let fresh = dirty_batch(&mut pg, &ids);
+        {
+            let _fp = failpoints::fail_wal_write_after(PAGE_SIZE + 100);
+            let r = pg.flush();
+            assert!(matches!(r, Err(GStoreError::Io(_))), "{r:?}");
+        }
+        assert!(pg.failure().is_none(), "nothing reached the file: retryable");
+        assert!(!wal.exists(), "no log got its name");
+        assert!(!wal_tmp_path(&wal).exists(), "the staged log is removed");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(pg.dirty_pages(), 23, "the batch is still pending");
+        pg.flush().expect("the retry commits");
+        drop(pg);
+        let pg = Pager::open(&path, 16).unwrap();
+        assert_batch_applied(&pg, &ids, &fresh);
+        drop(pg);
+        // Without the retry, a reopen finds the state before the batch.
+        let mut pg = Pager::open(&path, 16).unwrap();
+        pg.write_page(ids[7], &page_with(4000)).unwrap();
+        {
+            let _fp = failpoints::fail_wal_write_after(10);
+            assert!(pg.flush().is_err());
+        }
+        drop(pg);
+        let pg = Pager::open(&path, 16).unwrap();
+        assert_eq!(tag_of(&pg.read_page(ids[7]).unwrap()), 7);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_staged_log_never_replaces_a_complete_one_in_place() {
+        // Review durability#1 / disk#1: the log used to be opened with
+        // O_TRUNC, so rewriting it destroyed the complete one first. Now a
+        // log is staged and renamed: a failure leaves the old log intact.
+        let path = tmp("wal_no_trunc");
+        let wal = wal_path_for(&path);
+        let old = page_with(11);
+        write_wal(&wal, &[(1, &old)]).unwrap();
+        let complete = std::fs::read(&wal).unwrap();
+        let big: Vec<(PageId, Box<Page>)> = (1..40)
+            .map(|i| (i, Box::new(page_with(500 + i))))
+            .collect();
+        {
+            let _fp = failpoints::fail_wal_write_after(3 * PAGE_SIZE);
+            assert!(write_wal(&wal, &big).is_err());
+        }
+        assert_eq!(std::fs::read(&wal).unwrap(), complete, "untouched");
+        assert!(!wal_tmp_path(&wal).exists());
+        write_wal(&wal, &big).unwrap();
+        let replaced = parse_wal(&std::fs::read(&wal).unwrap()).expect("complete");
+        assert_eq!(replaced.len(), 39, "replaced whole, atomically");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn an_unreadable_wal_fails_the_open_and_only_a_missing_one_means_no_log() {
+        // Review disk#2 / durability#7 / robust#12: any read error used to
+        // mean "no log", so the file opened half-applied and the next flush
+        // overwrote the log for good.
+        let path = tmp("wal_unreadable");
+        let wal = wal_path_for(&path);
+        {
+            let mut pg = Pager::open(&path, 16).unwrap();
+            committed_pages(&mut pg, 3);
+        }
+        // A crash mid-apply: a complete log, page 1 applied, page 2 not.
+        write_wal(&wal, &[(1, &page_with(91)), (2, &page_with(92))]).unwrap();
+        {
+            let mut f = OpenOptions::new().write(true).open(&path).unwrap();
+            f.seek(SeekFrom::Start(PAGE_SIZE as u64)).unwrap();
+            f.write_all(&page_with(91)).unwrap();
+        }
+        let file = std::fs::read(&path).unwrap();
+        {
+            let _fp = failpoints::wal_unreadable();
+            let e = Pager::open(&path, 16).err().expect("the open fails");
+            assert!(e.to_string().contains("write-ahead log"), "{e}");
+        }
+        assert!(wal.exists(), "the log is kept");
+        assert_eq!(std::fs::read(&path).unwrap(), file, "the file untouched");
+        let pg = Pager::open(&path, 16).unwrap();
+        assert_eq!(tag_of(&pg.read_page(1).unwrap()), 91);
+        assert_eq!(tag_of(&pg.read_page(2).unwrap()), 92);
+        assert!(!wal.exists());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_leftover_staged_log_is_not_replayed_and_is_removed() {
+        let path = tmp("wal_tmp_left");
+        let wal = wal_path_for(&path);
+        {
+            let mut pg = Pager::open(&path, 16).unwrap();
+            committed_pages(&mut pg, 3);
+        }
+        // A crash after staging, before the rename: even a complete staged
+        // log is not a commit.
+        write_wal(&wal, &[(1, &page_with(77))]).unwrap();
+        std::fs::rename(&wal, wal_tmp_path(&wal)).unwrap();
+        let pg = Pager::open(&path, 16).unwrap();
+        assert_eq!(tag_of(&pg.read_page(1).unwrap()), 0);
+        assert!(!wal_tmp_path(&wal).exists());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_file_shorter_than_its_page_count_is_refused() {
+        let path = tmp("short_file");
+        {
+            let mut pg = Pager::open(&path, 16).unwrap();
+            committed_pages(&mut pg, 10);
+        }
+        let f = OpenOptions::new().write(true).open(&path).unwrap();
+        f.set_len(6 * PAGE_SIZE as u64).unwrap();
+        drop(f);
+        let e = Pager::open(&path, 16).err().expect("refused").to_string();
+        assert!(e.contains("torn or truncated"), "{e}");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn every_commit_fsyncs_the_directory_after_naming_and_removing_the_log() {
+        // Review durability#8 / robust#12.
+        let path = tmp("dir_sync");
+        let wal = wal_path_for(&path);
+        let mut pg = Pager::open(&path, 16).unwrap();
+        let ids = committed_pages(&mut pg, 4);
+        pg.write_page(ids[0], &page_with(5)).unwrap();
+        let before = failpoints::dir_syncs();
+        pg.flush().unwrap();
+        assert_eq!(failpoints::dir_syncs() - before, 2, "rename + removal");
+        drop(pg);
+        write_wal(&wal, &[(1, &page_with(6))]).unwrap();
+        let before = failpoints::dir_syncs();
+        let pg = Pager::open(&path, 16).unwrap();
+        assert_eq!(failpoints::dir_syncs() - before, 1, "the replayed log's removal");
+        assert_eq!(tag_of(&pg.read_page(1).unwrap()), 6);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_pager_marked_failed_refuses_writes_and_commits() {
+        let path = tmp("mark_failed");
+        let mut pg = Pager::open(&path, 16).unwrap();
+        let ids = committed_pages(&mut pg, 4);
+        pg.write_page(ids[0], &page_with(5)).unwrap();
+        let flag = pg.failure_flag();
+        let _ = flag.set("the store above found itself out of step".into());
+        assert_eq!(
+            pg.failure(),
+            Some("the store above found itself out of step")
+        );
+        assert!(is_storage_failed(&pg.flush()));
+        assert!(is_storage_failed(&pg.write_page(ids[1], &page_with(6))));
+        pg.mark_failed("a second reason is ignored");
+        assert_eq!(
+            pg.failure(),
+            Some("the store above found itself out of step")
+        );
+        drop(pg);
+        let pg = Pager::open(&path, 16).unwrap();
+        assert_eq!(tag_of(&pg.read_page(ids[0]).unwrap()), 0, "never committed");
         cleanup(&path);
     }
 }
