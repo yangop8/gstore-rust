@@ -367,6 +367,20 @@ impl Resp {
         Resp::new(200, JSON, status_json(0, msg))
     }
 
+    /// A success that carries a `"warning"`: HTTP 200 `{"StatusCode":0,
+    /// "StatusMsg":msg,"warning":…}` — for an operation that succeeded but
+    /// has something to report (an unload or reopen of a database whose
+    /// on-disk store failed discards its uncommitted changes). Never for a
+    /// write whose save failed: that is [`ok_warn`](Self::ok_warn)'s failure.
+    fn ok_with_warning(msg: &str, warning: &str) -> Resp {
+        let body = format!(
+            "{{\"StatusCode\":0,\"StatusMsg\":{}{}}}",
+            json_str(msg),
+            warn_field(&Some(warning.to_string()))
+        );
+        Resp::new(200, JSON, body.into_bytes())
+    }
+
     /// The answer to a write: [`ok`](Self::ok) when it is durable, or — when
     /// `warning` reports that persisting it failed ([`DbSlot::wrote`]) — the
     /// failure of [`write_outcome`](Self::write_outcome).
@@ -4127,7 +4141,7 @@ impl ApiInner {
                         let slot =
                             DbSlot::handle(db, dir, false, &st.load_policy, &st.query_settings);
                         st.dbs.insert(name.clone(), slot);
-                        Resp::ok_warn(&format!("database '{name}' reopened"), &Some(warning))
+                        Resp::ok_with_warning(&format!("database '{name}' reopened"), &warning)
                     }
                     Err(e) => Resp::fail(
                         500,
@@ -4345,7 +4359,7 @@ impl ApiInner {
                     }
                 }
                 drop(slot);
-                return Resp::ok_warn(&format!("database '{name}' unloaded"), &Some(warning));
+                return Resp::ok_with_warning(&format!("database '{name}' unloaded"), &warning);
             }
             let saved = if slot.dirty {
                 if let Err(e) = slot.save() {
