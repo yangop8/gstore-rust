@@ -573,3 +573,123 @@ fn graph_management_on_imported_graphs_in_rocksdb() {
     drop(db);
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// review tests-a#1: `a_failed_load_applies_nothing_silent_or_not` runs on
+/// an in-memory database only, so the persistent undo — `undo_inserts` of
+/// a whole import batch, the reclamation of the terms the `LOAD` minted and
+/// the commit point that makes the inserts and their undo durable together
+/// (and, on RocksDB, the statement's undo journal) — never ran under test.
+/// Here a `LOAD` whose first batch (64 Ki statements) is inserted before
+/// its parse error fails on the disk layout in both modes and on RocksDB:
+/// the data, the live term counts and the mutation count are what they
+/// were, and so is every reopen.
+#[test]
+fn a_failed_load_applies_nothing_on_the_persistent_layouts() {
+    use gstore::db::{DiskQueryMode, OpenOptions};
+
+    let dir = tmp("atomic_persistent");
+    // The base has N subjects and N objects; the LOAD mints 100 terms
+    // (and its predicate) and then links every base subject to every base
+    // object — N² > 64 Ki statements that mint nothing more, so that the
+    // first batch is a full one without a dictionary of 64 Ki new terms.
+    const N: usize = 257;
+    const _: () = assert!(N * N > gstore::parser::import::DEFAULT_BATCH_SIZE);
+    let mut base_text = String::from("<http://ex/k> <http://ex/p> <http://ex/k> .\n");
+    for i in 0..N {
+        base_text.push_str(&format!(
+            "<http://ex/s{i}> <http://ex/p> <http://ex/o{i}> .\n"
+        ));
+    }
+    let base = write(&dir, "base.nt", &base_text);
+    let mut text = String::new();
+    for i in 0..50 {
+        text.push_str(&format!(
+            "<http://ex/fresh{i}> <http://ex/p> \"fresh {i}\" .\n"
+        ));
+    }
+    for i in 0..N {
+        for j in 0..N {
+            text.push_str(&format!(
+                "<http://ex/s{i}> <http://ex/link> <http://ex/o{j}> .\n"
+            ));
+        }
+    }
+    text.push_str("<http://ex/bad> <http://ex/p> \"unterminated .\n");
+    let bad = write(&dir, "bad.nt", &text);
+    drop(text);
+    let mode = |m| OpenOptions {
+        disk_query_mode: m,
+        ..OpenOptions::default()
+    };
+    let counts = |db: &Database| {
+        (
+            db.triple_num(),
+            db.entity_num(),
+            db.literal_num(),
+            db.predicate_num(),
+        )
+    };
+    // (layout, the database directory, how to open it)
+    let mut layouts: Vec<(&str, PathBuf, Vec<OpenOptions>)> = Vec::new();
+    for m in [DiskQueryMode::Stream, DiskQueryMode::Materialize] {
+        let db_dir = dir.join(format!("{m:?}.db"));
+        Database::build_disk(&db_dir, &[&base]).unwrap();
+        // The LOAD runs in mode `m`; the reopens check both modes.
+        layouts.push((
+            if m == DiskQueryMode::Stream {
+                "disk (stream)"
+            } else {
+                "disk (materialize)"
+            },
+            db_dir,
+            vec![
+                mode(m),
+                mode(DiskQueryMode::Stream),
+                mode(DiskQueryMode::Materialize),
+            ],
+        ));
+    }
+    #[cfg(feature = "rocksdb")]
+    {
+        let db_dir = dir.join("rocks.db");
+        drop(Database::build_rocksdb_from_str("rocks", &db_dir, &base_text).unwrap());
+        layouts.push(("rocksdb", db_dir, vec![OpenOptions::default(); 2]));
+    }
+    for (layout, db_dir, opens) in layouts {
+        let mut db = Database::open_with(&db_dir, &opens[0]).unwrap();
+        let before = dump(&mut db);
+        let before_counts = counts(&db);
+        let mutations = db.mutation_count();
+        let err = db.query(&format!("LOAD <{bad}>")).unwrap_err();
+        assert!(
+            matches!(err, GStoreError::RdfParse { .. }),
+            "{layout}: {err}"
+        );
+        assert_eq!(dump(&mut db), before, "{layout}: statements left behind");
+        assert_eq!(counts(&db), before_counts, "{layout}: terms left behind");
+        assert_eq!(
+            db.mutation_count(),
+            mutations,
+            "{layout}: a failed LOAD is no change"
+        );
+        db.verify_integrity()
+            .unwrap_or_else(|e| panic!("{layout}: {e}"));
+        drop(db);
+        for opts in &opens[1..] {
+            let mut db = Database::open_with(&db_dir, opts).unwrap();
+            assert_eq!(
+                dump(&mut db),
+                before,
+                "{layout} reopened: statements left behind"
+            );
+            assert_eq!(
+                counts(&db),
+                before_counts,
+                "{layout} reopened: terms left behind"
+            );
+            db.verify_integrity()
+                .unwrap_or_else(|e| panic!("{layout} reopened: {e}"));
+        }
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
