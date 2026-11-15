@@ -2650,6 +2650,9 @@ impl ApiServer {
     /// proceed on other workers. Returns what the shutdown did.
     pub fn serve_forever(&self) -> ShutdownReport {
         let _ = self.inner.self_ref.set(Arc::downgrade(&self.inner));
+        // The body caps, budget and pre-body hook of this run (see
+        // `crate::preauth`).
+        let ingest = crate::preauth::api_ingest(&self.http, &self.inner, self.addr);
         let drained = run_accept_loop(
             &self.listener,
             &self.life,
@@ -2657,6 +2660,8 @@ impl ApiServer {
             &self.http,
             |acc| {
                 let inner = Arc::clone(&self.inner);
+                let mut acc = acc;
+                acc.env.ingest = Arc::clone(&ingest);
                 Box::new(move || {
                     let ctl = acc.stream.try_clone().ok();
                     serve_connection(
@@ -2679,6 +2684,9 @@ impl ApiServer {
     #[cfg(feature = "tls")]
     pub fn serve_forever_tls(&self, config: Arc<rustls::ServerConfig>) -> ShutdownReport {
         let _ = self.inner.self_ref.set(Arc::downgrade(&self.inner));
+        // The body caps, budget and pre-body hook of this run (see
+        // `crate::preauth`).
+        let ingest = crate::preauth::api_ingest(&self.http, &self.inner, self.addr);
         let drained = run_accept_loop(
             &self.listener,
             &self.life,
@@ -2687,6 +2695,8 @@ impl ApiServer {
             |acc| {
                 let inner = Arc::clone(&self.inner);
                 let config = Arc::clone(&config);
+                let mut acc = acc;
+                acc.env.ingest = Arc::clone(&ingest);
                 Box::new(move || {
                     let Ok(conn) = rustls::ServerConnection::new(config) else {
                         return;

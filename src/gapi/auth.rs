@@ -113,6 +113,74 @@ impl Credentials {
     }
 }
 
+/// The upstream credentials a request carries in its URL query string
+/// (`username`, `password`, `encryption`), read before its body: `None` when
+/// the query lacks a non-empty `username` or a `password` (they may be in
+/// the body, which is not read yet).
+pub(crate) fn credentials_in_query(query: Option<&str>) -> Option<Credentials> {
+    let params = Params::from_parts(query, None, b"").ok()?;
+    params.str("password")?;
+    let creds = Credentials::from_params(&params);
+    (!creds.username.is_empty()).then_some(creds)
+}
+
+/// The outcome of [`check_before_body`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreAuth {
+    /// The credentials are valid.
+    Valid,
+    /// They are not (counted towards the address's lockout).
+    Invalid,
+    /// Not checked: the address is blocked or locked out, or the stored
+    /// password can only be checked by a plaintext login (the request is
+    /// then served as unauthenticated, and its handler answers it).
+    Unchecked,
+}
+
+/// Check `creds` (`md5`: the password is its MD5 hex digest; `inner` is not
+/// honoured) against the user store before the request's body is read — the
+/// pre-body hook's check of credentials in a request head (see
+/// `crate::preauth`) — under the same IP rules as [`authenticate`]: a
+/// blocked or locked-out address is not checked at all, and a wrong
+/// password counts towards the lockout ([`note_auth_failure`]). A success
+/// does not reset the failure count (only a `login` does) and records no
+/// user: the request's handler authenticates it again.
+pub(crate) fn check_before_body(
+    inner: &crate::http_api::ApiInner,
+    remote_ip: &str,
+    creds: &Credentials,
+) -> PreAuth {
+    if creds.username.is_empty()
+        || !inner.ipfilter.permits(remote_ip)
+        || inner.ipfilter.locked_out(remote_ip)
+    {
+        return PreAuth::Unchecked;
+    }
+    let form = if creds.md5 {
+        PasswordForm::Md5Hex
+    } else {
+        PasswordForm::Plain
+    };
+    // The slow hash runs with the state lock released, as in `verify`.
+    let attempt = crate::server::locked(&inner.state).users.begin_check(
+        &creds.username,
+        &creds.password,
+        form,
+    );
+    let checked = attempt.verify();
+    let outcome = crate::server::locked(&inner.state)
+        .users
+        .finish_check(checked);
+    match outcome {
+        CredentialCheck::Valid => PreAuth::Valid,
+        CredentialCheck::Invalid => {
+            inner.ipfilter.note_failure(remote_ip);
+            PreAuth::Invalid
+        }
+        CredentialCheck::NeedsPlaintextLogin => PreAuth::Unchecked,
+    }
+}
+
 /// Authenticate the request's `username` / `password` (`encryption=1`: the
 /// password's MD5 hex digest) and record the user in [`Ctx::user`].
 ///

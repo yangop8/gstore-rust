@@ -38,7 +38,9 @@
 //! * `[log]`: the diagnostic log that upstream configures in a log4cplus
 //!   properties file — `log_level`, `log_file`, `log_days`, `log_stderr`
 //!   (see [`crate::logging`]);
-//! * `[upload]`: the limits a zip package must stay within —
+//! * `[upload]`: the request body caps before authentication and in all
+//!   (`preauth_max_body_size`, `request_body_budget`; see
+//!   [`crate::preauth`]), and the limits a zip package must stay within —
 //!   `unzip_max_entries`, `unzip_max_size` (see [`crate::zipio`]);
 //! * `[query]`: how every served database evaluates queries
 //!   ([`GStoreConfig::query_settings`], applied to each database the servers
@@ -246,6 +248,8 @@ pub const KNOWN_KEYS: &[(&str, &str)] = &[
     ("backup", "max_backups"),
     ("upload", "upload_path"),
     ("upload", "upload_max_body_size"),
+    ("upload", "preauth_max_body_size"),
+    ("upload", "request_body_budget"),
     ("upload", "upload_allow_extensions"),
     ("upload", "upload_allow_compress_packages"),
     // Rust-only extensions.
@@ -436,8 +440,26 @@ pub struct GStoreConfig {
     // ---- [upload] -------------------------------------------------------
     /// Upload staging directory (default `./upload/`).
     pub upload_path: PathBuf,
-    /// Maximum upload / request body size in bytes (default 1 GiB).
+    /// Maximum upload / request body size in bytes (default 256 MiB;
+    /// upstream ships 1 GiB). The HTTP layer lets a request carry this much
+    /// only when it is authenticated from its head (credentials in the URL
+    /// query string or an `Authorization` header) on a route that carries
+    /// payloads; every other request is held to
+    /// [`preauth_max_body_size`](Self::preauth_max_body_size) (see
+    /// [`crate::preauth`]).
     pub upload_max_body_size: u64,
+    /// *(Rust extension)* The largest body a request may have before it is
+    /// authenticated (default 64 MiB; at most
+    /// [`upload_max_body_size`](Self::upload_max_body_size)) — every route.
+    /// Upstream clients send their credentials inside the body (`/api` JSON,
+    /// the `/file/upload` form), so this is also the most they can upload;
+    /// set it to `upload_max_body_size` for upstream's limit.
+    pub preauth_max_body_size: u64,
+    /// *(Rust extension)* The request-body bytes all connections may hold in
+    /// memory at once (default 512 MiB; at least
+    /// [`upload_max_body_size`](Self::upload_max_body_size)): a request that
+    /// would exceed it is answered `503`.
+    pub request_body_budget: u64,
     /// Allowed upload extensions, and the extensions `build` / `batchInsert`
     /// / `batchRemove` sources may carry (default `nt|ttl|n3|rdf|txt|nq|trig`:
     /// upstream's, plus the quad formats — so a database's own export, N-Quads
@@ -588,7 +610,10 @@ impl Default for GStoreConfig {
             backup_path: PathBuf::from("./backups/"),
             max_backups: 3,
             upload_path: PathBuf::from("./upload/"),
-            upload_max_body_size: 1_073_741_824,
+            // 256 MiB (upstream: 1 GiB; review infra#1).
+            upload_max_body_size: 268_435_456,
+            preauth_max_body_size: crate::preauth::PREAUTH_MAX_BODY as u64,
+            request_body_budget: crate::preauth::DEFAULT_BODY_BUDGET as u64,
             upload_allow_extensions: split_list("nt|ttl|n3|rdf|txt|nq|trig"),
             upload_allow_compress_packages: split_list("zip"),
             unzip_max_entries: crate::zipio::DEFAULT_MAX_ENTRIES,
@@ -877,6 +902,12 @@ impl GStoreConfig {
             "upload_max_body_size" => {
                 self.upload_max_body_size = parse_num(v).ok_or_else(|| bad("a size in bytes"))?
             }
+            "preauth_max_body_size" => {
+                self.preauth_max_body_size = parse_num(v).ok_or_else(|| bad("a size in bytes"))?
+            }
+            "request_body_budget" => {
+                self.request_body_budget = parse_num(v).ok_or_else(|| bad("a size in bytes"))?
+            }
             "upload_allow_extensions" => self.upload_allow_extensions = split_list(v),
             "upload_allow_compress_packages" => self.upload_allow_compress_packages = split_list(v),
             "unzip_max_entries" => {
@@ -1026,6 +1057,8 @@ impl GStoreConfig {
             "max_backups" => self.max_backups.to_string(),
             "upload_path" => path(&self.upload_path),
             "upload_max_body_size" => self.upload_max_body_size.to_string(),
+            "preauth_max_body_size" => self.preauth_max_body_size.to_string(),
+            "request_body_budget" => self.request_body_budget.to_string(),
             "upload_allow_extensions" => self.upload_allow_extensions.join("|"),
             "upload_allow_compress_packages" => self.upload_allow_compress_packages.join("|"),
             "unzip_max_entries" => self.unzip_max_entries.to_string(),
@@ -1095,7 +1128,8 @@ impl GStoreConfig {
 
     /// The HTTP connection settings implied by this configuration: the worker
     /// pool (`thread_num`, `queue_size`), keep-alive, CORS, and the request
-    /// body cap (`upload_max_body_size`).
+    /// body caps (`upload_max_body_size`, `preauth_max_body_size`) and budget
+    /// (`request_body_budget`).
     pub fn http_options(&self) -> HttpOptions {
         HttpOptions {
             threads: self.thread_num.max(1),
@@ -1103,6 +1137,8 @@ impl GStoreConfig {
             keep_alive_timeout: Duration::from_secs(self.keep_alive_timeout),
             keep_alive_max: self.keep_alive_max.max(1),
             max_body: usize::try_from(self.upload_max_body_size).unwrap_or(usize::MAX),
+            preauth_max_body: usize::try_from(self.preauth_max_body_size).unwrap_or(usize::MAX),
+            body_budget: usize::try_from(self.request_body_budget).unwrap_or(usize::MAX),
             cors: self.cors,
             ..HttpOptions::default()
         }
@@ -1433,7 +1469,12 @@ upload_allow_compress_packages = "zip"
         assert_eq!(c.backup_path, PathBuf::from("./backups/"));
         assert_eq!(c.max_backups, 3);
         assert_eq!(c.upload_path, PathBuf::from("./upload/"));
-        assert_eq!(c.upload_max_body_size, 1_073_741_824);
+        // review infra#1: the upload cap is lowered from upstream's 1 GiB, and
+        // what a request may carry before it is authenticated, and all
+        // bodies in memory at once, are bounded on their own.
+        assert_eq!(c.upload_max_body_size, 256 << 20);
+        assert_eq!(c.preauth_max_body_size, 64 << 20);
+        assert_eq!(c.request_body_budget, 512 << 20);
         assert_eq!(
             c.upload_allow_extensions,
             ["nt", "ttl", "n3", "rdf", "txt", "nq", "trig"]
@@ -1535,11 +1576,19 @@ upload_allow_compress_packages = "zip"
         assert!(c.warnings().is_empty(), "{:?}", c.warnings());
         let upstream = GStoreConfig::from_ini_str(UPSTREAM_CONF);
         for (_, key) in KNOWN_KEYS {
-            if *key == "upload_allow_extensions" {
+            // review infra#1: the shipped upload cap is lowered (see below).
+            if *key == "upload_allow_extensions" || *key == "upload_max_body_size" {
                 continue;
             }
             assert_eq!(c.value(key), upstream.value(key), "{key}");
         }
+        // review infra#1: the shipped example lowers upstream's 1 GiB upload
+        // cap to the built-in default, 256 MiB.
+        assert_eq!(upstream.upload_max_body_size, 1 << 30);
+        assert_eq!(
+            c.upload_max_body_size,
+            GStoreConfig::default().upload_max_body_size
+        );
         // The one deliberate difference: the quad formats are allowed too,
         // so an export of a database with named graphs (N-Quads) builds
         // again.
@@ -1613,6 +1662,7 @@ upload_allow_compress_packages = "zip"
                     log_level=DEBUG\nlog_file=diag/gs.log\nlog_days=7\nlog_stderr=off\n\
                     [backup]\nbackup_path=/b\nmax_backups=11\n\
                     [upload]\nupload_path=/u\nupload_max_body_size=1024\n\
+                    preauth_max_body_size=512\nrequest_body_budget=4096\n\
                     upload_allow_extensions=nt | ttl\nupload_allow_compress_packages=zip|tar\n\
                     unzip_max_entries=12\nunzip_max_size=4096\n\
                     [query]\ninteger_division=truncate\nquery_cache_size=0\n\
@@ -1679,6 +1729,10 @@ upload_allow_compress_packages = "zip"
         assert_eq!(c.max_backups, 11);
         assert_eq!(c.upload_path, PathBuf::from("/u"));
         assert_eq!(c.upload_max_body_size, 1024);
+        assert_eq!(
+            (c.preauth_max_body_size, c.request_body_budget),
+            (512, 4096)
+        );
         assert_eq!(c.upload_allow_extensions, ["nt", "ttl"]);
         assert_eq!(c.upload_allow_compress_packages, ["zip", "tar"]);
         assert_eq!(
@@ -1734,6 +1788,7 @@ upload_allow_compress_packages = "zip"
         assert_eq!(h.keep_alive_timeout, Duration::ZERO);
         assert_eq!(h.keep_alive_max, 3);
         assert_eq!(h.max_body, 1024);
+        assert_eq!((h.preauth_max_body, h.body_budget), (512, 4096));
         assert!(!h.cors);
     }
 
