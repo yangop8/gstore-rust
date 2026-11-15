@@ -47,6 +47,33 @@ Behaviour changes first:
   `install_open_options` names `rocksdb_max_open_files` (as the
   r1-ingest-framing and r1-rocksdb fragments requested).
 
+- **Round-1 review fixes** (after the merge; each recorded in the
+  fragment of the package it belongs to, with its test):
+  - r1-durable-ack: the single-database gserver with `--no-checkpoint`
+    answers a failed commit point HTTP 500 "applied in memory but not
+    durable" (was 400 "query error"); the "saved by the next save" claim
+    is qualified for the on-disk layouts; `UserStore` and `IpFilter` keep
+    a change whose file was replaced although the directory sync failed.
+  - r1-ingest-caps: the pre-body hooks hold a request the server refuses
+    after its body (forwarded to the open single-database server, refused
+    by the browser policy) to the pre-authentication cap; the docs say
+    which head credentials lift the cap per route class.
+  - r1-ingest-framing: a chunked body's framing counts against the body
+    cap; a streamed download must be read at `min_body_rate` (a slow
+    reader no longer holds a download slot).
+  - r1-download: owner records are written atomically; a torn one is
+    swept with its expired file.
+  - r1-http-surface: an empty dataset parameter is ignored again; the
+    packages write the first-start password to `/etc/gstore/root_password`
+    instead of rewriting the `conf.ini` conffile (gserver skips a missing
+    `$GSTORE_ROOT_PASSWORD_FILE`); the reverse-proxy and Origin notes are
+    corrected.
+  - r1-rocksdb: crash recovery of a long journal is bounded and
+    resumable (a pending reclamation range in the `meta` CF); the
+    disk-layout comparison and the REST `/upload` caveat are corrected.
+  - r1-storage-failstate: a guard test for 2007ec7 (loading a healthy
+    database answers while a statement holds it).
+
 ## GAP_PLAN status line
 
 none
@@ -70,6 +97,13 @@ none
   so the figures are pessimistic; no gate came near its 3.00 bound.
 
 ## Requests/Not yet
+
+- Round-1 review follow-ups left open (each in its package fragment's
+  backlog notes): REST `/batchInsert` / `/batchRemove` / `/upload` as one
+  journaled RocksDB statement (r3-rest-parity); the chunked replay for a
+  live rollback of a very large RocksDB transaction; a per-client share of
+  `download_max_concurrent` (the send deadline bounds how long one slot is
+  held, not how many slots one client may take at once).
 
 - None of the packages' requests is left open: every standalone
   compat-warning line is folded, the conformance compat block is deduped,
