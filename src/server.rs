@@ -1287,12 +1287,31 @@ fn origin_listed(origin: &str, list: &[String]) -> bool {
 /// (any method but `GET`, `HEAD` and `OPTIONS`) with an `Origin` header must
 /// come from this server's own origin or a listed one.
 fn admission_refusal(req: &Request, loopback: bool, opts: &HttpOptions) -> Option<&'static str> {
-    let host = req.header("host");
+    browser_refusal(
+        &req.method,
+        req.header("host"),
+        req.header("origin"),
+        loopback,
+        opts,
+    )
+}
+
+/// [`admission_refusal`] of a request's `method` and its `Host` and
+/// `Origin` header values — also applied to a request head before its body
+/// is read ([`crate::preauth`]), so a request refused after its body never
+/// earns the upload cap.
+pub(crate) fn browser_refusal(
+    method: &str,
+    host: Option<&str>,
+    origin: Option<&str>,
+    loopback: bool,
+    opts: &HttpOptions,
+) -> Option<&'static str> {
     if loopback && host.is_some_and(|h| !host_allowed(h, &opts.allowed_hosts)) {
         return Some(HOST_REFUSED);
     }
-    if !matches!(req.method.as_str(), "GET" | "HEAD" | "OPTIONS") {
-        if let Some(origin) = req.header("origin") {
+    if !matches!(method, "GET" | "HEAD" | "OPTIONS") {
+        if let Some(origin) = origin {
             // `get`, not slicing: a header may hold any UTF-8, and this runs
             // outside the handlers' panic isolation.
             let same = host.is_some_and(|h| {

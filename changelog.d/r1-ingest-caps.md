@@ -23,7 +23,17 @@ Behaviour changes first:
     `/update`, `/tquery`, `/batchInsert`, `/batchRemove`. The
     single-database server compares its Basic credentials on `POST /update`
     and `POST /sparql`; without credentials configured it serves everyone
-    there as before;
+    there as before — except a request it refuses after the body anyway: one
+    a loopback reverse proxy forwards (`Forwarded` / `X-Forwarded-For` /
+    `X-Real-IP`, unless `trust_proxy_headers=on`) is held to the
+    pre-authentication cap (round-1 review fix; the API hook already
+    applied the loopback rule since the merge fix 12df188);
+  - in both modes a request the browser policy refuses before routing — a
+    foreign `Host` on a loopback connection, a foreign `Origin` on a
+    state-changing request (`allowed_hosts`, `cors_allow_origin`) — is held
+    to the pre-authentication cap whatever credentials its head carries:
+    it is answered `403` after its body (round-1 review fix; test
+    `tests/preauth_refused_requests_get_no_upload_cap.rs`);
   - a larger `Content-Length` is answered `413` without reading a body byte;
     a chunked body is cut off at its cap (`413`); `Expect: 100-continue` is
     answered only after this decision (never `100 Continue` for a body that

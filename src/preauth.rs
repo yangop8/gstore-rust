@@ -20,7 +20,10 @@
 //!   (`encryption`) in the URL query string — against the user store, the IP
 //!   lists and the failed-login lockout; the single-database server compares
 //!   its Basic credentials (and, without any, serves every client as
-//!   authenticated, as it always did). The hook runs only for a body that may
+//!   authenticated, as it always did — except a forwarded request, which it
+//!   refuses after the body anyway). In both modes a request the browser
+//!   policy (`allowed_hosts`, `cors_allow_origin`) refuses before routing
+//!   never earns the upload cap. The hook runs only for a body that may
 //!   exceed the pre-authentication cap (a larger or a chunked one), and
 //!   `100 Continue` is sent only after it. A larger `Content-Length` is
 //!   answered `413` without reading the body; a chunked body is cut off at
@@ -51,8 +54,8 @@ use crate::gapi::auth::{self, PreAuth};
 use crate::gapi::params::parse_form;
 use crate::http_api::{peer_ip, ApiInner};
 use crate::server::{
-    base64_decode, ct_eq, current_peer, ip_is_loopback, locked, strip_basic_prefix, BadRequest,
-    HttpOptions, FORWARDING_HEADERS,
+    base64_decode, browser_refusal, ct_eq, current_peer, ip_is_loopback, locked,
+    strip_basic_prefix, BadRequest, HttpOptions, FORWARDING_HEADERS,
 };
 
 /// The default [`HttpOptions::preauth_max_body`]: 64 MiB.
@@ -421,7 +424,10 @@ pub(crate) fn single_db_ingest(
     auth: &Option<(String, String)>,
     addr: SocketAddr,
 ) -> Arc<Ingest> {
-    let ingest = Arc::new(Ingest::new(opts, Some(single_db_hook(auth.clone()))));
+    let ingest = Arc::new(Ingest::new(
+        opts,
+        Some(single_db_hook(auth.clone(), opts.clone())),
+    ));
     ingest.register(addr);
     ingest
 }
@@ -433,7 +439,7 @@ pub(crate) fn api_ingest(
     inner: &Arc<ApiInner>,
     addr: SocketAddr,
 ) -> Arc<Ingest> {
-    let hook = api_hook(Arc::clone(inner), opts.trust_proxy_headers);
+    let hook = api_hook(Arc::clone(inner), opts.clone());
     let ingest = Arc::new(Ingest::new(opts, Some(hook)));
     ingest.register(addr);
     ingest
@@ -442,16 +448,21 @@ pub(crate) fn api_ingest(
 /// The single-database server's hook: `POST /update` and `POST /sparql`
 /// carry payloads; with Basic credentials configured (`auth`) a request is
 /// authenticated by a matching `Authorization: Basic` header, without any
-/// every client is (the open server serves everyone).
-pub(crate) fn single_db_hook(auth: Option<(String, String)>) -> PreBodyHook {
+/// every client is (the open server serves everyone) — except a request the
+/// server refuses after its body anyway (`ServerInner::handle`): one the
+/// browser policy of `opts` refuses (a foreign `Host` or `Origin`), and, on
+/// the open server, one a reverse proxy on this machine forwards (unless
+/// [`HttpOptions::trust_proxy_headers`]). Those are held to the
+/// pre-authentication cap.
+pub(crate) fn single_db_hook(auth: Option<(String, String)>, opts: HttpOptions) -> PreBodyHook {
     Box::new(move |head| {
         let payload_route =
             head.method == "POST" && matches!(head.route_path(), "/update" | "/sparql");
-        if !payload_route {
+        if !payload_route || browser_refused(head, &opts) {
             return Admission::PreAuth;
         }
         let authenticated = match &auth {
-            None => true,
+            None => !forwarded_by_untrusted_proxy(head, opts.trust_proxy_headers),
             Some((user, pass)) => basic_credentials(head)
                 .is_some_and(|decoded| ct_eq(&decoded, format!("{user}:{pass}").as_bytes())),
         };
@@ -464,11 +475,44 @@ pub(crate) fn single_db_hook(auth: Option<(String, String)>) -> PreBodyHook {
 }
 
 /// The multi-database server's hook (see the module docs): an upload route
-/// whose head carries valid credentials gets the upload cap.
-/// `trust_proxy_headers`: [`HttpOptions::trust_proxy_headers`], for whether
-/// the client counts as local (see [`client_is_local`]).
-pub(crate) fn api_hook(inner: Arc<ApiInner>, trust_proxy_headers: bool) -> PreBodyHook {
-    Box::new(move |head| api_admission(&inner, head, trust_proxy_headers))
+/// whose head carries valid credentials gets the upload cap — unless the
+/// browser policy of `opts` refuses the request (it is answered `403`
+/// before routing, after its body). `opts`'
+/// [`HttpOptions::trust_proxy_headers`] decides whether the client counts
+/// as local (see [`client_is_local`]).
+pub(crate) fn api_hook(inner: Arc<ApiInner>, opts: HttpOptions) -> PreBodyHook {
+    Box::new(move |head| {
+        if browser_refused(head, &opts) {
+            return Admission::PreAuth;
+        }
+        api_admission(&inner, head, opts.trust_proxy_headers)
+    })
+}
+
+/// Whether the browser policy of `opts` refuses the request of `head` (a
+/// foreign `Host` on a loopback connection, a foreign `Origin` on a
+/// state-changing request): the rule of `ConnMeta::refusal`, which both
+/// servers apply before routing.
+fn browser_refused(head: &HeadView<'_>, opts: &HttpOptions) -> bool {
+    let loopback = current_peer().is_some_and(|p| ip_is_loopback(p.ip()));
+    browser_refusal(
+        head.method,
+        head.header("host"),
+        head.header("origin"),
+        loopback,
+        opts,
+    )
+    .is_some()
+}
+
+/// Whether `head` comes from a reverse proxy on this machine whose
+/// forwarding headers are not trusted: a loopback peer forwarding one of
+/// [`FORWARDING_HEADERS`] — the rule of `ConnMeta::forwarded`, by which the
+/// open single-database server refuses a request after its body.
+fn forwarded_by_untrusted_proxy(head: &HeadView<'_>, trust_proxy_headers: bool) -> bool {
+    !trust_proxy_headers
+        && current_peer().is_some_and(|p| ip_is_loopback(p.ip()))
+        && FORWARDING_HEADERS.iter().any(|h| head.header(h).is_some())
 }
 
 /// Whether the client of `head` counts as local — the rule of
@@ -835,13 +879,13 @@ mod tests {
     #[test]
     fn the_single_database_hook() {
         let basic = vec![("authorization".to_string(), "Basic dTpw".to_string())]; // u:p
-        let open = single_db_hook(None);
+        let open = single_db_hook(None, HttpOptions::default());
         assert_eq!(open(&head("POST", "/update", None, &[])), Admission::Upload);
         assert_eq!(
             open(&head("POST", "/status", None, &[])),
             Admission::PreAuth
         );
-        let guarded = single_db_hook(Some(("u".into(), "p".into())));
+        let guarded = single_db_hook(Some(("u".into(), "p".into())), HttpOptions::default());
         assert_eq!(
             guarded(&head("POST", "/sparql", None, &basic)),
             Admission::Upload
@@ -850,7 +894,7 @@ mod tests {
             guarded(&head("POST", "/sparql", None, &[])),
             Admission::PreAuth
         );
-        let wrong = single_db_hook(Some(("u".into(), "x".into())));
+        let wrong = single_db_hook(Some(("u".into(), "x".into())), HttpOptions::default());
         assert_eq!(
             wrong(&head("POST", "/update", None, &basic)),
             Admission::PreAuth
