@@ -96,6 +96,20 @@ none
   test run (zip) was in the other build slot, load average 8.0 on 4 CPUs,
   so the figures are pessimistic; no gate came near its 3.00 bound.
 
+- Bench smoke gate after the round-1 review fixes (the HTTP read path
+  changed: chunked framing, the streamed-response send clock in
+  `ConnSocket::write`): release build of `gbuild` + `gstore-bench` at the
+  fixes' head, `GSTORE_BENCH_CACHE` warm, `target/release/gstore-bench ci
+  --baseline bench/baselines/smoke.json`: PASS, 456 gates checked, 0
+  failed; time geomean vs the committed baseline: LUBM-like snapshot 1.02,
+  disk 1.06, WatDiv-like snapshot 1.15, disk 1.17 (bound 1.50). Machine
+  state: the workspace test build in the other slot, so the figures are
+  pessimistic.
+- `scripts/conformance.sh --no-build` after the review fixes (dev
+  binaries): all six suites pass (basic, update, transaction, api, parser
+  with the two known failing cases 15 and 17, python 49/49); no further
+  compat switch was needed.
+
 ## Requests/Not yet
 
 - Round-1 review follow-ups left open (each in its package fragment's
