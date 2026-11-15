@@ -11,6 +11,13 @@
 //! | `POST /update` | run a SPARQL UPDATE |
 //! | `GET /status` | report [`DbStats`](crate::db::DbStats) |
 //!
+//! Parameters come from the URL and form bodies only (see the crate-private
+//! `Request`'s *Parameters*): a POSTed `application/sparql-query` /
+//! `application/sparql-update` body is the statement, verbatim. The
+//! protocol's dataset parameters (`default-graph-uri`, `named-graph-uri`,
+//! `using-graph-uri`, `using-named-graph-uri`) are answered `400`: there is
+//! no RDF dataset support (FROM / FROM NAMED are not supported either).
+//!
 //! SELECT/ASK results are content-negotiated (see [`crate::sparql_results`]):
 //! JSON (default), XML, CSV, or TSV via the `Accept` header or a `format=`
 //! query parameter; CONSTRUCT/DESCRIBE return N-Triples. Connections run
@@ -59,9 +66,18 @@
 //!   `Connection: close`, HTTP/1.0 semantics and `Keep-Alive: timeout=, max=`).
 //!   An idle connection gives its worker up early when other connections are
 //!   waiting for one, and closes at once when a shutdown begins;
-//! * **CORS**: with [`HttpOptions::cors`] (the default) every response carries
-//!   `Access-Control-Allow-Origin: *` and `OPTIONS` preflights are answered
-//!   directly (as upstream does for `/file/upload` and `/file/download`);
+//! * **CORS**: with [`HttpOptions::cors`] (the default) `OPTIONS` preflights
+//!   are answered directly (as upstream does for `/file/upload` and
+//!   `/file/download`) and responses carry `Access-Control-Allow-Origin` —
+//!   for the origins of [`HttpOptions::cors_allow_origin`] only (none by
+//!   default; `*` is upstream's header on every response);
+//! * **the browser policy** (secure defaults, each with an upstream-compat
+//!   switch in [`HttpOptions`]): a request arriving over loopback must name a
+//!   local `Host` (DNS rebinding); a state-changing request with a foreign
+//!   `Origin` is refused (CSRF); `GET` never runs a SPARQL UPDATE and
+//!   `/update` takes typed bodies only (`allow_get_update`); a loopback peer
+//!   forwarding proxy headers is not a local client
+//!   (`peer_is_trusted_local`, `trust_proxy_headers`);
 //! * a **request body cap** ([`HttpOptions::max_body`]): a larger
 //!   `Content-Length` is refused with `413` before anything is allocated, and
 //!   `Expect: 100-continue` is honoured.
@@ -180,10 +196,13 @@ pub struct HttpOptions {
     /// the check off. Empty by default. `conf.ini`: `allowed_hosts`.
     pub allowed_hosts: Vec<String>,
     /// Upstream behaviour (default off): let `GET /sparql` run a SPARQL
-    /// UPDATE and `/update` accept a body of any type (`text/plain`
-    /// included). Off, an UPDATE must be POSTed (SPARQL 1.1 Protocol) and
-    /// `/update` takes an `application/sparql-update` or form body (or an
-    /// unlabelled one). `conf.ini`: `allow_get_update`.
+    /// UPDATE and `/update` accept a `text/plain` or `multipart/form-data`
+    /// body. Off, an UPDATE must be POSTed (SPARQL 1.1 Protocol), and
+    /// `/update` refuses those two types (`415`) — the ones besides forms a
+    /// web page can POST cross-site without a CORS preflight; it takes
+    /// `application/sparql-update`, a form, an unlabelled body, or another
+    /// type (which a browser sends only after a preflight). `conf.ini`:
+    /// `allow_get_update`.
     pub allow_get_update: bool,
     /// Treat a loopback peer as a local client even when it forwards
     /// `Forwarded` / `X-Forwarded-For` / `X-Real-IP` (upstream behaviour;
@@ -1095,6 +1114,25 @@ const FORWARDED_REFUSED: &str = "request refused: this server has no authenticat
 pub(crate) const GET_UPDATE_REFUSED: &str = "a SPARQL UPDATE is not run over GET (SPARQL 1.1 \
      Protocol): POST it to /update (set [server] allow_get_update=on to restore the upstream \
      behaviour)";
+
+/// Whether the SPARQL text `q` is an UPDATE, by a parse alone (nothing
+/// runs). A text holding none of the keywords an update starts with
+/// (`INSERT`, `DELETE`, `LOAD`, `CLEAR`, `DROP`, `CREATE`, `WITH`, `ADD`,
+/// `MOVE`, `COPY`, in any case) is a query without being parsed, so a
+/// `GET` query is not parsed twice.
+pub(crate) fn is_update_text(q: &str) -> bool {
+    const STARTS: [&[u8]; 10] = [
+        b"INSERT", b"DELETE", b"LOAD", b"CLEAR", b"DROP", b"CREATE", b"WITH", b"ADD", b"MOVE",
+        b"COPY",
+    ];
+    let b = q.as_bytes();
+    // A backslash (an escape sequence) is parsed whatever it spells.
+    let maybe = b.contains(&b'\\')
+        || STARTS
+            .iter()
+            .any(|kw| b.windows(kw.len()).any(|w| w.eq_ignore_ascii_case(kw)));
+    maybe && Statement::parse(q).is_ok_and(|stmt| stmt.is_update())
+}
 
 /// Whether `origin` is one of `list` (case-insensitive, a trailing `/`
 /// ignored). `*` in the list matches only the query `*`.
@@ -2146,10 +2184,7 @@ impl ServerInner {
         if let Some(p) = req.first_param_of(QUERY_DATASET_PARAMS) {
             return Reply::plain(400, SPARQL_JSON, &err_json(&dataset_param_refusal(p)));
         }
-        if req.method == "GET"
-            && !allow_get_update
-            && Statement::parse(&q).is_ok_and(|stmt| stmt.is_update())
-        {
+        if req.method == "GET" && !allow_get_update && is_update_text(&q) {
             return Reply::plain(400, SPARQL_JSON, &err_json(GET_UPDATE_REFUSED));
         }
         let fmt = ResultFormat::negotiate(req.format_param().as_deref(), req.header("accept"));
@@ -2409,6 +2444,10 @@ impl Request {
             BodyKind::SparqlQuery
         } else if media.eq_ignore_ascii_case("application/sparql-update") {
             BodyKind::SparqlUpdate
+        } else if media.eq_ignore_ascii_case("text/plain")
+            || media.eq_ignore_ascii_case("multipart/form-data")
+        {
+            BodyKind::Simple
         } else {
             BodyKind::Other
         }
@@ -2505,24 +2544,27 @@ impl Request {
 
     /// The update text of a `POST /update`: an `application/sparql-update`
     /// (or unlabelled, non-form) body verbatim, or the `update=` parameter
-    /// of a form body (or of the URL). Any other body type — `text/plain`,
-    /// which a web page can send cross-site without a CORS preflight — is
-    /// refused with `415` unless `any_body`
-    /// ([`HttpOptions::allow_get_update`]), which takes it verbatim.
+    /// of a form body (or of the URL). A `text/plain` or
+    /// `multipart/form-data` body — the types a web page can send cross-site
+    /// without a CORS preflight ([`BodyKind::Simple`]) — is refused with
+    /// `415` unless `any_body` ([`HttpOptions::allow_get_update`]), which
+    /// takes it verbatim. Any other type needs a preflight (which follows
+    /// [`HttpOptions::cors_allow_origin`]) and is taken verbatim.
     pub(crate) fn update_text(&self, any_body: bool) -> Result<String, (u16, &'static str)> {
         const MISSING: (u16, &str) = (400, "missing update statement");
         match self.body_kind() {
-            BodyKind::SparqlUpdate | BodyKind::Untyped => self.raw_statement().ok_or(MISSING),
             BodyKind::Form | BodyKind::Empty => self.param("update").ok_or(MISSING),
-            BodyKind::SparqlQuery | BodyKind::Other if any_body => {
-                self.raw_statement().ok_or(MISSING)
-            }
-            BodyKind::SparqlQuery | BodyKind::Other => Err((
+            BodyKind::Simple if !any_body => Err((
                 415,
                 "/update takes an application/sparql-update or \
-                 application/x-www-form-urlencoded body (set [server] allow_get_update=on to \
-                 accept other types, as upstream does)",
+                 application/x-www-form-urlencoded body, not text/plain or multipart/form-data \
+                 (set [server] allow_get_update=on to accept them, as upstream does)",
             )),
+            BodyKind::SparqlUpdate
+            | BodyKind::Untyped
+            | BodyKind::SparqlQuery
+            | BodyKind::Simple
+            | BodyKind::Other => self.raw_statement().ok_or(MISSING),
         }
     }
 
@@ -2547,7 +2589,10 @@ pub(crate) enum BodyKind {
     SparqlUpdate,
     /// No `Content-Type`, and not shaped like a form (SPARQL or RDF text).
     Untyped,
-    /// Any other `Content-Type` (`text/plain`, JSON, RDF, multipart, …).
+    /// `text/plain` or `multipart/form-data`: besides forms, the types a web
+    /// page can POST cross-site without a CORS preflight.
+    Simple,
+    /// Any other `Content-Type` (JSON, RDF, …).
     Other,
 }
 

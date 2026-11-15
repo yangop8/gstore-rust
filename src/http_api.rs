@@ -181,7 +181,9 @@
 //! **Auth.** Every endpoint except `/login` requires a caller identity, supplied
 //! either as HTTP Basic credentials (validated against the user store) or as a
 //! session token from `/login` (carried via `Authorization: Bearer …`, an
-//! `X-Session-Token` header, or a `session=`/`token=` parameter). Lacking a
+//! `X-Session-Token` header, or a `session=`/`token=` parameter of the URL —
+//! never of the body). Root's default password is accepted from local
+//! clients only (see `server::peer_is_trusted_local`). Lacking a
 //! valid identity is `401`; lacking the required privilege is `403`.
 //! Privileges are those of the system store ([`crate::sysdb`]) and decided
 //! by the same rules as the `/api` layer: each endpoint counts as the
@@ -2937,7 +2939,7 @@ impl ApiInner {
                 let get_update = req
                     .param("sparql")
                     .or_else(|| req.query_string())
-                    .is_some_and(|q| Statement::parse(&q).is_ok_and(|s| s.is_update()));
+                    .is_some_and(|q| crate::server::is_update_text(&q));
                 if get_update {
                     return (
                         Resp::fail(400, crate::server::GET_UPDATE_REFUSED),

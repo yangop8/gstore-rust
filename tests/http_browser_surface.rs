@@ -298,6 +298,20 @@ fn get_never_runs_an_update_unless_the_compat_switch_is_on() {
     );
     assert_eq!(r.status, 400, "{r:?}");
     assert!(r.body.contains("allow_get_update"), "{r:?}");
+    for update in [
+        "insert data { <http://ex/l> <http://ex/p> 1 }",
+        "PREFIX ex: <http://ex/> DELETE WHERE { ?s ?p ?o }",
+        "CLEAR DEFAULT",
+    ] {
+        let r = send(
+            srv.addr,
+            "GET",
+            &format!("/sparql?query={}", enc(update)),
+            &[],
+            "",
+        );
+        assert_eq!(r.status, 400, "{update}: {r:?}");
+    }
     assert_eq!(srv.triples(), 1, "nothing was inserted");
     // A read over GET is fine, and so is the update over POST.
     let r = send(
@@ -354,7 +368,15 @@ fn update_refuses_untyped_text_bodies_unless_the_compat_switch_is_on() {
     let srv = Single::start("");
     let r = send(srv.addr, "POST", "/update", &[TEXT], INSERT);
     assert_eq!(r.status, 415, "{r:?}");
+    let multipart = ("Content-Type", "multipart/form-data; boundary=x");
+    let r = send(srv.addr, "POST", "/update", &[multipart], INSERT);
+    assert_eq!(r.status, 415, "{r:?}");
     assert_eq!(srv.triples(), 1);
+    // A type a browser sends only after a preflight is taken verbatim.
+    let json = ("Content-Type", "application/json");
+    let r = send(srv.addr, "POST", "/update", &[json], INSERT);
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(srv.triples(), 2);
     let compat = Single::start("[server]\nallow_get_update=on\n");
     let r = send(compat.addr, "POST", "/update", &[TEXT], INSERT);
     assert_eq!(r.status, 200, "{r:?}");

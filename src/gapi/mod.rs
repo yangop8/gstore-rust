@@ -139,9 +139,8 @@ pub struct Ctx<'a> {
     pub(crate) req: &'a Request,
     /// The client's IP address (`"unknown"` when the transport has none).
     pub remote_ip: String,
-    /// Whether the client counts as local
-    /// ([`peer_is_trusted_local`](crate::server::peer_is_trusted_local): a
-    /// loopback peer that is not a reverse proxy, unless `conf.ini`'s
+    /// Whether the client counts as local (`server::peer_is_trusted_local`:
+    /// a loopback peer that is not a reverse proxy, unless `conf.ini`'s
     /// `trust_proxy_headers`): the loopback privileges — upstream's *inner*
     /// requests ([`GapiConfig::trust_inner_localhost`]) and root's default
     /// password — are granted to it only.
