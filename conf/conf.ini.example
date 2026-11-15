@@ -45,7 +45,10 @@ ip_deny_path="./conf/ipDeny.config"
 # (T - 30) * min_body_rate bytes of the body must be in (what was really
 # received counts, not the declared Content-Length), so a client trickling it
 # in cannot hold a worker thread. A chunked body's framing (chunk extensions,
-# trailers) counts against the body cap too. 0 turns the limit off (default
+# trailers) counts against the body cap too. The same floor applies to a
+# client reading a file download: after write_timeout's grace (30 s) it must
+# take the response at this rate on average, or the connection is closed (a
+# slow reader cannot hold a download slot). 0 turns both limits off (default
 # 65536, 64 KiB/s)
 # min_body_rate=65536
 # most connections one client IP address may have open at once, those

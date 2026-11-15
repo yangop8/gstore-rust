@@ -190,6 +190,14 @@ pub struct HttpOptions {
     /// than `read_timeout + n / min_body_rate` for a body of `n` bytes. `0`
     /// turns this off: then only no single read may wait longer than
     /// `read_timeout`. `conf.ini`: `min_body_rate`.
+    ///
+    /// The same floor applies to a **streamed response** (a file download,
+    /// [`write_response_streamed`]) read by its client: after a grace of
+    /// [`write_timeout`](Self::write_timeout), the bytes the connection has
+    /// taken so far must keep up this rate, or the connection is closed. A
+    /// client draining a download a few bytes at a time cannot hold its
+    /// worker (and its download slot) for longer than `write_timeout + n /
+    /// min_body_rate` for `n` bytes.
     pub min_body_rate: u64,
     /// Most connections one client IP address may have open at once, those
     /// waiting for a worker included (default [`DEFAULT_MAX_CONNS_PER_IP`],
@@ -972,6 +980,7 @@ pub(crate) fn run_accept_loop(
         let mut refusal_logged: Option<Instant> = None;
         let limits = ReadLimits {
             read_timeout: opts.read_timeout,
+            write_timeout: opts.write_timeout,
             min_body_rate: opts.min_body_rate,
         };
         while !life.stopping() {
@@ -1766,14 +1775,70 @@ impl Drop for BodyScope {
     }
 }
 
-/// The read limits of a connection, fixed when it is accepted.
+/// The clock of a streamed response being sent on this worker thread
+/// ([`write_response_streamed`]): when it started, how many bytes it has,
+/// and how many the connection has taken so far.
+#[derive(Debug, Clone, Copy)]
+struct SendClock {
+    start: Instant,
+    declared: u64,
+    sent: u64,
+}
+
+thread_local! {
+    static SEND_CLOCK: Cell<Option<SendClock>> = const { Cell::new(None) };
+}
+
+/// Starts the clock of a streamed response ([`HttpOptions::min_body_rate`])
+/// for the connection socket of this thread; restores the previous one when
+/// dropped.
+struct SendScope(Option<SendClock>);
+
+impl SendScope {
+    fn enter(declared: u64) -> SendScope {
+        let clock = SendClock {
+            start: Instant::now(),
+            declared,
+            sent: 0,
+        };
+        SendScope(SEND_CLOCK.with(|c| c.replace(Some(clock))))
+    }
+}
+
+impl Drop for SendScope {
+    fn drop(&mut self) {
+        let previous = self.0;
+        SEND_CLOCK.with(|c| c.set(previous));
+    }
+}
+
+/// The read (and streamed-send) limits of a connection, fixed when it is
+/// accepted.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ReadLimits {
     read_timeout: Duration,
+    write_timeout: Duration,
     min_body_rate: u64,
 }
 
 impl ReadLimits {
+    /// When the next bytes of streamed response `send` must have been taken
+    /// by the connection: `write_timeout` after its start plus the bytes
+    /// taken so far (at most its length) at `min_body_rate` — the rule of
+    /// [`body_deadline`](Self::body_deadline) for sending; `None` when the
+    /// rate floor is off.
+    fn send_deadline(&self, send: &SendClock) -> Option<Instant> {
+        if self.min_body_rate == 0 {
+            return None;
+        }
+        let allowance = send.sent.min(send.declared);
+        let nanos = u128::from(allowance) * 1_000_000_000 / u128::from(self.min_body_rate);
+        let extra = Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX));
+        send.start
+            .checked_add(self.write_timeout)?
+            .checked_add(extra)
+    }
+
     /// When the next bytes of `body` must be in: `read_timeout` after its
     /// start plus its allowance — the bytes received so far (at most its
     /// declared length) — at `min_body_rate`; `None` when the rate floor is
@@ -1813,8 +1878,15 @@ impl ReadLimits {
 pub(crate) struct ConnSocket {
     sock: TcpStream,
     limits: ReadLimits,
-    /// A head or body deadline has passed: every read fails.
+    /// A head or body deadline has passed: every read fails (an error
+    /// response may still be written).
     expired: bool,
+    /// A streamed response's deadline has passed: every read and write
+    /// fails.
+    send_expired: bool,
+    /// The socket's write timeout was narrowed for a streamed response's
+    /// deadline (restored to `write_timeout` by the next write outside one).
+    write_narrowed: bool,
     _slot: IpSlot,
 }
 
@@ -1824,8 +1896,56 @@ impl ConnSocket {
             sock,
             limits,
             expired: false,
+            send_expired: false,
+            write_narrowed: false,
             _slot: slot,
         }
+    }
+
+    /// Before a write: while a streamed response is being sent
+    /// ([`SendScope`]), narrow the socket's write timeout to the time left
+    /// before its deadline ([`ReadLimits::send_deadline`]), or fail once the
+    /// deadline has passed (the connection is then done).
+    fn before_write(&mut self) -> io::Result<()> {
+        if self.send_expired {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        let deadline = SEND_CLOCK
+            .with(Cell::get)
+            .and_then(|send| self.limits.send_deadline(&send));
+        match deadline {
+            Some(at) => {
+                let now = Instant::now();
+                if now >= at {
+                    self.expired = true;
+                    self.send_expired = true;
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "the client reads the response too slowly ([server] min_body_rate)",
+                    ));
+                }
+                let wait = (at - now).min(self.limits.write_timeout);
+                let _ = self.sock.set_write_timeout(Some(wait));
+                self.write_narrowed = true;
+            }
+            None if self.write_narrowed => {
+                let _ = self.sock.set_write_timeout(Some(self.limits.write_timeout));
+                self.write_narrowed = false;
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    /// After a write of `n` bytes: count them on the streamed response's
+    /// clock, if one runs.
+    fn wrote(n: usize) {
+        SEND_CLOCK.with(|c| {
+            if let Some(mut send) = c.get() {
+                send.sent = send.sent.saturating_add(n as u64);
+                c.set(Some(send));
+            }
+        });
     }
 }
 
@@ -1876,11 +1996,17 @@ impl Read for ConnSocket {
 
 impl Write for ConnSocket {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.sock.write(buf)
+        self.before_write()?;
+        let n = self.sock.write(buf)?;
+        ConnSocket::wrote(n);
+        Ok(n)
     }
 
     fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
-        self.sock.write_vectored(bufs)
+        self.before_write()?;
+        let n = self.sock.write_vectored(bufs)?;
+        ConnSocket::wrote(n);
+        Ok(n)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -3450,6 +3576,14 @@ pub(crate) const STREAM_CHUNK: usize = 64 * 1024;
 /// count the bytes of the file). A `body` that ends before `len` bytes
 /// fails with `UnexpectedEof` — the response cannot be completed, and the
 /// caller closes the connection.
+///
+/// On a connection socket the client must take the response at
+/// [`HttpOptions::min_body_rate`] on average, after a grace of
+/// `write_timeout` ([`ConnSocket`]): a client draining it a few bytes at a
+/// time fails the write with `TimedOut` once it falls behind, so it holds
+/// the worker — and a download's slot — for at most `write_timeout + len /
+/// min_body_rate` (review of round 1: only each single write was bounded,
+/// by `write_timeout`).
 pub(crate) fn write_response_streamed<W: Write, R: Read>(
     stream: &mut W,
     status: u16,
@@ -3459,6 +3593,7 @@ pub(crate) fn write_response_streamed<W: Write, R: Read>(
     len: u64,
 ) -> std::io::Result<()> {
     let head = response_head(status, ctype, extra, len);
+    let _clock = SendScope::enter((head.len() as u64).saturating_add(len));
     let mut buf = Vec::with_capacity(head.len() + STREAM_CHUNK);
     buf.extend_from_slice(head.as_bytes());
     let mut left = len;

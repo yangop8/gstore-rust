@@ -42,6 +42,16 @@ Behaviour changes (both HTTP servers, the single-database `Server` and the
   a 1 KiB pre-authentication cap, charged to the body budget and earning
   `min_body_rate` time with every byte. Test:
   `tests/chunked_framing_counts_against_the_body_cap.rs`.
+- **A streamed response must be read at `min_body_rate` too** (round-1
+  review fix, gapi#4 follow-up): a file download (`write_response_streamed`)
+  must be taken by its client at `min_body_rate` on average after a grace
+  of `write_timeout`, by the rule a request body follows; a client that
+  falls behind gets its connection closed, which frees its worker and its
+  `download_max_concurrent` slot. Before, only each single write waited at
+  most `write_timeout`, so a reader taking a little every few seconds held
+  a download slot for as long as the file lasted (eight such readers, the
+  default slot count, turned every other download away with `503`). Test:
+  `tests/slow_download_readers_lose_their_slot.rs`.
 - **New `[server] max_conns_per_ip`** (`HttpOptions::max_conns_per_ip`,
   default `64`, `0` = no limit): a further connection from an address that
   already has that many open — waiting for a worker included — is closed
@@ -113,7 +123,8 @@ none
   worker longer takes really sending at least `min_body_rate` (one worker
   per 64 KiB/s of the client's bandwidth), and no request holds one longer
   than `30 s + (max_body + 64 KiB + max_body / 16) / min_body_rate` (the
-  last two terms: a chunked body's framing allowance) — keep `max_conns_per_ip` below
+  last two terms: a chunked body's framing allowance), nor a file download
+  longer than `write_timeout + size / min_body_rate` — keep `max_conns_per_ip` below
   `thread_num` where untrusted clients with fast links connect. Neither is
   an upstream-compat switch (upstream has no such limit; no conformance
   switch needed).
