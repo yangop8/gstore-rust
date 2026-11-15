@@ -2015,8 +2015,10 @@ struct Head {
 }
 
 /// Read one request from a connection. The request line and headers must
-/// arrive within `read_timeout` in total; the body only must not stall for
-/// longer than that between reads (a large upload may take longer overall).
+/// arrive within `read_timeout` in total; the body must not stall for
+/// longer than that between reads and must keep up
+/// [`HttpOptions::min_body_rate`] overall (see [`read_body`]; a large upload
+/// may take longer than `read_timeout`).
 /// `Ok(None)` when the client closed the connection before sending anything.
 ///
 /// Between the head and the body, `ingest` decides the body's cap (see

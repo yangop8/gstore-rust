@@ -517,8 +517,9 @@ fn report_config(cfg: &GStoreConfig) {
 /// (`GSTORE_DISK_QUERY_MODE`, `GSTORE_DISK_CACHE_MB`) on top. A database
 /// already loaded keeps the mode it was opened in. So do the storage
 /// defaults that are not open options: `[system] id_reclaim` and the
-/// RocksDB keys `[storage] rocksdb_block_cache_mb` / `rocksdb_bloom`
-/// (`GSTORE_ID_RECLAIM` / `GSTORE_ROCKS_BLOCK_CACHE_MB` on top). `/api
+/// RocksDB keys `[storage] rocksdb_block_cache_mb` / `rocksdb_bloom` /
+/// `rocksdb_max_open_files` (`GSTORE_ID_RECLAIM` /
+/// `GSTORE_ROCKS_BLOCK_CACHE_MB` on top). `/api
 /// refreshconf` re-installs both (the API server is built
 /// `with_storage_refresh`).
 fn install_open_options(cfg: &GStoreConfig) {

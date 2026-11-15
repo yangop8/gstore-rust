@@ -34,7 +34,8 @@
 //! in a properties file, or not at all:
 //!
 //! * `[server]`: the HTTP layer — `listen_addr`, `keep_alive_timeout`,
-//!   `keep_alive_max`, `queue_size`, `cors` — and the browser-facing secure
+//!   `keep_alive_max`, `queue_size`, `cors`, the slow-client limits
+//!   `min_body_rate` and `max_conns_per_ip` — and the browser-facing secure
 //!   defaults with their upstream-compat switches (`cors_allow_origin`,
 //!   `allowed_hosts`, `allow_get_update`, `trust_proxy_headers`,
 //!   `allow_default_root_password`; see
@@ -44,8 +45,12 @@
 //!   (see [`crate::logging`]);
 //! * `[upload]`: the request body caps before authentication and in all
 //!   (`preauth_max_body_size`, `request_body_budget`; see
-//!   [`crate::preauth`]), and the limits a zip package must stay within —
-//!   `unzip_max_entries`, `unzip_max_size` (see [`crate::zipio`]);
+//!   [`crate::preauth`]), the limits a zip package must stay within —
+//!   `unzip_max_entries`, `unzip_max_size` (see [`crate::zipio`]) — and the
+//!   download and file-retention policy of the `/api` layer
+//!   (`anonymous_download`, an upstream-compat switch;
+//!   `download_max_concurrent`, `file_retention_hours`,
+//!   `upload_user_quota`);
 //! * `[query]`: how every served database evaluates queries
 //!   ([`GStoreConfig::query_settings`], applied to each database the servers
 //!   open, build, create or restore) — `integer_division`,
