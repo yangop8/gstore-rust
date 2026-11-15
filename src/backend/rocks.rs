@@ -89,7 +89,10 @@
 //! prefix's successor, decoding each key in place (no allocation per key).
 //! An iterator or point-read error is reported through
 //! [`note_read_error`](crate::store::read_scope::note_read_error), so the
-//! statement reading it fails instead of seeing a silently shortened list.
+//! statement reading it fails instead of seeing a silently shortened list —
+//! and so is a key whose length is not the one its column family's
+//! decoder needs (a damaged store, or a key another tool wrote): it is
+//! never sliced into a panic.
 //! The contract-C1 counts come from the exact counters above
 //! (`count_po_by_s` = `s|s`, `count_ps_by_o` = `o|o`, `count_o_by_sp` =
 //! `x|p|s`, `count_s_by_po` = `y|p|o`, `count_so_by_p` = `c|p`) — one point
@@ -161,6 +164,31 @@ const JOURNAL_END: &[u8] = b"\x00txn-undo\x01";
 /// Journal record op: undo by re-inserting / by removing.
 const UNDO_INSERT: u8 = b'+';
 const UNDO_REMOVE: u8 = b'-';
+
+/// The length of a triple-ordering key (`spo`, `pos`, `osp`): three ids.
+const KEY3_LEN: usize = 12;
+/// The length of a quad key (`gspo`): four ids.
+const KEY4_LEN: usize = 16;
+/// The length of a single-id counter key (`c|`, `u|`, `v|`, `s|`, `o|`) and
+/// of a dictionary key (`dict`): a tag and one id.
+const TAG1_LEN: usize = 5;
+/// The length of a pair counter key (`x|`, `y|`): a tag and two ids.
+const TAG2_LEN: usize = 9;
+
+/// A key of column family `cf` that does not have the length `len` its
+/// decoder needs — a damaged store, or a key another tool wrote — as the
+/// read error reporting it (never a slice-index panic).
+fn check_len(cf: &str, k: &[u8], len: usize) -> std::result::Result<(), String> {
+    if k.len() == len {
+        return Ok(());
+    }
+    let shown = &k[..k.len().min(16)];
+    Err(format!(
+        "corrupt rocksdb key in column family '{cf}': {} byte(s) {shown:02x?}{}, expected {len}",
+        k.len(),
+        if k.len() > shown.len() { "…" } else { "" }
+    ))
+}
 
 /// The environment variable setting the shared block cache, in MiB (`0`:
 /// RocksDB's own default, a 32 MiB cache per column family).
@@ -1034,7 +1062,7 @@ impl RocksStore {
     pub fn load_terms(&self) -> Result<Vec<(TermSpace, u32, String)>> {
         let mut out = Vec::new();
         self.try_scan(CF_DICT, &[], |k, v| {
-            let space = (k.len() == 5)
+            let space = (k.len() == TAG1_LEN)
                 .then(|| TermSpace::from_tag(k[0]))
                 .flatten()
                 .ok_or_else(|| "corrupt rocksdb dictionary key".to_string())?;
@@ -1099,7 +1127,7 @@ impl RocksStore {
     pub fn quads(&self) -> Result<Vec<(u32, IdTriple)>> {
         let mut out = Vec::new();
         self.try_scan(CF_GSPO, &[], |k, _| {
-            if k.len() != 16 {
+            if k.len() != KEY4_LEN {
                 return Err("corrupt rocksdb quad key".to_string());
             }
             out.push((
@@ -1240,10 +1268,13 @@ impl RocksStore {
     }
 
     /// Visit every key of `cf` starting with `prefix`, ascending, decoded in
-    /// place. A read error is reported through [`note_read_error`] and ends
-    /// the scan (the statement fails; see the module docs).
-    fn scan(&self, cf: &str, prefix: &[u8], mut f: impl FnMut(&[u8])) {
+    /// place; every one must be `len` bytes long (a key of another length —
+    /// a damaged store — ends the scan with a read error instead of reaching
+    /// the decoder). A read error is reported through [`note_read_error`]
+    /// and ends the scan (the statement fails; see the module docs).
+    fn scan(&self, cf: &str, prefix: &[u8], len: usize, mut f: impl FnMut(&[u8])) {
         let res = self.try_scan(cf, prefix, |k, _| {
+            check_len(cf, k, len)?;
             f(k);
             Ok(true)
         });
@@ -1252,10 +1283,10 @@ impl RocksStore {
         }
     }
 
-    /// The number of keys of `cf` starting with `prefix`.
-    fn count_keys(&self, cf: &str, prefix: &[u8]) -> u64 {
+    /// The number of keys of `cf` starting with `prefix` (each `len` bytes).
+    fn count_keys(&self, cf: &str, prefix: &[u8], len: usize) -> u64 {
         let mut n = 0u64;
-        self.scan(cf, prefix, |_| n += 1);
+        self.scan(cf, prefix, len, |_| n += 1);
         n
     }
 
@@ -1263,7 +1294,7 @@ impl RocksStore {
     /// counter key being `tag ‖ be(id)`: ascending.
     fn ids_under(&self, tag: u8) -> Vec<EntityLiteralId> {
         let mut out = Vec::new();
-        self.scan(CF_STATS, &[tag], |k| out.push(de(&k[1..5])));
+        self.scan(CF_STATS, &[tag], TAG1_LEN, |k| out.push(de(&k[1..5])));
         out
     }
 
@@ -1271,7 +1302,9 @@ impl RocksStore {
     /// `y|p` objects): ascending.
     fn ids_under_pred(&self, tag: u8, pred: PredId, hint: u64) -> Vec<EntityLiteralId> {
         let mut out = reserved(hint);
-        self.scan(CF_STATS, &tag1(tag, pred), |k| out.push(de(&k[5..9])));
+        self.scan(CF_STATS, &tag1(tag, pred), TAG2_LEN, |k| {
+            out.push(de(&k[5..9]))
+        });
         out
     }
 
@@ -1455,7 +1488,7 @@ impl TripleSource for RocksStore {
     /// `s ? ?` → `(pred, obj)` pairs, sorted by `(pred, obj)` (SPO key order).
     fn po_by_s(&self, sub: EntityLiteralId) -> Vec<(PredId, EntityLiteralId)> {
         let mut out = Vec::new();
-        self.scan(CF_SPO, &be(sub), |k| {
+        self.scan(CF_SPO, &be(sub), KEY3_LEN, |k| {
             out.push((de(&k[4..8]), de(&k[8..12])))
         });
         out
@@ -1464,7 +1497,9 @@ impl TripleSource for RocksStore {
     /// `s p ?` → objects, ascending (SPO key order).
     fn o_by_sp(&self, sub: EntityLiteralId, pred: PredId) -> Vec<EntityLiteralId> {
         let mut out = Vec::new();
-        self.scan(CF_SPO, &key2(sub, pred), |k| out.push(de(&k[8..12])));
+        self.scan(CF_SPO, &key2(sub, pred), KEY3_LEN, |k| {
+            out.push(de(&k[8..12]))
+        });
         out
     }
 
@@ -1472,7 +1507,9 @@ impl TripleSource for RocksStore {
     /// `o ‖ s ‖ p`, so the `(o, s)` prefix yields predicates in ascending order.
     fn p_by_so(&self, sub: EntityLiteralId, obj: EntityLiteralId) -> Vec<PredId> {
         let mut out = Vec::new();
-        self.scan(CF_OSP, &key2(obj, sub), |k| out.push(de(&k[8..12])));
+        self.scan(CF_OSP, &key2(obj, sub), KEY3_LEN, |k| {
+            out.push(de(&k[8..12]))
+        });
         out
     }
 
@@ -1482,7 +1519,7 @@ impl TripleSource for RocksStore {
     /// sorted.
     fn ps_by_o(&self, obj: EntityLiteralId) -> Vec<(PredId, EntityLiteralId)> {
         let mut out = Vec::new();
-        self.scan(CF_OSP, &be(obj), |k| {
+        self.scan(CF_OSP, &be(obj), KEY3_LEN, |k| {
             out.push((de(&k[8..12]), de(&k[4..8])))
         });
         out.sort_unstable();
@@ -1492,7 +1529,9 @@ impl TripleSource for RocksStore {
     /// `? p o` → subjects, ascending (POS `(p, o)` prefix).
     fn s_by_po(&self, pred: PredId, obj: EntityLiteralId) -> Vec<EntityLiteralId> {
         let mut out = Vec::new();
-        self.scan(CF_POS, &key2(pred, obj), |k| out.push(de(&k[8..12])));
+        self.scan(CF_POS, &key2(pred, obj), KEY3_LEN, |k| {
+            out.push(de(&k[8..12]))
+        });
         out
     }
 
@@ -1506,7 +1545,7 @@ impl TripleSource for RocksStore {
             return self.so_by_p_seek(pred);
         }
         let mut out = reserved(c.card);
-        self.scan(CF_POS, &be(pred), |k| {
+        self.scan(CF_POS, &be(pred), KEY3_LEN, |k| {
             out.push((de(&k[8..12]), de(&k[4..8])))
         });
         out.sort_unstable();
@@ -1580,7 +1619,7 @@ impl TripleSource for RocksStore {
 
     /// No counter covers `(s, o)`: the OSP `(o, s)` keys are counted.
     fn count_p_by_so(&self, sub: EntityLiteralId, obj: EntityLiteralId) -> u64 {
-        self.count_keys(CF_OSP, &key2(obj, sub))
+        self.count_keys(CF_OSP, &key2(obj, sub), KEY3_LEN)
     }
 
     fn count_ps_by_o(&self, obj: EntityLiteralId) -> u64 {
@@ -1610,7 +1649,7 @@ impl TripleSource for RocksStore {
         }
         if degree <= self.preds.len().max(16) as u64 {
             let mut ps = Vec::with_capacity(degree as usize);
-            self.scan(CF_OSP, &be(obj), |k| ps.push(de(&k[8..12])));
+            self.scan(CF_OSP, &be(obj), KEY3_LEN, |k| ps.push(de(&k[8..12])));
             ps.sort_unstable();
             ps.dedup();
             return ps.len() as u64;
@@ -1655,6 +1694,7 @@ impl RocksStore {
         }
         let mut spo = self.raw_iter(CF_SPO, None);
         let res = self.try_scan(CF_STATS, &tag1(T_PS, pred), |k, _| {
+            check_len(CF_STATS, k, TAG2_LEN)?;
             let s = de(&k[5..9]);
             let at = key2(s, pred);
             spo.seek(at);
@@ -1662,6 +1702,7 @@ impl RocksStore {
                 if !key.starts_with(&at) {
                     break;
                 }
+                check_len(CF_SPO, key, KEY3_LEN)?;
                 out.push((s, de(&key[8..12])));
                 spo.next();
             }
@@ -1703,7 +1744,7 @@ impl RocksStore {
         let mut out: Vec<IdTriple> = Vec::new();
         let Some(total) = total.filter(|&n| out.try_reserve_exact(n).is_ok()) else {
             let mut all: Vec<IdTriple> = reserved(self.triple_count);
-            self.scan(CF_SPO, &[], |k| {
+            self.scan(CF_SPO, &[], KEY3_LEN, |k| {
                 all.push(IdTriple::new(de(&k[0..4]), de(&k[4..8]), de(&k[8..12])));
             });
             all.sort_unstable_by_key(|t| (t.pred, t.sub, t.obj));
@@ -1724,7 +1765,7 @@ impl RocksStore {
         }
         out.resize(total, IdTriple::new(0, 0, 0));
         let mut spill: Vec<IdTriple> = Vec::new();
-        self.scan(CF_SPO, &[], |k| {
+        self.scan(CF_SPO, &[], KEY3_LEN, |k| {
             let t = IdTriple::new(de(&k[0..4]), de(&k[4..8]), de(&k[8..12]));
             match slots.binary_search_by_key(&t.pred, |s| s.pred) {
                 Ok(i) if slots[i].next < slots[i].end => {
@@ -1764,6 +1805,10 @@ impl RocksStore {
         while let Some(k) = it.key() {
             if !k.starts_with(&prefix) {
                 break;
+            }
+            if let Err(e) = check_len(CF_SPO, k, KEY3_LEN) {
+                note_read_error(format!("rocksdb read ({CF_SPO}): {e}"));
+                return n;
             }
             let p = de(&k[4..8]);
             if last != Some(p) {
@@ -1827,6 +1872,7 @@ impl RocksStore {
         let mut triples = 0u64;
         let mut spo: Vec<[u32; 3]> = Vec::new();
         self.try_scan(CF_SPO, &[], |k, _| {
+            check_len(CF_SPO, k, KEY3_LEN)?;
             let (s, p, o) = (de(&k[0..4]), de(&k[4..8]), de(&k[8..12]));
             spo.push([s, p, o]);
             triples += 1;
@@ -1865,7 +1911,8 @@ impl RocksStore {
         want.extend(derived);
         let mut have: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
         self.try_scan(CF_STATS, &[], |k, v| {
-            let n = counter_value(v).ok_or_else(|| format!("corrupt counter value at {k:?}"))?;
+            let n = counter_value(v)
+                .ok_or_else(|| format!("corrupt counter value at {}", show_key(k)))?;
             have.insert(k.to_vec(), n);
             Ok(true)
         })
@@ -1890,19 +1937,14 @@ impl RocksStore {
                 Some(m) if m == n => {}
                 other => {
                     return Err(format!(
-                        "counter {:?}{:?}: stored {other:?}, recounted {n}",
-                        key[0] as char,
-                        &key[1..]
+                        "counter {}: stored {other:?}, recounted {n}",
+                        show_key(key)
                     ))
                 }
             }
         }
         if let Some((key, n)) = have.iter().find(|(k, _)| !want.contains_key(*k)) {
-            return Err(format!(
-                "stray counter {:?}{:?} = {n}",
-                key[0] as char,
-                &key[1..]
-            ));
+            return Err(format!("stray counter {} = {n}", show_key(key)));
         }
         for (cf, perm) in [(CF_POS, [1usize, 2, 0]), (CF_OSP, [2, 0, 1])] {
             let mut expect: Vec<[u32; 3]> = spo
@@ -1912,6 +1954,7 @@ impl RocksStore {
             expect.sort_unstable();
             let mut got = Vec::with_capacity(expect.len());
             self.try_scan(cf, &[], |k, _| {
+                check_len(cf, k, KEY3_LEN)?;
                 got.push([de(&k[0..4]), de(&k[4..8]), de(&k[8..12])]);
                 Ok(true)
             })
@@ -1945,6 +1988,340 @@ impl RocksStore {
             return Err("the c|/u|/v| mirror differs from the stats CF".into());
         }
         Ok(())
+    }
+}
+
+/// A stats key for a message: its tag as a character, then the id bytes.
+fn show_key(k: &[u8]) -> String {
+    match k.split_first() {
+        Some((t, rest)) => format!("{:?}{rest:?}", *t as char),
+        None => "(an empty key)".into(),
+    }
+}
+
+/// A forward cursor over the stored counters of one `stats` tag, in key
+/// order, for the merges of [`RocksStore::verify_stats`].
+struct CounterCursor<'a> {
+    it: rocksdb::DBRawIterator<'a>,
+    len: usize,
+}
+
+impl<'a> CounterCursor<'a> {
+    /// The counters tagged `tag`, each key `len` bytes long.
+    fn new(store: &'a RocksStore, tag: u8, len: usize) -> CounterCursor<'a> {
+        let mut it = store.raw_iter(CF_STATS, prefix_end(&[tag]));
+        it.seek([tag]);
+        CounterCursor { it, len }
+    }
+
+    /// The next stored counter `(key, key length, value)`, `None` after the
+    /// last.
+    fn peek(&self) -> std::result::Result<Option<([u8; TAG2_LEN], usize, u64)>, String> {
+        let Some((k, v)) = self.it.item() else {
+            return self
+                .it
+                .status()
+                .map(|()| None)
+                .map_err(|e| format!("rocksdb read ({CF_STATS}): {}", e.into_string()));
+        };
+        check_len(CF_STATS, k, self.len)?;
+        let n =
+            counter_value(v).ok_or_else(|| format!("corrupt counter value at {}", show_key(k)))?;
+        let mut key = [0u8; TAG2_LEN];
+        key[..k.len()].copy_from_slice(k);
+        Ok(Some((key, k.len(), n)))
+    }
+
+    /// The counter `key` must be the next one stored, with the value `n`:
+    /// a stored counter before it is a stray.
+    fn expect(&mut self, key: &[u8], n: u64) -> std::result::Result<(), String> {
+        match self.peek()? {
+            Some((k, len, m)) if &k[..len] == key => {
+                if m != n {
+                    return Err(format!(
+                        "counter {}: stored {m}, recounted {n}",
+                        show_key(key)
+                    ));
+                }
+                self.it.next();
+                Ok(())
+            }
+            Some((k, len, m)) if &k[..len] < key => {
+                Err(format!("stray counter {} = {m}", show_key(&k[..len])))
+            }
+            _ => Err(format!("counter {}: missing, recounted {n}", show_key(key))),
+        }
+    }
+
+    /// The end of the merge: no stored counter may be left.
+    fn finish(&self) -> std::result::Result<(), String> {
+        match self.peek()? {
+            Some((k, len, m)) => Err(format!("stray counter {} = {m}", show_key(&k[..len]))),
+            None => Ok(()),
+        }
+    }
+}
+
+impl RocksStore {
+    /// Check that the statistics are exact — what
+    /// [`check_stats`](Self::check_stats) checks — without holding them in
+    /// memory: each ordering and each counter prefix is read once in key
+    /// order and merged with the counts derived from the orderings (POS and
+    /// OSP keys are point-checked against SPO, each `x|p|s` counter against
+    /// the length of its SPO `(s, p)` run), so memory stays constant
+    /// whatever the size of the store. [`verify_integrity`] (`gcompact
+    /// --check`) runs it. `Err` names the first difference, or the first
+    /// malformed key or counter value.
+    ///
+    /// [`verify_integrity`]: crate::Database::verify_integrity
+    pub fn verify_stats(&self) -> std::result::Result<(), String> {
+        if let Some(e) = self.injected_read_failure() {
+            return Err(e);
+        }
+        let read = |e: ScanError| match e {
+            ScanError::Read(e) => format!("rocksdb read: {e}"),
+            ScanError::Visit(e) => e,
+        };
+        // Every stats key has a known tag, and that tag's length.
+        self.try_scan(CF_STATS, &[], |k, _| {
+            let len = match k.first() {
+                Some(b'T' | b'P' | b'S' | b'O') => 1,
+                Some(&(T_CARD | T_PSUBJ | T_POBJ | T_SUB | T_OBJ)) => TAG1_LEN,
+                Some(&(T_PS | T_PO)) => TAG2_LEN,
+                _ => return Err(format!("stray stats key {}", show_key(k))),
+            };
+            check_len(CF_STATS, k, len).map(|()| true)
+        })
+        .map_err(read)?;
+
+        // SPO: the triples; `s|s` is the length of the subject's run.
+        let mut s_cur = CounterCursor::new(self, T_SUB, TAG1_LEN);
+        let (mut triples, mut subjects) = (0u64, 0u64);
+        let mut run: Option<(u32, u64)> = None;
+        self.try_scan(CF_SPO, &[], |k, _| {
+            check_len(CF_SPO, k, KEY3_LEN)?;
+            let s = de(&k[0..4]);
+            triples += 1;
+            match &mut run {
+                Some((rs, n)) if *rs == s => *n += 1,
+                _ => {
+                    if let Some((rs, n)) = run.replace((s, 1)) {
+                        subjects += 1;
+                        s_cur.expect(&tag1(T_SUB, rs), n)?;
+                    }
+                }
+            }
+            Ok(true)
+        })
+        .map_err(read)?;
+        if let Some((rs, n)) = run {
+            subjects += 1;
+            s_cur.expect(&tag1(T_SUB, rs), n)?;
+        }
+        s_cur.finish()?;
+
+        // POS: every key is an SPO triple; `c|p` is the length of the
+        // predicate's run, `v|p` its number of distinct objects, `y|p|o`
+        // the length of the `(p, o)` run.
+        let close_p = |c: &mut CounterCursor, v: &mut CounterCursor, p: u32, n: u64, d: u64| {
+            c.expect(&tag1(T_CARD, p), n)?;
+            v.expect(&tag1(T_POBJ, p), d)
+        };
+        let mut c_cur = CounterCursor::new(self, T_CARD, TAG1_LEN);
+        let mut v_cur = CounterCursor::new(self, T_POBJ, TAG1_LEN);
+        let mut y_cur = CounterCursor::new(self, T_PO, TAG2_LEN);
+        let (mut pos_triples, mut preds) = (0u64, 0u64);
+        // The predicate's run: (p, triples, distinct objects); the (p, o) run.
+        let mut p_run: Option<(u32, u64, u64)> = None;
+        let mut po_run: Option<(u32, u32, u64)> = None;
+        self.try_scan(CF_POS, &[], |k, _| {
+            check_len(CF_POS, k, KEY3_LEN)?;
+            let (p, o, s) = (de(&k[0..4]), de(&k[4..8]), de(&k[8..12]));
+            self.spo_must_hold(CF_POS, s, p, o)?;
+            pos_triples += 1;
+            if p_run.is_none_or(|(rp, _, _)| rp != p) {
+                if let Some((rp, n, d)) = p_run.replace((p, 0, 0)) {
+                    preds += 1;
+                    close_p(&mut c_cur, &mut v_cur, rp, n, d)?;
+                }
+            }
+            if po_run.is_none_or(|(rp, ro, _)| (rp, ro) != (p, o)) {
+                if let Some((rp, ro, n)) = po_run.replace((p, o, 0)) {
+                    y_cur.expect(&tag2(T_PO, rp, ro), n)?;
+                }
+                if let Some((_, _, d)) = &mut p_run {
+                    *d += 1;
+                }
+            }
+            if let (Some((_, n, _)), Some((_, _, m))) = (&mut p_run, &mut po_run) {
+                *n += 1;
+                *m += 1;
+            }
+            Ok(true)
+        })
+        .map_err(read)?;
+        if let Some((rp, ro, n)) = po_run {
+            y_cur.expect(&tag2(T_PO, rp, ro), n)?;
+        }
+        if let Some((rp, n, d)) = p_run {
+            preds += 1;
+            close_p(&mut c_cur, &mut v_cur, rp, n, d)?;
+        }
+        c_cur.finish()?;
+        v_cur.finish()?;
+        y_cur.finish()?;
+
+        // OSP: every key is an SPO triple; `o|o` is the length of the
+        // object's run.
+        let mut o_cur = CounterCursor::new(self, T_OBJ, TAG1_LEN);
+        let (mut osp_triples, mut objects) = (0u64, 0u64);
+        let mut run: Option<(u32, u64)> = None;
+        self.try_scan(CF_OSP, &[], |k, _| {
+            check_len(CF_OSP, k, KEY3_LEN)?;
+            let (o, s, p) = (de(&k[0..4]), de(&k[4..8]), de(&k[8..12]));
+            self.spo_must_hold(CF_OSP, s, p, o)?;
+            osp_triples += 1;
+            match &mut run {
+                Some((ro, n)) if *ro == o => *n += 1,
+                _ => {
+                    if let Some((ro, n)) = run.replace((o, 1)) {
+                        objects += 1;
+                        o_cur.expect(&tag1(T_OBJ, ro), n)?;
+                    }
+                }
+            }
+            Ok(true)
+        })
+        .map_err(read)?;
+        if let Some((ro, n)) = run {
+            objects += 1;
+            o_cur.expect(&tag1(T_OBJ, ro), n)?;
+        }
+        o_cur.finish()?;
+        for (cf, n) in [(CF_POS, pos_triples), (CF_OSP, osp_triples)] {
+            if n != triples {
+                return Err(format!("{cf} holds {n} triples, spo {triples}"));
+            }
+        }
+
+        // `x|p|s` is the length of the SPO `(s, p)` run; per predicate they
+        // add up to `c|p` (checked against POS above), and `u|p` counts them.
+        let mut u_cur = CounterCursor::new(self, T_PSUBJ, TAG1_LEN);
+        let close_x = |u: &mut CounterCursor, p: u32, sum: u64, keys: u64| {
+            let card = self.get_counter(&tag1(T_CARD, p))?;
+            if card != sum {
+                return Err(format!(
+                    "the x| counters of predicate {p} add up to {sum}, its c| counter is {card}"
+                ));
+            }
+            u.expect(&tag1(T_PSUBJ, p), keys)
+        };
+        let mut spo = self.raw_iter(CF_SPO, None);
+        let mut x_run: Option<(u32, u64, u64)> = None;
+        let mut x_preds = 0u64;
+        self.try_scan(CF_STATS, &[T_PS], |k, v| {
+            check_len(CF_STATS, k, TAG2_LEN)?;
+            let n = counter_value(v)
+                .ok_or_else(|| format!("corrupt counter value at {}", show_key(k)))?;
+            let (p, s) = (de(&k[1..5]), de(&k[5..9]));
+            let at = key2(s, p);
+            spo.seek(at);
+            let mut len = 0u64;
+            while let Some(key) = spo.key() {
+                if !key.starts_with(&at) {
+                    break;
+                }
+                check_len(CF_SPO, key, KEY3_LEN)?;
+                len += 1;
+                spo.next();
+            }
+            spo.status()
+                .map_err(|e| format!("rocksdb read ({CF_SPO}): {}", e.into_string()))?;
+            if len != n || n == 0 {
+                return Err(format!(
+                    "counter {}: stored {n}, recounted {len}",
+                    show_key(k)
+                ));
+            }
+            if x_run.is_none_or(|(rp, _, _)| rp != p) {
+                if let Some((rp, sum, keys)) = x_run.replace((p, 0, 0)) {
+                    x_preds += 1;
+                    close_x(&mut u_cur, rp, sum, keys)?;
+                }
+            }
+            if let Some((_, sum, keys)) = &mut x_run {
+                *sum += n;
+                *keys += 1;
+            }
+            Ok(true)
+        })
+        .map_err(read)?;
+        if let Some((rp, sum, keys)) = x_run {
+            x_preds += 1;
+            close_x(&mut u_cur, rp, sum, keys)?;
+        }
+        u_cur.finish()?;
+        if x_preds != preds {
+            return Err(format!(
+                "{preds} predicate(s) have triples, {x_preds} have x| counters"
+            ));
+        }
+
+        // The global counters (stored as 0 after deletes, or absent), the
+        // cached ones, and the c|/u|/v| mirror.
+        for (key, n) in [
+            (K_TRIPLES, triples),
+            (K_PREDS, preds),
+            (K_SUBJECTS, subjects),
+            (K_OBJECTS, objects),
+        ] {
+            let stored = self.get_counter(key)?;
+            if stored != n {
+                return Err(format!(
+                    "global counter {}: stored {stored}, recounted {n}",
+                    show_key(key)
+                ));
+            }
+        }
+        if (
+            self.triple_count,
+            self.num_predicates,
+            self.distinct_subjects,
+            self.distinct_objects,
+        ) != (triples, preds, subjects, objects)
+        {
+            return Err("the cached global counters differ from the stats CF".into());
+        }
+        if self.preds.len() as u64 != preds {
+            return Err("the c|/u|/v| mirror differs from the stats CF".into());
+        }
+        let mut mirror = self.preds.iter();
+        self.try_scan(CF_STATS, &[T_CARD], |k, v| {
+            let p = de(&k[1..5]);
+            let stored = PredCounts {
+                card: counter_value(v).unwrap_or(0),
+                subjects: self.get_counter(&tag1(T_PSUBJ, p))?,
+                objects: self.get_counter(&tag1(T_POBJ, p))?,
+            };
+            match mirror.next() {
+                Some((&mp, c)) if mp == p && *c == stored => Ok(true),
+                _ => Err("the c|/u|/v| mirror differs from the stats CF".into()),
+            }
+        })
+        .map_err(read)?;
+        Ok(())
+    }
+
+    /// The check of a `cf` key that names the triple `(s, p, o)`: SPO must
+    /// hold it.
+    fn spo_must_hold(&self, cf: &str, s: u32, p: u32, o: u32) -> std::result::Result<(), String> {
+        match self.db.get_pinned_cf(self.cf(CF_SPO), key3(s, p, o)) {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(format!(
+                "{cf} holds the triple ({s}, {p}, {o}), which spo lacks"
+            )),
+            Err(e) => Err(format!("rocksdb read ({CF_SPO}): {}", e.into_string())),
+        }
     }
 }
 

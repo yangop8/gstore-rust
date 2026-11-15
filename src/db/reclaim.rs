@@ -637,11 +637,22 @@ impl Database {
     /// Check the structures id reclamation relies on, reading everything
     /// once: every term a default-graph triple or a named-graph quad uses
     /// (graph IRIs included) resolves in the dictionary; the named graphs'
-    /// reference counts equal a recount; and an on-disk store's free-id list
+    /// reference counts equal a recount; an on-disk store's free-id list
     /// is sound (each free id below its space's high-water mark names no
-    /// term, the counts match the list, none is the highest). `Err` names the
-    /// first violation. For tests and `gcompact --check`.
+    /// term, the counts match the list, none is the highest); and a RocksDB
+    /// store's statistics are exact — every counter (which reclamation's
+    /// reference checks and the planner trust) equals a recount from the
+    /// SPO keys, POS and OSP hold exactly the SPO triples
+    /// (`RocksStore::verify_stats`, streamed). `Err` names the first
+    /// violation (a malformed key included). For tests and `gcompact
+    /// --check`.
     pub fn verify_integrity(&self) -> Result<()> {
+        #[cfg(feature = "rocksdb")]
+        if let Some(rocks) = self.store.as_rocks() {
+            rocks.verify_stats().map_err(|e| {
+                GStoreError::Database(format!("integrity: rocksdb statistics: {e}"))
+            })?;
+        }
         let scope = ReadScope::enter();
         let missing = |what: &str, id: u32| {
             GStoreError::Database(format!("integrity: {what} id {id} names no term"))
