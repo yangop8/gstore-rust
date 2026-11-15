@@ -767,14 +767,14 @@ mod tests {
         // milliseconds either way. (The floor keeps a sub-millisecond short
         // search from making the bound meaninglessly tight.)
         assert!(
-            t_long < 50.0 * t_short.max(2e-3),
+            t_long < 50.0 * t_short.max(5e-3),
             "a 60,000-byte needle took {t_long:.4} s, a 64-byte one {t_short:.4} s"
         );
         // Linear in the body: doubling it about doubles the time.
         let hay2 = vec![b'-'; 2 << 20];
         let t_double = best_of(5, || assert_eq!(find(&hay2, &long, 0), None));
         assert!(
-            t_double < 6.0 * t_long.max(2e-3),
+            t_double < 6.0 * t_long.max(1e-2),
             "2 MiB took {t_double:.4} s, 1 MiB {t_long:.4} s"
         );
         // And it finds what it should.

@@ -43,6 +43,7 @@
 
 use std::io::{self, BufRead, Read};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
@@ -260,8 +261,12 @@ impl Ingest {
 pub(crate) struct BodyBudget {
     total: usize,
     state: Mutex<BudgetState>,
-    /// Notified on every change (for [`wait_body_budget`]).
+    /// Notified on every change while someone waits on it (only
+    /// [`wait_body_budget`] does: the serving path never waits for budget).
     changed: Condvar,
+    /// Threads in [`wait_body_budget`] (incremented before they lock
+    /// `state`, so a change made after their check sees them).
+    waiters: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -276,6 +281,15 @@ impl BodyBudget {
             total,
             state: Mutex::new(BudgetState::default()),
             changed: Condvar::new(),
+            waiters: AtomicUsize::new(0),
+        }
+    }
+
+    /// Wake the threads in [`wait_body_budget`], if any (a condition
+    /// variable's wake-up costs a system call even when nobody waits).
+    fn notify(&self) {
+        if self.waiters.load(Ordering::SeqCst) > 0 {
+            self.changed.notify_all();
         }
     }
 
@@ -287,7 +301,7 @@ impl BodyBudget {
                 st.held = held;
                 st.peak = st.peak.max(held);
                 drop(st);
-                self.changed.notify_all();
+                self.notify();
                 true
             }
             _ => false,
@@ -301,7 +315,7 @@ impl BodyBudget {
         let mut st = locked(&self.state);
         st.held = st.held.saturating_sub(n);
         drop(st);
-        self.changed.notify_all();
+        self.notify();
     }
 
     fn in_use(&self) -> (usize, usize) {
@@ -622,19 +636,26 @@ pub fn wait_body_budget(addr: SocketAddr, timeout: Duration, cond: impl Fn(usize
             .0;
     };
     drop(list);
-    let mut st = locked(&budget.state);
-    while !cond(st.held) {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return false;
+    budget.waiters.fetch_add(1, Ordering::SeqCst);
+    let met = {
+        let mut st = locked(&budget.state);
+        loop {
+            if cond(st.held) {
+                break true;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break false;
+            }
+            st = budget
+                .changed
+                .wait_timeout(st, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
         }
-        st = budget
-            .changed
-            .wait_timeout(st, left)
-            .unwrap_or_else(PoisonError::into_inner)
-            .0;
-    }
-    true
+    };
+    budget.waiters.fetch_sub(1, Ordering::SeqCst);
+    met
 }
 
 #[cfg(test)]

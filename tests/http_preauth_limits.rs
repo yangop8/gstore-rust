@@ -557,9 +557,11 @@ fn a_64_character_boundary_over_megabytes_parses_in_linear_time() {
             .fold(f64::INFINITY, f64::min)
     };
     let (t_small, t_large) = (best(&small, 4 << 20), best(&large, 8 << 20));
-    // Linear: twice the body, about twice the time (a generous bound).
+    // Linear: twice the body, about twice the time. The bound is generous,
+    // and floored: a parse of a few milliseconds is dominated by the
+    // allocation of the file's copy (page faults), not by the search.
     assert!(
-        t_large < 4.0 * t_small.max(2e-3),
+        t_large < 4.0 * t_small.max(0.05),
         "8 MiB took {t_large:.4} s, 4 MiB {t_small:.4} s"
     );
 }
