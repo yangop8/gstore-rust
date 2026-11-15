@@ -85,6 +85,19 @@ LOGS="$GHOME/conformance-logs"
 PORT=$(free_port)
 mkdir -p "$GHOME/conf" "$GHOME/bin" "$GHOME/data/lubm" "$GHOME/scripts/test" "$GHOME/api/http" "$LOGS"
 sed -e "s/^port=9000\$/port=$PORT/" "$REPO/conf/conf.ini.example" >"$GHOME/conf/conf.ini"
+# --- upstream compat switches (D1; see docs/DEPLOY.md) ---
+COMPAT_KEYS=""
+compat_switch() { # <section> <key> <value>: the first occurrence in the home section wins
+    sed -i -e "/^[[:space:]]*$2[[:space:]]*=/d" -e "/^\[$1\][[:space:]]*\$/a $2=$3" "$GHOME/conf/conf.ini"
+    grep -q "^$2=$3\$" "$GHOME/conf/conf.ini" || { echo "conformance: cannot set [$1] $2" >&2; exit 1; }
+    COMPAT_KEYS="$COMPAT_KEYS $2"
+}
+check_compat_switches() { # after the server started: every switch must be reported active
+    for k in $COMPAT_KEYS; do
+        grep -rqs "upstream-compat: $k=" "$LOGS" "$GHOME/logs" || { echo "conformance: compat switch $k did not take effect" >&2; return 1; }
+    done
+}
+compat_switch server allow_default_root_password on
 for b in "$BIN_DIR"/g*; do
     [ -x "$b" ] && [ -f "$b" ] && ln -s "$b" "$GHOME/bin/$(basename "$b")"
 done
@@ -120,6 +133,7 @@ if ! (cd "$GHOME" && bin/gserver -b --load-dir data --load-dir scripts/test) >"$
     cat "$LOGS/gserver-start.log"
     exit 1
 fi
+check_compat_switches || exit 1
 cat "$LOGS/gserver-start.log"
 
 # ---- 4. the suites -------------------------------------------------------------
