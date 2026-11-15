@@ -491,6 +491,9 @@ fn report_config(cfg: &GStoreConfig) {
     for w in cfg.warnings() {
         gs_warn!("conf.ini warning: {w}");
     }
+    if cfg.anonymous_download {
+        gs_warn!("upstream-compat: anonymous_download=on");
+    }
 }
 
 /// Install `conf.ini`'s `[storage]` section as the process's default open

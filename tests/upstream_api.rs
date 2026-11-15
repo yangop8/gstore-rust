@@ -81,10 +81,14 @@ fn api_test_script_on_small() {
         string(&j, "filepath"),
         "awk's field 10 is filepath: {text}"
     );
-    let (status, body) = http(
+    // review sec#4: a download needs credentials by default (the script's
+    // anonymous wget runs under `anonymous_download=on` in
+    // scripts/conformance.sh); here root's, as HTTP Basic ("root:123456").
+    let (status, body) = http_with(
         &srv.addr,
         "GET",
         &format!("/file/download/{export_path}"),
+        &[("Authorization", "Basic cm9vdDoxMjM0NTY=")],
         b"",
     );
     assert_eq!(status, 200, "{body}");

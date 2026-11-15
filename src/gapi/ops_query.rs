@@ -276,10 +276,12 @@ fn read_response(
 }
 
 /// Write a `format=file` / `n-triple-file` result (`write` streams it) into
-/// the export directory as `<db>_<threadId>_<YYYYmmddHHMMSS>.<ext>`
-/// (upstream's name; the time is UTC here, and a numeric suffix keeps two
-/// results of the same second apart). Returns the file name (relative to the
-/// export directory, which is where `/file/download` looks).
+/// the export directory as `<db>_<threadId>_<YYYYmmddHHMMSS>_<32 hex
+/// digits>.<ext>` (upstream's name, the time in UTC, plus 128 random bits so
+/// nobody can guess it — review sec#4), with an owner record: the users
+/// holding the `query` privilege on `db` may download it. Returns the file
+/// name (relative to the export directory, which is where `/file/download`
+/// looks).
 fn write_result_file(
     ctx: &Ctx<'_>,
     db: &str,
@@ -295,12 +297,18 @@ fn write_result_file(
     };
     let dir = ctx.export_dir();
     fs::create_dir_all(&dir).map_err(fail)?;
-    let stem = format!("{db}_{thread_id}_{}", compact_utc_now());
-    let (file, name) = super::ops_file::create_unique(&dir, &stem, ext).map_err(fail)?;
+    let stem = format!(
+        "{db}_{thread_id}_{}_{}",
+        compact_utc_now(),
+        super::ops_file::random_tag()
+    );
+    let owner = super::ops_file::Owner::of(ctx, super::ops_file::FileKind::QueryResult, Some(db));
+    let (file, name) =
+        super::ops_file::create_owned(ctx, &dir, &stem, ext, &owner).map_err(fail)?;
     let mut out = BufWriter::new(file);
     if let Err(e) = write(&mut out).and_then(|()| out.flush()) {
         drop(out);
-        let _ = fs::remove_file(dir.join(&name));
+        super::ops_file::remove_with_owner(ctx, &dir.join(&name));
         return Err(fail(e));
     }
     Ok(name)

@@ -1,6 +1,13 @@
-//! The policy of the upstream `/api` layer's file routes (`/file/download`)
-//! and of the files they serve (review gapi#4, robust#7, sec#11, gapi#11):
+//! The policy of the upstream `/api` layer's file routes (`/file/download`,
+//! `/file/upload`) and of the files they serve (review sec#4, gapi#2,
+//! gapi#4, robust#7, sec#11, gapi#14, gapi#11):
 //!
+//! * a download needs credentials by default; `anonymous_download=on`
+//!   restores upstream's public export directory;
+//! * a user reads an export or a `format=file` result only with the matching
+//!   privilege on its database, and an upload only when it is his — as a
+//!   download and as a `batchInsert` source;
+//! * export and result names carry 128 random bits;
 //! * a download is streamed (bounded memory), and only so many run at once;
 //! * `format=file` results are written without a result tree in memory.
 //!
@@ -324,6 +331,38 @@ fn build_loaded(addr: &SocketAddr, db: &str, path: &str) {
     ok(&api(addr, &[("operation", "load"), ("db_name", db)]));
 }
 
+fn add_user(addr: &SocketAddr, name: &str) {
+    ok(&api(
+        addr,
+        &[
+            ("operation", "usermanage"),
+            ("type", "1"),
+            ("op_username", name),
+            ("op_password", "pw"),
+        ],
+    ));
+}
+
+fn grant(addr: &SocketAddr, user: &str, db: &str, privileges: &str) {
+    ok(&api(
+        addr,
+        &[
+            ("operation", "userprivilegemanage"),
+            ("type", "1"),
+            ("op_username", user),
+            ("db_name", db),
+            ("privileges", privileges),
+        ],
+    ));
+}
+
+/// `export` of `db` as `user`: the reported file path.
+fn export_as(addr: &SocketAddr, user: &str, db: &str) -> String {
+    let j = api_as(addr, user, &[("operation", "export"), ("db_name", db)]);
+    ok(&j);
+    string(&j, "filepath")
+}
+
 /// A `format=file` query on `db` as `user`: the reported file name.
 fn query_file_as(addr: &SocketAddr, user: &str, db: &str, sparql: &str) -> String {
     let j = api_as(
@@ -338,6 +377,11 @@ fn query_file_as(addr: &SocketAddr, user: &str, db: &str, sparql: &str) -> Strin
     );
     ok(&j);
     string(&j, "FileName")
+}
+
+/// `GET /file/download/<target>` without credentials.
+fn download_anonymous(addr: &SocketAddr, target: &str) -> Reply {
+    send(addr, "GET", &format!("/file/download/{target}"), &[], b"")
 }
 
 /// `POST /file/download` as `user`.
@@ -356,7 +400,389 @@ fn download_as(addr: &SocketAddr, user: &str, target: &str) -> Reply {
     )
 }
 
+/// The `FileNotFound` envelope (`StatusCode` 11, HTTP 200).
+fn assert_not_found(r: &Reply, what: &str) {
+    assert_eq!(r.status, 200, "{what}: {}", r.text());
+    assert_eq!(code(&r.json()), 11, "{what}: {}", r.text());
+}
+
+/// `multipart/form-data` for `/file/upload`.
+fn multipart(user: &str, name: &str, data: &[u8]) -> (String, Vec<u8>) {
+    let boundary = "----gstoredownloadpolicy0x5f";
+    let mut body = Vec::new();
+    for (k, v) in [("username", user), ("password", password(user))] {
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n")
+                .as_bytes(),
+        );
+    }
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; \
+             filename=\"{name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(data);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    (format!("multipart/form-data; boundary={boundary}"), body)
+}
+
+/// `/file/upload` of `data` as `name` by `user`: the envelope.
+fn upload_as(addr: &SocketAddr, user: &str, name: &str, data: &[u8]) -> Json {
+    let (ctype, body) = multipart(user, name, data);
+    let r = send(
+        addr,
+        "POST",
+        "/file/upload",
+        &[("Content-Type", &ctype)],
+        &body,
+    );
+    assert_eq!(r.status, 200, "{}", r.text());
+    r.json()
+}
+
+const SECRET_A: &str = "<http://ex/alice> <http://ex/ssn> \"123-45-6789\" .\n\
+<http://ex/bob> <http://ex/ssn> \"987-65-4321\" .\n";
 const DATA_B: &str = "<http://ex/x> <http://ex/p> <http://ex/y> .\n";
+
+/// Databases `dba` (secret) and `dbb`; users `alice` (query + export +
+/// update on `dba`), `bob` (query + export + update on `dbb` only), `carol`
+/// (query on `dba`).
+fn two_databases(srv: &Srv) {
+    let a = &srv.addr;
+    let pa = srv.data_file("a.nt", SECRET_A);
+    let pb = srv.data_file("b.nt", DATA_B);
+    build_loaded(a, "dba", &pa);
+    build_loaded(a, "dbb", &pb);
+    for u in ["alice", "bob", "carol"] {
+        add_user(a, u);
+    }
+    grant(a, "alice", "dba", "query,export,update");
+    grant(a, "bob", "dbb", "query,export,update");
+    grant(a, "carol", "dba", "query");
+}
+
+fn count(addr: &SocketAddr, db: &str) -> i64 {
+    let j = api(
+        addr,
+        &[
+            ("operation", "query"),
+            ("db_name", db),
+            ("sparql", "SELECT * WHERE { ?s ?p ?o }"),
+        ],
+    );
+    ok(&j);
+    j.get("AnsNum").and_then(Json::as_i64).unwrap()
+}
+
+fn file_name(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned()
+}
+
+// ---------------------------------------------------------------------------
+// Authentication and owner checks
+// ---------------------------------------------------------------------------
+
+/// sec#4 / gapi#2: without credentials nothing is downloaded by default — an
+/// export and a `format=file` result answer 401 and leak nothing.
+#[test]
+fn anonymous_downloads_are_refused_by_default() {
+    let _g = serial();
+    let root = TempRoot::new("anon");
+    let srv = start_at(&root.0, |_| {});
+    let a = &srv.addr;
+    two_databases(&srv);
+    let export = export_as(a, "root", "dba");
+    let result = query_file_as(a, "root", "dba", "SELECT ?o WHERE { ?s ?p ?o }");
+    let export_name = file_name(&export);
+    for target in [export.clone(), export_name.clone(), result.clone()] {
+        let r = download_anonymous(a, &target);
+        assert_eq!(r.status, 401, "{target}: {}", r.text());
+        assert!(!r.text().contains("123-45-6789"), "{target}: {}", r.text());
+        assert_eq!(code(&r.json()), 1001, "{target}");
+        assert!(
+            r.header("WWW-Authenticate")
+                .is_some_and(|h| h.starts_with("Basic")),
+            "{}",
+            r.head
+        );
+        // POST with only the file path: the same.
+        let r = send(
+            a,
+            "POST",
+            "/file/download",
+            &[("Content-Type", "application/x-www-form-urlencoded")],
+            format!("filepath={target}").as_bytes(),
+        );
+        assert_eq!(r.status, 401, "{target}: {}", r.text());
+    }
+    // A file that does not exist answers the same (nothing is revealed).
+    assert_eq!(download_anonymous(a, "nothing.nt").status, 401);
+    // With credentials — parameters, or HTTP Basic — root downloads both.
+    let r = download_as(a, "root", &export_name);
+    assert_eq!(
+        (r.status, r.text()),
+        (200, fs::read_to_string(&export).unwrap())
+    );
+    let r = download_as(a, "root", &result);
+    assert_eq!(r.status, 200);
+    assert!(r.text().contains("123-45-6789"));
+    // "root:root" in base64.
+    let r = send(
+        a,
+        "GET",
+        &format!("/file/download/{export_name}"),
+        &[("Authorization", "Basic cm9vdDpyb290")],
+        b"",
+    );
+    assert_eq!(r.status, 200, "{}", r.text());
+    // "root:nope": refused like a wrong password parameter.
+    let r = send(
+        a,
+        "GET",
+        &format!("/file/download/{export_name}"),
+        &[("Authorization", "Basic cm9vdDpub3Bl")],
+        b"",
+    );
+    assert_eq!(code(&r.json()), 1001, "{}", r.text());
+}
+
+/// The upstream-compat switch restores upstream's public export directory
+/// (and only that: uploads stay private).
+#[test]
+fn anonymous_download_switch_restores_the_public_export_directory() {
+    let _g = serial();
+    let root = TempRoot::new("compat");
+    let srv = start_at(&root.0, |c| set(c, "anonymous_download", "on"));
+    let a = &srv.addr;
+    two_databases(&srv);
+    let export = export_as(a, "root", "dba");
+    let result = query_file_as(a, "root", "dba", "SELECT ?o WHERE { ?s ?p ?o }");
+    let r = download_anonymous(a, &export);
+    assert_eq!(
+        (r.status, r.text()),
+        (200, fs::read_to_string(&export).unwrap())
+    );
+    let r = download_anonymous(a, &result);
+    assert_eq!(r.status, 200);
+    assert!(r.text().contains("123-45-6789"));
+    // bob (no rights on `a`) reads it too: the directory is public.
+    assert_eq!(download_as(a, "bob", &result).status, 200);
+    // An upload is not part of it.
+    let j = upload_as(a, "alice", "mine.nt", DATA_B.as_bytes());
+    ok(&j);
+    let up = string(&j, "filepath");
+    assert_not_found(&download_anonymous(a, &up), "anonymous upload");
+    assert_not_found(&download_as(a, "bob", &up), "another user's upload");
+}
+
+/// sec#4: a user reads an export only with the `export` privilege on its
+/// database, a query result only with `query`; owner records and operator
+/// files are root's.
+#[test]
+fn downloads_are_checked_against_the_files_database() {
+    let _g = serial();
+    let root = TempRoot::new("owner");
+    let srv = start_at(&root.0, |_| {});
+    let a = &srv.addr;
+    two_databases(&srv);
+    let export = export_as(a, "root", "dba");
+    let result = query_file_as(a, "root", "dba", "SELECT ?o WHERE { ?s ?p ?o }");
+    // alice (query + export on a): both.
+    assert_eq!(download_as(a, "alice", &export).status, 200);
+    assert_eq!(download_as(a, "alice", &result).status, 200);
+    // carol (query on a): the result, not the export.
+    assert_eq!(download_as(a, "carol", &result).status, 200);
+    assert_not_found(&download_as(a, "carol", &export), "carol's export");
+    // bob (nothing on a): neither.
+    assert_not_found(&download_as(a, "bob", &export), "bob, export of a");
+    assert_not_found(&download_as(a, "bob", &result), "bob, result of a");
+    // bob's own export of b, which alice may not read.
+    let export_b = export_as(a, "bob", "dbb");
+    assert_eq!(download_as(a, "bob", &export_b).status, 200);
+    assert_not_found(&download_as(a, "alice", &export_b), "alice, export of b");
+    // A file the operator put in the export directory: root's alone.
+    fs::write(srv.export_dir().join("manual.nt"), DATA_B).unwrap();
+    assert_not_found(&download_as(a, "alice", "manual.nt"), "operator file");
+    assert_eq!(download_as(a, "root", "manual.nt").status, 200);
+    // Owner records (under the root, file_owners/) are never served.
+    let records: Vec<PathBuf> = fs::read_dir(srv.root.join("file_owners"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    assert!(!records.is_empty(), "exports carry owner records");
+    for rec in &records {
+        let rec = rec.to_string_lossy();
+        assert_not_found(&download_as(a, "root", &rec), "owner record");
+        assert_not_found(&download_as(a, "alice", &rec), "owner record");
+    }
+}
+
+/// sec#4: an export directory file is not a `batchInsert` source for a user
+/// without access to the database it came from.
+#[test]
+fn batch_insert_from_another_databases_export_is_refused() {
+    let _g = serial();
+    let root = TempRoot::new("batch");
+    let srv = start_at(&root.0, |_| {});
+    let a = &srv.addr;
+    two_databases(&srv);
+    let export = export_as(a, "root", "dba");
+    let before = count(a, "dbb");
+    // bob may update b, but not read a's export.
+    let j = api_as(
+        a,
+        "bob",
+        &[
+            ("operation", "batchInsert"),
+            ("db_name", "dbb"),
+            ("file", &export),
+        ],
+    );
+    assert_eq!(code(&j), 1003, "{j}");
+    assert!(!j.to_string().contains("123-45-6789"), "{j}");
+    // Nor through `dir` (every RDF file of the export directory).
+    let dir = srv.export_dir().to_string_lossy().into_owned();
+    let j = api_as(
+        a,
+        "bob",
+        &[
+            ("operation", "batchInsert"),
+            ("db_name", "dbb"),
+            ("dir", &dir),
+        ],
+    );
+    assert_eq!(code(&j), 1003, "{j}");
+    assert_eq!(count(a, "dbb"), before, "nothing of a reached b");
+    // alice holds export on a: she may use it (into a, which she updates).
+    let j = api_as(
+        a,
+        "alice",
+        &[
+            ("operation", "batchInsert"),
+            ("db_name", "dba"),
+            ("file", &export),
+        ],
+    );
+    ok(&j);
+    // root may use anything.
+    ok(&api(
+        a,
+        &[
+            ("operation", "batchInsert"),
+            ("db_name", "dbb"),
+            ("file", &export),
+        ],
+    ));
+    assert_eq!(count(a, "dbb"), before + 2);
+}
+
+/// gapi#14: an upload is its uploader's (and root's) — to download and to
+/// use as a source.
+#[test]
+fn uploads_are_private_to_their_uploader() {
+    let _g = serial();
+    let root = TempRoot::new("uploads");
+    let srv = start_at(&root.0, |_| {});
+    let a = &srv.addr;
+    two_databases(&srv);
+    let private = "<http://ex/s> <http://ex/p> \"alice-private-secret\" .\n";
+    let j = upload_as(a, "alice", "private.nt", private.as_bytes());
+    ok(&j);
+    let path = string(&j, "filepath");
+    let name = file_name(&path);
+    // bob: neither by path nor by name, nor as a batchInsert source.
+    assert_not_found(&download_as(a, "bob", &path), "bob, by path");
+    assert_not_found(&download_as(a, "bob", &name), "bob, by name");
+    let before = count(a, "dbb");
+    let j = api_as(
+        a,
+        "bob",
+        &[
+            ("operation", "batchInsert"),
+            ("db_name", "dbb"),
+            ("file", &path),
+        ],
+    );
+    assert_eq!(code(&j), 1003, "{j}");
+    assert_eq!(count(a, "dbb"), before);
+    // An operator's file in the upload directory is root's alone too.
+    let operator = srv.data_file("operator.nt", DATA_B);
+    assert_not_found(&download_as(a, "bob", &operator), "operator upload");
+    // alice and root read it; alice inserts it into a.
+    let r = download_as(a, "alice", &path);
+    assert_eq!((r.status, r.text()), (200, private.to_string()));
+    assert_eq!(download_as(a, "root", &name).status, 200);
+    ok(&api_as(
+        a,
+        "alice",
+        &[
+            ("operation", "batchInsert"),
+            ("db_name", "dba"),
+            ("file", &path),
+        ],
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// Names
+// ---------------------------------------------------------------------------
+
+/// `<digits>` of exactly `n` decimal digits.
+fn digits(s: &str, n: usize) -> bool {
+    s.len() == n && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn hex128(s: &str) -> bool {
+    s.len() == 32
+        && s.bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+/// sec#4 / gapi#2: export and result names carry 128 random bits.
+#[test]
+fn export_and_result_names_are_unguessable() {
+    let _g = serial();
+    let root = TempRoot::new("names");
+    let srv = start_at(&root.0, |_| {});
+    let a = &srv.addr;
+    two_databases(&srv);
+    let mut tags = Vec::new();
+    for _ in 0..2 {
+        // dba_<YYYYmmddHHMMSS>_<32 hex>.nt
+        let name = file_name(&export_as(a, "root", "dba"));
+        let stem = name.strip_suffix(".nt").expect(&name);
+        let parts: Vec<&str> = stem.split('_').collect();
+        assert_eq!(parts.len(), 3, "{name}");
+        assert!(
+            parts[0] == "dba" && digits(parts[1], 14) && hex128(parts[2]),
+            "{name}"
+        );
+        tags.push(parts[2].to_string());
+        // dba_<thread>_<YYYYmmddHHMMSS>_<32 hex>.json
+        let name = query_file_as(a, "root", "dba", "SELECT ?s WHERE { ?s ?p ?o }");
+        let stem = name.strip_suffix(".json").expect(&name);
+        let parts: Vec<&str> = stem.split('_').collect();
+        assert_eq!(parts.len(), 4, "{name}");
+        assert!(
+            parts[0] == "dba"
+                && parts[1].bytes().all(|b| b.is_ascii_digit())
+                && digits(parts[2], 14)
+                && hex128(parts[3]),
+            "{name}"
+        );
+        tags.push(parts[3].to_string());
+    }
+    tags.sort();
+    tags.dedup();
+    assert_eq!(tags.len(), 4, "every name has its own random part");
+}
 
 // ---------------------------------------------------------------------------
 // Streaming, the download cap

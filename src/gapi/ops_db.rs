@@ -559,6 +559,9 @@ fn source_files(
                 return Err(refusal.answer(param, r, roots.as_deref().unwrap_or_default()))
             }
         };
+        // Another database's export, another user's upload (review sec#4,
+        // gapi#14).
+        ops_file::check_source(ctx, &path, r, param)?;
         if check_suffix(ctx, r, r)? {
             unpack_package(ctx, &path, &mut out)?;
             continue;
@@ -693,7 +696,10 @@ fn dir_files(ctx: &Ctx<'_>, requested: &str) -> Result<Inputs, GResp> {
         // `is_file` followed a symlink: where it leads is confined too.
         let shown = entry.to_string_lossy();
         match ops_file::resolve_existing(&shown, roots.as_deref(), &[]) {
-            Ok(file) => files.push(file),
+            Ok(file) => {
+                ops_file::check_source(ctx, &file, &shown, "file")?;
+                files.push(file)
+            }
             Err(refusal) => {
                 return Err(refusal.answer("file", &shown, roots.as_deref().unwrap_or_default()))
             }
@@ -2228,10 +2234,12 @@ fn restore(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
 }
 
 /// `export` — write the loaded database `db_name` to
-/// `<db_path>/<db>_<YYYYmmddHHMMSS>.nt` (upstream's name; a numeric suffix
-/// keeps two exports of one second apart), `db_path` defaulting to the
-/// export directory and confined to it. Answers `0 "Export the database
-/// successfully."` with `filepath`, which `/file/download` serves.
+/// `<db_path>/<db>_<YYYYmmddHHMMSS>_<32 hex digits>.nt` (upstream's name
+/// plus 128 random bits, so nobody can guess it; review sec#4), `db_path`
+/// defaulting to the export directory and confined to it. Answers `0
+/// "Export the database successfully."` with `filepath`, which
+/// `/file/download` serves to the users holding the `export` privilege on
+/// the database (the file's owner record, see `ops_file`).
 ///
 /// The format (a Rust extension; upstream writes N-Triples): `format=nt` (or
 /// `ntriples` / `n-triples`) writes N-Triples — the default graph, as
@@ -2285,8 +2293,14 @@ fn export(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         Err(e) => return op_error(&db, "Export fail: ", e),
     };
     let format = format.unwrap_or_else(|| ExportFormat::for_database(&slot.db));
-    let stem = format!("{db}_{}", ops_file::timestamp_now());
-    let (file, name) = match ops_file::create_unique(&target, &stem, format.extension()) {
+    let stem = format!(
+        "{db}_{}_{}",
+        ops_file::timestamp_now(),
+        ops_file::random_tag()
+    );
+    let owner = ops_file::Owner::of(ctx, ops_file::FileKind::Export, Some(&db));
+    let (file, name) = match ops_file::create_owned(ctx, &target, &stem, format.extension(), &owner)
+    {
         Ok(x) => x,
         Err(e) => return fail(e.to_string()),
     };
@@ -2295,7 +2309,7 @@ fn export(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     drop(slot);
     drop(out);
     if let Err(e) = written {
-        let _ = fs::remove_file(target.join(&name));
+        ops_file::remove_with_owner(ctx, &target.join(&name));
         return fail(e.to_string());
     }
     let name = if compress {
@@ -2305,19 +2319,19 @@ fn export(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
             .rsplit_once('.')
             .map_or(name.as_str(), |(s, _)| s)
             .to_string();
-        let packed = match ops_file::create_unique(&target, &file_stem, "zip") {
+        let packed = match ops_file::create_owned(ctx, &target, &file_stem, "zip", &owner) {
             Ok((_, zip)) => {
                 match zipio::pack_file(&target.join(&name), &target.join(&zip), &name) {
                     Ok(()) => Ok(zip),
                     Err(e) => {
-                        let _ = fs::remove_file(target.join(&zip));
+                        ops_file::remove_with_owner(ctx, &target.join(&zip));
                         Err(e.to_string())
                     }
                 }
             }
             Err(e) => Err(e.to_string()),
         };
-        let _ = fs::remove_file(target.join(&name));
+        ops_file::remove_with_owner(ctx, &target.join(&name));
         match packed {
             Ok(zip) => zip,
             Err(e) => {

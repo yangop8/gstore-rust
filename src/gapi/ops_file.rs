@@ -13,8 +13,8 @@
 //!
 //! | root | what lives there | read by | written by |
 //! |------|------------------|---------|------------|
-//! | upload dir (`upload_path`, else `<db home>/upload`) | uploaded RDF files and zip packages; packages unpacked for one operation | `build`, `batchInsert`, `batchRemove` | `/file/upload`; `build` / `batch*` unpacking a zip |
-//! | export dir (`<db home>/export` unless configured) | exports, `format=file` query results | the same, `/file/download` | `export`, `query` |
+//! | upload dir (`upload_path`, else `<db home>/upload`) | uploaded RDF files and zip packages; packages unpacked for one operation | `build`, `batchInsert`, `batchRemove`, `/file/download` (each upload by its uploader) | `/file/upload`; `build` / `batch*` unpacking a zip |
+//! | export dir (`<db home>/export` unless configured) | exports, `format=file` query results | the same (each file by the users of its database) | `export`, `query` |
 //! | backup dir (`backup_path`, else `<db home>/backups`) | `<db>.db_<YYYYmmddHHMMSS>` backups (directories, or `.zip` archives) | `restore` | `backup` |
 //! | the load policy's directories (`gserver --load-dir`) | server-local data sets | `build`, `batch*`, `restore` | — |
 //!
@@ -26,6 +26,25 @@
 //! does not exist, would resolve) outside every root — with the same answer
 //! whether or not the file exists, so the check reveals nothing about the
 //! rest of the file system.
+//!
+//! # Owner records and names
+//!
+//! Every file the server writes for a client — an upload, an export, a
+//! `format=file` query result — gets an **owner record** (its path, the kind
+//! of file, the database it came from, the user whose request wrote it),
+//! kept in `<db home>/file_owners/`, which no route serves. A user other
+//! than `root` (or an `admin`) may read such a file — download it, or name
+//! it as a `build` / `batch*` source — only when the record allows: an
+//! upload its uploader, an export the users holding the `export` privilege
+//! on its database, a query result those holding `query` on it (review
+//! sec#4, gapi#2, gapi#14). A file in these two directories without a
+//! record (an operator's, or one written before records existed) is
+//! `root`'s / `admin`'s alone.
+//!
+//! Export and query-result names carry 128 random bits
+//! (`<db>_<YYYYmmddHHMMSS>_<32 hex digits>.nt`, `<db>_<thread>_<UTC
+//! time>_<32 hex digits>.json`): clients use the name the answer reports, so
+//! nothing depends on guessing one.
 //!
 //! # `/file/upload`
 //!
@@ -39,30 +58,38 @@
 //! `<name>_<YYYYmmddHHMMSS>.<ext>` (the client's base name, reduced to
 //! `[A-Za-z0-9._-]`; a numeric suffix keeps two uploads of one second apart).
 //! The answer `{"StatusCode":0,"StatusMsg":"success","filepath":…}` names the
-//! stored file as a path `build` / `batchInsert` accept as `db_path` / `file`.
-//! (Upstream checks this route's privilege under the name `uploadfile`,
-//! which its privilege table does not list, so only `root` may upload there;
-//! its documentation and its table's `upload` entry open uploads to every
-//! user, which is what this server does.)
+//! stored file as a path `build` / `batchInsert` accept as `db_path` / `file`
+//! — from the uploader (or `root`) only. (Upstream checks this route's
+//! privilege under the name `uploadfile`, which its privilege table does not
+//! list, so only `root` may upload there; its documentation and its table's
+//! `upload` entry open uploads to every user, which is what this server
+//! does.)
 //!
 //! # `/file/download`
 //!
 //! The file named by the path after `/file/download/` (URL-decoded) or by the
 //! `filepath` parameter, sent as `application/octet-stream` with a
 //! `Content-Disposition: attachment` file name. Like upstream, a relative path
-//! is taken inside the export directory (`export/…` and bare names alike) and
-//! **no credentials are needed** for files there — what an `export` or a
-//! `format=file` query produced. With valid `username` / `password`
-//! parameters a caller may also download its uploads (any user), and `root`
-//! (or an `admin` user) files of the backup directory and of database
-//! directories; nothing else under the database home — the user table, the
-//! registry, the logs — is ever served. A file outside those roots, or that
-//! does not exist, is answered with upstream's `FileNotFound` envelope
-//! (`StatusCode` 11) either way.
+//! is taken inside the export directory (`export/…` and bare names alike).
 //!
-//! The body is streamed from the file in bounded chunks, never compressed,
-//! and at most `download_max_concurrent` downloads run at once (more are
-//! answered `503` with `Retry-After`).
+//! A download needs valid credentials — `username` / `password` parameters
+//! (`encryption=1` as everywhere), or an HTTP `Authorization: Basic` header;
+//! without them the answer is HTTP `401` (`WWW-Authenticate: Basic`, a
+//! `1001` envelope as the body) before anything is resolved. A user then
+//! reads the files the owner records allow (see above), and `root` (or an
+//! `admin` user) every file of the export and upload directories, of the
+//! backup directory and of database directories; nothing else under the
+//! database home — the user table, the registry, the logs, the owner
+//! records — is ever served. A file outside those roots, that the caller
+//! may not read, or that does not exist, is answered with upstream's
+//! `FileNotFound` envelope (`StatusCode` 11) either way.
+//!
+//! Upstream asks for no credentials and serves the export directory to
+//! anyone: `conf.ini`'s upstream-compat switch `[upload] anonymous_download=on`
+//! restores that (every file of the export directory, to anyone; `gserver`
+//! warns at startup while it is on). The body is streamed from the file in
+//! bounded chunks, never compressed, and at most `download_max_concurrent`
+//! downloads run at once (more are answered `503` with `Retry-After`).
 //!
 //! A single `Range: bytes=a-b` (or `a-`, `-n`) request header is honoured
 //! with `206 Partial Content` and a `Content-Range` (`416` when it cannot be
@@ -71,7 +98,7 @@
 //! RFC 7233.)
 
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -81,6 +108,7 @@ use super::envelope::{FileBody, GResp, Status};
 use super::params::{self, Params};
 use super::{Ctx, PathRoute, Registry};
 use crate::http_api::ApiInner;
+use crate::json::Json;
 use crate::server::locked;
 use crate::sysdb::clock;
 
@@ -394,6 +422,206 @@ pub(super) fn create_unique_dir(dir: &Path, stem: &str) -> std::io::Result<PathB
 }
 
 // ---------------------------------------------------------------------------
+// Owner records, unguessable names (see the module docs)
+// ---------------------------------------------------------------------------
+
+/// What wrote a file the server keeps for clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FileKind {
+    /// An `export` of a database: read with the `export` privilege on it.
+    Export,
+    /// A `format=file` / `n-triple-file` query result: the `query` privilege.
+    QueryResult,
+    /// A `/file/upload`: its uploader.
+    Upload,
+}
+
+impl FileKind {
+    fn name(self) -> &'static str {
+        match self {
+            FileKind::Export => "export",
+            FileKind::QueryResult => "query",
+            FileKind::Upload => "upload",
+        }
+    }
+
+    fn parse(s: &str) -> Option<FileKind> {
+        [FileKind::Export, FileKind::QueryResult, FileKind::Upload]
+            .into_iter()
+            .find(|k| k.name() == s)
+    }
+}
+
+/// The owner record of a server-written file (see the module docs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Owner {
+    pub(super) kind: FileKind,
+    /// The database an export or a query result came from.
+    pub(super) db: Option<String>,
+    /// The user whose request wrote the file.
+    pub(super) user: String,
+}
+
+impl Owner {
+    /// The record of a file written for `ctx`'s caller.
+    pub(super) fn of(ctx: &Ctx<'_>, kind: FileKind, db: Option<&str>) -> Owner {
+        Owner {
+            kind,
+            db: db.map(str::to_string),
+            user: ctx.user().to_string(),
+        }
+    }
+}
+
+/// The directory, under the server root, that holds the owner records
+/// (outside every directory a client reads from).
+const OWNER_DIR: &str = "file_owners";
+
+/// The record store of `ctx`'s server.
+fn owner_dir(ctx: &Ctx<'_>) -> PathBuf {
+    ctx.root_dir().join(OWNER_DIR)
+}
+
+/// Where the owner record of the file at canonical `path` is kept: one
+/// file per recorded file, named by the SHA-256 of its path.
+fn record_path(ctx: &Ctx<'_>, path: &Path) -> PathBuf {
+    let key = crate::query::hash::sha256_hex(&path.to_string_lossy());
+    owner_dir(ctx).join(format!("{key}.json"))
+}
+
+/// Record `owner` as the owner of `file` (written right after `file` was
+/// created, before its name is reported to anyone).
+pub(super) fn record_owner(ctx: &Ctx<'_>, file: &Path, owner: &Owner) -> io::Result<()> {
+    let path = fs::canonicalize(file)?;
+    let mut j = Json::obj()
+        .with("path", path.to_string_lossy().as_ref())
+        .with("kind", owner.kind.name())
+        .with("user", owner.user.as_str());
+    if let Some(db) = &owner.db {
+        j.set("db", db.as_str());
+    }
+    fs::create_dir_all(owner_dir(ctx))?;
+    fs::write(record_path(ctx, &path), j.to_string())
+}
+
+/// A record's file and owner.
+fn parse_record(text: &str) -> Option<(PathBuf, Owner)> {
+    let j = crate::json::parse(text).ok()?;
+    let path = PathBuf::from(j.get("path")?.as_str()?);
+    let owner = Owner {
+        kind: FileKind::parse(j.get("kind")?.as_str()?)?,
+        db: j.get("db").and_then(Json::as_str).map(str::to_string),
+        user: j.get("user")?.as_str()?.to_string(),
+    };
+    Some((path, owner))
+}
+
+/// The owner record of `file`, if it has one.
+pub(super) fn read_owner(ctx: &Ctx<'_>, file: &Path) -> Option<Owner> {
+    let path = fs::canonicalize(file).ok()?;
+    let text = fs::read_to_string(record_path(ctx, &path)).ok()?;
+    let (recorded, owner) = parse_record(&text)?;
+    (recorded == path).then_some(owner)
+}
+
+/// Remove a server-written file and its owner record.
+pub(super) fn remove_with_owner(ctx: &Ctx<'_>, file: &Path) {
+    if let Ok(path) = fs::canonicalize(file) {
+        let _ = fs::remove_file(record_path(ctx, &path));
+    }
+    let _ = fs::remove_file(file);
+}
+
+/// Create `dir/<stem><n>.<ext>` like [`create_unique`] and record `owner`
+/// for it; on a failure to record, the new file is removed again.
+pub(super) fn create_owned(
+    ctx: &Ctx<'_>,
+    dir: &Path,
+    stem: &str,
+    ext: &str,
+    owner: &Owner,
+) -> io::Result<(File, String)> {
+    let (file, name) = create_unique(dir, stem, ext)?;
+    if let Err(e) = record_owner(ctx, &dir.join(&name), owner) {
+        drop(file);
+        remove_with_owner(ctx, &dir.join(&name));
+        return Err(e);
+    }
+    Ok((file, name))
+}
+
+/// 128 random bits as 32 lowercase hex digits: the part of an export's or a
+/// query result's name nobody can guess (review sec#4, gapi#2).
+pub(super) fn random_tag() -> String {
+    let mut bytes = [0u8; 16];
+    crate::http_users::random_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Whether the caller is `root` or an `admin` user.
+fn is_admin(ctx: &Ctx<'_>) -> bool {
+    ctx.is_root() || (ctx.user.is_some() && ctx.state().users.is_superuser(ctx.user()))
+}
+
+/// Whether the authenticated caller may read the server-written `file` (a
+/// download, or a `build` / `batch*` source) as its owner record allows:
+/// `root` / `admin` always; an upload its uploader; an export the holders
+/// of the `export` privilege on its database, a query result those of
+/// `query`. A file without a record is `root`'s / `admin`'s alone.
+pub(super) fn may_read_recorded(ctx: &Ctx<'_>, file: &Path) -> bool {
+    if ctx.user.is_none() {
+        return false;
+    }
+    if is_admin(ctx) {
+        return true;
+    }
+    match read_owner(ctx, file) {
+        Some(Owner {
+            kind: FileKind::Upload,
+            user,
+            ..
+        }) => user == ctx.user(),
+        Some(Owner {
+            kind: FileKind::Export,
+            db: Some(db),
+            ..
+        }) => auth::check_privilege(ctx, "export", Some(&db)),
+        Some(Owner {
+            kind: FileKind::QueryResult,
+            db: Some(db),
+            ..
+        }) => auth::check_privilege(ctx, "query", Some(&db)),
+        _ => false,
+    }
+}
+
+/// Refuse an RDF source (`build`'s `db_path`, `batch*`'s `file` / a file
+/// of `dir`; `file` canonical) the caller may not read: one in the export
+/// or the upload directory must pass [`may_read_recorded`] — no `batchInsert`
+/// from another database's export or another user's upload (review sec#4,
+/// gapi#14). Sources in the load policy's directories are not affected.
+pub(super) fn check_source(
+    ctx: &Ctx<'_>,
+    file: &Path,
+    requested: &str,
+    param: &str,
+) -> Result<(), GResp> {
+    let inside = |root: PathBuf| fs::canonicalize(root).is_ok_and(|r| file.starts_with(&r));
+    let recorded_root = inside(ctx.export_dir()) || inside(upload_dir(ctx));
+    if !recorded_root || may_read_recorded(ctx, file) {
+        return Ok(());
+    }
+    Err(GResp::error(
+        Status::ParamIsIllegal,
+        format!(
+            "the {param} '{requested}' is refused: you may not read it (an export or query \
+             result of a database you lack the privilege on, another user's upload, or a \
+             file only root may use)"
+        ),
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Per-server state
 // ---------------------------------------------------------------------------
 
@@ -506,13 +734,14 @@ fn upload(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     if let Err(e) = fs::create_dir_all(&dir) {
         return fail(e);
     }
-    let (mut out, name) = match create_unique(&dir, &stem, &ext) {
+    let owner = Owner::of(ctx, FileKind::Upload, None);
+    let (mut out, name) = match create_owned(ctx, &dir, &stem, &ext, &owner) {
         Ok(x) => x,
         Err(e) => return fail(e),
     };
     if let Err(e) = out.write_all(&file.data).and_then(|()| out.sync_all()) {
         drop(out);
-        let _ = fs::remove_file(dir.join(&name));
+        remove_with_owner(ctx, &dir.join(&name));
         return fail(e);
     }
     GResp::success("success").with("filepath", shown(&dir, &name))
@@ -525,11 +754,15 @@ fn upload(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
 /// What a download request may reach.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Reach {
-    /// No (valid) credentials: the export directory only.
+    /// No credentials, under the upstream-compat switch `anonymous_download`:
+    /// the export directory.
     Public,
-    /// An authenticated user: also the upload directory.
+    /// An authenticated user: the files of the export and upload directories
+    /// the owner records allow (and the whole export directory under the
+    /// switch).
     User,
-    /// `root` or an `admin` user: also backups and database directories.
+    /// `root` or an `admin` user: every file of the export and upload
+    /// directories, backups and database directories.
     Admin,
 }
 
@@ -551,13 +784,15 @@ fn download_file(ctx: &Ctx<'_>, requested: &str, reach: Reach) -> Option<PathBuf
     let export = ctx.export_dir();
     let home = ctx.root_dir().to_path_buf();
     let canon_home = fs::canonicalize(&home).ok();
-    // The export directory is public unless it holds the whole database home
-    // (a configuration that would publish the user table).
-    let export_public = match (fs::canonicalize(&export), &canon_home) {
-        (Ok(e), Some(h)) => !h.starts_with(&e),
-        (Ok(_), None) => true,
-        (Err(_), _) => false,
-    };
+    // Under the upstream-compat switch the export directory is public,
+    // unless it holds the whole database home (a configuration that would
+    // publish the user table).
+    let export_public = ctx.inner.config().anonymous_download
+        && match (fs::canonicalize(&export), &canon_home) {
+            (Ok(e), Some(h)) => !h.starts_with(&e),
+            (Ok(_), None) => true,
+            (Err(_), _) => false,
+        };
     // A relative name is taken inside the root, or — `export/x.nt`, as
     // upstream's answers name files — inside the root's parent.
     let in_root = |root: PathBuf| {
@@ -566,16 +801,23 @@ fn download_file(ctx: &Ctx<'_>, requested: &str, reach: Reach) -> Option<PathBuf
         resolve_existing(requested, Some(std::slice::from_ref(&root)), &bases).ok()
     };
     let file = |p: PathBuf| p.is_file().then_some(p);
-    if export_public || reach == Reach::Admin {
-        if let Some(p) = in_root(export) {
-            return file(p);
+    let readable = |p: &Path| reach == Reach::Admin || may_read_recorded(ctx, p);
+    if let Some(p) = in_root(export) {
+        if export_public || readable(&p) {
+            if let Some(f) = file(p) {
+                return Some(f);
+            }
         }
     }
     if reach == Reach::Public {
         return None;
     }
     if let Some(p) = in_root(upload_dir(ctx)) {
-        return file(p);
+        if readable(&p) {
+            if let Some(f) = file(p) {
+                return Some(f);
+            }
+        }
     }
     if reach != Reach::Admin {
         return None;
@@ -643,6 +885,45 @@ fn http_error(status: u16, code: Status, msg: &str) -> GResp {
     GResp::raw(status, ctype, body)
 }
 
+/// The answer to a download without credentials (see the module docs).
+fn auth_required() -> GResp {
+    http_error(
+        401,
+        Status::AuthenticationFailed,
+        "Authentication required: send username and password (or HTTP Basic credentials) \
+         to download a file",
+    )
+    .with_header("WWW-Authenticate", "Basic realm=\"gStore\"")
+}
+
+/// Authenticate a download's credentials, if it carries any: `username` /
+/// `password` parameters (upstream's), else an `Authorization: Basic`
+/// header. `Ok(false)` when it carries none.
+fn authenticate_download(ctx: &mut Ctx<'_>, p: &Params) -> Result<bool, GResp> {
+    let basic = if p.has("username") {
+        None
+    } else {
+        match crate::server::parse_basic_auth(ctx.req) {
+            Some(b) => Some(b),
+            None => return Ok(false),
+        }
+    };
+    auth::check_ip(ctx, IpStage::Operation)?;
+    match basic {
+        None => auth::authenticate(ctx, p)?,
+        Some((username, password)) => {
+            let creds = auth::Credentials {
+                username,
+                password,
+                md5: false,
+                inner: false,
+            };
+            auth::verify(ctx, &creds, false)?
+        }
+    };
+    Ok(true)
+}
+
 /// Holds one of the server's `download_max_concurrent` download slots.
 struct DownloadPermit(Arc<FileState>);
 
@@ -677,23 +958,15 @@ fn download(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     if has_traversal(&requested) {
         return PathRefusal::Traversal.answer("filepath", &requested, &[]);
     }
-    // Credentials are optional (upstream asks for none): they widen what may
-    // be downloaded, and wrong ones are refused.
-    let reach = if p.has("username") {
-        if let Err(r) = auth::check_ip(ctx, IpStage::Operation) {
-            return r;
-        }
-        if let Err(r) = auth::authenticate(ctx, p) {
-            return r;
-        }
-        let admin = ctx.is_root() || ctx.state().users.is_superuser(ctx.user());
-        if admin {
-            Reach::Admin
-        } else {
-            Reach::User
-        }
-    } else {
-        Reach::Public
+    // Credentials are required (review sec#4, gapi#2), unless the
+    // upstream-compat switch serves the export directory to anyone; wrong
+    // ones are refused either way.
+    let reach = match authenticate_download(ctx, p) {
+        Err(r) => return r,
+        Ok(false) if !ctx.inner.config().anonymous_download => return auth_required(),
+        Ok(false) => Reach::Public,
+        Ok(true) if is_admin(ctx) => Reach::Admin,
+        Ok(true) => Reach::User,
     };
     let Some(path) = download_file(ctx, &requested, reach) else {
         return not_found();

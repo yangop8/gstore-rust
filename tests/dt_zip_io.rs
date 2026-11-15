@@ -1181,10 +1181,11 @@ mod with_zip {
             "the plain file is removed"
         );
         // It downloads, and it builds a database again (round trip).
+        // review sec#4: a download needs credentials by default (root's).
         let (status, body) = send(
             a,
             "GET",
-            &format!("/file/download/{zname}"),
+            &format!("/file/download/{zname}?username=root&password=root"),
             "text/plain",
             b"",
         );
