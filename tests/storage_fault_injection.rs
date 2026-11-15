@@ -339,12 +339,16 @@ fn materialize_small_cache_two_failed_updates_then_a_clean_drop_leave_a_consiste
 
 // ---- the review's server scenario: gserver, kill -9, gquery, gcompact ------------
 
-/// One `POST` with a body; `(status, body)`.
-fn post(addr: SocketAddr, target: &str, body: &str) -> (u16, String) {
+/// One SPARQL 1.1 Protocol update `POST` (a loopback `Host`, the update
+/// media type); `(status, body)`.
+fn post_update(addr: SocketAddr, body: &str) -> (u16, String) {
     let mut s = TcpStream::connect(addr).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(120))).unwrap();
     let raw = format!(
-        "POST {target} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST /update HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\
+         Content-Type: application/sparql-update\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        addr.port(),
         body.len()
     );
     s.write_all(raw.as_bytes()).unwrap();
@@ -414,6 +418,9 @@ fn server_scenario(mode: &str) {
         });
     }
     let mut child = Child(cmd.spawn().unwrap());
+    // Drained, so a chatty log can never fill the pipe and stall the server.
+    let stderr = child.0.stderr.take().unwrap();
+    std::thread::spawn(move || std::io::copy(&mut BufReader::new(stderr), &mut std::io::sink()));
     let stdout = child.0.stdout.take().unwrap();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -436,10 +443,18 @@ fn server_scenario(mode: &str) {
             break a;
         }
     };
-    let (s1, b1) = post(addr, "/update", &insert("u1", U1));
-    assert_ne!(s1, 200, "the first update must fail: {b1}");
-    let (s2, b2) = post(addr, "/update", &insert("u2", U2));
-    assert_ne!(s2, 200, "the second update must fail: {b2}");
+    // Both updates must fail because of the file-size limit (EFBIG), not
+    // because the request was refused: otherwise nothing below is tested.
+    let (s1, b1) = post_update(addr, &insert("u1", U1));
+    assert!(
+        s1 != 200 && b1.contains("File too large"),
+        "the first update must fail on the full disk: {s1} {b1}"
+    );
+    let (s2, b2) = post_update(addr, &insert("u2", U2));
+    assert!(
+        s2 != 200 && b2.contains("File too large"),
+        "the second update must fail on the full disk: {s2} {b2}"
+    );
     eprintln!("gserver ({mode}): {s1} {b1}\n{s2} {b2}");
     // kill -9 while the disk is still "full".
     drop(child);

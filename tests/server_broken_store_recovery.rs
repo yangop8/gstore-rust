@@ -37,14 +37,26 @@ use gstore::{Database, OpenOptions};
 
 const BASE: usize = 40;
 
+/// A temporary directory, removed when dropped (also when the test fails,
+/// even before the server over it started).
+struct TmpRoot(PathBuf);
+
+impl Drop for TmpRoot {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 /// An in-process API server (root password `root`) over a temporary root
 /// holding one on-disk database `dbx`; stops the server and removes the root
 /// when dropped (also when the test fails).
 struct Srv {
     server: Arc<ApiServer>,
     addr: SocketAddr,
-    root: PathBuf,
     serving: Option<thread::JoinHandle<ShutdownReport>>,
+    /// Declared last: removed after the server stopped (fields drop after
+    /// `Drop::drop`, in declaration order).
+    root: TmpRoot,
 }
 
 impl Srv {
@@ -57,15 +69,16 @@ impl Srv {
         ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
-        let nt = root.join("base.nt");
+        let root = TmpRoot(root);
+        let nt = root.0.join("base.nt");
         let data: String = (0..BASE)
             .map(|i| format!("<http://ex/s{i}> <http://ex/p> <http://ex/o{i}> .\n"))
             .collect();
         fs::write(&nt, data).unwrap();
-        Database::build_disk(root.join("dbx.db"), &[&nt]).unwrap();
+        Database::build_disk(root.0.join("dbx.db"), &[&nt]).unwrap();
         fs::remove_file(&nt).unwrap();
         let server = Arc::new(
-            ApiServer::bind(&root, "root", "127.0.0.1:0")
+            ApiServer::bind(&root.0, "root", "127.0.0.1:0")
                 .unwrap()
                 .with_open_options(options),
         );
@@ -75,13 +88,13 @@ impl Srv {
         Srv {
             server,
             addr,
-            root,
             serving,
+            root,
         }
     }
 
     fn db_dir(&self) -> PathBuf {
-        self.root.join("dbx.db")
+        self.root.0.join("dbx.db")
     }
 
     /// Make every commit of `dbx` fail before its log gets a name.
@@ -159,7 +172,6 @@ impl Drop for Srv {
         if let Some(serving) = self.serving.take() {
             let _ = serving.join();
         }
-        let _ = fs::remove_dir_all(&self.root);
     }
 }
 
