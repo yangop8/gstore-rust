@@ -488,3 +488,53 @@ fn dataset_protocol_parameters_are_refused() {
     assert_eq!(r.status, 400, "{r:?}");
     assert_eq!(api.count("dba"), 1);
 }
+
+/// An *empty* dataset parameter (`default-graph-uri=`, as a blank "default
+/// graph" field of a query form sends it) names no graph: the statement runs
+/// as without it, on both servers. Only a parameter naming a graph is
+/// refused (round-1 review of gap-doc-claims#2: every value was refused,
+/// an empty one included).
+#[test]
+fn empty_dataset_protocol_parameters_are_ignored() {
+    let srv = Single::start(ONE);
+    let q = enc("SELECT * WHERE { ?s ?p ?o }");
+    for target in [
+        format!("/sparql?query={q}&default-graph-uri="),
+        format!("/sparql?default-graph-uri=&query={q}&named-graph-uri="),
+        format!("/sparql?query={q}&named-graph-uri=%20"),
+    ] {
+        let r = send(srv.addr, "GET", &target, &[], "");
+        assert_eq!(r.status, 200, "{target}: {r:?}");
+    }
+    let body = format!("query={q}&default-graph-uri=");
+    let r = send(srv.addr, "POST", "/sparql", &[FORM], &body);
+    assert_eq!(r.status, 200, "an empty parameter in a form: {r:?}");
+    let r = send(
+        srv.addr,
+        "POST",
+        "/update?using-graph-uri=&using-named-graph-uri=",
+        &[SPARQL_UPDATE],
+        "INSERT DATA { <http://ex/z> <http://ex/p> 1 }",
+    );
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(srv.triples(), 2, "the update ran");
+
+    let api = Api::start("dataset_empty");
+    let r = send(
+        api.addr,
+        "GET",
+        &format!("/sparql?db_name=dba&query={q}&default-graph-uri="),
+        &[ROOT],
+        "",
+    );
+    assert_eq!(r.status, 200, "{r:?}");
+    let r = send(
+        api.addr,
+        "POST",
+        "/update?db_name=dba&using-graph-uri=",
+        &[ROOT, SPARQL_UPDATE],
+        "INSERT DATA { <http://ex/z> <http://ex/p> 1 }",
+    );
+    assert_eq!(r.status, 200, "{r:?}");
+    assert_eq!(api.count("dba"), 2);
+}

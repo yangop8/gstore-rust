@@ -35,7 +35,11 @@ at startup for every switch that is on):
   `default-graph-uri` / `named-graph-uri`, and `/update` with
   `using-graph-uri` / `using-named-graph-uri`, answer `400 … dataset
   parameter … is not supported` on both servers, instead of silently
-  evaluating over the whole default graph.
+  evaluating over the whole default graph. An empty value (a blank
+  "default graph" field of a query form: `default-graph-uri=`) names no
+  graph and is ignored, as before this round (round-1 review fix: it was
+  refused too; test
+  `tests/http_request_semantics.rs::empty_dataset_protocol_parameters_are_ignored`).
 - **GET never runs a SPARQL UPDATE; `/update` takes typed bodies** (H-10:
   http#2, design#2, sec#8): `GET /sparql` with an UPDATE answers `400` (it
   is classified by a parse alone, before anything runs; only texts that

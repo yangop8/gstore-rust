@@ -3214,10 +3214,14 @@ impl Request {
         }
     }
 
-    /// The first of `keys` the request carries as a parameter (see
-    /// [`param`](Self::param)).
+    /// The first of `keys` the request carries as a parameter with a
+    /// non-blank value (see [`param`](Self::param)): an empty one, such as a
+    /// blank "default graph" field of a query form (`default-graph-uri=`),
+    /// names nothing and does not count.
     pub(crate) fn first_param_of(&self, keys: &[&'static str]) -> Option<&'static str> {
-        keys.iter().copied().find(|k| self.param(k).is_some())
+        keys.iter()
+            .copied()
+            .find(|k| self.param(k).is_some_and(|v| !v.trim().is_empty()))
     }
 }
 
