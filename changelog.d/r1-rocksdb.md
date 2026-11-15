@@ -13,7 +13,10 @@
   a statement boundary — never half of a DELETE/INSERT rename, half a LOAD
   or half a CLEAR — like the disk layout, whose commit point writes a
   statement as one. A statement that fails part-way keeps what it applied
-  (the documented semantics): its journal is committed too. The ids a
+  (the documented semantics): its journal is committed too — also when it
+  panics (a bug the servers answer with a 500 while they keep serving), so
+  the journal never stays open to refuse later statements and
+  transactions or to undo later writes at the next open. The ids a
   journaled statement frees are freed at its end, in the batch that deletes
   the journal (until then they are neither deleted nor reused). A failed
   `LOAD` stays "no change at all" (mutation count and CSR put back).
@@ -67,7 +70,8 @@
   write batches over a DELETE/INSERT rename, `INSERT DATA`, `LOAD`, `CLEAR
   GRAPH`, `insert_sources`, `remove_sources` and a rollback; every reopened
   state is a statement boundary with live term counts equal to the
-  referenced terms), `tests/rocksdb_checkpoint_resources.rs` (120
+  referenced terms; an UPDATE request, `insert_sources` and
+  `remove_sources` that panic part-way are ended like failed statements), `tests/rocksdb_checkpoint_resources.rs` (120
   checkpointed single-triple `/update`s through `gserver`'s single-database
   server add no table file per write; options file records the bounds; the
   config key), `tests/rocksdb_damaged_store.rs` (malformed keys in SPO,
@@ -174,7 +178,9 @@ no behaviour change).
   slice of length 3" in a full scan and "… 8 … length 6" in an open with
   `vstree_on_open`; "missing counter: verify_integrity passed"). The
   agreement test and the config-key test use new API and were not run on
-  base.
+  base. The review's panic test (`a_panicking_statement_is_ended_like_a_failed_one`)
+  fails on the package's first version (`4aadce7`): "a statement after a
+  panicking one: rocksdb: a transaction is already being journaled".
 - **tests-a#1 cost.** The first version of the persistent failed-LOAD
   test (65,536 + 1,000 statements, each minting two terms) took 93 s for
   the three layouts; the committed one (50 minting statements + 257 x 257
