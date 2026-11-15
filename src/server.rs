@@ -2183,9 +2183,22 @@ pub(crate) fn write_response_ext<W: Write>(
     extra: &[(&str, &str)],
     body: &[u8],
 ) -> std::io::Result<()> {
+    let head = response_head(status, ctype, extra, body.len() as u64);
+    // One write for head + body, so a kept-alive connection never waits on
+    // Nagle between them.
+    let mut buf = head.into_bytes();
+    buf.extend_from_slice(body);
+    stream.write_all(&buf)?;
+    stream.flush()
+}
+
+/// The status line and header block of a response with a `Content-Length`
+/// of `len` (see [`write_response_ext`]).
+fn response_head(status: u16, ctype: &str, extra: &[(&str, &str)], len: u64) -> String {
     let reason = match status {
         200 => "OK",
         201 => "Created",
+        206 => "Partial Content",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
@@ -2193,14 +2206,13 @@ pub(crate) fn write_response_ext<W: Write>(
         405 => "Method Not Allowed",
         409 => "Conflict",
         413 => "Payload Too Large",
+        416 => "Range Not Satisfiable",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "OK",
     };
-    let mut head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n",
-        body.len()
-    );
+    let mut head =
+        format!("HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {len}\r\n");
     let mut has_connection = false;
     for &(k, v) in extra {
         has_connection |= k.eq_ignore_ascii_case("connection");
@@ -2212,12 +2224,139 @@ pub(crate) fn write_response_ext<W: Write>(
         head.push_str("Connection: close\r\n");
     }
     head.push_str("\r\n");
-    // One write for head + body, so a kept-alive connection never waits on
-    // Nagle between them.
-    let mut buf = head.into_bytes();
-    buf.extend_from_slice(body);
-    stream.write_all(&buf)?;
+    head
+}
+
+/// The chunk size of [`write_response_streamed`].
+pub(crate) const STREAM_CHUNK: usize = 64 * 1024;
+
+/// Write a response whose body — exactly `len` bytes — is copied from
+/// `body` in chunks of [`STREAM_CHUNK`] bytes, never held in memory as a
+/// whole (a file download; review gapi#4, robust#7, sec#11). The head goes
+/// out with the first chunk. The body is sent as is, with its
+/// `Content-Length`: a streamed body is never compressed (its compressed
+/// length is not known before it has been read, and a `Range` answer must
+/// count the bytes of the file). A `body` that ends before `len` bytes
+/// fails with `UnexpectedEof` — the response cannot be completed, and the
+/// caller closes the connection.
+pub(crate) fn write_response_streamed<W: Write, R: Read>(
+    stream: &mut W,
+    status: u16,
+    ctype: &str,
+    extra: &[(&str, &str)],
+    mut body: R,
+    len: u64,
+) -> std::io::Result<()> {
+    let head = response_head(status, ctype, extra, len);
+    let mut buf = Vec::with_capacity(head.len() + STREAM_CHUNK);
+    buf.extend_from_slice(head.as_bytes());
+    let mut left = len;
+    loop {
+        let start = buf.len();
+        let want = usize::try_from(left).map_or(STREAM_CHUNK, |l| l.min(STREAM_CHUNK));
+        buf.resize(start + want, 0);
+        let mut filled = start;
+        while filled < buf.len() {
+            match body.read(&mut buf[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        buf.truncate(filled);
+        let got = (filled - start) as u64;
+        left -= got;
+        stream.write_all(&buf)?;
+        if left == 0 {
+            break;
+        }
+        if got == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "the streamed body ended before its Content-Length",
+            ));
+        }
+        buf.clear();
+    }
     stream.flush()
+}
+
+#[cfg(test)]
+mod streamed_response_tests {
+    use super::*;
+
+    /// Records the size of every write.
+    #[derive(Default)]
+    struct Sink {
+        bytes: Vec<u8>,
+        largest_write: usize,
+    }
+
+    impl Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.largest_write = self.largest_write.max(buf.len());
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn streamed_bodies_go_out_in_bounded_chunks() {
+        let body: Vec<u8> = (0..STREAM_CHUNK * 3 + 17).map(|i| i as u8).collect();
+        let mut sink = Sink::default();
+        write_response_streamed(
+            &mut sink,
+            206,
+            "application/octet-stream",
+            &[("Content-Range", "bytes 0-1/2")],
+            &body[..],
+            body.len() as u64,
+        )
+        .unwrap();
+        let text = String::from_utf8_lossy(&sink.bytes);
+        assert!(
+            text.starts_with("HTTP/1.1 206 Partial Content\r\n"),
+            "{text:.80}"
+        );
+        assert!(text.contains(&format!("Content-Length: {}\r\n", body.len())));
+        assert!(text.contains("Content-Range: bytes 0-1/2\r\n"));
+        let split = sink
+            .bytes
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        assert_eq!(&sink.bytes[split..], &body[..]);
+        assert!(
+            sink.largest_write <= split + STREAM_CHUNK,
+            "{}",
+            sink.largest_write
+        );
+        // Only `len` bytes are sent, even from a longer reader.
+        let mut sink = Sink::default();
+        write_response_streamed(&mut sink, 200, "x", &[], &body[..], 10).unwrap();
+        let split = sink
+            .bytes
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        assert_eq!(&sink.bytes[split..], &body[..10]);
+        // An empty body.
+        let mut sink = Sink::default();
+        write_response_streamed(&mut sink, 200, "x", &[], io::empty(), 0).unwrap();
+        assert!(String::from_utf8_lossy(&sink.bytes)
+            .ends_with("Content-Length: 0\r\nConnection: close\r\n\r\n"));
+        // A reader shorter than the announced length cannot complete the
+        // response.
+        let mut sink = Sink::default();
+        let err = write_response_streamed(&mut sink, 200, "x", &[], &body[..5], 6).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
 }
 
 /// Stream a SELECT result with `Transfer-Encoding: chunked`, framing each

@@ -60,6 +60,10 @@
 //! does not exist, is answered with upstream's `FileNotFound` envelope
 //! (`StatusCode` 11) either way.
 //!
+//! The body is streamed from the file in bounded chunks, never compressed,
+//! and at most `download_max_concurrent` downloads run at once (more are
+//! answered `503` with `Retry-After`).
+//!
 //! A single `Range: bytes=a-b` (or `a-`, `-n`) request header is honoured
 //! with `206 Partial Content` and a `Content-Range` (`416` when it cannot be
 //! satisfied); every response carries `Accept-Ranges: bytes`. (Upstream always
@@ -67,13 +71,17 @@
 //! RFC 7233.)
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use super::auth::{self, IpStage};
-use super::envelope::{GResp, Status};
+use super::envelope::{FileBody, GResp, Status};
 use super::params::{self, Params};
 use super::{Ctx, PathRoute, Registry};
+use crate::http_api::ApiInner;
+use crate::server::locked;
 use crate::sysdb::clock;
 
 pub(super) fn register(reg: &mut Registry) {
@@ -386,6 +394,34 @@ pub(super) fn create_unique_dir(dir: &Path, stem: &str) -> std::io::Result<PathB
 }
 
 // ---------------------------------------------------------------------------
+// Per-server state
+// ---------------------------------------------------------------------------
+
+/// Per-server state of the file routes: the downloads in flight.
+#[derive(Default)]
+struct FileState {
+    downloads: AtomicUsize,
+}
+
+/// The [`FileState`] of `ctx`'s server, kept by server (`None` before it
+/// serves: no download limit).
+fn file_state(ctx: &Ctx<'_>) -> Option<Arc<FileState>> {
+    // Each entry keeps its server's allocation (not the server) alive, so a
+    // later server never shares an address — and an entry — with a dropped
+    // one; entries of dropped servers go on the next lookup.
+    static STATES: Mutex<Vec<(Weak<ApiInner>, Arc<FileState>)>> = Mutex::new(Vec::new());
+    let me = ctx.inner.weak_self()?;
+    let mut states = locked(&STATES);
+    states.retain(|(server, _)| server.strong_count() > 0);
+    if let Some((_, state)) = states.iter().find(|(server, _)| server.ptr_eq(&me)) {
+        return Some(Arc::clone(state));
+    }
+    let state = Arc::new(FileState::default());
+    states.push((me, Arc::clone(&state)));
+    Some(state)
+}
+
+// ---------------------------------------------------------------------------
 // /file/upload
 // ---------------------------------------------------------------------------
 
@@ -600,6 +636,36 @@ fn not_found() -> GResp {
     GResp::error(Status::FileNotFound, "")
 }
 
+/// A non-envelope answer at HTTP `status` whose body is the envelope of
+/// `code` / `msg` (a client that saves the body as the file sees the error).
+fn http_error(status: u16, code: Status, msg: &str) -> GResp {
+    let (_, ctype, body, _) = GResp::error(code, msg).into_parts();
+    GResp::raw(status, ctype, body)
+}
+
+/// Holds one of the server's `download_max_concurrent` download slots.
+struct DownloadPermit(Arc<FileState>);
+
+impl Drop for DownloadPermit {
+    fn drop(&mut self) {
+        self.0.downloads.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A download slot: `Ok(None)` without a limit, `Err(())` when all are
+/// taken.
+fn download_permit(ctx: &Ctx<'_>) -> Result<Option<DownloadPermit>, ()> {
+    let max = ctx.inner.config().download_max_concurrent;
+    let Some(state) = file_state(ctx).filter(|_| max > 0) else {
+        return Ok(None);
+    };
+    if state.downloads.fetch_add(1, Ordering::SeqCst) >= max {
+        state.downloads.fetch_sub(1, Ordering::SeqCst);
+        return Err(());
+    }
+    Ok(Some(DownloadPermit(state)))
+}
+
 fn download(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     let requested = download_target(ctx, p);
     if requested.trim().is_empty() {
@@ -632,7 +698,7 @@ fn download(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     let Some(path) = download_file(ctx, &requested, reach) else {
         return not_found();
     };
-    let Ok(mut f) = File::open(&path) else {
+    let Ok(f) = File::open(&path) else {
         return not_found();
     };
     let size = match f.metadata() {
@@ -652,14 +718,21 @@ fn download(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
                 .with_header("Accept-Ranges", "bytes")
         }
     };
-    let mut bytes = Vec::new();
-    let read = f
-        .seek(SeekFrom::Start(start))
-        .and_then(|_| f.take(len).read_to_end(&mut bytes));
-    if read.is_err() {
-        return GResp::error(Status::FileReadError, "");
+    // Streamed by the HTTP layer in bounded chunks, holding a download slot
+    // until it has been sent (review gapi#4, robust#7, sec#11).
+    let Ok(permit) = download_permit(ctx) else {
+        return http_error(
+            503,
+            Status::OperationFailed,
+            "too many downloads at once (download_max_concurrent): retry later",
+        )
+        .with_header("Retry-After", "1");
+    };
+    let mut body = FileBody::new(f, start, len);
+    if let Some(permit) = permit {
+        body = body.with_permit(permit);
     }
-    let mut resp = GResp::raw(status, "application/octet-stream", bytes)
+    let mut resp = GResp::file(status, "application/octet-stream", body)
         .with_header(
             "Content-Disposition",
             format!("attachment; filename=\"{name}\""),
