@@ -8,6 +8,8 @@
 //! - log retention on a sibling file whose name has a multi-byte character
 //!   at byte 10 after the prefix (M15, bulkcli#1) panicked — `gserver`
 //!   could not start;
+//! - the SPARQL lexer was quadratic on long name runs with `-` / `.` and no
+//!   `:` (H-14, parser#2): one request burnt minutes of CPU;
 //! - a log line was written with two `write(2)` calls, so concurrent
 //!   writers interleaved (conc#6).
 
@@ -242,6 +244,32 @@ fn log_retention_skips_non_ascii_sibling_names() {
     gstore::logging::roll_daily(&access, 30);
     assert!(!access.exists(), "the stale log was rolled");
     assert_eq!(rolled_files(&access).len(), 1);
+}
+
+// ---- lexer complexity (H-14) ------------------------------------------------------
+
+/// Lexing a 1 MB name run with `-` / `.` separators and no `:` is linear:
+/// far below a second in a release build, and well within the generous
+/// bound here in the test profile (before: about 20 minutes at the test
+/// profile's opt-level — 80 KB already took ~3 s and each doubling cost 4×).
+#[test]
+fn lexing_a_megabyte_name_run_is_fast() {
+    for sep in ["-", "."] {
+        let run = format!("a{sep}").repeat(1 << 19);
+        let q = format!("ASK {{ FILTER(?x = {run}a) }}");
+        let started = Instant::now();
+        let tokens = gstore::parser::sparql::lexer::tokenize(&q).unwrap();
+        let took = started.elapsed();
+        assert!(tokens.len() > 1 << 20, "{}", tokens.len());
+        assert!(took < Duration::from_secs(20), "sep {sep:?}: {took:?}");
+    }
+    // A long run that does end in a prefix is one prefixed name.
+    let q = format!("ASK {{ FILTER(?x = {}a:b) }}", "a-".repeat(1 << 18));
+    let tokens = gstore::parser::sparql::lexer::tokenize(&q).unwrap();
+    assert!(tokens.iter().any(
+        |t| matches!(t, gstore::parser::sparql::lexer::Token::PName(p, l)
+            if p.len() == (1 << 19) + 1 && l == "b")
+    ));
 }
 
 // ---- log lines (conc#6) --------------------------------------------------------------
