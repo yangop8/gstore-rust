@@ -178,6 +178,26 @@ pub struct HttpOptions {
     /// Write timeout for responses (default 30 s): a client that stops reading
     /// cannot pin a worker forever.
     pub write_timeout: Duration,
+    /// Minimum average rate, in bytes per second, at which a request body
+    /// must arrive (default [`DEFAULT_MIN_BODY_RATE`], 64 KiB/s), after a
+    /// grace of [`read_timeout`](Self::read_timeout): `t` after the end of
+    /// its head, at least `(t - read_timeout) * min_body_rate` bytes of it
+    /// must have been received, or the connection is closed. The allowance
+    /// grows with the bytes actually received (what the client declares in
+    /// `Content-Length` earns it nothing), so a client trickling a body in
+    /// cannot hold a worker of the bounded pool for longer than
+    /// `read_timeout` plus what it really sent at that rate — never longer
+    /// than `read_timeout + n / min_body_rate` for a body of `n` bytes. `0`
+    /// turns this off: then only no single read may wait longer than
+    /// `read_timeout`. `conf.ini`: `min_body_rate`.
+    pub min_body_rate: u64,
+    /// Most connections one client IP address may have open at once, those
+    /// waiting for a worker included (default [`DEFAULT_MAX_CONNS_PER_IP`],
+    /// 64; `0`: no limit). A further connection from that address is closed
+    /// as soon as it is accepted, so one client cannot take every worker and
+    /// queue place. Clients behind one NAT or proxy share an address: raise
+    /// it for them. `conf.ini`: `max_conns_per_ip`.
+    pub max_conns_per_ip: usize,
     /// Maximum request body in bytes (default [`MAX_REQUEST_BODY`]); larger
     /// requests are answered `413` without reading the body. Only a request
     /// authenticated from its head, on a route that carries payloads, may
@@ -238,6 +258,12 @@ pub struct HttpOptions {
 /// The default worker-pool size (gStore's `thread_num` default).
 pub const DEFAULT_THREADS: usize = 30;
 
+/// The default of [`HttpOptions::min_body_rate`]: 64 KiB/s.
+pub const DEFAULT_MIN_BODY_RATE: u64 = 64 * 1024;
+
+/// The default of [`HttpOptions::max_conns_per_ip`].
+pub const DEFAULT_MAX_CONNS_PER_IP: usize = 64;
+
 impl Default for HttpOptions {
     fn default() -> Self {
         HttpOptions {
@@ -247,6 +273,8 @@ impl Default for HttpOptions {
             keep_alive_max: 100,
             read_timeout: CONN_READ_TIMEOUT,
             write_timeout: CONN_READ_TIMEOUT,
+            min_body_rate: DEFAULT_MIN_BODY_RATE,
+            max_conns_per_ip: DEFAULT_MAX_CONNS_PER_IP,
             max_body: MAX_REQUEST_BODY,
             preauth_max_body: crate::preauth::PREAUTH_MAX_BODY,
             body_budget: crate::preauth::DEFAULT_BODY_BUDGET,
@@ -803,7 +831,10 @@ pub(crate) type Job = Box<dyn FnOnce() + Send + 'static>;
 /// What the accept loop hands to a server's job factory for each accepted
 /// connection.
 pub(crate) struct Accepted {
-    pub(crate) stream: TcpStream,
+    /// The socket (it dereferences to its [`TcpStream`]); serve the
+    /// connection on it, directly or under TLS, so that the request deadlines
+    /// apply to every socket read (see [`ConnSocket`]).
+    pub(crate) stream: ConnSocket,
     pub(crate) peer: SocketAddr,
     /// Counts the connection's first request as in flight from the moment it
     /// was accepted (so a shutdown waits for it, bounded by the grace period).
@@ -935,19 +966,43 @@ pub(crate) fn run_accept_loop(
         let pool = WorkerPool::start(opts.threads, opts.queue_len, waiting);
         // When `accept` failures were last logged (at most once a second).
         let mut accept_error_logged: Option<std::time::Instant> = None;
+        // The per-address cap, and when a refusal was last logged (at most
+        // once a second).
+        let per_ip = IpLimiter::new(opts.max_conns_per_ip);
+        let mut refusal_logged: Option<Instant> = None;
+        let limits = ReadLimits {
+            read_timeout: opts.read_timeout,
+            min_body_rate: opts.min_body_rate,
+        };
         while !life.stopping() {
             match sock.accept() {
                 Ok((stream, peer)) => {
                     if life.stopping() {
                         break; // the wake-up self-connection (or a late client)
                     }
+                    // An address already holding its share of connections
+                    // gets no more: closed at once, before any worker or
+                    // queue place is spent on it.
+                    let Some(slot) = per_ip.admit(peer.ip()) else {
+                        if refusal_logged.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
+                            crate::gs_warn!(
+                                "refused a connection from {}: it already has {} open \
+                                 ([server] max_conns_per_ip)",
+                                peer.ip(),
+                                opts.max_conns_per_ip
+                            );
+                            refusal_logged = Some(Instant::now());
+                        }
+                        drop(stream);
+                        continue;
+                    };
                     let _ = stream.set_read_timeout(Some(opts.read_timeout));
                     let _ = stream.set_write_timeout(Some(opts.write_timeout));
                     // Responses go out as one write; don't let Nagle hold back
                     // a kept-alive connection's next response.
                     let _ = stream.set_nodelay(true);
                     let job = make_job(Accepted {
-                        stream,
+                        stream: ConnSocket::new(stream, limits, slot),
                         peer,
                         guard: life.enter(),
                         env: env.clone(),
@@ -1001,6 +1056,48 @@ impl BadRequest {
         status: 413,
         message: "request body exceeds the maximum size",
     };
+    /// The request (head or body) did not arrive in time — a read deadline
+    /// passed (see [`ConnSocket`]).
+    const TIMED_OUT: BadRequest = BadRequest {
+        status: 400,
+        message: "bad request: the request did not arrive in time",
+    };
+    /// A header line that is not `name: value` with a token name right before
+    /// the colon (RFC 9112 §5.1), e.g. whitespace before the colon or an
+    /// obs-fold continuation line (§5.2).
+    const BAD_FIELD: BadRequest = BadRequest {
+        status: 400,
+        message: "bad request: malformed header field",
+    };
+    /// A control character (other than HTAB) in the request line, a header
+    /// line, a chunk-size line or a trailer — a bare CR or a NUL included
+    /// (RFC 9112 §2.2, RFC 9110 §5.5).
+    const BAD_CONTROL: BadRequest = BadRequest {
+        status: 400,
+        message: "bad request: control character in a request line, header or chunk line",
+    };
+    /// A body length that cannot be determined unambiguously (RFC 9112 §6):
+    /// `Content-Length` and `Transfer-Encoding` together, differing or
+    /// non-decimal `Content-Length` values, a transfer coding other than
+    /// exactly `chunked`, or a malformed chunk size.
+    const BAD_FRAMING: BadRequest = BadRequest {
+        status: 400,
+        message: "bad request: ambiguous or unsupported message framing \
+                  (Content-Length / Transfer-Encoding)",
+    };
+
+    /// A failed read: a timeout ([`TIMED_OUT`](Self::TIMED_OUT)) or else a
+    /// malformed or truncated request.
+    fn from_read(e: &io::Error) -> BadRequest {
+        if matches!(
+            e.kind(),
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+        ) {
+            BadRequest::TIMED_OUT
+        } else {
+            BadRequest::MALFORMED
+        }
+    }
 }
 
 /// Per-request connection facts a request handler must honour: the headers
@@ -1465,10 +1562,12 @@ impl<S: Write> Write for ResponseSink<S> {
 }
 
 /// The connection's transport plus an optional deadline: while one is set,
-/// every read first narrows the socket's read timeout to the time left (and
-/// fails once it has passed), so a request head must arrive *in full* within
-/// [`HttpOptions::read_timeout`] — a client dripping one byte at a time cannot
-/// hold a worker of the bounded pool indefinitely.
+/// it is published to the socket reads underneath ([`ConnSocket`]), which wait
+/// at most for the time left and fail once it has passed — a TLS handshake's
+/// and a TLS record's many socket reads within one read here included — so a
+/// request head must arrive *in full* within [`HttpOptions::read_timeout`]:
+/// a client dripping one byte at a time cannot hold a worker of the bounded
+/// pool indefinitely.
 struct Timed<'a, S> {
     inner: S,
     ctl: Option<&'a TcpStream>,
@@ -1477,13 +1576,12 @@ struct Timed<'a, S> {
 
 impl<S: Read> Read for Timed<'_, S> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if let (Some(deadline), Some(ctl)) = (self.deadline, self.ctl) {
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(io::ErrorKind::TimedOut.into());
-            }
-            let _ = ctl.set_read_timeout(Some(deadline - now));
-        }
+        let Some(at) = self.deadline else {
+            return self.inner.read(buf);
+        };
+        // Enforced by the `ConnSocket` under `inner` at every socket read,
+        // which also makes a passed deadline final for the connection.
+        let _deadline = DeadlineScope::enter(Deadline { at, hard: true });
         self.inner.read(buf)
     }
 }
@@ -1491,6 +1589,9 @@ impl<S: Read> Read for Timed<'_, S> {
 /// Wait (at most `idle`) for the next request on a kept-alive connection.
 /// `false` — close the connection — on EOF, timeout, a shutdown, or when other
 /// connections are waiting for a worker (an idle connection yields its worker).
+/// `true` once the next request has begun: its first byte is readable, or —
+/// under TLS — bytes of the record carrying it have reached the socket (its
+/// head deadline then covers the rest of that record).
 fn wait_for_request<S: Read>(
     reader: &mut BufReader<S>,
     ctl: &TcpStream,
@@ -1502,6 +1603,7 @@ fn wait_for_request<S: Read>(
         return true; // a pipelined request is already buffered
     }
     let deadline = Instant::now() + idle;
+    let arrived = socket_bytes();
     loop {
         if life.stopping() || waiting.load(Ordering::SeqCst) > 0 {
             return false;
@@ -1510,7 +1612,14 @@ fn wait_for_request<S: Read>(
         if now >= deadline {
             return false;
         }
-        let _ = ctl.set_read_timeout(Some((deadline - now).min(IDLE_POLL)));
+        let poll = (deadline - now).min(IDLE_POLL);
+        let _ = ctl.set_read_timeout(Some(poll));
+        // Bounds the whole poll, every socket read under TLS included, so a
+        // record trickling in cannot keep this wait from its checks above.
+        let _poll = DeadlineScope::enter(Deadline {
+            at: now + poll,
+            hard: false,
+        });
         match reader.fill_buf() {
             Ok(buf) => return !buf.is_empty(),
             Err(e)
@@ -1519,8 +1628,290 @@ fn wait_for_request<S: Read>(
                     io::ErrorKind::WouldBlock
                         | io::ErrorKind::TimedOut
                         | io::ErrorKind::Interrupted
-                ) => {}
+                ) =>
+            {
+                if socket_bytes() != arrived {
+                    return true; // part of a TLS record: the request has begun
+                }
+            }
             Err(_) => return false,
+        }
+    }
+}
+
+// --- read deadlines below the transport; the per-address cap ------------------
+
+/// A read deadline, published by the request reader for the socket reads it
+/// causes on this worker thread ([`DeadlineScope`], read by [`ConnSocket`]).
+#[derive(Debug, Clone, Copy)]
+struct Deadline {
+    at: Instant,
+    /// `true`: the request has failed once `at` passes — the connection
+    /// reads nothing more (its head's deadline, see [`Timed`]). `false`: an
+    /// idle poll's, after which the waiting just re-checks
+    /// ([`wait_for_request`]).
+    hard: bool,
+}
+
+/// The request body being received on this worker thread ([`BodyScope`]).
+#[derive(Debug, Clone, Copy)]
+struct BodyClock {
+    /// When its first byte was awaited (the end of the head).
+    start: Instant,
+    /// Its `Content-Length` (`None` for a chunked body): the most its
+    /// allowance can grow to.
+    declared: Option<u64>,
+    /// Bytes read from the socket since `start`.
+    received: u64,
+}
+
+/// What the request reader on this worker thread expects of the socket
+/// reads underneath it. A worker serves one connection at a time, so this
+/// is the state of the connection it is serving; it travels beside the
+/// readers' signatures (which are generic over any [`BufRead`]) the way the
+/// peer address does ([`current_peer`]).
+#[derive(Debug, Clone, Copy)]
+struct ReadClock {
+    deadline: Option<Deadline>,
+    body: Option<BodyClock>,
+    /// Bytes read from connection sockets on this thread so far (wrapping).
+    socket_bytes: u64,
+}
+
+thread_local! {
+    static READ_CLOCK: Cell<ReadClock> = const {
+        Cell::new(ReadClock {
+            deadline: None,
+            body: None,
+            socket_bytes: 0,
+        })
+    };
+}
+
+fn with_read_clock<T>(f: impl FnOnce(&mut ReadClock) -> T) -> T {
+    READ_CLOCK.with(|c| {
+        let mut clock = c.get();
+        let out = f(&mut clock);
+        c.set(clock);
+        out
+    })
+}
+
+fn socket_bytes() -> u64 {
+    READ_CLOCK.with(|c| c.get().socket_bytes)
+}
+
+/// Publishes a [`Deadline`] for the socket reads made while it lives; the
+/// previous one is back when it is dropped.
+struct DeadlineScope(Option<Deadline>);
+
+impl DeadlineScope {
+    fn enter(deadline: Deadline) -> DeadlineScope {
+        DeadlineScope(with_read_clock(|c| c.deadline.replace(deadline)))
+    }
+}
+
+impl Drop for DeadlineScope {
+    fn drop(&mut self) {
+        let previous = self.0;
+        with_read_clock(|c| c.deadline = previous);
+    }
+}
+
+/// Starts the clock of a request body ([`HttpOptions::min_body_rate`]) for
+/// the socket reads made while it lives; the previous state is back when it
+/// is dropped.
+struct BodyScope(Option<BodyClock>);
+
+impl BodyScope {
+    fn enter(declared: Option<u64>) -> BodyScope {
+        let clock = BodyClock {
+            start: Instant::now(),
+            declared,
+            received: 0,
+        };
+        BodyScope(with_read_clock(|c| c.body.replace(clock)))
+    }
+}
+
+impl Drop for BodyScope {
+    fn drop(&mut self) {
+        let previous = self.0;
+        with_read_clock(|c| c.body = previous);
+    }
+}
+
+/// The read limits of a connection, fixed when it is accepted.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReadLimits {
+    read_timeout: Duration,
+    min_body_rate: u64,
+}
+
+impl ReadLimits {
+    /// When the next bytes of `body` must be in: `read_timeout` after its
+    /// start plus its allowance — the bytes received so far (at most its
+    /// declared length) — at `min_body_rate`; `None` when the rate floor is
+    /// off. The allowance is earned, not declared: a client announcing a
+    /// large `Content-Length` and dripping it is cut off after about
+    /// `read_timeout` (review robust#3's scenario), while one that keeps
+    /// sending at the rate keeps moving the deadline ahead of it.
+    fn body_deadline(&self, body: &BodyClock) -> Option<Instant> {
+        if self.min_body_rate == 0 {
+            return None;
+        }
+        let allowance = body
+            .declared
+            .map_or(body.received, |len| body.received.min(len));
+        let nanos = u128::from(allowance) * 1_000_000_000 / u128::from(self.min_body_rate);
+        let extra = Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX));
+        body.start
+            .checked_add(self.read_timeout)?
+            .checked_add(extra)
+    }
+}
+
+/// An accepted connection's socket, the transport every connection is served
+/// on — directly, or under TLS. Each of its reads honours the deadline the
+/// request reader published for this worker thread: the head's ([`Timed`]),
+/// an idle poll's ([`wait_for_request`]) or the body's
+/// ([`HttpOptions::min_body_rate`], see [`read_body`]). It narrows the
+/// socket's read timeout to the time left before every single socket read,
+/// so the deadline also holds where one read above makes many below — a
+/// `rustls` stream drives a whole handshake, or waits for a whole record,
+/// inside one read — and after a head or body deadline has passed it fails
+/// every further read: the connection is done (even writing the error
+/// response cannot make a TLS stream wait for an unfinished handshake). It
+/// also holds the connection's place in its address's count
+/// ([`HttpOptions::max_conns_per_ip`]) until it is dropped — the connection
+/// ended. Dereferences to the [`TcpStream`].
+pub(crate) struct ConnSocket {
+    sock: TcpStream,
+    limits: ReadLimits,
+    /// A head or body deadline has passed: every read fails.
+    expired: bool,
+    _slot: IpSlot,
+}
+
+impl ConnSocket {
+    fn new(sock: TcpStream, limits: ReadLimits, slot: IpSlot) -> ConnSocket {
+        ConnSocket {
+            sock,
+            limits,
+            expired: false,
+            _slot: slot,
+        }
+    }
+}
+
+impl std::ops::Deref for ConnSocket {
+    type Target = TcpStream;
+
+    fn deref(&self) -> &TcpStream {
+        &self.sock
+    }
+}
+
+impl Read for ConnSocket {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.expired {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        let clock = READ_CLOCK.with(Cell::get);
+        let body = clock.body.and_then(|b| self.limits.body_deadline(&b));
+        let deadline = match (clock.deadline, body) {
+            (Some(d), Some(at)) if at < d.at => Some(Deadline { at, hard: true }),
+            (Some(d), _) => Some(d),
+            (None, Some(at)) => Some(Deadline { at, hard: true }),
+            (None, None) => None,
+        };
+        if let Some(d) = deadline {
+            let now = Instant::now();
+            if now >= d.at {
+                self.expired |= d.hard;
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            let mut wait = d.at - now;
+            if clock.body.is_some() {
+                // Within a body, no single read waits longer than this either.
+                wait = wait.min(self.limits.read_timeout);
+            }
+            let _ = self.sock.set_read_timeout(Some(wait));
+        }
+        let n = self.sock.read(buf)?;
+        with_read_clock(|c| {
+            c.socket_bytes = c.socket_bytes.wrapping_add(n as u64);
+            if let Some(body) = &mut c.body {
+                body.received = body.received.saturating_add(n as u64);
+            }
+        });
+        Ok(n)
+    }
+}
+
+impl Write for ConnSocket {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.sock.write(buf)
+    }
+
+    fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        self.sock.write_vectored(bufs)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.sock.flush()
+    }
+}
+
+type OpenPerIp = Arc<Mutex<std::collections::HashMap<IpAddr, usize>>>;
+
+/// The per-address connection cap of one accept loop
+/// ([`HttpOptions::max_conns_per_ip`]).
+struct IpLimiter {
+    max: usize,
+    open: OpenPerIp,
+}
+
+/// An open connection's place in its address's count, given back when it is
+/// dropped (with the connection's [`ConnSocket`]).
+pub(crate) struct IpSlot(Option<(OpenPerIp, IpAddr)>);
+
+impl IpLimiter {
+    fn new(max: usize) -> IpLimiter {
+        IpLimiter {
+            max,
+            open: Arc::default(),
+        }
+    }
+
+    /// A place for a connection from `ip`, or `None` when that address
+    /// already has `max` connections open. (An IPv4-mapped IPv6 address
+    /// counts as its IPv4 address.)
+    fn admit(&self, ip: IpAddr) -> Option<IpSlot> {
+        if self.max == 0 {
+            return Some(IpSlot(None));
+        }
+        let ip = ip.to_canonical();
+        let mut open = locked(&self.open);
+        let n = open.entry(ip).or_insert(0);
+        if *n >= self.max {
+            return None;
+        }
+        *n += 1;
+        Some(IpSlot(Some((Arc::clone(&self.open), ip))))
+    }
+}
+
+impl Drop for IpSlot {
+    fn drop(&mut self) {
+        if let Some((open, ip)) = &self.0 {
+            let mut open = locked(open);
+            if let Some(n) = open.get_mut(ip) {
+                *n -= 1;
+                if *n == 0 {
+                    open.remove(ip);
+                }
+            }
         }
     }
 }
@@ -1701,24 +2092,85 @@ fn read_request<S: Read + Write>(
 }
 
 /// Read one bounded CRLF/LF-terminated line (without the terminator).
-/// `Ok(None)` at EOF before any byte.
+/// `Ok(None)` at EOF before any byte. A line holding a control character
+/// other than HTAB — a bare CR (RFC 9112 §2.2), a NUL, … — is refused: as a
+/// header value it could otherwise be reflected into a response header
+/// (review robust#14).
 fn read_line_bounded<R: BufRead>(r: &mut R) -> Result<Option<String>, BadRequest> {
     let mut buf = Vec::new();
     let n = r
         .by_ref()
         .take(MAX_HEADER_LINE)
         .read_until(b'\n', &mut buf)
-        .map_err(|_| BadRequest::MALFORMED)?;
+        .map_err(|e| BadRequest::from_read(&e))?;
     if n == 0 {
         return Ok(None);
     }
     if buf.last() != Some(&b'\n') {
         return Err(BadRequest::MALFORMED); // over-long line, or EOF mid-line
     }
-    let line = String::from_utf8(buf).map_err(|_| BadRequest::MALFORMED)?;
-    Ok(Some(line.trim_end_matches(['\r', '\n']).to_string()))
+    buf.pop();
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    if buf.iter().any(|&b| (b < 0x20 && b != b'\t') || b == 0x7f) {
+        return Err(BadRequest::BAD_CONTROL);
+    }
+    String::from_utf8(buf)
+        .map(Some)
+        .map_err(|_| BadRequest::MALFORMED)
 }
 
+/// An RFC 9110 `tchar`: what a header field name is made of.
+fn is_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+}
+
+/// Split a header line into name and value (RFC 9112 §5): the name is a
+/// token directly followed by the colon — whitespace before it (§5.1), an
+/// obs-fold continuation line (§5.2) or a line without a colon is refused —
+/// and the value loses the optional whitespace around it.
+fn split_field(line: &str) -> Result<(&str, &str), BadRequest> {
+    let (name, value) = line.split_once(':').ok_or(BadRequest::BAD_FIELD)?;
+    if name.is_empty() || !name.bytes().all(is_tchar) {
+        return Err(BadRequest::BAD_FIELD);
+    }
+    Ok((name, value.trim_matches([' ', '\t'])))
+}
+
+/// A `Content-Length` value: decimal digits only (RFC 9110 §8.6 — no sign,
+/// no list). Digits too many for a `usize` are an absurd length: too large.
+fn content_length_value(v: &str) -> Result<usize, BadRequest> {
+    if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(BadRequest::BAD_FRAMING);
+    }
+    v.parse().map_err(|_| BadRequest::TOO_LARGE)
+}
+
+/// The size of a chunk from its chunk-size line (RFC 9112 §7.1): hex digits
+/// — no sign, prefix or leading whitespace — optionally followed by
+/// whitespace and `;` extensions, which are ignored.
+fn chunk_size(line: &str) -> Result<usize, BadRequest> {
+    let size = line
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches([' ', '\t']);
+    if size.is_empty() || !size.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(BadRequest::BAD_FRAMING);
+    }
+    usize::from_str_radix(size, 16).map_err(|_| BadRequest::TOO_LARGE)
+}
+
+/// Read a request line and its header fields. The body's framing must be
+/// unambiguous (RFC 9112 §6; review sec#16, http#14) — a front end that
+/// framed the request differently could otherwise make this server read part
+/// of one request as the next one — so these are refused (`400`, and the
+/// connection is closed): `Content-Length` together with
+/// `Transfer-Encoding`; `Content-Length` values that differ or are not plain
+/// decimal digits; a `Transfer-Encoding` other than exactly `chunked` (the
+/// only coding implemented), or in an HTTP/1.0 request; malformed header
+/// lines (see [`split_field`]).
 fn read_head<R: BufRead>(r: &mut R, max_body: usize) -> Result<Option<Head>, BadRequest> {
     let Some(line) = read_line_bounded(r)? else {
         return Ok(None);
@@ -1733,8 +2185,9 @@ fn read_head<R: BufRead>(r: &mut R, max_body: usize) -> Result<Option<Head>, Bad
         None => (target, None),
     };
 
-    let mut content_length = 0usize;
-    let mut chunked = false;
+    let mut content_length: Option<usize> = None;
+    // The transfer codings of every `Transfer-Encoding` line, in order.
+    let mut codings: Option<Vec<String>> = None;
     let mut expect_continue = false;
     let mut headers = Vec::new();
     // EOF also ends the headers.
@@ -1745,27 +2198,36 @@ fn read_head<R: BufRead>(r: &mut R, max_body: usize) -> Result<Option<Head>, Bad
         if headers.len() >= MAX_HEADERS {
             return Err(BadRequest::MALFORMED);
         }
-        if let Some((k, v)) = h.split_once(':') {
-            let k = k.trim();
-            let v = v.trim();
-            if k.eq_ignore_ascii_case("content-length") {
-                // An absurd value (e.g. u64::MAX) overflows: refuse it as too
-                // large; anything else unparsable is malformed.
-                content_length = v.parse().map_err(|e: std::num::ParseIntError| {
-                    if *e.kind() == std::num::IntErrorKind::PosOverflow {
-                        BadRequest::TOO_LARGE
-                    } else {
-                        BadRequest::MALFORMED
-                    }
-                })?;
-            } else if k.eq_ignore_ascii_case("transfer-encoding") {
-                chunked = !v.eq_ignore_ascii_case("identity");
-            } else if k.eq_ignore_ascii_case("expect") {
-                expect_continue = v.eq_ignore_ascii_case("100-continue");
+        let (k, v) = split_field(&h)?;
+        if k.eq_ignore_ascii_case("content-length") {
+            let n = content_length_value(v)?;
+            if content_length.is_some_and(|m| m != n) {
+                return Err(BadRequest::BAD_FRAMING);
             }
-            headers.push((k.to_ascii_lowercase(), v.to_string()));
+            content_length = Some(n);
+        } else if k.eq_ignore_ascii_case("transfer-encoding") {
+            // A list; empty elements do not count (RFC 9110 §5.6.1).
+            codings.get_or_insert_with(Vec::new).extend(
+                v.split(',')
+                    .map(|c| c.trim_matches([' ', '\t']))
+                    .filter(|c| !c.is_empty())
+                    .map(str::to_ascii_lowercase),
+            );
+        } else if k.eq_ignore_ascii_case("expect") {
+            expect_continue = v.eq_ignore_ascii_case("100-continue");
         }
+        headers.push((k.to_ascii_lowercase(), v.to_string()));
     }
+    let chunked = match codings {
+        None => false,
+        Some(codings) => {
+            if content_length.is_some() || http10 || codings != ["chunked"] {
+                return Err(BadRequest::BAD_FRAMING);
+            }
+            true
+        }
+    };
+    let content_length = content_length.unwrap_or(0);
 
     // Refuse an oversized Content-Length BEFORE allocating, so a client cannot
     // make the server reserve arbitrary memory with a single header — this runs
@@ -1786,29 +2248,38 @@ fn read_head<R: BufRead>(r: &mut R, max_body: usize) -> Result<Option<Head>, Bad
     }))
 }
 
+/// Read a `Content-Length` body of `len` bytes. On a connection it must
+/// keep up [`HttpOptions::min_body_rate`] on average after a grace of
+/// `read_timeout` from here — so it is in within `read_timeout + len /
+/// min_body_rate` at the latest, however it trickles in (enforced by
+/// [`ConnSocket`]).
 fn read_body<R: BufRead>(r: &mut R, len: usize) -> Result<Vec<u8>, BadRequest> {
     // Grow as the bytes actually arrive instead of trusting the header.
     let mut body = Vec::with_capacity(len.min(1 << 20));
     if len > 0 {
+        let _clock = BodyScope::enter(Some(len as u64));
         r.by_ref()
             .take(len as u64)
             .read_to_end(&mut body)
-            .map_err(|_| BadRequest::MALFORMED)?;
+            .map_err(|e| BadRequest::from_read(&e))?;
         if body.len() != len {
-            return Err(BadRequest::MALFORMED); // truncated (or timed out)
+            return Err(BadRequest::MALFORMED); // truncated
         }
     }
     Ok(body)
 }
 
 /// Decode a `Transfer-Encoding: chunked` request body (RFC 9112 §7.1), at most
-/// `max_body` bytes in total; chunk extensions and trailers are ignored.
+/// `max_body` bytes in total; chunk extensions and trailers are ignored, a
+/// malformed chunk size is refused. On a connection it must keep up
+/// [`HttpOptions::min_body_rate`] on average: from here, `read_timeout` plus
+/// the bytes received so far at that rate ([`ConnSocket`]).
 fn read_chunked_body<R: BufRead>(r: &mut R, max_body: usize) -> Result<Vec<u8>, BadRequest> {
+    let _clock = BodyScope::enter(None);
     let mut body = Vec::new();
     loop {
         let line = read_line_bounded(r)?.ok_or(BadRequest::MALFORMED)?;
-        let size_hex = line.split(';').next().unwrap_or("").trim();
-        let size = usize::from_str_radix(size_hex, 16).map_err(|_| BadRequest::MALFORMED)?;
+        let size = chunk_size(&line)?;
         if size == 0 {
             break;
         }
@@ -1819,7 +2290,7 @@ fn read_chunked_body<R: BufRead>(r: &mut R, max_body: usize) -> Result<Vec<u8>, 
         r.by_ref()
             .take(size as u64)
             .read_to_end(&mut body)
-            .map_err(|_| BadRequest::MALFORMED)?;
+            .map_err(|e| BadRequest::from_read(&e))?;
         if body.len() - start != size {
             return Err(BadRequest::MALFORMED);
         }

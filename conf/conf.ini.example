@@ -40,6 +40,18 @@ ip_deny_path="./conf/ipDeny.config"
 # listen_addr=127.0.0.1
 # keep-alive idle timeout in seconds, 0 turns keep-alive off (default 60)
 # keep_alive_timeout=60
+# minimum average rate, in bytes per second, at which a request body must
+# arrive after a 30 s grace: T seconds after the request head, at least
+# (T - 30) * min_body_rate bytes of the body must be in (what was really
+# received counts, not the declared Content-Length), so a client trickling it
+# in cannot hold a worker thread; 0 turns the limit off (default 65536,
+# 64 KiB/s)
+# min_body_rate=65536
+# most connections one client IP address may have open at once, those
+# waiting for a worker thread included; further ones are closed at once.
+# Clients behind one NAT or proxy share an address: raise it for them;
+# 0 = no limit (default 64)
+# max_conns_per_ip=64
 # maximum requests served on one connection (default 100)
 # keep_alive_max=100
 # accepted connections that may wait for a free worker thread before the
