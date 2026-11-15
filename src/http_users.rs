@@ -875,6 +875,13 @@ impl UserStore {
 
     /// Persist the user table to disk (sorted by name for stable output),
     /// atomically: a crash or I/O error mid-save leaves the previous file.
+    ///
+    /// `Err` means the file still holds its previous content (the callers
+    /// then roll memory back, so memory and disk agree). A save whose file
+    /// was replaced but whose directory could not be synced afterwards (also
+    /// on a retry) is `Ok`: the file holds the new table, which every reader
+    /// and a restart see, so memory must keep it too; it is logged as a
+    /// durability warning (the rename may not survive a crash).
     pub fn save(&self) -> io::Result<()> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
@@ -891,10 +898,19 @@ impl UserStore {
         }
         // It holds password hashes: created owner-only, and a replacement keeps
         // whatever mode the operator gave the existing file.
-        crate::db::fsutil::atomic_write_private(&self.path, out.as_bytes()).map_err(|e| match e {
-            crate::error::GStoreError::Io(io) => io,
-            other => io::Error::other(other.to_string()),
-        })
+        match crate::db::fsutil::atomic_replace(&self.path, out.as_bytes(), true) {
+            Ok(None) => Ok(()),
+            Ok(Some(e)) => {
+                crate::gs_warn!(
+                    "{} was replaced, but syncing its directory failed: {e}; the change \
+                     is in effect but may not survive a crash",
+                    self.path.display()
+                );
+                Ok(())
+            }
+            Err(crate::error::GStoreError::Io(io)) => Err(io),
+            Err(other) => Err(io::Error::other(other.to_string())),
+        }
     }
 
     // ---- user management --------------------------------------------------
@@ -1543,6 +1559,60 @@ mod tests {
         let mut p = std::env::temp_dir();
         p.push(format!("gstore_users_{}_{}.db", name, new_token()));
         p
+    }
+
+    /// A save whose file was replaced but whose directory sync failed after
+    /// the rename (also on the retry) is not rolled back: `users.db` holds
+    /// the change, so memory keeps it and its side effects run (round-1
+    /// review of sec#15's rollback: memory went back to the old state while
+    /// the file — and so the next restart — held the new one).
+    #[test]
+    fn a_save_whose_directory_sync_failed_after_the_rename_keeps_the_change() {
+        use crate::db::fsutil::FAIL_DIR_SYNC_AFTER_RENAME;
+        /// Removes the store file, also when the test fails.
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.0);
+            }
+        }
+        let path = tmp("unsynced");
+        let _cleanup = Cleanup(path.clone());
+        let mut store = UserStore::open(&path, "rootpw").unwrap();
+        store
+            .add("alice", "oldpw", BTreeSet::from([Privilege::Query]))
+            .unwrap();
+        let token = store.login("alice", "oldpw").expect("alice logs in");
+        let unsynced = |store: &mut UserStore, f: &dyn Fn(&mut UserStore) -> Result<(), String>| {
+            FAIL_DIR_SYNC_AFTER_RENAME.with(|n| n.set(2));
+            let r = f(store);
+            FAIL_DIR_SYNC_AFTER_RENAME.with(|n| n.set(0));
+            r
+        };
+        // set_password: the new password is in force, in memory as in the
+        // file, and the old sessions are revoked.
+        assert_eq!(
+            unsynced(&mut store, &|s| s.set_password("alice", "newpw")),
+            Ok(())
+        );
+        assert!(store.verify("alice", "newpw") && !store.verify("alice", "oldpw"));
+        assert_eq!(store.session_user(&token), None, "sessions are revoked");
+        let reopened = UserStore::open(&path, "rootpw").unwrap();
+        assert!(reopened.verify("alice", "newpw"));
+        // add / drop_user: memory follows the file.
+        assert_eq!(
+            unsynced(&mut store, &|s| s.add(
+                "bob",
+                "bobpw",
+                BTreeSet::from([Privilege::Query])
+            )),
+            Ok(())
+        );
+        assert!(store.exists("bob"));
+        assert!(UserStore::open(&path, "rootpw").unwrap().exists("bob"));
+        assert_eq!(unsynced(&mut store, &|s| s.drop_user("bob")), Ok(()));
+        assert!(!store.exists("bob"));
+        assert!(!UserStore::open(&path, "rootpw").unwrap().exists("bob"));
     }
 
     #[test]

@@ -16,6 +16,7 @@
 - **Behaviour change: user-store mutations whose `users.db` save fails change nothing** (sec#15).
   - `UserStore::add`, `drop_user`, `set_password`, `forget_database` and `copy_database_privileges` roll the in-memory table back when the save fails. Before, a "failed" password change left the new password live until a restart brought the old one back.
   - A user's sessions are revoked only after a successful save.
+  - "Failed" means the file still holds its previous content. A save whose new `users.db` was already renamed into place, but whose directory `fsync` failed afterwards (EMFILE / ENFILE on opening the directory, EIO on its `fsync`) and failed again on one retry, keeps the change: the file holds it, so memory does too (sessions revoked, cached verifications forgotten), and the failed sync is logged as a durability warning (the rename may not survive a crash). Until the round-1 review fix such a save rolled memory back while the file — and the next restart — held the change. New crate-internal `fsutil::atomic_replace` reports the two cases apart; unit test `http_users::tests::a_save_whose_directory_sync_failed_after_the_rename_keeps_the_change` (a test-only `fsutil` failpoint; an integration test cannot reach it, so `tests/user_store_consistency.rs` is unchanged).
 - **Login sessions are bounded** (sec#12, http#12).
   - A login sweeps expired sessions once the table has grown. The next sweep waits until the table has doubled, so a sweep costs amortised O(1) per login.
   - One user holds at most `MAX_SESSIONS_PER_USER` (1024) sessions. A further login ends that user's oldest session, never another user's.
@@ -25,6 +26,7 @@
 - **`ipmanage` saves only entries its loader reads back** (gapi#7).
   - The list loader keeps a line shorter than 7 characters when it is a valid entry, such as `::1`, `::` or `1::`. Other short lines stay comments, as upstream.
   - `IpFilter::save` refuses a list the loader would not read back whole. An allow list of `::1` no longer comes back empty and locks everyone out.
+  - A save whose list file was replaced but whose directory `fsync` failed after the rename (also on a retry) puts the new list in effect, as the file holds it, and logs a durability warning; before the round-1 review fix the filter kept the old list while the file (and the next reload) held the new one. Unit test `gapi::ipfilter::tests::a_save_whose_directory_sync_failed_after_the_rename_takes_the_new_list`.
   - Divergence from upstream: upstream skips every line shorter than 7 characters.
 - Tests:
   - New test files:

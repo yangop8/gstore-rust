@@ -391,8 +391,19 @@ impl IpFilter {
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir).map_err(|e| SaveError::Io(e.to_string()))?;
         }
-        crate::db::fsutil::atomic_write(path, text.as_bytes())
+        // `Err`: the file holds its previous list, so the filter keeps it. A
+        // file that was replaced but whose directory sync failed holds the new
+        // list (a reload or a restart reads it): the filter takes it too, and
+        // the failed sync is a durability warning.
+        let unsynced = crate::db::fsutil::atomic_replace(path, text.as_bytes(), false)
             .map_err(|e| SaveError::Io(e.to_string()))?;
+        if let Some(e) = unsynced {
+            crate::gs_warn!(
+                "{} was replaced, but syncing its directory failed: {e}; the new list is in \
+                 effect but may not survive a crash",
+                path.display()
+            );
+        }
         *list = saved;
         Ok(())
     }
@@ -571,6 +582,46 @@ mod tests {
             Err(SaveError::NotConfigured(ListKind::Deny))
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A save whose file was replaced but whose directory sync failed after
+    /// the rename (also on the retry): the file holds the new list, so the
+    /// filter takes it too — memory and file agree (round-1 review of
+    /// gapi#7's rollback: the filter kept the old list while the file held
+    /// the new one). A failure before the rename keeps the old list.
+    #[test]
+    fn a_save_whose_directory_sync_failed_after_the_rename_takes_the_new_list() {
+        use crate::db::fsutil::FAIL_DIR_SYNC_AFTER_RENAME;
+        /// Removes the directory, also when the test fails.
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = tmp("unsynced");
+        let _cleanup = Cleanup(dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        let deny = dir.join("deny");
+        std::fs::write(&deny, "10.1.1.1\n").unwrap();
+        let f = IpFilter::new(None, Some(deny.clone()));
+        FAIL_DIR_SYNC_AFTER_RENAME.with(|n| n.set(2));
+        let saved = f.save(ListKind::Deny, &["10.2.2.2".into()]);
+        FAIL_DIR_SYNC_AFTER_RENAME.with(|n| n.set(0));
+        assert_eq!(saved, Ok(()));
+        assert!(std::fs::read_to_string(&deny).unwrap().contains("10.2.2.2"));
+        assert!(!f.permits("10.2.2.2"), "the new list is in effect");
+        assert!(f.permits("10.1.1.1"), "the old list is not");
+        f.reload();
+        assert_eq!(f.entries(ListKind::Deny), Some(vec!["10.2.2.2".into()]));
+        // Nothing replaced (the target is a directory): the old list stays.
+        std::fs::remove_file(&deny).unwrap();
+        std::fs::create_dir_all(deny.join("blocker")).unwrap();
+        assert!(matches!(
+            f.save(ListKind::Deny, &["10.3.3.3".into()]),
+            Err(SaveError::Io(_))
+        ));
+        assert!(!f.permits("10.2.2.2") && f.permits("10.3.3.3"));
     }
 
     #[test]

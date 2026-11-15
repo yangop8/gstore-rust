@@ -174,27 +174,102 @@ fn atomic_write_mode<F>(path: &Path, new_mode: Option<u32>, fill: F) -> Result<(
 where
     F: FnOnce(&mut BufWriter<File>) -> Result<()>,
 {
-    let tmp = write_tmp_mode(path, new_mode, fill)?;
+    atomic_replace_mode(path, new_mode, fill).map_err(|e| e.error)
+}
+
+/// How an atomic replacement failed: `replaced` when the new file was
+/// already renamed over the target (every reader sees the new content) and
+/// only the `fsync` of its directory failed — the rename may then not
+/// survive a crash; otherwise the target still holds its previous content.
+struct ReplaceError {
+    replaced: bool,
+    error: GStoreError,
+}
+
+/// [`atomic_write_mode`], telling a failure after the rename apart from one
+/// before it ([`ReplaceError::replaced`]).
+fn atomic_replace_mode<F>(
+    path: &Path,
+    new_mode: Option<u32>,
+    fill: F,
+) -> std::result::Result<(), ReplaceError>
+where
+    F: FnOnce(&mut BufWriter<File>) -> Result<()>,
+{
+    let not_replaced = |error| ReplaceError {
+        replaced: false,
+        error,
+    };
+    let tmp = write_tmp_mode(path, new_mode, fill).map_err(not_replaced)?;
     if let Err(e) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
-        return Err(e.into());
+        return Err(not_replaced(e.into()));
+    }
+    sync_replaced_dir(path).map_err(|error| ReplaceError {
+        replaced: true,
+        error,
+    })
+}
+
+/// `fsync` the directory of `path`, a file just renamed into place.
+fn sync_replaced_dir(path: &Path) -> Result<()> {
+    #[cfg(test)]
+    if FAIL_DIR_SYNC_AFTER_RENAME.with(|n| {
+        let left = n.get();
+        n.set(left.saturating_sub(1));
+        left > 0
+    }) {
+        return Err(GStoreError::Io(io::Error::other(
+            "injected directory sync failure",
+        )));
     }
     sync_dir(parent_of(path))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only failpoint: the next this-many directory syncs after an
+    /// atomic replacement's rename fail (as `open(2)` of the directory does
+    /// on EMFILE, or its `fsync` on EIO).
+    pub(crate) static FAIL_DIR_SYNC_AFTER_RENAME: std::cell::Cell<u32> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Atomically replace `path` with `bytes` (as [`atomic_write`]; with
+/// `private`, for a file holding secrets such as password hashes, a file
+/// that does not exist yet is created owner-only, `0600`, while an existing
+/// file keeps its permissions), for a caller that keeps the file's content
+/// in memory and must know what the file holds afterwards:
+///
+/// * `Ok(None)`: replaced, durably;
+/// * `Ok(Some(e))`: replaced — every reader sees `bytes` — but the `fsync` of
+///   the directory failed, also on one retry (`e`), so the rename may not
+///   survive a crash. The caller keeps its new state (it is what the file
+///   holds) and reports `e` as a durability warning, never as "nothing
+///   changed";
+/// * `Err`: not replaced; the file holds its previous content.
+pub(crate) fn atomic_replace(
+    path: &Path,
+    bytes: &[u8],
+    private: bool,
+) -> Result<Option<GStoreError>> {
+    let new_mode = private.then_some(0o600);
+    match atomic_replace_mode(path, new_mode, |w| {
+        w.write_all(bytes)?;
+        Ok(())
+    }) {
+        Ok(()) => Ok(None),
+        Err(ReplaceError {
+            replaced: false,
+            error,
+        }) => Err(error),
+        Err(ReplaceError { replaced: true, .. }) => Ok(sync_replaced_dir(path).err()),
+    }
 }
 
 /// Atomically replace `path` with `bytes`.
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     atomic_write_with(path, |w| {
-        w.write_all(bytes)?;
-        Ok(())
-    })
-}
-
-/// Atomically replace `path` with `bytes`, for a file holding secrets (e.g.
-/// password hashes): created owner-only (`0600`) when it does not exist yet;
-/// an existing file keeps its permissions.
-pub(crate) fn atomic_write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    atomic_write_mode(path, Some(0o600), |w| {
         w.write_all(bytes)?;
         Ok(())
     })
@@ -635,10 +710,10 @@ mod tests {
             assert_eq!(fs::read(&f).unwrap(), b"3");
         }
         let secret = dir.join("secret");
-        atomic_write_private(&secret, b"s").unwrap();
+        assert!(atomic_replace(&secret, b"s", true).unwrap().is_none());
         assert_eq!(mode(&secret), 0o600);
         fs::set_permissions(&secret, fs::Permissions::from_mode(0o640)).unwrap();
-        atomic_write_private(&secret, b"t").unwrap();
+        assert!(atomic_replace(&secret, b"t", true).unwrap().is_none());
         assert_eq!(mode(&secret), 0o640, "an existing file keeps its mode");
         let _ = fs::remove_dir_all(&dir);
     }
