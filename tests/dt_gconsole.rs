@@ -830,8 +830,14 @@ fn help_version_and_unknown_commands() {
     );
 }
 
+/// Root's password on the `gserver` binaries started here. review sec#8 /
+/// infra#3: gserver refuses to serve root's default password (123456, the
+/// harness's [`PASSWORD`] for in-process servers), so they get their own.
+const GSERVER_PASSWORD: &str = "gconsole-pw";
+
 /// A `gserver` binary serving `dir` (its `conf/conf.ini` written from
-/// `conf_extra` plus the port and `db_home`), killed when dropped.
+/// `conf_extra` plus the port, `db_home` and root's password), killed when
+/// dropped.
 struct Gserver {
     child: Child,
     port: u16,
@@ -855,7 +861,8 @@ impl Gserver {
         fs::write(
             dir.join("conf/conf.ini"),
             format!(
-                "[server]\nport={port}\nthread_num=4\n[system]\ndb_home=./dbhome/\n{conf_extra}"
+                "[server]\nport={port}\nthread_num=4\n[system]\ndb_home=./dbhome/\n\
+                 root_password={GSERVER_PASSWORD}\n{conf_extra}"
             ),
         )
         .unwrap();
@@ -880,7 +887,7 @@ impl Gserver {
     fn script(&self, cwd: &Path, stdin: &str) -> Run {
         let addr: SocketAddr = ([127, 0, 0, 1], self.port).into();
         let mut cmd = gconsole(&addr, cwd);
-        cmd.args(["-u", "root", "-p", PASSWORD]);
+        cmd.args(["-u", "root", "-p", GSERVER_PASSWORD]);
         run(cmd, stdin)
     }
 }
@@ -1886,7 +1893,12 @@ fn gconsole_finds_gserver_through_conf_ini() {
     fs::create_dir_all(dir.join("conf")).unwrap();
     fs::write(
         dir.join("conf/conf.ini"),
-        format!("[server]\nport={port}\nthread_num=4\n[system]\ndb_home=./dbhome/\n"),
+        // review sec#8 / infra#3: an explicit root password (gserver refuses
+        // the default one).
+        format!(
+            "[server]\nport={port}\nthread_num=4\n[system]\ndb_home=./dbhome/\n\
+             root_password={GSERVER_PASSWORD}\n"
+        ),
     )
     .unwrap();
     let data_dir = path_str(&data("small"));
@@ -1916,7 +1928,7 @@ fn gconsole_finds_gserver_through_conf_ini() {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_gconsole"));
     cmd.current_dir(&dir)
         .env("GSTORE_HISTFILE", "")
-        .args(["-u", "root", "-p", PASSWORD]);
+        .args(["-u", "root", "-p", GSERVER_PASSWORD]);
     let r = run(
         cmd,
         &format!(

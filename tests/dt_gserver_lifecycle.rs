@@ -579,7 +579,12 @@ mod binary {
         std::fs::write(&pid_file, format!("{dead}\nx\n0\n127.0.0.1:1\n0\n")).unwrap();
         let (code, out, _) = gserver(&dir, &["-S", "--api", &home_s]);
         assert!(code == 0 && out.contains("inactive (dead)"), "{out}");
-        let (code, out, err) = gserver(&dir, &["-b", "--api", &home_s, "-p", "0"]);
+        // review sec#8 / infra#3: gserver refuses root's default password,
+        // so the new store gets its own.
+        let (code, out, err) = gserver(
+            &dir,
+            &["-b", "--api", &home_s, "-p", "0", "--password", "pw"],
+        );
         assert_eq!(code, 0, "stdout:{out}\nstderr:{err}");
         let (code, _, _) = gserver(&dir, &["-t", "--api", &home_s]);
         assert_eq!(code, 0);
@@ -945,7 +950,12 @@ mod binary {
             dir: dir.clone(),
             pid_file: pid_file.clone(),
         };
-        let (code, out, err) = gserver(&dir, &["-b", "--api", &home_s, "-p", "0"]);
+        // review sec#8 / infra#3: gserver refuses root's default password,
+        // so the store gets its own.
+        let (code, out, err) = gserver(
+            &dir,
+            &["-b", "--api", &home_s, "-p", "0", "--password", "pw"],
+        );
         assert_eq!(code, 0, "stdout:{out}\nstderr:{err}");
         let first = pid_lines(&pid_file).unwrap()[0].clone();
 
@@ -1086,8 +1096,10 @@ mod binary {
         let ini = dir.join("d.ini");
         std::fs::write(
             &ini,
+            // review sec#8 / infra#3: an explicit root password (gserver
+            // refuses the default one).
             format!(
-                "[server]\nport={}\ndeamon=on\n[system]\ndb_home={}\n",
+                "[server]\nport={}\ndeamon=on\n[system]\ndb_home={}\nroot_password=pw\n",
                 free_port(),
                 home.display()
             ),
@@ -1143,8 +1155,10 @@ mod binary {
         let ini = dir.join("d.ini");
         std::fs::write(
             &ini,
+            // review sec#8 / infra#3: an explicit root password (gserver
+            // refuses the default one).
             format!(
-                "[server]\nport={}\ndeamon=on\n[system]\ndb_home={}\n",
+                "[server]\nport={}\ndeamon=on\n[system]\ndb_home={}\nroot_password=pw\n",
                 free_port(),
                 home.display()
             ),
