@@ -4,12 +4,49 @@
 //!   a multiple of 2^32 (review H-8, analytics#1): the count that wraps to 0
 //!   was also the "not reached" marker, so the frontier doubled every level
 //!   until an allocation failure aborted the process;
-//! - `maximumKplex` on a CSR without vertices (gap-gfun-fuzz#1) panicked.
+//! - `maximumKplex` on a CSR without vertices (gap-gfun-fuzz#1) panicked;
+//! - log retention on a sibling file whose name has a multi-byte character
+//!   at byte 10 after the prefix (M15, bulkcli#1) panicked — `gserver`
+//!   could not start;
+//! - a log line was written with two `write(2)` calls, so concurrent
+//!   writers interleaved (conc#6).
 
-use std::time::{Duration, Instant};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 
+use gstore::logging::{rolled_files, FileSinkConfig, Level, LogConfig, Logger};
 use gstore::parser::ntriples::parse_term;
 use gstore::{Database, Term};
+
+/// A temporary directory, removed when dropped (also when a test fails).
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(tag: &str) -> TempDir {
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!(
+            "gstore_crash_regr_{tag}_{}_{n}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(&p).unwrap();
+        TempDir(p)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
 
 /// The lexical form of the plain literal in the only cell of `q`'s result.
 fn only_plain(db: &mut Database, q: &str) -> String {
@@ -139,4 +176,167 @@ fn maximum_kplex_on_a_vertexless_graph_is_empty() {
             );
         }
     }
+}
+
+// ---- log retention (M15) ----------------------------------------------------------
+
+/// Backdate `path`'s modification time by `days` days.
+fn backdate(path: &Path, days: u64) {
+    let f = fs::File::options().write(true).open(path).unwrap();
+    f.set_modified(SystemTime::now() - Duration::from_secs(days * 86_400))
+        .unwrap();
+}
+
+/// A sibling of the log file whose name has a multi-byte character at byte
+/// 10 after `<name>.` is skipped, not a panic: the logger `gserver` opens at
+/// start-up comes up (before: exit 101 at start-up), and the daily roll of
+/// the access/query logs goes on (before: a panic in the first request of
+/// each day). Rolled files are still recognised and pruned.
+#[test]
+fn log_retention_skips_non_ascii_sibling_names() {
+    let dir = TempDir::new("logs");
+    let log = dir.path().join("diag.log");
+    fs::write(&log, "old\n").unwrap();
+    let odd = [
+        "diag.log.旧日志文件",
+        "diag.log.2024-01-0é",
+        "diag.log.2024-01-01é",
+        "diag.log.é",
+    ];
+    for name in odd {
+        fs::write(dir.path().join(name), "x").unwrap();
+    }
+    let rolled = dir.path().join("diag.log.2020-01-01");
+    fs::write(&rolled, "rolled\n").unwrap();
+    assert_eq!(
+        rolled_files(&log)
+            .into_iter()
+            .map(|(p, d)| (p, d.iso()))
+            .collect::<Vec<_>>(),
+        vec![(rolled.clone(), "2020-01-01".to_string())]
+    );
+    let cfg = LogConfig {
+        level: Some(Level::Info),
+        stderr: None,
+        file: Some(FileSinkConfig {
+            path: log.clone(),
+            days: 30,
+            threshold: Level::Trace,
+        }),
+    };
+    let logger = Logger::new(&cfg).expect("the logger opens");
+    logger.log(Level::Info, "test", format_args!("started"));
+    assert!(
+        !rolled.exists(),
+        "a rolled file older than 30 days is pruned"
+    );
+    for name in odd {
+        assert!(dir.path().join(name).exists(), "{name} is not touched");
+    }
+
+    // The access/query logs roll on the first line of a new day.
+    let access = dir.path().join("access.log");
+    fs::write(&access, "yesterday\n").unwrap();
+    fs::write(dir.path().join("access.log.旧日志文件"), "x").unwrap();
+    backdate(&access, 1);
+    gstore::logging::roll_daily(&access, 30);
+    assert!(!access.exists(), "the stale log was rolled");
+    assert_eq!(rolled_files(&access).len(), 1);
+}
+
+// ---- log lines (conc#6) --------------------------------------------------------------
+
+/// Concurrent writers of a plain-text log (the REST access/query/txn logs)
+/// never interleave inside a line: each line is one `write(2)` (before: the
+/// line and its newline were two, so a line could end up glued to another
+/// with an empty line after them).
+#[test]
+fn concurrent_log_lines_never_interleave() {
+    const THREADS: usize = 8;
+    const LINES: usize = 4000;
+    let dir = TempDir::new("loglines");
+    let path = dir.path().join("access.log");
+    let barrier = std::sync::Barrier::new(THREADS);
+    thread::scope(|s| {
+        for t in 0..THREADS {
+            let (path, barrier) = (&path, &barrier);
+            s.spawn(move || {
+                barrier.wait();
+                for i in 0..LINES {
+                    let line = format!("{t}\t{i}\t{}", "x".repeat(40 + t));
+                    gstore::logging::append_line(path, &line).unwrap();
+                }
+            });
+        }
+    });
+    let text = fs::read_to_string(&path).unwrap();
+    let mut seen = vec![0usize; THREADS];
+    for line in text.lines() {
+        let f: Vec<&str> = line.split('\t').collect();
+        assert_eq!(f.len(), 3, "malformed line {line:?}");
+        let t: usize = f[0].parse().unwrap_or_else(|_| panic!("{line:?}"));
+        assert_eq!(f[2], "x".repeat(40 + t), "malformed line {line:?}");
+        seen[t] += 1;
+    }
+    assert_eq!(seen, vec![LINES; THREADS]);
+}
+
+/// One `GET` to `addr` with root's Basic credentials (`root:root`); the
+/// status code.
+fn get_status(addr: &std::net::SocketAddr, target: &str) -> u16 {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+    write!(
+        s,
+        "GET {target} HTTP/1.1\r\nHost: x\r\nAuthorization: Basic cm9vdDpyb290\r\n\
+         Connection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).unwrap();
+    resp.split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or_else(|| panic!("no status in {resp:?}"))
+}
+
+/// The REST server's access log under concurrent requests: one well-formed
+/// line per request (a guard over the server path that writes through
+/// [`gstore::logging::append_line`]; the interleaving window per request is
+/// small, so the test above is the one that caught the two-write lines).
+#[test]
+fn concurrent_rest_requests_log_whole_lines() {
+    const THREADS: usize = 8;
+    const REQUESTS: usize = 40;
+    let dir = TempDir::new("restlog");
+    let root = dir.path().join("root");
+    let server = std::sync::Arc::new(
+        gstore::http_api::ApiServer::bind(&root, "root", "127.0.0.1:0").unwrap(),
+    );
+    let addr = server.local_addr().unwrap();
+    let s2 = std::sync::Arc::clone(&server);
+    let serving = thread::spawn(move || s2.serve_forever());
+    thread::scope(|s| {
+        for _ in 0..THREADS {
+            s.spawn(|| {
+                for _ in 0..REQUESTS {
+                    assert_eq!(get_status(&addr, "/status"), 200);
+                }
+            });
+        }
+    });
+    server.shutdown();
+    let _ = serving.join();
+    let text = fs::read_to_string(root.join("access.log")).unwrap();
+    let mut status_lines = 0;
+    for line in text.lines() {
+        let f: Vec<&str> = line.split('\t').collect();
+        assert_eq!(f.len(), 6, "malformed access-log line {line:?}");
+        assert!(f[0].bytes().all(|b| b.is_ascii_digit()), "{line:?}");
+        if f[1] == "GET" && f[2] == "/status" {
+            status_lines += 1;
+        }
+    }
+    assert_eq!(status_lines, THREADS * REQUESTS, "{text}");
 }

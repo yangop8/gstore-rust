@@ -6081,15 +6081,11 @@ pub(crate) fn append_daily_log(root: &Path, file: &str, line: &str, days: u32) {
     append_log(root, file, line);
 }
 
-/// Append one line (with a trailing newline) to `root/file`, best effort.
+/// Append one line (with a trailing newline) to `root/file`, best effort:
+/// one `write(2)` per line ([`crate::logging::append_line`]), so concurrent
+/// requests' lines never interleave (review conc#6).
 pub(crate) fn append_log(root: &Path, file: &str, line: &str) {
-    if let Ok(mut f) = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(root.join(file))
-    {
-        let _ = writeln!(f, "{line}");
-    }
+    let _ = crate::logging::append_line(&root.join(file), line);
 }
 
 /// Milliseconds since the Unix epoch (for log timestamps).
