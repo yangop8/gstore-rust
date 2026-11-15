@@ -491,6 +491,13 @@ fn report_config(cfg: &GStoreConfig) {
     for w in cfg.warnings() {
         gs_warn!("conf.ini warning: {w}");
     }
+    // The upstream-compat switches that are on (each restores an upstream
+    // behaviour a secure default turned off). A starting server reports the
+    // configuration after its diagnostic log is set up, so these reach the
+    // log in both modes.
+    for w in cfg.upstream_compat_warnings() {
+        gs_warn!("{w}");
+    }
 }
 
 /// Install `conf.ini`'s `[storage]` section as the process's default open
@@ -1125,9 +1132,9 @@ fn serve(cli: &Cli, cfg: &GStoreConfig, target: &Target, supervisor: u32) -> u8 
             // default password and is refused again.
             if cfg.root_password == DEFAULT_ROOT_PASSWORD
                 && !root.join(gstore::sysdb::USERS_FILE).exists()
-                && !binds_loopback_only(addr)
+                && !default_password_allowed(cfg, binds_loopback_only(addr))
             {
-                refuse_default_password(&cfg.listen_addr);
+                refuse_default_password(cfg);
                 return 1;
             }
             let server = match ApiServer::bind_with_config(served) {
@@ -1147,17 +1154,20 @@ fn serve(cli: &Cli, cfg: &GStoreConfig, target: &Target, supervisor: u32) -> u8 
                 }
             };
             // Every gStore install shares the default root password: never
-            // serve it beyond this machine.
+            // serve it, unless allow_default_root_password=on — and even then
+            // only on loopback, where the servers accept it from local
+            // clients only (not from a reverse proxy, see
+            // `HttpOptions::trust_proxy_headers`).
             if server.root_has_default_password() {
-                let local = server.local_addr().ok();
-                if local.is_some_and(|a| !a.ip().is_loopback()) {
-                    refuse_default_password(&cfg.listen_addr);
+                let loopback = server.local_addr().is_ok_and(|a| a.ip().is_loopback());
+                if !default_password_allowed(cfg, loopback) {
+                    refuse_default_password(cfg);
                     return 1;
                 }
                 gs_warn!(
-                    "root is using the default password '{DEFAULT_ROOT_PASSWORD}'; change it \
-                     before exposing this server (gserver refuses to listen beyond loopback \
-                     with it)"
+                    "root is using the default password '{DEFAULT_ROOT_PASSWORD}' \
+                     (allow_default_root_password=on): it is accepted from local clients only; \
+                     change it and remove the switch"
                 );
             }
             let root_s = root.display();
@@ -1262,16 +1272,29 @@ fn binds_loopback_only(addr: (&str, u16)) -> bool {
         .unwrap_or(true)
 }
 
-/// Log why the API server will not serve root's default password on
-/// `listen_addr`.
-fn refuse_default_password(listen_addr: &str) {
+/// Whether the API server may start although root has the default password:
+/// only with `conf.ini`'s `allow_default_root_password=on` (an
+/// upstream-compat switch), and only on a loopback address.
+fn default_password_allowed(cfg: &GStoreConfig, loopback: bool) -> bool {
+    cfg.allow_default_root_password && loopback
+}
+
+/// Log why the API server will not serve root's default password, naming
+/// both remedies.
+fn refuse_default_password(cfg: &GStoreConfig) {
+    let listen_addr = &cfg.listen_addr;
+    let why = if cfg.allow_default_root_password {
+        format!("would listen on {listen_addr}, beyond loopback")
+    } else {
+        format!("would listen on {listen_addr}")
+    };
     gs_error!(
-        "root still has the default password '{DEFAULT_ROOT_PASSWORD}' and the \
-         server would listen on {listen_addr}: refusing to start. Set root's password \
-         first: for a new user store with --password-file FILE (or the \
-         {ENV_PASSWORD_FILE} environment variable, or conf.ini's root_password); \
-         for an existing one, start on 127.0.0.1 and change it with gconsole's \
-         setpswd or the /api userPassword operation."
+        "root still has the default password '{DEFAULT_ROOT_PASSWORD}' and the server \
+         {why}: refusing to start. Set root's password first: for a new user store with \
+         --password-file FILE (or the {ENV_PASSWORD_FILE} environment variable, or \
+         conf.ini's root_password); for an existing one, start once on 127.0.0.1 with \
+         [server] allow_default_root_password=on in conf.ini, change the password \
+         (gconsole's setpswd or the /api userPassword operation), then remove the switch."
     );
 }
 

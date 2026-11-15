@@ -34,7 +34,11 @@
 //! in a properties file, or not at all:
 //!
 //! * `[server]`: the HTTP layer — `listen_addr`, `keep_alive_timeout`,
-//!   `keep_alive_max`, `queue_size` and `cors`;
+//!   `keep_alive_max`, `queue_size`, `cors` — and the browser-facing secure
+//!   defaults with their upstream-compat switches (`cors_allow_origin`,
+//!   `allowed_hosts`, `allow_get_update`, `trust_proxy_headers`,
+//!   `allow_default_root_password`; see
+//!   [`GStoreConfig::upstream_compat_warnings`]);
 //! * `[log]`: the diagnostic log that upstream configures in a log4cplus
 //!   properties file — `log_level`, `log_file`, `log_days`, `log_stderr`
 //!   (see [`crate::logging`]);
@@ -260,6 +264,11 @@ pub const KNOWN_KEYS: &[(&str, &str)] = &[
     ("server", "keep_alive_max"),
     ("server", "queue_size"),
     ("server", "cors"),
+    ("server", "cors_allow_origin"),
+    ("server", "allowed_hosts"),
+    ("server", "allow_get_update"),
+    ("server", "trust_proxy_headers"),
+    ("server", "allow_default_root_password"),
     ("log", "log_level"),
     ("log", "log_file"),
     ("log", "log_days"),
@@ -346,9 +355,35 @@ pub struct GStoreConfig {
     /// *(Rust extension)* Accepted connections that may wait for a free worker
     /// before the server stops accepting (default `128`).
     pub queue_size: usize,
-    /// *(Rust extension)* Send CORS headers and answer `OPTIONS` preflights
-    /// (default on).
+    /// *(Rust extension)* CORS processing: answer `OPTIONS` preflights and
+    /// send `Access-Control-Allow-Origin` — to the origins of
+    /// [`cors_allow_origin`](Self::cors_allow_origin) only (default on).
     pub cors: bool,
+    /// *(Rust extension)* The origins (`scheme://host[:port]`, separated by
+    /// `|`, `,` or spaces) whose web pages may call the server cross-origin
+    /// ([`HttpOptions::cors_allow_origin`]). Empty by default; `*` is
+    /// upstream's `Access-Control-Allow-Origin: *` (an upstream-compat
+    /// switch: gserver warns at startup).
+    pub cors_allow_origin: Vec<String>,
+    /// *(Rust extension)* Host names a loopback request may carry besides IP
+    /// literals, `localhost` and names without a dot (the DNS-rebinding
+    /// guard, [`HttpOptions::allowed_hosts`]); `*` turns the check off.
+    /// Empty by default (the listen address, when it is a name, is added).
+    pub allowed_hosts: Vec<String>,
+    /// *(Rust extension, upstream-compat switch)* Let `GET /sparql` run an
+    /// UPDATE and `/update` take a body of any type, as upstream does
+    /// (default off, [`HttpOptions::allow_get_update`]).
+    pub allow_get_update: bool,
+    /// *(Rust extension, upstream-compat switch)* Treat a loopback peer as
+    /// local even when it forwards `Forwarded` / `X-Forwarded-For` /
+    /// `X-Real-IP` (default off, [`HttpOptions::trust_proxy_headers`]).
+    pub trust_proxy_headers: bool,
+    /// *(Rust extension, upstream-compat switch)* Let `gserver` start the
+    /// API server although root still has the default password
+    /// ([`DEFAULT_ROOT_PASSWORD`]) — on a loopback address only, and the
+    /// password is then accepted from local clients only (default off:
+    /// refused on every address).
+    pub allow_default_root_password: bool,
 
     // ---- [system] -------------------------------------------------------
     /// Minimum free memory in MB for the resource check (default `512`).
@@ -557,6 +592,11 @@ impl Default for GStoreConfig {
             keep_alive_max: 100,
             queue_size: 128,
             cors: true,
+            cors_allow_origin: Vec::new(),
+            allowed_hosts: Vec::new(),
+            allow_get_update: false,
+            trust_proxy_headers: false,
+            allow_default_root_password: false,
             min_memory: 512,
             min_million_disk: 50,
             min_million_memory: 20,
@@ -780,6 +820,18 @@ impl GStoreConfig {
             }
             "queue_size" => self.queue_size = parse_num(v).ok_or_else(|| bad("an integer"))?,
             "cors" => self.cors = parse_switch(v).ok_or_else(|| bad("on or off"))?,
+            "cors_allow_origin" => self.cors_allow_origin = split_words(v),
+            "allowed_hosts" => self.allowed_hosts = split_words(v),
+            "allow_get_update" => {
+                self.allow_get_update = parse_switch(v).ok_or_else(|| bad("on or off"))?
+            }
+            "trust_proxy_headers" => {
+                self.trust_proxy_headers = parse_switch(v).ok_or_else(|| bad("on or off"))?
+            }
+            "allow_default_root_password" => {
+                self.allow_default_root_password =
+                    parse_switch(v).ok_or_else(|| bad("on or off"))?
+            }
             "min_memory" => self.min_memory = parse_num(v).ok_or_else(|| bad("an integer (MB)"))?,
             "min_million_disk" => {
                 self.min_million_disk = parse_num(v).ok_or_else(|| bad("an integer (MB)"))?
@@ -994,6 +1046,11 @@ impl GStoreConfig {
             "keep_alive_max" => self.keep_alive_max.to_string(),
             "queue_size" => self.queue_size.to_string(),
             "cors" => switch(self.cors),
+            "cors_allow_origin" => self.cors_allow_origin.join("|"),
+            "allowed_hosts" => self.allowed_hosts.join("|"),
+            "allow_get_update" => switch(self.allow_get_update),
+            "trust_proxy_headers" => switch(self.trust_proxy_headers),
+            "allow_default_root_password" => switch(self.allow_default_root_password),
             "min_memory" => self.min_memory.to_string(),
             "min_million_disk" => self.min_million_disk.to_string(),
             "min_million_memory" => self.min_million_memory.to_string(),
@@ -1104,8 +1161,74 @@ impl GStoreConfig {
             keep_alive_max: self.keep_alive_max.max(1),
             max_body: usize::try_from(self.upload_max_body_size).unwrap_or(usize::MAX),
             cors: self.cors,
+            cors_allow_origin: self.cors_allow_origin.clone(),
+            allowed_hosts: self.allowed_hosts_with_listen_addr(),
+            allow_get_update: self.allow_get_update,
+            trust_proxy_headers: self.trust_proxy_headers,
             ..HttpOptions::default()
         }
+    }
+
+    /// One warning line per upstream-compat switch that is on (the D1 secure
+    /// defaults of the review fixes, each restoring an upstream behaviour):
+    /// `gserver` logs them at startup, each containing
+    /// `upstream-compat: <key>=<value>`.
+    pub fn upstream_compat_warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.cors_allow_origin.iter().any(|o| o.trim() == "*") {
+            out.push(
+                "upstream-compat: cors_allow_origin=* (every web page may read this server's \
+                 answers and send it writes through a visitor's browser)"
+                    .to_string(),
+            );
+        } else if !self.cors_allow_origin.is_empty() {
+            out.push(format!(
+                "upstream-compat: cors_allow_origin={} (these origins may call this server \
+                 from a browser)",
+                self.cors_allow_origin.join("|")
+            ));
+        }
+        if !self.allowed_hosts.is_empty() {
+            out.push(format!(
+                "upstream-compat: allowed_hosts={} (accepted in the Host header of loopback \
+                 requests)",
+                self.allowed_hosts.join("|")
+            ));
+        }
+        if self.allow_get_update {
+            out.push(
+                "upstream-compat: allow_get_update=on (GET /sparql runs SPARQL UPDATE and \
+                 /update takes any body type: a web page can change data through a visitor's \
+                 browser)"
+                    .to_string(),
+            );
+        }
+        if self.trust_proxy_headers {
+            out.push(
+                "upstream-compat: trust_proxy_headers=on (a loopback peer forwarding \
+                 X-Forwarded-For / Forwarded / X-Real-IP counts as a local client)"
+                    .to_string(),
+            );
+        }
+        if self.allow_default_root_password {
+            out.push(format!(
+                "upstream-compat: allow_default_root_password=on (root may keep the default \
+                 password '{DEFAULT_ROOT_PASSWORD}' on a loopback server: change it and remove \
+                 the switch)"
+            ));
+        }
+        out
+    }
+
+    /// [`allowed_hosts`](Self::allowed_hosts) plus `listen_addr` when that is
+    /// a host name (an address is accepted anyway).
+    fn allowed_hosts_with_listen_addr(&self) -> Vec<String> {
+        let mut hosts = self.allowed_hosts.clone();
+        let listen = self.listen_addr.trim();
+        if !listen.is_empty() && listen.parse::<std::net::IpAddr>().is_err() {
+            hosts.push(listen.to_string());
+        }
+        hosts
     }
 
     /// The query-evaluation settings of the `[query]` section, which the
@@ -1275,6 +1398,14 @@ fn nonempty(v: &str) -> Option<&str> {
 
 /// Split a `|`-separated list (upstream `getline(ss, item, '|')`), dropping
 /// empty items and surrounding whitespace.
+/// A list separated by `|`, `,` or whitespace.
+fn split_words(v: &str) -> Vec<String> {
+    v.split(|c: char| c == '|' || c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn split_list(v: &str) -> Vec<String> {
     v.split('|')
         .map(str::trim)
@@ -1602,7 +1733,9 @@ upload_allow_compress_packages = "zip"
         let text = "[server]\nport=9100\ntcp_port=9200\nthread_num=4\nmax_database_num=5\n\
                     max_user_num=6\ndeamon=on\nmax_output_size=7\nip_allow_path=allow.txt\n\
                     ip_deny_path=off\nlisten_addr=0.0.0.0\nkeep_alive_timeout=0\nkeep_alive_max=3\n\
-                    queue_size=0\ncors=off\n\
+                    queue_size=0\ncors=off\ncors_allow_origin=https://a.example|http://b.example:81\n\
+                    allowed_hosts=gs.example, gs2.example\nallow_get_update=on\n\
+                    trust_proxy_headers=on\nallow_default_root_password=on\n\
                     [system]\nmin_memory=1\nmin_million_disk=2\nmin_million_memory=3\n\
                     resource_check=on\ndb_home=/data/gs\ndb_suffix=.gdb\nroot_username=admin\n\
                     root_password=s3cret\nsystem_username=sys\npfn_base_path=/p\nlicensetype=x\n\
@@ -1643,6 +1776,12 @@ upload_allow_compress_packages = "zip"
             (0, 3, 0)
         );
         assert!(!c.cors);
+        assert_eq!(
+            c.cors_allow_origin,
+            ["https://a.example", "http://b.example:81"]
+        );
+        assert_eq!(c.allowed_hosts, ["gs.example", "gs2.example"]);
+        assert!(c.allow_get_update && c.trust_proxy_headers && c.allow_default_root_password);
         assert_eq!(
             (c.min_memory, c.min_million_disk, c.min_million_memory),
             (1, 2, 3)
@@ -1735,6 +1874,28 @@ upload_allow_compress_packages = "zip"
         assert_eq!(h.keep_alive_max, 3);
         assert_eq!(h.max_body, 1024);
         assert!(!h.cors);
+        assert_eq!(h.cors_allow_origin, c.cors_allow_origin);
+        // listen_addr (0.0.0.0) is an address: nothing to add.
+        assert_eq!(h.allowed_hosts, c.allowed_hosts);
+        assert!(h.allow_get_update && h.trust_proxy_headers);
+        let compat = c.upstream_compat_warnings();
+        for key in [
+            "cors_allow_origin",
+            "allowed_hosts",
+            "allow_get_update",
+            "trust_proxy_headers",
+            "allow_default_root_password",
+        ] {
+            assert!(
+                compat
+                    .iter()
+                    .any(|w| w.starts_with(&format!("upstream-compat: {key}="))),
+                "{key}: {compat:?}"
+            );
+        }
+        assert!(GStoreConfig::default()
+            .upstream_compat_warnings()
+            .is_empty());
     }
 
     #[test]
