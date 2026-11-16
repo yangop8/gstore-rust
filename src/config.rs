@@ -624,10 +624,13 @@ pub struct GStoreConfig {
     /// expression> LIMIT` over a tree-shaped BGP: `auto` (when the
     /// statistics predict it pays off, the default), `always` or `off`.
     pub topk_dpb: DpbMode,
-    /// *(Rust extension)* The most bytes of JSON one graph-function call
-    /// (`shortestPaths(…)`, `kHopEnumerate(…)`, …) may produce before the
-    /// query fails (default [`DEFAULT_GFUN_MAX_OUTPUT_BYTES`], 64 MiB).
-    /// Also bounds the text one PFN function call may emit.
+    /// *(Rust extension)* The most bytes of JSON the graph-function calls
+    /// (`shortestPaths(…)`, `kHopEnumerate(…)`, …) of one query may produce
+    /// together — every call, `GROUP BY` group and `GRAPH` block of the
+    /// query charged against one budget — before the query fails (default
+    /// [`DEFAULT_GFUN_MAX_OUTPUT_BYTES`], 64 MiB; review gap-gfun-fuzz#5).
+    /// The text the PFN function calls of the query emit counts against it
+    /// too.
     pub gfun_max_output_bytes: usize,
 
     // ---- [pfn] (Rust extension) -----------------------------------------
@@ -2333,6 +2336,10 @@ upload_allow_compress_packages = "zip"
             ("trust_proxy_headers", "on"),
             ("allow_default_root_password", "on"),
             ("anonymous_download", "on"),
+            // Round 2: r2-limits-auth's lockout switch and r2-txn's
+            // upstream value of the transaction idle timeout.
+            ("upstream_login_lockout", "on"),
+            ("txn_idle_timeout", "0"),
         ];
         let defaults = GStoreConfig::default();
         assert_eq!(

@@ -323,9 +323,10 @@ upload_user_quota = 0
 # DP-B Top-K for ORDER BY <linear expression> LIMIT over a tree-shaped BGP:
 # auto (when the statistics predict it pays off), always or off
 # topk_dpb=auto
-# the most bytes of JSON one graph-function call (shortestPaths, kHopEnumerate,
-# PR, ...) may produce before the query fails with an error (default 64 MiB;
-# an embedded Database allows 256 MiB)
+# the most bytes of JSON the graph-function calls (shortestPaths, kHopEnumerate,
+# PR, ...) of one query may produce together -- every call, GROUP BY group and
+# GRAPH block of the query counts -- before the query fails with an error
+# (default 64 MiB; an embedded Database allows 256 MiB)
 # gfun_max_output_bytes=67108864
 
 # ---- gstore-rust extension (not in upstream conf.ini) ----
@@ -334,7 +335,7 @@ upload_user_quota = 0
 # WebAssembly in an interpreter (cargo feature pfn-wasm) instead of compiling
 # C++ with g++ and dlopen()ing it like upstream; see docs/PFN.md. They live
 # under [system]'s pfn_base_path (upstream's key; when it is not set:
-# <db_home>/pfn). The output of one call is bounded by [query]'s
+# <db_home>/pfn). The output of the calls of one query is bounded by [query]'s
 # gfun_max_output_bytes. Like [query], these apply to every database the
 # server serves and /api refreshconf re-applies them (to the loaded databases
 # and to the function registry). The values shown are the defaults.
