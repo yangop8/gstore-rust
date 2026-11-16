@@ -680,10 +680,14 @@ impl Database {
     /// recorded since the previous commit point. Auto-commit SPARQL UPDATEs and
     /// [`commit`](Self::commit) already do this; call it after mutating through
     /// the direct API ([`insert_triple`](Self::insert_triple), …). A no-op for an
-    /// in-memory database — persist that with [`save`](Self::save).
+    /// in-memory database — persist that with [`save`](Self::save) — except
+    /// for its redo and update logs: what they are still owed is appended
+    /// and they are `fdatasync`ed (see
+    /// [`enable_redo_log`](Self::enable_redo_log)).
     pub fn sync(&self) -> Result<()> {
         let _persist = self.persist_guard();
-        self.commit_point()
+        self.commit_point()?;
+        self.sync_logs()
     }
 
     /// Detach this database from its on-disk storage, returning a purely

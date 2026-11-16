@@ -13,7 +13,6 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -43,6 +42,8 @@ use crate::store::{Backend, MutableStore, TripleSource, TripleStore};
 mod admin;
 pub mod dirlock;
 pub(crate) mod fsutil;
+mod logs;
+use logs::LogKind;
 mod open_options;
 pub(crate) mod persist;
 mod statement;
@@ -97,15 +98,15 @@ const VSTREE_FILE: &str = "vstree.bin";
 const NAMED_FILE: &str = "named.bin";
 /// The append-only update log inside a database directory (gStore's update.log).
 const UPDATE_LOG_FILE: &str = "update.log";
-/// Marker file inside a *full* backup directory recording the update-log
+/// Marker file inside a *full* backup directory recording the redo-log
 /// checkpoint (byte length) captured at backup time. Lets a later incremental
 /// backup know where its delta begins; ignored by [`Database::load`].
 const BACKUP_OFFSET_FILE: &str = "BACKUP_OFFSET";
 /// Marker file inside an *incremental* backup directory describing its delta
-/// (the base/end update-log byte offsets it covers).
+/// (the base/end redo-log byte offsets it covers).
 const INCREMENTAL_MARKER_FILE: &str = "INCREMENTAL";
-/// The copied slice of the update log inside an incremental backup directory —
-/// the raw length-prefixed UPDATE records for `[base_offset, end_offset)`.
+/// The copied slice of the redo log inside an incremental backup directory —
+/// its whole records for `[base_offset, end_offset)`.
 const INCREMENTAL_LOG_FILE: &str = "incr.log";
 /// The append-only triple-level redo log inside a database directory. Records
 /// every *committed* mutation so it can be re-applied on recovery (the redo half
@@ -245,16 +246,47 @@ struct Meta {
     predicate_num: u64,
 }
 
-/// One pending/serialized redo-log record: an applied mutation in surface form.
-/// `op` is `b'I'` (insert), `b'D'` (delete), `b'C'` (clear the graph:
-/// `DEFAULT` without a graph, else the named graph) or `b'N'` (clear every
-/// named graph); `graph` is the named-graph IRI (`None` ⇒ default graph);
-/// `triple` is the N-Triples `s p o .` text (empty for the clears).
+/// One pending redo-log record: an applied mutation in surface form (framed
+/// by [`logs::frame_redo`]). `op` is `b'I'` (insert), `b'D'` (delete),
+/// `b'C'` (clear the graph: `DEFAULT` without a graph, else the named
+/// graph) or `b'N'` (clear every named graph); `graph` is the named-graph
+/// IRI (`None` ⇒ default graph); `triple` is the `s p o .` text
+/// ([`CLEAR_BODY`] for the clears).
 #[derive(Debug, Clone)]
 struct RedoRec {
     op: u8,
     graph: Option<String>,
     triple: String,
+}
+
+/// The body of a clear (`C` / `N`) redo record. Readers older than clear
+/// records parse every record's body as triples and refuse any op but `I` /
+/// `D` for them, so this triple makes them fail loudly ("unknown redo.log op
+/// 'C'") instead of skipping the clear and bringing the cleared data back
+/// (review gap-doc-claims#1). This reader takes it, and the empty body the
+/// clears were written with before.
+const CLEAR_BODY: &str = "<urn:x-gstore:redo> <urn:x-gstore:redo#op> \"clear\" .";
+
+/// One pending update-log record: a committed UPDATE request (framed by
+/// [`logs::frame_update`]).
+#[derive(Debug, Clone)]
+struct UpdateRec {
+    millis: u128,
+    changed: usize,
+    sparql: String,
+}
+
+impl UpdateRec {
+    fn now(sparql: &str, changed: usize) -> UpdateRec {
+        UpdateRec {
+            millis: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0),
+            changed,
+            sparql: sparql.to_owned(),
+        }
+    }
 }
 
 /// What a `CLEAR` redo record clears (see [`RedoRec`]).
@@ -317,21 +349,38 @@ pub struct Database {
     /// The sandbox limits PFN calls run under (see
     /// [`set_pfn_limits`](Self::set_pfn_limits)).
     pfn_limits: crate::pfn::PfnLimits,
-    /// When set, every applied SPARQL UPDATE is appended to this file (gStore's
-    /// `update.log`), so the write history can be replayed or audited. `None`
-    /// disables logging (the default).
+    /// When set, every committed SPARQL UPDATE is appended to this file
+    /// (gStore's `update.log`), so the write history can be replayed or
+    /// audited. `None` disables logging (the default).
     update_log: Option<PathBuf>,
+    /// The update-log records of the open transaction's statements:
+    /// appended at its commit, dropped when it rolls back.
+    update_pending: Vec<UpdateRec>,
+    /// The update log's appender (see [`logs`]); behind a mutex because the
+    /// commit points [`sync`](Self::sync) takes `&self`.
+    update_writer: Mutex<logs::LogWriter>,
     /// When set, every *committed* triple mutation is appended to this file as a
     /// redo record so it can be re-applied on recovery. `None` disables it.
     redo_log: Option<PathBuf>,
-    /// Redo records buffered while a (single-writer) transaction is open; flushed
-    /// to [`redo_log`](Self::redo_log) on commit, discarded on rollback. In
-    /// auto-commit mode records are written through immediately and this stays empty.
+    /// Redo records of mutations not committed yet: the open (single-writer)
+    /// transaction's, appended at its commit and dropped when it rolls back,
+    /// or the running auto-commit statement's (see
+    /// [`redo_hold`](Self::redo_hold)). Records of committed mutations whose
+    /// append failed are owed by [`redo_writer`](Self::redo_writer) instead,
+    /// so nothing that rolls back or disables the log drops them (review
+    /// db#2).
     redo_pending: Vec<RedoRec>,
-    /// Incremental-backup checkpoint: the update-log byte offset the most recent
+    /// The redo log's appender (see [`logs`]); behind a mutex because the
+    /// backups and [`sync`](Self::sync) take `&self`.
+    redo_writer: Mutex<logs::LogWriter>,
+    /// An auto-commit statement (an UPDATE request, a reasoning run) is
+    /// running: its redo records are appended together at its end — after
+    /// its commit point — instead of one by one as a direct-API mutation's.
+    redo_hold: bool,
+    /// Incremental-backup checkpoint: the redo-log byte offset the most recent
     /// full ([`backup`](Self::backup)) or incremental
     /// ([`backup_incremental`](Self::backup_incremental)) backup ended at. The
-    /// next incremental captures update-log records from here onward, so
+    /// next incremental captures redo-log records from here onward, so
     /// successive incrementals chain contiguously. Atomic because both backup
     /// methods take `&self` (they run under [`persist_lock`](Self::persist_lock)).
     backup_offset: AtomicU64,
@@ -681,8 +730,12 @@ impl Database {
             pfn: None,
             pfn_limits: crate::pfn::PfnLimits::default(),
             update_log: None,
+            update_pending: Vec::new(),
+            update_writer: Mutex::new(logs::LogWriter::default()),
             redo_log: None,
             redo_pending: Vec::new(),
+            redo_writer: Mutex::new(logs::LogWriter::default()),
+            redo_hold: false,
             backup_offset: AtomicU64::new(0),
             rules: crate::reason::RuleSet::new(),
             reason_home: crate::reason::store::RuleHome::default(),
@@ -2006,9 +2059,12 @@ impl Database {
         }
         drop(log);
         drop(minted);
-        let redo = self.flush_redo();
+        // Committed: its redo records and its statements' update-log
+        // records are appended now, after the commit point (review
+        // durability#6).
+        let logged = self.log_commit();
         self.run_deferred_rebuild();
-        redo.map_err(CommitFailure::CommittedWithError)
+        logged.map_err(CommitFailure::CommittedWithError)
     }
 
     /// The commit point of a closing transaction failed with `e`: roll it
@@ -2025,10 +2081,13 @@ impl Database {
         journal_gone: bool,
     ) -> CommitFailure {
         if journal_gone || self.wal_batches() != batches {
-            // Applied: its redo records stay unwritten (it is not known to
-            // be durable) and its frees are not made (nothing references
-            // them less than before the failure would justify).
+            // Applied: its redo and update-log records stay unwritten (it
+            // is not known to be durable) and its frees are not made
+            // (nothing references them less than before the failure would
+            // justify). Committed records still owed to the logs are not
+            // its own: they stay owed (review db#2).
             self.redo_pending.clear();
+            self.update_pending.clear();
             self.reclaim.clear();
             self.run_deferred_rebuild();
             return CommitFailure::NotDurable(e);
@@ -2111,9 +2170,12 @@ impl Database {
         // freed once its inserts are gone.
         self.reclaim.clear();
         // The transaction's mutations are being undone, so its buffered redo
-        // records must never reach the log, nor its queued write-through the
-        // on-disk store (which never saw them).
+        // and update-log records must never reach the logs, nor its queued
+        // write-through the on-disk store (which never saw them). Records
+        // of earlier commits whose append failed are owed by the log
+        // writers, not buffered here: they are kept (review db#2).
         self.redo_pending.clear();
+        self.update_pending.clear();
         self.disk_discard_pending();
         // Stream mode: the overlay (default graph and queued quads) is just
         // dropped; only the in-memory named graphs are undone below.
@@ -2635,6 +2697,9 @@ impl Database {
     ) -> Result<QueryResult> {
         let before = self.mutations;
         let mut changed = 0;
+        // The request's redo records are appended together at its end,
+        // after its commit point (review durability#6, db#8).
+        self.redo_hold = true;
         for op in ops {
             // Each operation is applied inside a read scope (C2): an
             // out-of-core dictionary's read error while a DELETE, CLEAR or
@@ -2655,25 +2720,37 @@ impl Database {
             self.flush_reclaim();
             match applied {
                 Ok(n) => changed += n,
-                Err(e) => return Err(self.failed_update(e, before, journaled)),
-            }
-        }
-        // Append the applied statement to the update log, if enabled.
-        if let Some(path) = self.update_log.clone() {
-            if let Err(e) = append_update_log(&path, sparql, changed) {
-                return Err(self.failed_update(e, before, journaled));
+                Err(e) => {
+                    let e = self.failed_update(e, before, journaled);
+                    // The part applied before the failure stays (committed,
+                    // outside a transaction): its redo records are logged.
+                    return Err(match self.end_statement_logs(None) {
+                        Ok(()) => e,
+                        Err(le) => GStoreError::Database(format!("{e}; in addition, {le}")),
+                    });
+                }
             }
         }
         // Outside a transaction each UPDATE request is a commit point:
         // its write-through is made durable before it is acknowledged
         // (RocksDB: its journal is deleted first, with the ids it freed).
-        if journaled {
+        let point = if journaled {
             let ended = self.end_update_statement(before);
             let point = self.commit_point();
-            ended.and(point)?;
+            ended.and(point)
         } else if self.txn.is_none() {
-            self.commit_point()?;
-        }
+            self.commit_point()
+        } else {
+            Ok(())
+        };
+        // Then its redo records and its update-log record (inside a
+        // transaction: at the commit), never before the commit point
+        // (review durability#6).
+        let logged = self.end_statement_logs(Some((sparql, changed)));
+        point?;
+        logged.map_err(|e| {
+            GStoreError::Database(format!("the update is applied and committed, but {e}"))
+        })?;
         Ok(QueryResult::Update { changed })
     }
 
@@ -3108,10 +3185,10 @@ impl Database {
         self.redo_pending.push(RedoRec {
             op,
             graph,
-            triple: String::new(),
+            triple: CLEAR_BODY.to_owned(),
         });
-        if self.txn.is_none() {
-            let _ = self.flush_redo();
+        if self.txn.is_none() && !self.redo_hold {
+            let _ = self.flush_redo(false);
         }
     }
 
@@ -3409,9 +3486,9 @@ impl Database {
         let _persist = self.persist_guard();
         self.save_locked(backup_dir)?;
         self.backup_reason_rules(backup_dir)?;
-        let off = self.redo_log_len();
-        self.backup_offset.store(off, Ordering::SeqCst);
+        let off = self.redo_log_len()?;
         write_backup_offset(&backup_dir.join(BACKUP_OFFSET_FILE), off)?;
+        self.backup_offset.store(off, Ordering::SeqCst);
         Ok(())
     }
 
@@ -3433,16 +3510,20 @@ impl Database {
         self.backup_offset.load(Ordering::SeqCst)
     }
 
-    /// Byte length of the redo log, or 0 when logging is disabled or the file
-    /// does not exist yet. This is the incremental-backup checkpoint unit: the
-    /// redo log is append-only and every record is written whole, so its length
-    /// is always a clean record boundary.
-    fn redo_log_len(&self) -> u64 {
-        self.redo_log
-            .as_ref()
-            .and_then(|p| fs::metadata(p).ok())
-            .map(|m| m.len())
-            .unwrap_or(0)
+    /// The redo log's whole length, or 0 when logging is disabled or the file
+    /// does not exist yet. This is the incremental-backup checkpoint unit,
+    /// always a commit boundary (see [`logs`]): a torn tail a crash left is
+    /// cut off first. Commits still owed to the log are written first; when
+    /// that fails they land after this checkpoint later, and replaying them
+    /// again over a base that holds them is harmless (redo records make a
+    /// triple present or absent; they do not count).
+    fn redo_log_len(&self) -> Result<u64> {
+        if self.redo_log.is_none() {
+            return Ok(0);
+        }
+        let mut writer = self.redo_writer_lock();
+        let _ = writer.flush(LogKind::Redo, true);
+        writer.whole_len(LogKind::Redo, 0)
     }
 
     /// Produce an **incremental** backup into `out_dir`: the delta relative to the
@@ -3471,9 +3552,12 @@ impl Database {
     /// * `reason_rule_files/` — the database's reasoning rules and their
     ///   ledgers at the time of the increment (empty when it has none): the
     ///   rules the replayed inferred triples belong to.
+    ///
+    /// Refused while committed redo records are owed to the log (their
+    /// append failed and fails again now): the increment would miss them
+    /// (review robust#10).
     pub fn backup_incremental<P: AsRef<Path>>(&self, out_dir: P) -> Result<()> {
         let out_dir = out_dir.as_ref();
-        let _persist = self.persist_guard();
         let Some(log_path) = self.redo_log.clone() else {
             return Err(GStoreError::Database(
                 "backup_incremental requires redo logging to be enabled \
@@ -3481,20 +3565,32 @@ impl Database {
                     .into(),
             ));
         };
+        let _persist = self.persist_guard();
         let base = self.backup_offset.load(Ordering::SeqCst);
-        // Missing log ⇒ no records yet (treat as empty), so an incremental taken
-        // before any logged mutation is simply an empty (but valid) delta.
-        let data = fs::read(&log_path).unwrap_or_default();
-        let end = data.len() as u64;
-        if end < base {
-            return Err(GStoreError::Database(format!(
-                "redo log ({end} bytes) shrank below the backup checkpoint ({base}); \
-                 the log was truncated or replaced since the last backup"
-            )));
-        }
-        fs::create_dir_all(out_dir)?;
-        let slice = &data[base as usize..end as usize];
-        fsutil::atomic_write(&out_dir.join(INCREMENTAL_LOG_FILE), slice)?;
+        let (end, slice) = {
+            let mut writer = self.redo_writer_lock();
+            if let Err(e) = writer.flush(LogKind::Redo, true) {
+                let why = writer
+                    .failure(LogKind::Redo)
+                    .unwrap_or_else(|| e.to_string());
+                return Err(GStoreError::Database(format!(
+                    "backup_incremental: {why}; an increment taken now would miss them"
+                )));
+            }
+            // A missing log has no records yet: an increment taken before
+            // any logged mutation is an empty (but valid) delta. Any other
+            // error reading it is reported, not taken for an empty log.
+            let end = writer.whole_len(LogKind::Redo, base)?;
+            if end < base {
+                return Err(GStoreError::Database(format!(
+                    "redo log ({end} bytes) shrank below the backup checkpoint ({base}); \
+                     the log was truncated or replaced since the last backup"
+                )));
+            }
+            (end, logs::read_range(&log_path, base, end)?)
+        };
+        fsutil::create_dir_durable(out_dir)?;
+        fsutil::atomic_write(&out_dir.join(INCREMENTAL_LOG_FILE), &slice)?;
         // The reasoning rules and ledgers as they are now, which the replayed
         // triples go with (an empty rule directory: none).
         self.backup_reason_rules(out_dir)?;
@@ -3551,7 +3647,20 @@ impl Database {
                     )));
                 }
                 let bytes = fs::read(dir.join(INCREMENTAL_LOG_FILE))?;
-                db.apply_redo_records(&bytes)?;
+                // The marker's range and the copied records must agree: a
+                // shorter copy (even one that ends on a record boundary)
+                // would restore less without a word.
+                if end.checked_sub(base) != Some(bytes.len() as u64) {
+                    return Err(GStoreError::Database(format!(
+                        "incremental backup '{}' holds {} log bytes but its marker covers \
+                         [{base}, {end})",
+                        dir.display(),
+                        bytes.len()
+                    )));
+                }
+                // An increment is a whole copy: an incomplete record in it
+                // is an error, not a torn tail to skip.
+                db.apply_redo_records(&bytes, false)?;
                 expected = end;
             }
             // The rules the last increment carries replace the base's.
@@ -3574,9 +3683,15 @@ impl Database {
 
     /// Enable update logging to `path`: every subsequent SPARQL UPDATE applied
     /// through [`query`](Self::query) is appended to the file (gStore
-    /// `update.log`). The file is created on first write.
+    /// `update.log`) once it is committed — after its commit point, or at the
+    /// commit of the transaction it ran in (one rolled back is never
+    /// logged). The file is created on first write; its format and crash
+    /// behaviour are those of the redo log (see
+    /// [`enable_redo_log`](Self::enable_redo_log)).
     pub fn enable_update_log<P: AsRef<Path>>(&mut self, path: P) {
-        self.update_log = Some(path.as_ref().to_path_buf());
+        let path = path.as_ref().to_path_buf();
+        self.update_writer_mut().retarget(&path, LogKind::Update);
+        self.update_log = Some(path);
     }
 
     /// Enable update logging at the conventional `update.log` inside a database
@@ -3584,12 +3699,17 @@ impl Database {
     pub fn enable_update_log_in<P: AsRef<Path>>(&mut self, dir: P) -> Result<()> {
         let dir = dir.as_ref();
         fs::create_dir_all(dir)?;
-        self.update_log = Some(dir.join(UPDATE_LOG_FILE));
+        self.enable_update_log(dir.join(UPDATE_LOG_FILE));
         Ok(())
     }
 
-    /// Disable update logging (subsequent updates are not recorded).
+    /// Disable update logging (subsequent updates are not recorded). The open
+    /// transaction's statements are not logged; committed ones whose append
+    /// failed are written now (when that fails again, they are kept for the
+    /// next time this file is enabled).
     pub fn disable_update_log(&mut self) {
+        self.update_pending.clear();
+        let _ = self.update_writer_mut().flush(LogKind::Update, true);
         self.update_log = None;
     }
 
@@ -3601,7 +3721,9 @@ impl Database {
     /// Replay every UPDATE statement recorded in an update log `path` against
     /// this database, in order, returning the number of statements applied.
     /// Logging is suspended during replay so the log is not rewritten and no
-    /// recursion occurs.
+    /// recursion occurs. A torn tail a crash left (see
+    /// [`replay_redo_log`](Self::replay_redo_log)) is skipped; a damaged
+    /// record anywhere else is an error.
     pub fn replay_update_log<P: AsRef<Path>>(&mut self, path: P) -> Result<usize> {
         let data = fs::read(path)?;
         let saved = self.update_log.take();
@@ -3610,53 +3732,91 @@ impl Database {
         result
     }
 
-    /// Parse and apply the length-prefixed records of an update log buffer.
+    /// Parse and apply the records of an update log buffer, a commit at a
+    /// time (see [`logs`]).
     fn replay_records(&mut self, bytes: &[u8]) -> Result<usize> {
-        let mut pos = 0usize;
         let mut applied = 0usize;
-        while pos < bytes.len() {
-            // Header line: `REC <millis> <changed> <byte_len>`.
-            let nl = bytes[pos..]
-                .iter()
-                .position(|&b| b == b'\n')
-                .map(|i| pos + i)
-                .ok_or_else(|| GStoreError::Database("truncated update.log header".into()))?;
-            let header = std::str::from_utf8(&bytes[pos..nl])
-                .map_err(|_| GStoreError::Database("non-UTF-8 update.log header".into()))?;
-            let mut it = header.split_whitespace();
-            if it.next() != Some("REC") {
-                return Err(GStoreError::Database(format!(
-                    "malformed update.log record header: {header:?}"
-                )));
+        let walk = logs::walk(bytes, LogKind::Update, false, |commit| {
+            let mut statements = Vec::with_capacity(commit.len());
+            for r in commit {
+                statements.push(std::str::from_utf8(r.body).map_err(|_| {
+                    GStoreError::Database(format!(
+                        "update.log record at byte {} is not UTF-8",
+                        r.start
+                    ))
+                })?);
             }
-            let _millis = it.next();
-            let _changed = it.next();
-            let len: usize = it.next().and_then(|s| s.parse().ok()).ok_or_else(|| {
-                GStoreError::Database("missing length in update.log record".into())
-            })?;
-            let start = nl + 1;
-            let end = start + len;
-            if end > bytes.len() {
-                return Err(GStoreError::Database("truncated update.log body".into()));
+            for sparql in statements {
+                self.query(sparql)?;
+                applied += 1;
             }
-            let sparql = std::str::from_utf8(&bytes[start..end])
-                .map_err(|_| GStoreError::Database("non-UTF-8 update.log body".into()))?;
-            self.query(sparql)?;
-            applied += 1;
-            // Skip the body and its trailing newline.
-            pos = (end + 1).min(bytes.len());
+            Ok(())
+        })?;
+        if let Some((at, why)) = walk.torn {
+            crate::gs_warn!("update.log: skipping a torn tail at byte {at} ({why})");
         }
         Ok(applied)
+    }
+
+    /// Append the open transaction's (or the ending statement's) update-log
+    /// records, as one commit (see [`logs`]).
+    fn flush_update_log(&mut self, sync: bool) -> Result<()> {
+        let recs = std::mem::take(&mut self.update_pending);
+        let Some(path) = self.update_log.clone() else {
+            return Ok(());
+        };
+        let mut commit = Vec::new();
+        for (i, r) in recs.iter().enumerate() {
+            logs::frame_update(
+                &mut commit,
+                r.millis,
+                r.changed,
+                &r.sparql,
+                i + 1 == recs.len(),
+            );
+        }
+        self.update_writer_mut()
+            .append(&path, LogKind::Update, &commit, sync)
+    }
+
+    fn update_writer_mut(&mut self) -> &mut logs::LogWriter {
+        self.update_writer
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn update_writer_lock(&self) -> MutexGuard<'_, logs::LogWriter> {
+        self.update_writer.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     // ---- redo log (the redo half of gStore's WAL) -------------------------
 
     /// Enable redo logging to `path`: every subsequent *committed* triple
-    /// mutation (insert/delete, default or named graph) is appended as a redo
-    /// record so it can be re-applied on recovery with
-    /// [`replay_redo_log`](Self::replay_redo_log).
+    /// mutation (insert/delete, default or named graph, inferred triples,
+    /// clears) is appended as a redo record so it can be re-applied on
+    /// recovery with [`replay_redo_log`](Self::replay_redo_log), or carried
+    /// by [`backup_incremental`](Self::backup_incremental).
+    ///
+    /// The records of one commit are appended with one write, after its
+    /// commit point: an auto-commit UPDATE's at its end (`fdatasync`ed), a
+    /// transaction's at [`commit`](Self::commit) (`fdatasync`ed; one rolled
+    /// back is never logged), a direct-API mutation's
+    /// ([`insert_triple`](Self::insert_triple), …, which has no commit point
+    /// of its own) when it is applied, `fdatasync`ed by the next commit
+    /// point ([`sync`](Self::sync), an UPDATE, a commit, a backup). An
+    /// append that fails is cut off again and its records are kept, in
+    /// order, for the next append: an UPDATE or a commit reports it,
+    /// [`sync`](Self::sync) too, and
+    /// [`backup_incremental`](Self::backup_incremental) refuses until the
+    /// log has them. A crash in the middle of an append leaves a torn tail,
+    /// which replay skips (a commit replays whole or not at all) and the
+    /// next append cuts off. The record format is in the `logs` module docs:
+    /// length-prefixed, with a CRC-32 per record; logs written before
+    /// checksums replay as before.
     pub fn enable_redo_log<P: AsRef<Path>>(&mut self, path: P) {
-        self.redo_log = Some(path.as_ref().to_path_buf());
+        let path = path.as_ref().to_path_buf();
+        self.redo_writer_mut().retarget(&path, LogKind::Redo);
+        self.redo_log = Some(path);
     }
 
     /// Enable redo logging at the conventional `redo.log` inside a database
@@ -3664,15 +3824,18 @@ impl Database {
     pub fn enable_redo_log_in<P: AsRef<Path>>(&mut self, dir: P) -> Result<()> {
         let dir = dir.as_ref();
         fs::create_dir_all(dir)?;
-        self.redo_log = Some(dir.join(REDO_LOG_FILE));
+        self.enable_redo_log(dir.join(REDO_LOG_FILE));
         Ok(())
     }
 
-    /// Disable redo logging (subsequent mutations are not recorded). Any buffered
-    /// (uncommitted-transaction) records are dropped.
+    /// Disable redo logging (subsequent mutations are not recorded). The open
+    /// transaction's buffered records are dropped; committed ones whose
+    /// append failed are written now (when that fails again, they are kept
+    /// for the next time this file is enabled — never dropped, review db#2).
     pub fn disable_redo_log(&mut self) {
-        self.redo_log = None;
         self.redo_pending.clear();
+        let _ = self.redo_writer_mut().flush(LogKind::Redo, true);
+        self.redo_log = None;
     }
 
     /// Whether redo logging is currently enabled.
@@ -3680,11 +3843,13 @@ impl Database {
         self.redo_log.is_some()
     }
 
-    /// Record one committed mutation into the redo log. In auto-commit mode the
-    /// record is written through immediately; inside a (single-writer)
-    /// transaction it is buffered until [`commit`](Self::commit). No-op when the
-    /// redo log is disabled. Best-effort on the immediate-write path (an I/O
-    /// error there is swallowed so it never changes a mutation's `bool` result).
+    /// Record one applied mutation for the redo log. Inside a (single-writer)
+    /// transaction, or an auto-commit statement ([`redo_hold`](Self::redo_hold)),
+    /// it is buffered until the commit; a direct-API mutation is committed
+    /// as it is applied, so its record is appended now. No-op when the redo
+    /// log is disabled. A failed append cannot change a mutation's `bool`
+    /// result: its record is owed to the log (see
+    /// [`enable_redo_log`](Self::enable_redo_log)).
     fn record_redo(&mut self, op: u8, graph: Option<u32>, id: IdTriple) {
         if self.redo_log.is_none() {
             return;
@@ -3706,139 +3871,165 @@ impl Database {
             .and_then(|g| self.dict.term(g))
             .map(|g| strip_angle(&g).to_owned());
         self.redo_pending.push(RedoRec { op, graph, triple });
-        if self.txn.is_none() {
-            // Auto-commit: the mutation is already durable, so flush now.
-            let _ = self.flush_redo();
+        if self.txn.is_none() && !self.redo_hold {
+            let _ = self.flush_redo(false);
         }
     }
 
-    /// Flush buffered redo records to the redo log and clear the buffer.
-    fn flush_redo(&mut self) -> Result<()> {
-        if self.redo_pending.is_empty() {
+    /// Append the buffered redo records as one commit (`fdatasync`ed when
+    /// `sync`), after any commit still owed to the log.
+    fn flush_redo(&mut self, sync: bool) -> Result<()> {
+        let recs = std::mem::take(&mut self.redo_pending);
+        let Some(path) = self.redo_log.clone() else {
+            return Ok(());
+        };
+        let mut commit = Vec::new();
+        for (i, r) in recs.iter().enumerate() {
+            logs::frame_redo(
+                &mut commit,
+                r.op,
+                r.graph.as_deref(),
+                &r.triple,
+                i + 1 == recs.len(),
+            );
+        }
+        self.redo_writer_mut()
+            .append(&path, LogKind::Redo, &commit, sync)
+    }
+
+    /// The commit that just succeeded: append its redo records and its
+    /// statements' update-log records, each log in one `fdatasync`ed
+    /// append.
+    fn log_commit(&mut self) -> Result<()> {
+        let redo = self.flush_redo(true);
+        let update = self.flush_update_log(true);
+        redo.and(update)
+    }
+
+    /// The end of an auto-commit UPDATE request (`update`: its text and how
+    /// many triples it changed, `None` when it failed part-way), after its
+    /// commit point. Inside a transaction its update-log record waits for
+    /// the commit (its redo records already do). Outside one its records
+    /// are appended — unless the on-disk store is broken (its commit point
+    /// failed): then nothing since the last successful commit point is
+    /// known to be durable, and nothing is logged (as for a transaction
+    /// whose commit is not durable). Any other failed commit point (a
+    /// RocksDB write error reported there) left the request applied, so it
+    /// is logged.
+    fn end_statement_logs(&mut self, update: Option<(&str, usize)>) -> Result<()> {
+        self.redo_hold = false;
+        if self.redo_log.is_none() && self.update_log.is_none() {
             return Ok(());
         }
-        if let Some(path) = self.redo_log.clone() {
-            append_redo_log(&path, &self.redo_pending)?;
+        if let (Some((sparql, changed)), true) = (update, self.update_log.is_some()) {
+            self.update_pending.push(UpdateRec::now(sparql, changed));
         }
-        self.redo_pending.clear();
-        Ok(())
+        if self.txn.is_some() {
+            return Ok(());
+        }
+        if self.storage_failure().is_some() {
+            self.redo_pending.clear();
+            self.update_pending.clear();
+            return Ok(());
+        }
+        self.log_commit()
+    }
+
+    /// The commit point of the logs, for [`sync`](Self::sync): append what
+    /// is still owed to each enabled log and `fdatasync` it.
+    pub(super) fn sync_logs(&self) -> Result<()> {
+        let redo = match self.redo_log {
+            Some(_) => self.redo_writer_lock().flush(LogKind::Redo, true),
+            None => Ok(()),
+        };
+        let update = match self.update_log {
+            Some(_) => self.update_writer_lock().flush(LogKind::Update, true),
+            None => Ok(()),
+        };
+        redo.and(update)
+    }
+
+    fn redo_writer_mut(&mut self) -> &mut logs::LogWriter {
+        self.redo_writer
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn redo_writer_lock(&self) -> MutexGuard<'_, logs::LogWriter> {
+        self.redo_writer.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Re-apply every mutation recorded in a redo log `path` against this
     /// database, in order, returning the number of records applied. Replay onto a
     /// database in the same state the log began from reconstructs the final
     /// state. Redo logging is suspended during replay so the log is not rewritten.
+    ///
+    /// A commit is applied only once all of its records were read and
+    /// checked; a torn tail a crash left (an incomplete last commit) is
+    /// skipped. A damaged record anywhere else, an unknown op or a record
+    /// without its triple is an error (review gap-doc-claims#1, db#9).
     pub fn replay_redo_log<P: AsRef<Path>>(&mut self, path: P) -> Result<usize> {
         let data = fs::read(path)?;
         let saved = self.redo_log.take();
-        let result = self.apply_redo_records(&data);
+        let result = self.apply_redo_records(&data, true);
         self.redo_log = saved;
         result
     }
 
-    /// Parse and apply the length-prefixed records of a redo log buffer.
-    fn apply_redo_records(&mut self, bytes: &[u8]) -> Result<usize> {
-        let mut pos = 0usize;
+    /// Parse and apply the records of a redo log buffer, a commit at a time.
+    /// `torn_ok`: a torn tail is skipped (a live log after a crash) rather
+    /// than an error (an increment, which is a whole copy).
+    fn apply_redo_records(&mut self, bytes: &[u8], torn_ok: bool) -> Result<usize> {
         let mut applied = 0usize;
-        while pos < bytes.len() {
-            // Header line: `REDO <op> <graph_len> <triple_len>`.
-            let nl = bytes[pos..]
+        let walk = logs::walk(bytes, LogKind::Redo, false, |commit| {
+            // Every record of the commit is checked before any is applied.
+            let ops = commit
                 .iter()
-                .position(|&b| b == b'\n')
-                .map(|i| pos + i)
-                .ok_or_else(|| GStoreError::Database("truncated redo.log header".into()))?;
-            let header = std::str::from_utf8(&bytes[pos..nl])
-                .map_err(|_| GStoreError::Database("non-UTF-8 redo.log header".into()))?;
-            let mut it = header.split_whitespace();
-            if it.next() != Some("REDO") {
+                .map(parse_redo_record)
+                .collect::<Result<Vec<_>>>()?;
+            for op in ops {
+                self.apply_redo_op(op)?;
+                applied += 1;
+            }
+            Ok(())
+        })?;
+        if let Some((at, why)) = walk.torn {
+            if !torn_ok {
                 return Err(GStoreError::Database(format!(
-                    "malformed redo.log record header: {header:?}"
+                    "redo records end incomplete at byte {at} ({why})"
                 )));
             }
-            let op = it
-                .next()
-                .and_then(|s| s.chars().next())
-                .ok_or_else(|| GStoreError::Database("missing op in redo.log record".into()))?;
-            let glen: usize = it
-                .next()
-                .and_then(|s| s.parse().ok())
-                .ok_or_else(|| GStoreError::Database("missing graph length in redo.log".into()))?;
-            let tlen: usize = it
-                .next()
-                .and_then(|s| s.parse().ok())
-                .ok_or_else(|| GStoreError::Database("missing triple length in redo.log".into()))?;
-            let named = it.next() == Some("G");
-            let gstart = nl + 1;
-            let gend = gstart + glen;
-            let tend = gend + tlen;
-            if tend > bytes.len() {
-                return Err(GStoreError::Database("truncated redo.log body".into()));
-            }
-            let graph = std::str::from_utf8(&bytes[gstart..gend])
-                .map_err(|_| GStoreError::Database("non-UTF-8 redo.log graph".into()))?;
-            let triple_str = std::str::from_utf8(&bytes[gend..tend])
-                .map_err(|_| GStoreError::Database("non-UTF-8 redo.log triple".into()))?;
-            // A named-graph record is flagged `G`; without the flag (a log
-            // written before it existed) a non-empty graph is named.
-            let graph_opt = if named || !graph.is_empty() {
-                Some(graph)
-            } else {
-                None
-            };
-            match op {
-                // CLEAR / DROP (and the clears of MOVE / COPY).
-                'C' => {
-                    match graph_opt {
-                        None => {
-                            self.clear_default()?;
-                        }
-                        Some(g) => {
-                            self.clear_named(g);
-                        }
-                    }
-                    self.flush_reclaim();
-                    applied += 1;
-                    pos = (tend + 1).min(bytes.len());
-                    continue;
-                }
-                'N' => {
-                    self.clear_all_named();
-                    self.flush_reclaim();
-                    applied += 1;
-                    pos = (tend + 1).min(bytes.len());
-                    continue;
-                }
-                _ => {}
-            }
-            // The record names stored terms (verbatim blank labels), in
-            // `record_key` form: read with the matching parser, so a term
-            // the strict N-Triples reader refuses (a language tag `zh_CN`,
-            // a label holding a space) replays as itself (review parser#1).
-            // A record of another shape is read as N-Triples, as before.
-            let triples = match crate::model::term::parse_record_triple(triple_str) {
-                Some(t) => vec![t],
-                None => crate::parser::ntriples::parse_str(triple_str)?,
-            };
-            for t in triples {
-                match op {
-                    'I' => {
-                        self.insert_quad(&t, graph_opt)?;
-                    }
-                    'D' => {
-                        self.delete_quad(&t, graph_opt);
-                    }
-                    other => {
-                        return Err(GStoreError::Database(format!(
-                            "unknown redo.log op '{other}'"
-                        )))
-                    }
-                }
-            }
-            self.flush_reclaim();
-            applied += 1;
-            pos = (tend + 1).min(bytes.len());
+            crate::gs_warn!("redo.log: skipping a torn tail at byte {at} ({why})");
         }
         Ok(applied)
+    }
+
+    /// Apply one checked redo record.
+    fn apply_redo_op(&mut self, op: RedoOp<'_>) -> Result<()> {
+        match op {
+            RedoOp::Insert(graph, triples) => {
+                for t in triples {
+                    self.insert_quad(&t, graph)?;
+                }
+            }
+            RedoOp::Delete(graph, triples) => {
+                for t in triples {
+                    self.delete_quad(&t, graph);
+                }
+            }
+            // CLEAR / DROP (and the clears of MOVE / COPY).
+            RedoOp::Clear(None) => {
+                self.clear_default()?;
+            }
+            RedoOp::Clear(Some(g)) => {
+                self.clear_named(g);
+            }
+            RedoOp::ClearNamed => {
+                self.clear_all_named();
+            }
+        }
+        self.flush_reclaim();
+        Ok(())
     }
 
     // (Id reclamation lives in the `reclaim` module.)
@@ -4571,50 +4762,77 @@ impl BuildAccumulator {
     }
 }
 
-/// Append one UPDATE statement to the update log as a length-prefixed record:
-/// `REC <unix_millis> <changed> <byte_len>\n<sparql bytes>\n`. The length prefix
-/// makes the body opaque, so a statement may contain any bytes (including the
-/// record-delimiter text) without corrupting the log.
-fn append_update_log(path: &Path, sparql: &str, changed: usize) -> Result<()> {
-    let mut f = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    writeln!(f, "REC {millis} {changed} {}", sparql.len())?;
-    f.write_all(sparql.as_bytes())?;
-    f.write_all(b"\n")?;
-    Ok(())
+/// One checked redo record (see [`parse_redo_record`]); the graph is a
+/// named graph's IRI, `None` the default graph.
+enum RedoOp<'a> {
+    Insert(Option<&'a str>, Vec<Triple>),
+    Delete(Option<&'a str>, Vec<Triple>),
+    /// `CLEAR` of the default graph (`None`) or of one named graph.
+    Clear(Option<&'a str>),
+    /// `CLEAR NAMED`.
+    ClearNamed,
 }
 
-/// Append redo records to the redo log. Each record is length-prefixed:
-/// `REDO <op> <graph_len> <triple_len>[ G]\n<graph bytes><triple bytes>\n`,
-/// `G` marking a named-graph record (so a graph whose IRI is empty is not
-/// taken for the default graph). The lengths make the graph/triple bodies
-/// opaque, so they may hold any bytes.
-fn append_redo_log(path: &Path, recs: &[RedoRec]) -> Result<()> {
-    let mut f = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    for r in recs {
-        let g = r.graph.as_deref().unwrap_or("");
-        let flag = if r.graph.is_some() { " G" } else { "" };
-        writeln!(
-            f,
-            "REDO {} {} {}{flag}",
-            r.op as char,
-            g.len(),
-            r.triple.len()
-        )?;
-        f.write_all(g.as_bytes())?;
-        f.write_all(r.triple.as_bytes())?;
-        f.write_all(b"\n")?;
+/// Check a redo record and read its op: `I` / `D` with at least one triple,
+/// `C` / `N` with the empty body of the clears written before
+/// [`CLEAR_BODY`] or that body (`N` without a graph). Any other op is
+/// refused before its body is read — a record a later version adds must
+/// not replay as nothing (review gap-doc-claims#1).
+fn parse_redo_record<'a>(r: &logs::Record<'a>) -> Result<RedoOp<'a>> {
+    let at = r.start;
+    let op = r.fields.first().copied().unwrap_or("");
+    if !matches!(op, "I" | "D" | "C" | "N") {
+        return Err(GStoreError::Database(format!(
+            "unknown redo.log op '{op}' at byte {at}"
+        )));
     }
-    Ok(())
+    let glen: usize = r.fields.get(1).and_then(|f| f.parse().ok()).unwrap_or(0);
+    let named = r.fields.get(3) == Some(&"G");
+    let (graph, triple) = r.body.split_at(glen.min(r.body.len()));
+    let text = |b: &'a [u8], what: &str| {
+        std::str::from_utf8(b).map_err(|_| {
+            GStoreError::Database(format!("redo.log record at byte {at}: non-UTF-8 {what}"))
+        })
+    };
+    let (graph, triple) = (text(graph, "graph")?, text(triple, "triple")?);
+    // A named-graph record is flagged `G`; without the flag (a log
+    // written before it existed) a non-empty graph is named.
+    let graph = (named || !graph.is_empty()).then_some(graph);
+    match op {
+        "C" | "N" => {
+            if !(triple.is_empty() || triple == CLEAR_BODY) || (op == "N" && graph.is_some()) {
+                return Err(GStoreError::Database(format!(
+                    "malformed redo.log clear record at byte {at}"
+                )));
+            }
+            Ok(if op == "C" {
+                RedoOp::Clear(graph)
+            } else {
+                RedoOp::ClearNamed
+            })
+        }
+        _ => {
+            // The record names stored terms (verbatim blank labels), in
+            // `record_key` form: read with the matching parser, so a term
+            // the strict N-Triples reader refuses (a language tag `zh_CN`,
+            // a label holding a space) replays as itself (review parser#1).
+            // A record of another shape is read as N-Triples, as before.
+            let triples = match crate::model::term::parse_record_triple(triple) {
+                Some(t) => vec![t],
+                None => crate::parser::ntriples::parse_str(triple)?,
+            };
+            if triples.is_empty() {
+                return Err(GStoreError::Database(format!(
+                    "redo.log {op} record at byte {at} names no triple"
+                )));
+            }
+            Ok(if op == "I" {
+                RedoOp::Insert(graph, triples)
+            } else {
+                RedoOp::Delete(graph, triples)
+            })
+        }
+    }
 }
 
 /// Parse `key <u64>` out of a simple `MAGIC 1\n<key> <value>\n…` marker text,
