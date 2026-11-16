@@ -549,10 +549,10 @@ impl Database {
     /// released. Fails when another process holds `dir`.
     pub fn hold_dir_lock<P: AsRef<Path>>(&mut self, dir: P) -> Result<()> {
         let dir = dir.as_ref();
-        if let (Some(held), Ok(canonical)) = (&self.dir_lock, fs::canonicalize(dir)) {
-            if held.dir() == canonical {
-                return Ok(());
-            }
+        // The file `<dir>/LOCK` names now, not the path the lock was taken
+        // under: a directory moved away is not `dir` any more (review db#10).
+        if self.dir_lock.as_ref().is_some_and(|held| held.holds(dir)) {
+            return Ok(());
         }
         self.dir_lock = Some(super::dirlock::DirLock::acquire(dir)?);
         Ok(())

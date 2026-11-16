@@ -15,14 +15,23 @@
 //! that one, which is why a bulk build also checks it).
 //!
 //! **The rule within one process.** The lock excludes *other processes*. Within
-//! a process the lock is reference-counted per (canonical) directory: opening
-//! a directory this process already holds succeeds and shares the lock, which
-//! is released when the last holder is dropped. Code that opens the same
-//! database twice in one process (tests do, and the server reopens a database
-//! after a restore) therefore keeps working; keeping two *writers* of one
-//! directory apart inside a process is the caller's job — the HTTP server does
-//! it with its registry of loaded databases and its per-name lifecycle
-//! reservations.
+//! a process the lock is reference-counted per locked file: opening a
+//! directory whose `LOCK` file this process already holds succeeds and shares
+//! the lock, which is released when the last holder is dropped. Code that
+//! opens the same database twice in one process (tests do, and the server
+//! reopens a database after a restore) therefore keeps working; keeping two
+//! *writers* of one directory apart inside a process is the caller's job — the
+//! HTTP server does it with its registry of loaded databases and its per-name
+//! lifecycle reservations.
+//!
+//! **Which file is locked.** The registry is keyed by the identity of the
+//! locked `LOCK` file — its (device, inode) on Unix — not by the directory's
+//! path: a restore or an `/api` rename moves a locked directory (its `LOCK`
+//! file with it), and a new directory at the old path has a `LOCK` file of
+//! its own, which a later [`DirLock::acquire`] locks afresh instead of
+//! sharing the entry of the file that moved away (review db#10). (Off Unix,
+//! where the standard library gives no file identity, the key is the
+//! canonical directory path, as before.)
 //!
 //! On a file system without advisory-lock support the lock is skipped (the
 //! database still opens): exclusion is a safety net, never a reason to refuse
@@ -39,16 +48,68 @@ use crate::error::{GStoreError, Result};
 /// The lock file inside a database directory.
 pub const LOCK_FILE: &str = "LOCK";
 
-/// A lock this process holds, shared by every [`DirLock`] on the directory.
+/// A lock this process holds, shared by every [`SideLock`] on the file.
 struct Held {
     /// The locked file (`None` where the file system has no advisory locks).
     file: Option<File>,
     holders: usize,
 }
 
-/// The directories this process holds, by canonical path.
-fn registry() -> &'static Mutex<HashMap<PathBuf, Held>> {
-    static REG: OnceLock<Mutex<HashMap<PathBuf, Held>>> = OnceLock::new();
+/// The identity of a directory's `LOCK` file: its (device, inode) on Unix —
+/// stable while the directory is renamed, distinct from the `LOCK` file of a
+/// new directory at the old path — and the canonical directory path
+/// elsewhere, where the standard library gives no file identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct LockKey(#[cfg(unix)] (u64, u64), #[cfg(not(unix))] PathBuf);
+
+/// The key of the open lock file `file` of canonical directory `dir`.
+fn key_of(file: &File, dir: &Path) -> io::Result<LockKey> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _ = dir;
+        let meta = file.metadata()?;
+        Ok(LockKey((meta.dev(), meta.ino())))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        Ok(LockKey(dir.to_path_buf()))
+    }
+}
+
+/// The key of the file `<dir>/LOCK` names now (canonical `dir`), without
+/// opening or creating it; `None` when there is none.
+fn key_at(dir: &Path) -> Option<LockKey> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::metadata(dir.join(LOCK_FILE)).ok()?;
+        Some(LockKey((meta.dev(), meta.ino())))
+    }
+    #[cfg(not(unix))]
+    {
+        Some(LockKey(dir.to_path_buf()))
+    }
+}
+
+/// A directory lock this process holds, shared by every [`DirLock`] on the
+/// same `LOCK` file.
+struct DirHeld {
+    /// The lock file, kept open for as long as the lock is held (also where
+    /// the file system has no advisory locks: an open file keeps its inode,
+    /// so no other file can take over its key meanwhile).
+    file: File,
+    /// Whether `file` is locked (`false` where the file system has no
+    /// advisory locks).
+    locked: bool,
+    holders: usize,
+}
+
+/// The directory locks this process holds, by the identity of the locked
+/// `LOCK` file (see the module docs).
+fn registry() -> &'static Mutex<HashMap<LockKey, DirHeld>> {
+    static REG: OnceLock<Mutex<HashMap<LockKey, DirHeld>>> = OnceLock::new();
     REG.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -56,15 +117,19 @@ fn registry() -> &'static Mutex<HashMap<PathBuf, Held>> {
 /// docs. Released when dropped.
 #[derive(Debug)]
 pub struct DirLock {
-    /// The canonical directory.
+    /// The canonical directory, as it was named when the lock was taken.
     dir: PathBuf,
+    /// The locked file's registry key.
+    key: LockKey,
 }
 
 impl DirLock {
     /// Lock directory `dir` (which must exist) for this process: shares the
-    /// lock when this process already holds it, else takes `<dir>/LOCK`
-    /// exclusively — failing with a [`GStoreError::Database`] that names the
-    /// holder when another process has it.
+    /// lock when this process already holds the file `<dir>/LOCK` names (not
+    /// merely a lock taken under the same path: see the module docs), else
+    /// takes `<dir>/LOCK` exclusively — failing with a
+    /// [`GStoreError::Database`] that names the holder when another process
+    /// has it.
     pub fn acquire(dir: &Path) -> Result<DirLock> {
         let canonical = fs::canonicalize(dir).map_err(|e| {
             GStoreError::Database(format!(
@@ -72,47 +137,76 @@ impl DirLock {
                 dir.display()
             ))
         })?;
-        let mut reg = registry().lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(held) = reg.get_mut(&canonical) {
-            held.holders += 1;
-            return Ok(DirLock { dir: canonical });
-        }
         let path = canonical.join(LOCK_FILE);
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)?;
-        let file = match file.try_lock() {
-            Ok(()) => {
-                // Record the holder for the error message of a later contender
-                // (best effort: the lock, not the content, is what excludes).
-                let _ = record_pid(&mut file);
-                Some(file)
+        let mut reg = registry().lock().unwrap_or_else(PoisonError::into_inner);
+        // A few rounds: another process's restore or rename may move the
+        // directory (its lock file with it) between our open and our lock.
+        for _ in 0..8 {
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)?;
+            let key = key_of(&file, &canonical)?;
+            if let Some(held) = reg.get_mut(&key) {
+                // This process holds the very file `<dir>/LOCK` names: share
+                // it. (Dropping the probe descriptor keeps the lock: an
+                // advisory file lock belongs to the descriptor that took it.)
+                held.holders += 1;
+                return Ok(DirLock {
+                    dir: canonical,
+                    key,
+                });
             }
-            Err(TryLockError::WouldBlock) => {
-                let holder = read_pid(&mut file)
-                    .map(|pid| format!(" (pid {pid})"))
-                    .unwrap_or_default();
-                return Err(GStoreError::Database(format!(
-                    "database directory '{}' is locked by another process{holder}: a gserver or \
-                     another gStore tool has it open; stop it (or unload the database there) \
-                     and retry",
-                    dir.display()
-                )));
-            }
-            // No advisory locks on this file system: open without one.
-            Err(TryLockError::Error(e)) if e.kind() == io::ErrorKind::Unsupported => None,
-            Err(TryLockError::Error(e)) => {
-                return Err(GStoreError::Database(format!(
-                    "cannot lock database directory '{}': {e}",
-                    dir.display()
-                )))
-            }
-        };
-        reg.insert(canonical.clone(), Held { file, holders: 1 });
-        Ok(DirLock { dir: canonical })
+            let locked = match file.try_lock() {
+                // Moved away (or replaced) since the open: start over on the
+                // file the path names now.
+                Ok(()) if !still_named_by(&file, &path) => continue,
+                Ok(()) => {
+                    // Record the holder for the error message of a later
+                    // contender (best effort: the lock, not the content, is
+                    // what excludes).
+                    let _ = record_pid(&mut file);
+                    true
+                }
+                Err(TryLockError::WouldBlock) => {
+                    let holder = read_pid(&mut file)
+                        .map(|pid| format!(" (pid {pid})"))
+                        .unwrap_or_default();
+                    return Err(GStoreError::Database(format!(
+                        "database directory '{}' is locked by another process{holder}: a gserver or \
+                         another gStore tool has it open; stop it (or unload the database there) \
+                         and retry",
+                        dir.display()
+                    )));
+                }
+                // No advisory locks on this file system: open without one.
+                Err(TryLockError::Error(e)) if e.kind() == io::ErrorKind::Unsupported => false,
+                Err(TryLockError::Error(e)) => {
+                    return Err(GStoreError::Database(format!(
+                        "cannot lock database directory '{}': {e}",
+                        dir.display()
+                    )))
+                }
+            };
+            reg.insert(
+                key.clone(),
+                DirHeld {
+                    file,
+                    locked,
+                    holders: 1,
+                },
+            );
+            return Ok(DirLock {
+                dir: canonical,
+                key,
+            });
+        }
+        Err(GStoreError::Database(format!(
+            "cannot lock database directory '{}': its lock file keeps being replaced",
+            dir.display()
+        )))
     }
 
     /// Lock `dir` like [`acquire`](Self::acquire) when it is a directory;
@@ -129,27 +223,42 @@ impl DirLock {
         }
     }
 
-    /// The canonical directory this lock holds.
+    /// The canonical directory this lock was taken on (where its `LOCK` file
+    /// was then; see [`holds`](Self::holds) for where it is now).
     pub fn dir(&self) -> &Path {
         &self.dir
     }
 
-    /// Whether this process holds a lock on `dir`.
+    /// Whether this lock is on the file `<dir>/LOCK` names now — `false`
+    /// once the locked directory was moved away (renamed, swapped out by a
+    /// restore) and `dir` is another directory.
+    pub fn holds(&self, dir: &Path) -> bool {
+        fs::canonicalize(dir)
+            .ok()
+            .and_then(|canonical| key_at(&canonical))
+            .is_some_and(|key| key == self.key)
+    }
+
+    /// Whether this process holds a lock on `dir` (on the file `<dir>/LOCK`
+    /// names now).
     pub fn held_here(dir: &Path) -> bool {
-        let Ok(canonical) = fs::canonicalize(dir) else {
+        let Some(key) = fs::canonicalize(dir)
+            .ok()
+            .and_then(|canonical| key_at(&canonical))
+        else {
             return false;
         };
         registry()
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .contains_key(&canonical)
+            .contains_key(&key)
     }
 }
 
 impl Drop for DirLock {
     fn drop(&mut self) {
         let mut reg = registry().lock().unwrap_or_else(PoisonError::into_inner);
-        let last = match reg.get_mut(&self.dir) {
+        let last = match reg.get_mut(&self.key) {
             Some(held) => {
                 held.holders = held.holders.saturating_sub(1);
                 held.holders == 0
@@ -157,13 +266,12 @@ impl Drop for DirLock {
             None => false,
         };
         if last {
-            if let Some(Held {
-                file: Some(file), ..
-            }) = reg.remove(&self.dir)
-            {
+            if let Some(held) = reg.remove(&self.key) {
                 // Closing the file releases the lock too; unlock explicitly so
                 // it is gone before anyone can observe the registry change.
-                let _ = file.unlock();
+                if held.locked {
+                    let _ = held.file.unlock();
+                }
             }
         }
     }
