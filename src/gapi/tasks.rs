@@ -69,10 +69,16 @@
 //! synchronous request would have answered, plus its `opt_id` — is POSTed
 //! there as `application/json` (upstream `HttpUtil::Post`; upstream's
 //! payloads carry the `opt_id` for most operations, here all do). Delivery
-//! happens on the runner thread after the task already reads as finished,
-//! bounded by [`TaskConfig::callback_timeout`], one attempt by default as
-//! upstream ([`TaskConfig::callback_retries`]); its outcome is recorded
-//! ([`TaskInfo::callback_status`]) and never changes the task's state. The
+//! happens after the task already reads as finished, on the manager's own
+//! callback threads (at most [`TaskConfig::callback_workers`], fed by a
+//! queue of at most [`TaskConfig::max_pending`] deliveries) — never on a
+//! runner, so a slow or unresponsive callback host holds a callback thread,
+//! not the runners every user's asynchronous operations need (review
+//! gapi#12). Each delivery is bounded by [`TaskConfig::callback_timeout`]
+//! (name resolution, connect, TLS handshake, send and receive), one attempt
+//! by default as upstream ([`TaskConfig::callback_retries`]); its outcome is
+//! recorded ([`TaskInfo::callback_status`]) and never changes the task's
+//! state. The
 //! URL must be `http://…` (`https://…` with the `tls` feature) and is checked
 //! before the operation is accepted. As upstream, the server POSTs wherever
 //! the (authenticated, privileged) caller says — except to a host-local
@@ -177,9 +183,18 @@ pub struct TaskConfig {
     /// operations after cancelling them.
     pub shutdown_wait: Duration,
     /// A finished asynchronous result larger than this (serialized, bytes)
-    /// is written to the export directory instead of kept in memory
-    /// (`query` results always are, like upstream).
+    /// is written to the server's private task directory, `<root>/tasks`,
+    /// instead of kept in memory (`query` results always are). Upstream
+    /// writes them to its export directory; here they must not go there:
+    /// anyone allowed to download from it could read another user's result,
+    /// while `<root>/tasks` is read only by `checkOperationState`, which
+    /// checks the task's owner (review sec#21).
     pub spill_threshold: usize,
+    /// Threads delivering callbacks (at least 1), separate from the runners
+    /// (review gapi#12); further deliveries wait in a queue of at most
+    /// [`max_pending`](Self::max_pending), beyond which one is recorded as
+    /// failed without being attempted.
+    pub callback_workers: usize,
 }
 
 impl Default for TaskConfig {
@@ -197,6 +212,7 @@ impl Default for TaskConfig {
             cancel_wait: Duration::from_secs(3),
             shutdown_wait: Duration::from_secs(5),
             spill_threshold: 256 * 1024,
+            callback_workers: 2,
         }
     }
 }
@@ -427,9 +443,14 @@ struct Inner {
     queue: VecDeque<Job>,
     /// Live runner threads.
     workers: usize,
-    /// Asynchronous operations taken off the queue and not yet done
-    /// (callback delivery included).
+    /// Asynchronous operations taken off the queue and not yet done.
     active: usize,
+    /// Callbacks waiting for a callback thread.
+    callbacks: VecDeque<Delivery>,
+    /// Live callback threads.
+    callback_workers: usize,
+    /// Callbacks being delivered.
+    delivering: usize,
     closed: bool,
     last_ms: u64,
     seq: u64,
@@ -453,6 +474,13 @@ struct Job {
     on_finish: Option<FinishHook>,
 }
 
+/// A finished operation's callback, waiting for a callback thread.
+struct Delivery {
+    id: u64,
+    url: String,
+    body: Vec<u8>,
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -467,6 +495,14 @@ fn clip(s: &str, max: usize) -> String {
 }
 
 impl Inner {
+    /// No operation queued or running, no callback waiting or in delivery.
+    fn idle(&self) -> bool {
+        self.queue.is_empty()
+            && self.active == 0
+            && self.callbacks.is_empty()
+            && self.delivering == 0
+    }
+
     /// The next `opt_id` (see the module docs): strictly increasing, also
     /// when the clock steps back or a millisecond's 4096 sequence numbers
     /// run out (the timestamp part then runs ahead of the clock).
@@ -660,6 +696,9 @@ impl TaskManager {
                     queue: VecDeque::new(),
                     workers: 0,
                     active: 0,
+                    callbacks: VecDeque::new(),
+                    callback_workers: 0,
+                    delivering: 0,
                     closed: false,
                     last_ms: 0,
                     seq: 0,
@@ -801,8 +840,12 @@ impl TaskManager {
         remove_files(files);
         if spawn {
             let shared = Arc::clone(&self.shared);
+            // The stack of the HTTP workers: an operation parses and
+            // evaluates here what a synchronous request does on a worker
+            // (review design#8).
             let started = std::thread::Builder::new()
                 .name("gstore-task".to_string())
+                .stack_size(crate::server::WORKER_STACK_SIZE)
                 .spawn(move || runner(shared));
             if let Err(e) = started {
                 let mut st = self.shared.lock();
@@ -929,10 +972,10 @@ impl TaskManager {
         self.shared.lock().closed
     }
 
-    /// Whether no asynchronous operation is queued or running.
+    /// Whether no asynchronous operation is queued or running (callback
+    /// deliveries included).
     pub fn async_idle(&self) -> bool {
-        let st = self.shared.lock();
-        st.queue.is_empty() && st.active == 0
+        self.shared.lock().idle()
     }
 
     /// Wait up to `timeout` until no asynchronous operation is queued or
@@ -941,7 +984,7 @@ impl TaskManager {
         let deadline = Instant::now() + timeout;
         let mut st = self.shared.lock();
         loop {
-            if st.queue.is_empty() && st.active == 0 {
+            if st.idle() {
                 return true;
             }
             let now = Instant::now();
@@ -958,26 +1001,221 @@ impl TaskManager {
     }
 }
 
+/// The bookkeeping of a runner or callback thread, kept right if the thread
+/// unwinds (review gapi#20): only the operation itself runs under
+/// `catch_unwind`, so a panic in what follows it — the result's
+/// serialization and spill, the finish hook, a callback delivery — would
+/// otherwise leave a runner counted that no longer exists (after `workers`
+/// of them no runner would ever start again) and an operation counted as
+/// running (`wait_async_idle` waiting out its whole timeout).
+struct ThreadSlot {
+    shared: Arc<Shared>,
+    /// Which pool the thread belongs to.
+    callbacks: bool,
+    /// The operation (or delivery) in progress, if any.
+    busy: Option<u64>,
+    /// The thread left its pool normally (its count already taken back).
+    left: bool,
+}
+
+impl ThreadSlot {
+    fn new(shared: Arc<Shared>, callbacks: bool) -> ThreadSlot {
+        ThreadSlot {
+            shared,
+            callbacks,
+            busy: None,
+            left: false,
+        }
+    }
+}
+
+impl Drop for ThreadSlot {
+    fn drop(&mut self) {
+        if self.left && self.busy.is_none() {
+            return;
+        }
+        // Unwinding: give back what the thread held, and end an operation
+        // the panic interrupted before its outcome was recorded.
+        let mut st = self.shared.lock();
+        if let Some(id) = self.busy {
+            if self.callbacks {
+                st.delivering -= 1;
+            } else {
+                st.active -= 1;
+                let running = st
+                    .tasks
+                    .get(&id)
+                    .is_some_and(|r| r.info.state == TaskState::Running);
+                if running {
+                    if let Some(r) = st.tasks.get_mut(&id) {
+                        r.info.status_code = Some(Status::OperationFailed.code());
+                        r.info.status_msg =
+                            "internal server error: the operation's runner panicked".to_string();
+                    }
+                    st.end(id, TaskState::Failed);
+                }
+            }
+        }
+        // A thread that dies is replaced if work is waiting (a submission
+        // made while it was dying counted it as alive and started none).
+        let mut respawn = false;
+        if !self.left {
+            if self.callbacks {
+                st.callback_workers -= 1;
+                respawn = !st.callbacks.is_empty();
+                if respawn {
+                    st.callback_workers += 1;
+                }
+            } else {
+                st.workers -= 1;
+                respawn = !st.queue.is_empty();
+                if respawn {
+                    st.workers += 1;
+                }
+            }
+        }
+        drop(st);
+        if respawn {
+            let shared = Arc::clone(&self.shared);
+            let callbacks = self.callbacks;
+            let started = std::thread::Builder::new()
+                .name(
+                    if callbacks {
+                        "gstore-callback"
+                    } else {
+                        "gstore-task"
+                    }
+                    .to_string(),
+                )
+                .stack_size(crate::server::WORKER_STACK_SIZE)
+                .spawn(move || {
+                    if callbacks {
+                        callback_runner(shared)
+                    } else {
+                        runner(shared)
+                    }
+                });
+            if started.is_err() {
+                let mut st = self.shared.lock();
+                if callbacks {
+                    st.callback_workers -= 1;
+                } else {
+                    st.workers -= 1;
+                }
+            }
+        }
+        self.shared.changed.notify_all();
+    }
+}
+
 /// A runner thread: run queued operations until the queue is empty.
 fn runner(shared: Arc<Shared>) {
+    let mut slot = ThreadSlot::new(shared, false);
     loop {
         let job = {
-            let mut st = shared.lock();
+            let mut st = slot.shared.lock();
             match st.queue.pop_front() {
                 Some(job) => {
                     st.active += 1;
                     job
                 }
                 None => {
+                    // Leaving under the same lock that found the queue
+                    // empty: a submission now sees one runner fewer and
+                    // starts another.
                     st.workers -= 1;
+                    slot.left = true;
                     drop(st);
-                    shared.changed.notify_all();
+                    slot.shared.changed.notify_all();
                     return;
                 }
             }
         };
-        run_job(&shared, job);
-        shared.lock().active -= 1;
+        slot.busy = Some(job.id);
+        run_job(&slot.shared, job);
+        slot.busy = None;
+        slot.shared.lock().active -= 1;
+        slot.shared.changed.notify_all();
+    }
+}
+
+/// A callback thread: deliver queued callbacks until the queue is empty.
+fn callback_runner(shared: Arc<Shared>) {
+    let mut slot = ThreadSlot::new(shared, true);
+    loop {
+        let (delivery, config) = {
+            let mut st = slot.shared.lock();
+            match st.callbacks.pop_front() {
+                Some(d) => {
+                    st.delivering += 1;
+                    (d, st.config.clone())
+                }
+                None => {
+                    st.callback_workers -= 1;
+                    slot.left = true;
+                    drop(st);
+                    slot.shared.changed.notify_all();
+                    return;
+                }
+            }
+        };
+        slot.busy = Some(delivery.id);
+        let outcome = deliver_callback(&delivery.url, &delivery.body, &config);
+        slot.busy = None;
+        let mut st = slot.shared.lock();
+        st.delivering -= 1;
+        if let Some(r) = st.tasks.get_mut(&delivery.id) {
+            r.info.callback_status = Some(outcome);
+        }
+        drop(st);
+        slot.shared.changed.notify_all();
+    }
+}
+
+/// Queue `delivery` for a callback thread (starting one if fewer than
+/// [`TaskConfig::callback_workers`] run). A full queue records the callback
+/// as failed without attempting it.
+fn queue_callback(shared: &Arc<Shared>, delivery: Delivery) {
+    let spawn = {
+        let mut st = shared.lock();
+        let max = st.config.max_pending.max(1);
+        if st.callbacks.len() >= max {
+            if let Some(r) = st.tasks.get_mut(&delivery.id) {
+                r.info.callback_status = Some(format!(
+                    "failed: too many callbacks are waiting for delivery (at most {max})"
+                ));
+            }
+            return;
+        }
+        st.callbacks.push_back(delivery);
+        let spawn = st.callback_workers < st.config.callback_workers.max(1);
+        if spawn {
+            st.callback_workers += 1;
+        }
+        spawn
+    };
+    if !spawn {
+        return;
+    }
+    let shared2 = Arc::clone(shared);
+    let started = std::thread::Builder::new()
+        .name("gstore-callback".to_string())
+        .stack_size(crate::server::WORKER_STACK_SIZE)
+        .spawn(move || callback_runner(shared2));
+    if let Err(e) = started {
+        let mut st = shared.lock();
+        st.callback_workers -= 1;
+        if st.callback_workers == 0 {
+            // Nobody would deliver them: record them as failed.
+            let stranded: Vec<Delivery> = st.callbacks.drain(..).collect();
+            for d in stranded {
+                if let Some(r) = st.tasks.get_mut(&d.id) {
+                    r.info.callback_status =
+                        Some(format!("failed: cannot start a callback thread: {e}"));
+                }
+            }
+        }
+        drop(st);
         shared.changed.notify_all();
     }
 }
@@ -1071,7 +1309,7 @@ fn run_job(shared: &Arc<Shared>, job: Job) {
         }
         _ => TaskResult::Json(envelope),
     };
-    let (config, info) = {
+    let info = {
         let mut st = shared.lock();
         let cancelled = job.cancel.load(Ordering::Relaxed);
         if let Some(r) = st.tasks.get_mut(&job.id) {
@@ -1096,22 +1334,35 @@ fn run_job(shared: &Arc<Shared>, job: Job) {
         // Taken before the prune, which may already retire it.
         let info = st.tasks.get(&job.id).map(Inner::snapshot);
         let files = st.prune();
-        let config = st.config.clone();
         drop(st);
         remove_files(files);
-        (config, info)
+        info
     };
     if let (Some(hook), Some(info)) = (job.on_finish, info) {
         let _ = catch_unwind(AssertUnwindSafe(|| hook(&info)));
     }
     shared.changed.notify_all();
+    #[cfg(test)]
+    if job.operation == PANIC_AFTER_JOB {
+        panic!("test-triggered panic outside the operation's catch_unwind");
+    }
+    // Delivered by a callback thread, not this runner (review gapi#12).
     if let Some(url) = job.callback {
-        let outcome = deliver_callback(&url, text.as_bytes(), &config);
-        if let Some(r) = shared.lock().tasks.get_mut(&job.id) {
-            r.info.callback_status = Some(outcome);
-        }
+        queue_callback(
+            shared,
+            Delivery {
+                id: job.id,
+                url,
+                body: text.into_bytes(),
+            },
+        );
     }
 }
+
+/// The operation name that makes [`run_job`] panic after the operation ran
+/// (outside its `catch_unwind`), for the unwind-guard test.
+#[cfg(test)]
+const PANIC_AFTER_JOB: &str = "__test_panic_after_job__";
 
 /// POST a finished operation's result to its callback URL (upstream
 /// `HttpUtil::Post` with `Content-Type: application/json`); returns the
@@ -1299,6 +1550,36 @@ mod tests {
 
     fn wait_state(m: &TaskManager, id: u64) -> TaskState {
         m.wait_finished(id, Duration::from_secs(10)).unwrap()
+    }
+
+    /// review gapi#20: a panic in a runner outside the operation's
+    /// `catch_unwind` gives its runner slot back, so the next operation
+    /// still gets a runner (with one runner configured, it would otherwise
+    /// never run) and the manager becomes idle again.
+    #[test]
+    fn a_runner_that_panics_outside_the_operation_gives_its_slot_back() {
+        let m = TaskManager::new(TaskConfig {
+            workers: 1,
+            ..TaskConfig::default()
+        });
+        let spec = |op: &str| TaskSpec {
+            operation: op.to_string(),
+            ..TaskSpec::default()
+        };
+        let ok = || -> TaskJob { Box::new(|_| Json::obj().with("StatusCode", 0)) };
+        let doomed = m.submit(spec(PANIC_AFTER_JOB), ok()).unwrap();
+        let guard = Duration::from_secs(60);
+        assert_eq!(m.wait_finished(doomed, guard), Some(TaskState::Succeeded));
+        let next = m.submit(spec("next"), ok()).unwrap();
+        assert_eq!(
+            m.wait_finished(next, guard),
+            Some(TaskState::Succeeded),
+            "a runner was started for the next operation"
+        );
+        assert!(
+            m.wait_async_idle(guard),
+            "nothing is left counted as running"
+        );
     }
 
     #[test]

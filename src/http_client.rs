@@ -19,7 +19,7 @@
 //! and redirects are out of scope. Every exchange is bounded by [`Limits`].
 
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -516,7 +516,7 @@ fn exchange(
     };
     let mut stream = None;
     let mut last_err = io::Error::new(io::ErrorKind::NotFound, "endpoint host did not resolve");
-    for addr in (target.host.as_str(), target.port).to_socket_addrs()? {
+    for addr in resolve_within(&target.host, target.port, remaining()?, what)? {
         if refuse_local && is_local_addr(&addr.ip()) {
             last_err = io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -545,7 +545,15 @@ fn exchange(
         #[cfg(feature = "tls")]
         {
             let mut tls = tls_client::connect(stream, &target.host, ca_file)?;
-            tls.write_all(request)?;
+            // The handshake reads the peer inside the first write: bound it
+            // by the deadline too, or a peer that accepts the connection and
+            // never answers the ClientHello holds the caller for good
+            // (review gapi#12).
+            arm()?;
+            tls.write_all(request).map_err(|e| match e.kind() {
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => timed_out(),
+                _ => e,
+            })?;
             tls.flush()?;
             return read_to_eof(&mut tls, &arm, limits, &timed_out, what);
         }
@@ -561,6 +569,41 @@ fn exchange(
     stream.write_all(request)?;
     stream.flush()?;
     read_to_eof(&mut stream, &arm, limits, &timed_out, what)
+}
+
+/// Resolve `host:port` within `limit`: the system resolver runs on a helper
+/// thread, so a resolver that hangs costs the caller at most `limit` (the
+/// helper finishes in the background when the resolver gives up). An IP
+/// literal is not looked up. Review gapi#12: a callback (or `SERVICE`)
+/// host whose name never resolves could otherwise hold a task thread far
+/// past its deadline.
+fn resolve_within(
+    host: &str,
+    port: u16,
+    limit: Duration,
+    what: &str,
+) -> io::Result<Vec<SocketAddr>> {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = bare.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let name = host.to_string();
+    std::thread::Builder::new()
+        .name("gstore-resolve".to_string())
+        .spawn(move || {
+            let found = (name.as_str(), port)
+                .to_socket_addrs()
+                .map(|addrs| addrs.collect::<Vec<_>>());
+            let _ = tx.send(found);
+        })?;
+    match rx.recv_timeout(limit) {
+        Ok(found) => found,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("{what} timed out resolving '{host}'"),
+        )),
+    }
 }
 
 /// Read to EOF, re-arming the read timeout with what is left of the deadline
@@ -1080,6 +1123,60 @@ mIjSMKbBFgquUgIhAPHupNklmfNjoKbt7eKBPIKOTzsJbKSpBaMVuL/X4bNv
 
     /// `post_with` speaks https (feature `tls`), trusting the given CA file
     /// and refusing a certificate it cannot verify.
+    /// review gapi#12: an `https://` peer that accepts the connection and
+    /// never answers the TLS handshake is bounded by the deadline too (the
+    /// handshake reads inside the first write, before any read timeout used
+    /// to be armed). The receive timeout is only a hang guard.
+    #[cfg(feature = "tls")]
+    #[test]
+    fn an_https_peer_that_never_answers_the_handshake_hits_the_deadline() {
+        use std::sync::mpsc;
+        /// Removes the directory, also when the test fails.
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "gstore_https_silent_{}_{}",
+            std::process::id(),
+            crate::sysdb::clock::unix_millis()
+        ));
+        let _cleanup = Cleanup(dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("cert.pem");
+        std::fs::write(&cert, CERT_PEM).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (release, latch) = mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            let _ = latch.recv();
+            drop(sock);
+        });
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let opts = PostOptions {
+                limits: Limits {
+                    total: Duration::from_millis(300),
+                    max_response: 1 << 10,
+                },
+                ca_file: Some(cert),
+                refuse_local: false,
+            };
+            let url = format!("https://localhost:{port}/cb");
+            let _ = tx.send(post_with(&url, "application/json", b"{}", &opts));
+        });
+        let outcome = rx.recv_timeout(Duration::from_secs(60));
+        let _ = release.send(());
+        holder.join().unwrap();
+        let err = outcome
+            .expect("the request was still blocked in the handshake")
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+    }
+
     #[cfg(feature = "tls")]
     #[test]
     fn post_over_https_verifies_the_server() {
