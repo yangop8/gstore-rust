@@ -26,7 +26,8 @@
 //! locked at the caller's address is refused (`1101`) before the password
 //! hash runs, on every path that checks one — [`verify`] (every
 //! authenticated operation, `login` and `testConnect` included, and the
-//! lifecycle routes) and the pre-body check ([`check_before_body`]).
+//! lifecycle routes) and the pre-body check (`check_before_body`, see
+//! `crate::preauth`).
 
 use super::envelope::{GResp, Status};
 use super::ipfilter;
