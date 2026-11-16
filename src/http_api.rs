@@ -7243,8 +7243,15 @@ mod tests {
                             r#"{"operation":"testConnect","username":"nobody","password":"x"}"#,
                         )),
                     };
-                    // 403: the address got locked out (failed logins).
-                    assert!(s == 401 || s == 200 || s == 403, "unexpected status {s}");
+                    // 429: the account got locked out at this address
+                    // (failed logins; review http#6: the lockout covers
+                    // `/login` and Basic credentials, and answers 429 with
+                    // Retry-After — upstream's per-address 403 is the
+                    // upstream_login_lockout switch).
+                    assert!(
+                        s == 401 || s == 200 || s == 403 || s == 429,
+                        "unexpected status {s}"
+                    );
                     n += 1;
                 }
                 n
@@ -7261,11 +7268,12 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_micros(500));
         }
-        // Authenticated requests are still served meanwhile (refused, 403,
-        // once the failed logins from this same address locked it out).
+        // Authenticated requests are still served meanwhile (refused, 429,
+        // once the failed logins from this same address locked root out —
+        // review http#6).
         let root = basic("root", "root");
         let (s, _) = split_status_body(&raw_request(&addr, "GET", "/tasklist", Some(&root), ""));
-        assert!(s == 200 || s == 403, "{s}");
+        assert!(s == 200 || s == 429, "{s}");
         stop.store(true, Ordering::Relaxed);
         let attempts: usize = attackers.into_iter().map(|h| h.join().unwrap()).sum();
         assert!(attempts > 0);

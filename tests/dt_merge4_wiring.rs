@@ -451,10 +451,10 @@ fn reason_and_pfn_operations_reach_the_access_and_query_logs() {
     });
     assert_eq!(field(&r, "dbname"), "fam", "{r}");
     assert_eq!(r.get("statusCode").and_then(Json::as_i64), Some(0), "{r}");
-    // The REST endpoints log failed statements too; the /api `query`
-    // operation logs the ones that ran — as upstream's, whose `catch`
-    // returns before the log callback — so the /api PFN query is logged
-    // when the runtime is there.
+    // The REST endpoints log failed statements too, and so does the /api
+    // `query` operation, with its status (review gapi#8: upstream's `catch`
+    // returns before the log callback, which hid every failed query from
+    // the log; this test pinned that).
     let r = logged(&srv, "query", "the REST PFN query", |r| {
         field(r, "sparql") == rest_pfn
     });
@@ -464,17 +464,15 @@ fn reason_and_pfn_operations_reach_the_access_and_query_logs() {
         cfg!(feature = "pfn-wasm"),
         "{r}"
     );
-    if cfg!(feature = "pfn-wasm") {
-        let r = logged(&srv, "query", "the /api PFN query", |r| {
-            field(r, "sparql") == api_pfn
-        });
-        assert_eq!(field(&r, "dbname"), "fam", "{r}");
-        assert_eq!(r.get("statusCode").and_then(Json::as_i64), Some(0), "{r}");
-    } else {
-        assert!(log_records(&srv, "query")
-            .iter()
-            .all(|r| field(r, "sparql") != api_pfn));
-    }
+    let r = logged(&srv, "query", "the /api PFN query", |r| {
+        field(r, "sparql") == api_pfn
+    });
+    assert_eq!(field(&r, "dbname"), "fam", "{r}");
+    assert_eq!(
+        r.get("statusCode").and_then(Json::as_i64) == Some(0),
+        cfg!(feature = "pfn-wasm"),
+        "{r}"
+    );
 }
 
 /// The `<Rule:next2>` triples of `db` (`?s ?o` pairs, N-Triples).

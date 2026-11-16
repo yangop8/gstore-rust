@@ -220,7 +220,7 @@ fn result_table(result: QueryResult) -> ResultSet {
 /// separators and the escapes a value may need.
 const CELL_OVERHEAD: u64 = 48;
 
-/// Whether the first `shown` rows of `rs` (all with `None`) would serialize
+/// Whether the first `shown` rows of `rs` (all of them for `None`) would serialize
 /// to more than `budget` bytes, by the size of their cells (each row's
 /// variable names and values plus [`CELL_OVERHEAD`]) — stopping at the
 /// first row past the budget.
