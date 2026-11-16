@@ -22,7 +22,11 @@
 //! reopens a database after a restore) therefore keeps working; keeping two
 //! *writers* of one directory apart inside a process is the caller's job — the
 //! HTTP server does it with its registry of loaded databases and its per-name
-//! lifecycle reservations.
+//! lifecycle reservations — except for the one write a database makes into a
+//! directory that is not its own: a [`save`](super::Database::save) (or
+//! [`backup`](super::Database::backup)) into another directory also holds
+//! [`DirLock::writing`], so two saves into the same directory, in this
+//! process or in two, never interleave their files.
 //!
 //! **Which file is locked.** The registry is keyed by the identity of the
 //! locked `LOCK` file — its (device, inode) on Unix — not by the directory's
@@ -41,7 +45,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use crate::error::{GStoreError, Result};
 
@@ -104,6 +108,9 @@ struct DirHeld {
     /// advisory locks).
     locked: bool,
     holders: usize,
+    /// Serializes the writers of this process that hold
+    /// [`DirLock::writing`].
+    writer: Arc<Mutex<()>>,
 }
 
 /// The directory locks this process holds, by the identity of the locked
@@ -121,6 +128,8 @@ pub struct DirLock {
     dir: PathBuf,
     /// The locked file's registry key.
     key: LockKey,
+    /// The writer exclusion shared by every holder of the same file.
+    writer: Arc<Mutex<()>>,
 }
 
 impl DirLock {
@@ -157,6 +166,7 @@ impl DirLock {
                 return Ok(DirLock {
                     dir: canonical,
                     key,
+                    writer: Arc::clone(&held.writer),
                 });
             }
             let locked = match file.try_lock() {
@@ -190,17 +200,20 @@ impl DirLock {
                     )))
                 }
             };
+            let writer = Arc::new(Mutex::new(()));
             reg.insert(
                 key.clone(),
                 DirHeld {
                     file,
                     locked,
                     holders: 1,
+                    writer: Arc::clone(&writer),
                 },
             );
             return Ok(DirLock {
                 dir: canonical,
                 key,
+                writer,
             });
         }
         Err(GStoreError::Database(format!(
@@ -253,6 +266,26 @@ impl DirLock {
             .unwrap_or_else(PoisonError::into_inner)
             .contains_key(&key)
     }
+
+    /// Exclusive use of the locked directory among this process's writers
+    /// that ask for it: blocks while another holder of the same lock file
+    /// holds it (the inter-process lock already keeps other processes out).
+    /// [`Database::save`](super::Database::save) into a directory that is not
+    /// the database's home holds it for the whole save, so two saves into
+    /// one directory never interleave — the second waits for the first, and
+    /// the snapshot recovery at the start of a save never deletes the files
+    /// another save is staging (review db#11).
+    pub fn writing(&self) -> MutexGuard<'_, ()> {
+        match self.writer.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                #[cfg(test)]
+                writer_probe::waiting(&self.dir);
+                self.writer.lock().unwrap_or_else(PoisonError::into_inner)
+            }
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        }
+    }
 }
 
 impl Drop for DirLock {
@@ -273,6 +306,51 @@ impl Drop for DirLock {
                     let _ = held.file.unlock();
                 }
             }
+        }
+    }
+}
+
+/// Test hook: who is told when a [`DirLock::writing`] has to wait.
+#[cfg(test)]
+pub(crate) mod writer_probe {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    /// What to call when a writer has to wait.
+    pub(crate) type Hook = Arc<dyn Fn() + Send + Sync>;
+
+    /// The watched directories (canonical paths) and what to call.
+    static WATCHED: Mutex<Vec<(PathBuf, Hook)>> = Mutex::new(Vec::new());
+
+    /// Call `hook` (on the waiting thread) whenever a writer of canonical
+    /// directory `dir` has to wait.
+    pub(crate) fn watch(dir: &Path, hook: Hook) {
+        WATCHED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((dir.to_path_buf(), hook));
+    }
+
+    /// Stop watching `dir`.
+    pub(crate) fn unwatch(dir: &Path) {
+        WATCHED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(d, _)| d != dir);
+    }
+
+    /// Called by [`DirLock::writing`](super::DirLock::writing) before it
+    /// blocks on canonical directory `dir`.
+    pub(super) fn waiting(dir: &Path) {
+        let hooks: Vec<Hook> = WATCHED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(d, _)| d == dir)
+            .map(|(_, h)| Arc::clone(h))
+            .collect();
+        for hook in hooks {
+            hook();
         }
     }
 }
@@ -591,5 +669,159 @@ mod tests {
         drop(held);
         drop(SideLock::acquire(&target, ".restore-lock").unwrap());
         let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A temp directory (canonical path) removed when dropped, also when the
+    /// test fails.
+    struct TmpDir(PathBuf);
+
+    impl TmpDir {
+        fn new(tag: &str) -> TmpDir {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static CTR: AtomicU64 = AtomicU64::new(0);
+            let n = CTR.fetch_add(1, Ordering::Relaxed);
+            let p = std::env::temp_dir().join(format!(
+                "gstore_dirlock_ut_{tag}_{}_{n}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&p);
+            fs::create_dir_all(&p).unwrap();
+            TmpDir(fs::canonicalize(&p).unwrap())
+        }
+    }
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Unwatches the save probes when dropped (also when the test fails).
+    struct Unwatch(PathBuf);
+
+    impl Drop for Unwatch {
+        fn drop(&mut self) {
+            crate::db::fsutil::snapshot_probe::unwatch(&self.0);
+            writer_probe::unwatch(&self.0);
+        }
+    }
+
+    /// Review db#11: two saves into the same new directory. Save A is
+    /// parked after it staged its first member; save B starts. Before the
+    /// fix B took no lock: its snapshot recovery deleted A's staged member,
+    /// B committed its own set, and A — resumed — committed its remaining
+    /// members over B's, so the directory held B's dictionary with A's
+    /// store and meta (unopenable). Now both hold the directory's lock and
+    /// writer exclusion: B waits for A, and the directory ends as B's
+    /// complete snapshot.
+    #[test]
+    fn two_saves_into_one_new_directory_never_interleave() {
+        use crate::db::fsutil::snapshot_probe;
+        use crate::db::Database;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        const HANG_GUARD: Duration = Duration::from_secs(120);
+        let base = TmpDir::new("save_race");
+        let target = base.0.join("new.db");
+        let _unwatch = Unwatch(target.clone());
+        let a = Database::build_from_str(
+            "a",
+            "<http://ex/a1> <http://ex/p> <http://ex/a2> .\n<http://ex/a3> <http://ex/p> <http://ex/a4> .\n",
+        )
+        .unwrap();
+        let b = Database::build_from_str("b", "<http://ex/b1> <http://ex/q> \"b\" .\n").unwrap();
+
+        // A parks after its first staged member until `go`.
+        let (staged_tx, staged_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let go_rx = Mutex::new(go_rx);
+        let parked = AtomicBool::new(false);
+        snapshot_probe::watch(
+            &target,
+            Arc::new(move |_member| {
+                if thread::current().name() == Some("saver-a")
+                    && !parked.swap(true, Ordering::SeqCst)
+                {
+                    let _ = staged_tx.send(());
+                    let _ = go_rx.lock().unwrap().recv_timeout(HANG_GUARD);
+                }
+            }),
+        );
+        // What B did while A was parked: wait for the directory, or finish.
+        let (event_tx, event_rx) = mpsc::channel::<&'static str>();
+        let waits = Mutex::new(event_tx.clone());
+        writer_probe::watch(
+            &target,
+            Arc::new(move || {
+                let _ = waits.lock().unwrap().send("b waits");
+            }),
+        );
+
+        let ta = {
+            let target = target.clone();
+            thread::Builder::new()
+                .name("saver-a".into())
+                .spawn(move || a.save(&target))
+                .unwrap()
+        };
+        staged_rx
+            .recv_timeout(HANG_GUARD)
+            .expect("save A staged a member");
+        let tb = {
+            let target = target.clone();
+            thread::Builder::new()
+                .name("saver-b".into())
+                .spawn(move || {
+                    let r = b.save(&target);
+                    let _ = event_tx.send("b finished");
+                    r
+                })
+                .unwrap()
+        };
+        let event = event_rx
+            .recv_timeout(HANG_GUARD)
+            .expect("save B progressed");
+        go_tx.send(()).unwrap();
+        let (ra, rb) = (ta.join().unwrap(), tb.join().unwrap());
+        ra.expect("save A");
+        rb.expect("save B");
+
+        let saved = Database::open(&target).unwrap_or_else(|e| {
+            panic!("the directory must hold one complete snapshot (B {event}): {e}")
+        });
+        let rows = Database::read_copy(&target).unwrap().triple_num();
+        assert_eq!(rows, 1, "B saved last: its snapshot, complete");
+        assert_eq!(saved.name(), "b");
+        assert_eq!(event, "b waits", "B waited for A's save");
+    }
+
+    /// Review db#12: creating a database directory fsyncs the parent of
+    /// every directory created, for a save and for a snapshot write on its
+    /// own; an existing directory syncs no parent.
+    #[test]
+    fn creating_a_database_directory_syncs_the_parent_of_each_new_directory() {
+        use crate::db::fsutil::{SnapshotWriter, DURABLE_DIR_PARENT_SYNCS};
+        use crate::db::Database;
+        let take = || DURABLE_DIR_PARENT_SYNCS.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        let base = TmpDir::new("durable_mkdir");
+        let db =
+            Database::build_from_str("d", "<http://ex/s> <http://ex/p> <http://ex/o> .\n").unwrap();
+        take();
+        let target = base.0.join("a").join("b.db");
+        db.save(&target).unwrap();
+        let synced = take();
+        assert!(
+            synced.contains(&base.0.join("a")) && synced.contains(&base.0),
+            "the parents of both new directories: {synced:?}"
+        );
+        db.save(&target).unwrap();
+        assert_eq!(take(), Vec::<PathBuf>::new(), "nothing new to make durable");
+
+        let other = base.0.join("c.db");
+        drop(SnapshotWriter::begin(&other, &["x.bin"]).unwrap());
+        assert_eq!(take(), vec![base.0.clone()]);
     }
 }

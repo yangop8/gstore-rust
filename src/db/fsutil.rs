@@ -69,6 +69,44 @@ pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Create directory `dir` and every missing ancestor (as
+/// `fs::create_dir_all`), then `fsync` the parent of every directory it
+/// created, so the new entries survive a power loss once the files written
+/// into `dir` are synced (review db#12; `sync_dir(dir)` only makes entries
+/// *inside* `dir` durable). A no-op beyond the existence check when `dir`
+/// exists.
+pub(crate) fn create_dir_durable(dir: &Path) -> Result<()> {
+    let mut missing = Vec::new();
+    let mut at = dir;
+    while !at.exists() {
+        missing.push(at.to_path_buf());
+        match at.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => at = parent,
+            _ => break,
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    fs::create_dir_all(dir)?;
+    // Deepest first: each new directory's own entry, then its parent's.
+    for created in &missing {
+        let parent = parent_of(created);
+        #[cfg(test)]
+        DURABLE_DIR_PARENT_SYNCS.with(|s| s.borrow_mut().push(parent.to_path_buf()));
+        sync_dir(parent)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: the parent directories [`create_dir_durable`] synced on
+    /// this thread, in order.
+    pub(crate) static DURABLE_DIR_PARENT_SYNCS: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Remove a file, treating "not found" as success.
 pub(crate) fn remove_file_if_exists(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
@@ -335,10 +373,14 @@ pub(crate) struct SnapshotWriter<'a> {
 }
 
 impl<'a> SnapshotWriter<'a> {
-    /// Start a snapshot write into `dir` (created if needed), first finishing or
-    /// discarding any interrupted earlier write.
+    /// Start a snapshot write into `dir` (created if needed, durably: see
+    /// [`create_dir_durable`]), first finishing or discarding any interrupted
+    /// earlier write. That recovery deletes the staged files of a write in
+    /// progress too, so the caller excludes every other writer of `dir`
+    /// first: `Database::save` holds the directory's lock and its
+    /// [`writing`](super::dirlock::DirLock::writing) exclusion (review db#11).
     pub(crate) fn begin(dir: &'a Path, members: &'a [&'a str]) -> Result<SnapshotWriter<'a>> {
-        fs::create_dir_all(dir)?;
+        create_dir_durable(dir)?;
         recover_snapshot(dir, members)?;
         Ok(SnapshotWriter {
             dir,
@@ -356,6 +398,8 @@ impl<'a> SnapshotWriter<'a> {
             Ok(())
         })?;
         self.staged.push(name);
+        #[cfg(test)]
+        snapshot_probe::staged(self.dir, name);
         Ok(())
     }
 
@@ -377,6 +421,50 @@ impl Drop for SnapshotWriter<'_> {
             for name in &self.staged {
                 let _ = fs::remove_file(tmp_path(&self.dir.join(name)));
             }
+        }
+    }
+}
+
+/// Test hook: lets a test park a snapshot write after it staged a member.
+#[cfg(test)]
+pub(crate) mod snapshot_probe {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    /// What to call after a member is staged in a watched directory (with the
+    /// member's name).
+    pub(crate) type Hook = Arc<dyn Fn(&str) + Send + Sync>;
+
+    static WATCHED: Mutex<Vec<(PathBuf, Hook)>> = Mutex::new(Vec::new());
+
+    /// Call `hook` (on the writing thread) after every member a snapshot
+    /// write into `dir` stages.
+    pub(crate) fn watch(dir: &Path, hook: Hook) {
+        WATCHED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((dir.to_path_buf(), hook));
+    }
+
+    /// Stop watching `dir`.
+    pub(crate) fn unwatch(dir: &Path) {
+        WATCHED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(d, _)| d != dir);
+    }
+
+    /// Called by `SnapshotWriter::stage` once `name` is staged in `dir`.
+    pub(super) fn staged(dir: &Path, name: &str) {
+        let hooks: Vec<Hook> = WATCHED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(d, _)| d == dir)
+            .map(|(_, h)| Arc::clone(h))
+            .collect();
+        for hook in hooks {
+            hook(name);
         }
     }
 }

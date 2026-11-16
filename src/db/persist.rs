@@ -735,20 +735,36 @@ impl Database {
 
     /// [`save`](Self::save), with `persist_lock` held by the caller.
     pub(super) fn save_locked(&self, dir: &Path) -> Result<()> {
-        fs::create_dir_all(dir)?;
+        // A new directory's entry is made durable too (review db#12).
+        fsutil::create_dir_durable(dir)?;
         let at_home = self
             .home
             .as_deref()
             .is_some_and(|h| fsutil::same_dir(h, dir));
         // Saving over a database another process has open — replacing its
         // files, removing its other layouts — would strand every write it
-        // acknowledges later: that directory's lock is taken first (a
-        // database of this process shares it). A directory without a
-        // database has nothing to lock.
-        let _lock = if !at_home && Database::storage_kind(dir).is_some() {
-            Some(super::dirlock::DirLock::acquire(dir)?)
-        } else {
+        // acknowledges later; saving into a new (or empty) directory another
+        // saver is filling would mix both saves' files, or delete the files
+        // the other one staged (review db#11). So every save into a
+        // directory that is not the database's home takes that directory's
+        // lock first, whatever it holds — an empty directory is locked too —
+        // (a database of this process shares it), and every save that
+        // writes files there holds the lock's writer exclusion, which also
+        // serializes savers within this process. A save at home writes
+        // files only as a snapshot; it uses the database's own lock.
+        let lock = if at_home {
             None
+        } else {
+            Some(super::dirlock::DirLock::acquire(dir)?)
+        };
+        let _writing = match &lock {
+            Some(lock) => Some(lock.writing()),
+            None if self.storage() == StorageKind::Snapshot => self
+                .dir_lock
+                .as_ref()
+                .filter(|own| own.holds(dir))
+                .map(|own| own.writing()),
+            None => None,
         };
         if self.is_disk_backed() {
             self.commit_point()?;
@@ -1103,10 +1119,10 @@ impl Database {
         dir.as_ref().join(KV_FILE).is_file()
     }
 
-    /// Open an on-disk database without taking the directory lock (see
-    /// [`open`](Self::open), which does), in the mode of the process's
+    /// Open an on-disk database in the mode of the process's
     /// [`default_open_options`]; see
-    /// [`load_disk_with`](Self::load_disk_with).
+    /// [`load_disk_with`](Self::load_disk_with). Takes the directory's lock
+    /// as [`open`](Self::open) does.
     pub fn load_disk<P: AsRef<Path>>(dir: P) -> Result<Database> {
         Database::load_disk_with(dir, &default_open_options())
     }
@@ -1129,6 +1145,14 @@ impl Database {
     ///   (`vstree.kv`) is opened — or rebuilt first if an update made it stale,
     ///   or if the dictionary's ids had a gap (its entries are keyed by the
     ///   store's ids).
+    ///
+    /// Opening writes (a WAL replay, a legacy-shadow reconcile, a VS-tree
+    /// rebuild), and the database writes every committed update through, so
+    /// the directory's inter-process lock ([`dirlock`](super::dirlock)) is
+    /// taken first and held for as long as the database lives, as
+    /// [`open`](Self::open) holds it (shared with `open`'s own when it calls
+    /// this): fails, touching nothing, while another process holds it
+    /// (review db#17).
     pub fn load_disk_with<P: AsRef<Path>>(dir: P, options: &OpenOptions) -> Result<Database> {
         let dir = dir.as_ref();
         let kv = dir.join(KV_FILE);
@@ -1138,12 +1162,15 @@ impl Database {
                 kv.display()
             )));
         }
+        let lock = super::dirlock::DirLock::acquire(dir)?;
         let mut ds = DiskStore::open(&kv, options.disk_cache_pages)?;
         reconcile_legacy_shadow(dir, &mut ds)?;
-        match options.disk_query_mode {
+        let mut db = match options.disk_query_mode {
             DiskQueryMode::Stream => Database::load_disk_stream(dir, ds, options),
             DiskQueryMode::Materialize => Database::load_disk_materialize(dir, ds),
-        }
+        }?;
+        db.dir_lock = Some(lock);
+        Ok(db)
     }
 
     /// The Stream-mode half of [`load_disk_with`](Self::load_disk_with).
