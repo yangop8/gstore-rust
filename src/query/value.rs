@@ -31,8 +31,10 @@
 //!
 //! Valid literals compare by value: `"01"^^xsd:integer = "1"^^xsd:integer`,
 //! `"1"^^xsd:byte = 1.0`. The store accepts ill-typed literals as they are —
-//! RDF allows them, and SPARQL Update `INSERT DATA` stores any literal
-//! unchanged — so only expression evaluation treats them specially.
+//! RDF allows them, and a strict import stores any literal unchanged (SPARQL
+//! Update refuses only the numeric ones the tolerant loader refuses, review
+//! sparqlconf#12, and stores the rest, such as `"x"^^xsd:decimal`) — so only
+//! expression evaluation treats them specially.
 //!
 //! # Numbers
 //!
