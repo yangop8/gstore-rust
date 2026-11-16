@@ -191,6 +191,22 @@ building an N-Triples string.
     (1) and `tests/gfun_limits.rs` (1): a cancelled statement's status
     `400` → `503`, each commented `review design#3` (convention 13b; the
     tests otherwise unchanged).
+- Tests corrected (D6), in this package's own `src/http_api.rs`: the unit
+  tests that expected `400` for a cancelled `/sparql` / `/tquery` and for a
+  bulk build refused by another process's lock now expect `503` / `409`;
+  `a_failed_snapshot_rebuild_keeps_the_acknowledged_writes` injected its
+  fault by making the rule directory unremovable, which no longer precedes
+  the save (http#10) — it now fails the save itself and still checks that
+  the previous database is served again with the acknowledged write, and
+  checks the unremovable rule directory separately (built, not served,
+  `500`). Each is commented `review <id>`.
+- Seen once, unrelated: `tests/no_background_thread_outlives_serve_forever.rs`
+  `the_asynchronous_operation_runner_is_joined` failed in the stream-mode
+  workspace run while a `--features zip` run built in the same target
+  directory (load average ~13); it passed in the memory-mode run and three
+  times in a row alone in stream mode. (The parallel zip run also replaced
+  `target/debug/grestore` mid-run, failing three `dt_zip_io` CLI tests;
+  rerun serially with `--features zip` they pass.)
 - Divergence found for another package (r4-api-hygiene, parity suite): REST
   `/upload` with `format=nquads` or `trig` flattens every named graph into
   the default graph (`parse_rdf` uses `parse_str_triples`), where `/api`
