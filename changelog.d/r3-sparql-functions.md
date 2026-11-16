@@ -17,14 +17,17 @@ Behaviour changes first:
   a `GRAPH` block) and a different one in every other solution and query
   (SPARQL 1.1 §17.4.2.9). Only the labels change; nothing on disk.
 - **Behaviour change (query#5, found by the round-2 w3c harness): a labelled
-  blank node in a CONSTRUCT / INSERT / DELETE template (`_:v`) is a fresh
-  node per solution**, the same across the template triples of one solution
-  (Query §16.2.1, Update §3.1.3); `[]` / `( … )` template nodes already
-  were. It was copied verbatim, so every solution and every later request
-  wrote the one stored node `_:v`. A CONSTRUCT whose template holds one is
-  no longer served from the query cache. In a DELETE template (which SPARQL
-  forbids blank nodes in) such a node now matches nothing. Labelled blank
-  nodes in WHERE patterns and in `INSERT DATA` are unchanged (see Requests).
+  blank node in a CONSTRUCT / INSERT template (`_:v`) is a fresh node per
+  solution**, the same across the template triples of one solution (Query
+  §16.2.1, Update §3.1.3); `[]` / `( … )` template nodes already were. It
+  was copied verbatim, so every solution and every later request wrote the
+  one stored node `_:v`. A CONSTRUCT whose template holds one is no longer
+  served from the query cache. In a DELETE template (where SPARQL forbids
+  blank nodes) a labelled node still names the stored node of that label,
+  as in WHERE patterns and `DELETE DATA`, so `DELETE WHERE { <a> <p> _:v }`
+  with a label a query returned deletes the triple it matched (unchanged).
+  Labelled blank nodes in WHERE patterns and in `INSERT DATA` are unchanged
+  (see Requests).
 - **`UUID()` / `STRUUID()` / `RAND()` are safe under concurrency (review
   conc#1, M10).** They shared one process-wide xorshift state advanced by a
   non-atomic load-then-store, so concurrent queries (the servers' shared read
@@ -38,7 +41,9 @@ Behaviour changes first:
 - **`NOW()` is one instant per query (review query#16).** It read the clock
   at every call, so a query spanning a second boundary returned several
   instants (§17.4.5.1 requires one). The instant is taken at the first call
-  and shared with `GRAPH` blocks.
+  and shared with `GRAPH` blocks; every `Evaluator::evaluate` /
+  `eval_update_modify` call is a new execution with its own instant and
+  `BNODE` nodes, also on an evaluator a library caller reuses.
 - **Behaviour change (review query#11, sparqlconf#8, M14): `REGEX` and
   `REPLACE` follow XPath `fn:matches` / `fn:replace`.** Flags: `s`
   (dot matches newline), `m` (multi-line), `i`, `x` (whitespace outside
@@ -58,8 +63,14 @@ Behaviour changes first:
   sparqlconf#8).** Patterns were compiled for every solution: a
   `FILTER(REGEX(?o, "^1.*9$"))` over 20,000 rows spent nearly all its time
   compiling (36 µs per row in release). A per-query cache keyed by (flags,
-  pattern), bounded to 1024 patterns, compiles each once, `GRAPH` blocks
-  included. `Evaluator::regex_compilations()` reports the count.
+  pattern) compiles each once, `GRAPH` blocks included.
+  `Evaluator::regex_compilations()` reports the count. The cache is bounded
+  by weight, not by count: a compiled pattern keeps its program (up to the
+  regex crate's 10 MiB limit) and its search caches for as long as it is
+  cached, so it holds at most 64 patterns whose program fits 256 KiB, or 8
+  larger ones (each weighs 8), and is emptied when a new pattern would
+  exceed that; a constant pattern is then compiled again at most once per
+  63 distinct patterns built from the data.
 - **Behaviour change (review query#8, sparqlconf#7, M14): `MIN` / `MAX`
   use the `ORDER BY` order and return the stored term.** They used the
   partial `<`, so for an IRI and a literal, or a number and a string, the
@@ -99,8 +110,9 @@ New files and tests:
   (`QueryCtx`: `NOW()`'s instant, the `BNODE(str)` map, the minted blank
   nodes, the `RAND()` generator, the UUID randomness, the pattern cache),
   created by `Evaluator::new` / `with_vstree` and shared by `Rc` with the
-  `GRAPH` sub-evaluators.
-- `tests/sparql_builtins.rs`: 17 tests, each failing on the old code (the
+  `GRAPH` sub-evaluators; `evaluate` / `eval_update_modify` start a new
+  execution in it (instant and `BNODE` nodes forgotten).
+- `tests/sparql_builtins.rs`: 19 tests, each failing on the old code (the
   compile-count test needs the new `regex_compilations()`, so on the old
   code it does not build): `BNODE(str)` per solution (projection and
   `BIND` chains), `BNODE()` across two `gquery` processes, blank-node and
@@ -112,7 +124,14 @@ New files and tests:
   over every rotation of a mixed set, terms kept, the `AVG` divisor,
   `DISTINCT` on terms, and linear scaling of aggregate `DISTINCT` and
   `DESCRIBE` (against the same query without the de-duplication, and
-  with 16× the data; D9).
+  with 16× the data; D9). Added in review: a labelled blank node in a
+  DELETE template / `DELETE WHERE` still deletes the stored node of that
+  label while the INSERT template's is fresh
+  (`delete_templates_keep_labelled_blank_nodes`; its DELETE half passes on
+  the base and failed on the first version of this package), and an
+  evaluator reused for a second query gets a new `NOW()` and new
+  `BNODE("x")` nodes (`a_reused_evaluator_starts_every_query_afresh`); unit
+  test `xpath_regex::tests::the_cache_is_bounded_by_weight`.
 - `tests/w3c/functions/` (6 cases: §17.4.3.14 / §17.4.3.15 and the XPath
   F&O §5.6.3 examples, flag `q`, the error cases) and
   `tests/w3c/aggregates/` (5 cases from §18.5.1: MIN/MAX over blank node /
@@ -132,6 +151,12 @@ New files and tests:
 - Corrected test (D6): `builtin_tests::bnode_uuid_struuid_shapes` asserted
   that `BNODE("seed")` starts with `_:b` (the old hash label); it now checks
   the node kind (`_:`), with a `review query#5` comment.
+- Corrected case (review): `aggregates/count-distinct-compares-terms`
+  expected `SUM(DISTINCT ?v)` over `"01"`, `"1"` and `"x"` to be `2`, which
+  is the engine's skip-non-numeric extension, not SPARQL (the sum over `"x"`
+  is an error, §18.5.1.3; `tricky/avg-over-an-error-is-unbound` tracks
+  that divergence). The case now filters to numeric values, so every
+  expected value is the spec's.
 
 ## GAP_PLAN status line
 
@@ -216,6 +241,13 @@ none
   against a 12× bound and failed once on a loaded machine with
   `--features rocksdb` (other tests of the binary running at the same
   time), hence the same-size baseline and the alternating runs.
+- **Pattern cache memory (review)**, measured with regex 1.12.4 in release:
+  a compiled `\w{200}` keeps about 11.7 MiB (`\w{300}` exceeds the crate's
+  10 MiB program limit), and a small pattern searched over 1 MB of
+  adversarial text keeps about 3 MiB of search caches. With the first
+  version's bound of 1024 entries one query building its patterns from
+  the data could pin about 12 GiB; with the weight bound at most 64 small
+  patterns (about 200 MiB at worst, 3 MiB each) or 8 large ones are held.
 
 ## Requests/Not yet
 
@@ -230,6 +262,13 @@ none
   in `every_table_builtin_has_an_engine_arm` (now `regex::Regex::new`).
   `src/db/query_cache.rs`: `is_cacheable`'s CONSTRUCT arm also refuses a
   template with a labelled blank node (`PatternTerm::Term(Term::Blank)`).
+  Added in review, also in `src/query/engine.rs`: `instantiate_template`
+  and `instantiate_quad` take a `fresh_labels` flag (CONSTRUCT passes
+  `true`), `eval_update_modify`'s template loop passes `false` for the
+  DELETE template and `true` for the INSERT one, and the first line of
+  `evaluate` and of `eval_update_modify` is `self.ctx.begin_execution();`
+  (one line each; expect a trivial conflict if another round-3 package
+  edits the start of those functions).
 - **query#16 is partial here by plan:** its third sub-claim (`SECONDS`
   returns `xsd:integer` / `xsd:double` instead of `xsd:decimal`) is the
   `SECONDS` arm, which the plan gives to r4-db-graph (with sparqlconf#16).
