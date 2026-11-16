@@ -84,6 +84,19 @@
   `"@context": {}` per node away (1.8 s for 5000 such nodes under 4000
   terms, now 4 ms), and a `@context` array of 8000 one-term members took
   10.5 s (quadratic, now 8 ms).
+- **RDF/XML: namespace declarations on inner elements (found in review).**
+  An `xmlns:p` declaration on any element but `rdf:RDF` (a node element, a
+  property element, or a node element used as the document element, RDF/XML
+  §7.2.11) failed the whole document with `undefined namespace prefix
+  'xmlns:'`. The reserved prefix `xmlns` is now bound, so such declarations
+  are read as declarations, scoped to their element.
+- **RDF/XML shares the namespace bindings and the base (parser#7's pattern,
+  found in review).** Every node and property element copied every
+  namespace binding declared above it: 40000 elements took 0.12 s under 10
+  declarations and 3.8 s under 1000. Bindings are now layers, like the
+  JSON-LD and RDFa maps (56 ms under 1000), and the `xml:base` in scope is
+  shared instead of copied per element. The canonical form of
+  `parseType="Literal"` content keeps its rendered namespaces the same way.
 - **Blank graph labels in large documents (parser#14).** In N-Quads / TriG,
   the check of whether a blank graph label was used before as a subject or
   object is now a growing (scalable) Bloom filter.
@@ -141,7 +154,18 @@ Phase 5 RDF readers (r3-parser):
   per RFC 3986 in every format. A database built from RDF/XML, JSON-LD or
   RDFa with relative references (`../x`, `//host/x`, `?q`) under a base has
   the old, wrong IRIs until it is rebuilt.
-- docs/REFACTOR_BACKLOG.md: none. No id of this package is deferred.
+- docs/REFACTOR_BACKLOG.md (review parser#7, the same pattern in another
+  dimension; not deferred work of this package's ids, which are fixed): the
+  tree-walking RDF readers still copy inherited *strings* per element. The
+  RDFa reader clones the base, `vocab`, language and the parent subject /
+  object terms for every element; JSON-LD clones the base, `@vocab` and
+  `@language` for a node with its own `@context`; RDF/XML clones `xml:lang`.
+  With a 1 MiB `<base href>`, 10000 RDFa elements took 4.2 s (JSON-LD,
+  5000 nodes with `"@context": {}` under a 1 MiB `@base`: 0.18 s). Sharing
+  them needs `Rc<str>` contexts and shared terms through the RDFa walk, a
+  refactor of the extractors; the documents are bounded by
+  `max_document_bytes` (256 MiB) and the reader needs a privileged import
+  path.
 
 ## Measured numbers
 From the tests of `tests/rdf_parser_conformance.rs` (test profile,
@@ -157,6 +181,9 @@ two other agents' builds):
 - **parser#8.** Tokenizing 16 MiB of whitespace peaks at 1.2 KB, and 16 MiB
   of comments at 296 B. A 16 MiB string literal peaks at 16.8 MB, which is
   its own token. Before, the tokenizer took 201 MB for 16 MiB of whitespace.
+- **RDF/XML namespaces (review follow-up).** 20000 `rdf:Description`s
+  (40000 elements) under 10 / 1000 namespace declarations: 66 ms / 3.46 s
+  before (52.3x), 83 ms / 56 ms after (`rdfxml_elements_share_the_namespace_bindings`).
 - **parser#14.**
   - 5Mi labels (import.rs unit test): 0.51% false positives over 200000
     probes, filters of 20,561,600 bytes, no false negatives.
@@ -213,4 +240,15 @@ two other agents' builds):
   `install_storage_defaults`, so its SPARQL requests have no size limit. The
   in-place tokenizer still removes the 12× amplification. Wiring the limit
   is left to r5-cluster if wanted.
+- For a later owner of `src/http_api.rs` / `src/gapi/` (r4-api-hygiene):
+  `sparql_max_size` is checked when the request text is parsed, after the
+  HTTP layer has read the body (bounded by `upload_max_body_size`). Refusing
+  a `/sparql`, `/query` or `/api` query body longer than `sparql_max_size`
+  before reading it would also save buffering the body. The tokenizer no
+  longer amplifies it, so this is not a parser#8 residual.
+- For the owner of `src/db/mod.rs` (library API, not used by any binary):
+  `Database::build_from_ntriples_parallel` reads its chunks with
+  `read_until`, so one line longer than `rdf_max_token_size` is held whole
+  before `ntriples::parse_str` refuses it. The streaming readers that every
+  binary uses (`import_reader`, the bulk loaders) are bounded.
 - Nothing deferred.

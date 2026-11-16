@@ -468,6 +468,115 @@ fn an_rdfxml_xml_literal_keeps_its_markup() {
     );
 }
 
+/// Exclusive canonicalization (XML-EXC-C14N §3, the namespaces an element
+/// visibly uses): a binding the nearest enclosing output element already
+/// rendered with the same value is not declared again; a different value,
+/// or an inner element back in no namespace (`xmlns=""`), is.
+#[test]
+fn an_rdfxml_xml_literal_redeclares_only_changed_namespaces() {
+    let xml_literal = |v: &str| Term::typed_literal(v, format!("{RDF}XMLLiteral"));
+    let doc = rdfxml_doc(
+        "xmlns:h=\"http://h/\"",
+        "<ex:xml rdf:parseType=\"Literal\"><h:a><h:b xmlns:h=\"http://h/\">\
+         <h:c xmlns:h=\"http://h2/\"><h:d/></h:c></h:b></h:a>\
+         <a xmlns=\"http://d/\"><b xmlns=\"\"><c/></b></a></ex:xml>",
+    );
+    let ts = rdfxml::parse_str(&doc).unwrap();
+    assert_eq!(
+        object_of(&ts, "http://ex/xml"),
+        xml_literal(
+            "<h:a xmlns:h=\"http://h/\"><h:b><h:c xmlns:h=\"http://h2/\"><h:d></h:d></h:c>\
+             </h:b></h:a><a xmlns=\"http://d/\"><b xmlns=\"\"><c></c></b></a>"
+        )
+    );
+}
+
+/// XML Namespaces §6.1 (scoping): a declaration applies to the element
+/// that carries it and its content, an inner one hides an outer one there,
+/// and siblings keep the outer binding. (Found in review: a declaration on
+/// any element but `rdf:RDF` failed the document, "undefined namespace
+/// prefix 'xmlns:'", so did a node element as the document element, RDF/XML
+/// §7.2.11.)
+#[test]
+fn an_rdfxml_namespace_declaration_is_scoped_to_its_element() {
+    let doc = format!(
+        "<ex:T xmlns:rdf=\"{RDF}\" xmlns:ex=\"http://ex/\" rdf:about=\"http://ex/s0\">\
+         <ex:p xmlns:ex=\"http://inner/\" rdf:resource=\"http://ex/o\"/></ex:T>"
+    );
+    assert_eq!(
+        rdfxml::parse_str(&doc).unwrap(),
+        [
+            Triple::new(
+                iri("http://ex/s0"),
+                iri(&format!("{RDF}type")),
+                iri("http://ex/T")
+            ),
+            Triple::new(
+                iri("http://ex/s0"),
+                iri("http://inner/p"),
+                iri("http://ex/o")
+            ),
+        ]
+    );
+    let doc = format!(
+        "<rdf:RDF xmlns:rdf=\"{RDF}\" xmlns:ex=\"http://ex/\">\
+         <rdf:Description rdf:about=\"http://ex/s1\" xmlns:ex=\"http://inner/\">\
+           <ex:p>a</ex:p><ex:q xmlns:ex=\"http://innermost/\">b</ex:q><ex:r>c</ex:r>\
+         </rdf:Description>\
+         <rdf:Description rdf:about=\"http://ex/s2\"><ex:p>d</ex:p></rdf:Description></rdf:RDF>"
+    );
+    let ts = rdfxml::parse_str(&doc).unwrap();
+    for (s, p, o) in [
+        ("http://ex/s1", "http://inner/p", "a"),
+        ("http://ex/s1", "http://innermost/q", "b"),
+        ("http://ex/s1", "http://inner/r", "c"),
+        ("http://ex/s2", "http://ex/p", "d"),
+    ] {
+        assert!(
+            ts.contains(&Triple::new(iri(s), iri(p), lit(o))),
+            "{s} {p} {o:?} missing from {ts:?}"
+        );
+    }
+    assert_eq!(ts.len(), 4, "{ts:?}");
+}
+
+/// The pattern of review parser#7 in the RDF/XML reader (found in review):
+/// every node and property element copied every namespace binding declared
+/// above it (40000 elements: 0.12 s under 10 declarations, 3.8 s under
+/// 1000). The bindings are now shared layers: 100 times the declarations
+/// cost about the same (bound: 4).
+#[test]
+fn rdfxml_elements_share_the_namespace_bindings() {
+    let elements = 20000;
+    let doc = |declarations: usize| {
+        let decl: String = (0..declarations)
+            .map(|i| format!(" xmlns:n{i}=\"http://ex/n{i}/\""))
+            .collect();
+        let body: String = (0..elements)
+            .map(|i| {
+                format!(
+                    "<rdf:Description rdf:about=\"http://ex/s{i}\"><ex:p>x</ex:p></rdf:Description>"
+                )
+            })
+            .collect();
+        format!("<rdf:RDF xmlns:rdf=\"{RDF}\" xmlns:ex=\"http://ex/\"{decl}>{body}</rdf:RDF>")
+    };
+    let small = doc(10);
+    let large = doc(1000);
+    assert_eq!(rdfxml::parse_str(&large).unwrap().len(), elements);
+    let t_small = fastest(|| {
+        rdfxml::parse_str(&small).unwrap();
+    });
+    let t_large = fastest(|| {
+        rdfxml::parse_str(&large).unwrap();
+    });
+    let ratio = t_large.as_secs_f64() / t_small.as_secs_f64().max(1e-6);
+    assert!(
+        ratio < 4.0 || t_large < Duration::from_millis(30),
+        "100x the namespace declarations took {ratio:.1}x as long ({t_small:?} -> {t_large:?})"
+    );
+}
+
 /// RDF/XML §7.2.21 (emptyPropertyElt): with property attributes the object
 /// is `rdf:resource`, `rdf:nodeID` or a fresh blank node, and the property
 /// attributes (and `rdf:type`) describe it; without any it is the literal

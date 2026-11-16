@@ -44,6 +44,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::rc::Rc;
 
 use crate::error::{GStoreError, Result};
 use crate::model::{Term, Triple};
@@ -52,6 +53,9 @@ use crate::parser::stream::{BlankLabeler, TermBudget};
 
 const RDF_NS: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
+/// The namespace the reserved prefix `xmlns` is bound to (XML Namespaces
+/// §3): `xmlns:p` attributes are namespace declarations, not data.
+const XMLNS_NS: &str = "http://www.w3.org/2000/xmlns/";
 
 /// Deepest element nesting accepted. The XML reader, the triple extractor and
 /// dropping the element tree all recurse once per level, so an unbounded depth
@@ -758,23 +762,82 @@ struct Extractor {
     budget: TermBudget,
 }
 
-/// The inherited XML context threaded through the walk.
+/// The inherited XML context threaded through the walk. Cloning it for an
+/// element copies no namespace binding and no base: both are shared (review
+/// parser#7's pattern: every element copied every namespace declared above
+/// it, 3.8 s for 40000 elements under 1000 declarations).
 #[derive(Clone)]
 struct Ctx {
-    ns: HashMap<String, String>,
+    ns: Rc<Ns>,
     lang: Option<String>,
-    base: String,
+    base: Rc<str>,
 }
 
 impl Ctx {
     fn root() -> Ctx {
+        // The two reserved prefixes. Binding `xmlns` lets the attribute
+        // loops expand an `xmlns:p` declaration (and skip it as syntax): a
+        // declaration on any element but `rdf:RDF` used to fail the document
+        // with "undefined namespace prefix 'xmlns:'".
         let mut ns = HashMap::new();
         ns.insert("xml".to_string(), XML_NS.to_string());
+        ns.insert("xmlns".to_string(), XMLNS_NS.to_string());
         Ctx {
-            ns,
+            ns: Rc::new(Ns {
+                own: ns,
+                below: None,
+            }),
             lang: None,
-            base: String::new(),
+            base: Rc::from(""),
         }
+    }
+}
+
+/// The namespace bindings in scope, in layers: those an element declares
+/// (`xmlns`, `xmlns:p`) over the layers of its ancestors, which are shared,
+/// not copied. A lookup walks the layers from the innermost, so an inner
+/// declaration hides an outer one. Only elements that declare a namespace
+/// add a layer, so there are at most as many as the document is deep.
+#[derive(Default)]
+struct Ns {
+    own: HashMap<String, String>,
+    below: Option<Rc<Ns>>,
+}
+
+impl Ns {
+    fn get(&self, prefix: &str) -> Option<&String> {
+        let mut layer = self;
+        loop {
+            if let Some(uri) = layer.own.get(prefix) {
+                return Some(uri);
+            }
+            layer = layer.below.as_deref()?;
+        }
+    }
+
+    /// The bindings `own` over `below` (`below` itself when `own` is empty).
+    fn layer(below: &Rc<Ns>, own: HashMap<String, String>) -> Rc<Ns> {
+        if own.is_empty() {
+            Rc::clone(below)
+        } else {
+            Rc::new(Ns {
+                own,
+                below: Some(Rc::clone(below)),
+            })
+        }
+    }
+
+    /// The namespace declarations among `attrs` (`""` = the default one).
+    fn declared(attrs: &[(String, String)]) -> HashMap<String, String> {
+        let mut own = HashMap::new();
+        for (k, v) in attrs {
+            if k == "xmlns" {
+                own.insert(String::new(), v.clone());
+            } else if let Some(prefix) = k.strip_prefix("xmlns:") {
+                own.insert(prefix.to_string(), v.clone());
+            }
+        }
+        own
     }
 }
 
@@ -810,15 +873,12 @@ impl Extractor {
     /// tag fails the document (review parser#1).
     fn child_ctx(&self, parent: &Ctx, el: &XmlElement) -> Result<Ctx> {
         let mut ctx = parent.clone();
+        ctx.ns = Ns::layer(&parent.ns, Ns::declared(&el.attrs));
         for (k, v) in &el.attrs {
-            if k == "xmlns" {
-                ctx.ns.insert(String::new(), v.clone());
-            } else if let Some(prefix) = k.strip_prefix("xmlns:") {
-                ctx.ns.insert(prefix.to_string(), v.clone());
-            } else if k == "xml:base" {
+            if k == "xml:base" {
                 // XML Base: a relative `xml:base` is resolved against the
                 // base in scope (RFC 3986, review parser#4).
-                ctx.base = resolve(&parent.base, v);
+                ctx.base = resolve(&parent.base, v).into();
             } else if k == "xml:lang" {
                 ctx.lang = crate::model::term::normalize_lang_tag(v).map_err(|msg| {
                     GStoreError::RdfParse {
@@ -1097,16 +1157,35 @@ fn property_attributes(
 /// `&`, `<`, `>` and carriage returns, attribute values `&`, `<`, `"`,
 /// tabs, line feeds and carriage returns. CDATA sections are text, and DTD
 /// entity references are already expanded.
-fn xml_literal(pe: &XmlElement, ns: &HashMap<String, String>) -> Result<String> {
+fn xml_literal(pe: &XmlElement, ns: &Rc<Ns>) -> Result<String> {
     let mut out = String::new();
-    write_c14n_content(&pe.children, ns, &HashMap::new(), &mut out)?;
+    write_c14n_content(&pe.children, ns, None, &mut out)?;
     Ok(out)
+}
+
+/// The namespace declarations the canonical form has written on the
+/// enclosing elements of the literal, innermost first (a chain on the
+/// stack, so an element adds its own without copying its ancestors').
+struct Rendered<'a> {
+    own: HashMap<String, String>,
+    below: Option<&'a Rendered<'a>>,
+}
+
+/// The value the nearest enclosing element rendered for `prefix`.
+fn rendered_uri<'a>(mut layer: Option<&'a Rendered<'a>>, prefix: &str) -> Option<&'a str> {
+    while let Some(r) = layer {
+        if let Some(uri) = r.own.get(prefix) {
+            return Some(uri);
+        }
+        layer = r.below;
+    }
+    None
 }
 
 fn write_c14n_content(
     children: &[XmlChild],
-    scope: &HashMap<String, String>,
-    rendered: &HashMap<String, String>,
+    scope: &Rc<Ns>,
+    rendered: Option<&Rendered<'_>>,
     out: &mut String,
 ) -> Result<()> {
     for child in children {
@@ -1135,33 +1214,15 @@ fn write_c14n_content(
 
 fn write_c14n_element(
     el: &XmlElement,
-    parent_scope: &HashMap<String, String>,
-    rendered: &HashMap<String, String>,
+    parent_scope: &Rc<Ns>,
+    rendered: Option<&Rendered<'_>>,
     out: &mut String,
 ) -> Result<()> {
     let undefined = |prefix: &str| GStoreError::RdfParse {
         line: 0,
         msg: format!("undefined namespace prefix '{prefix}:' in an XML literal"),
     };
-    let declares = el
-        .attrs
-        .iter()
-        .any(|(k, _)| k == "xmlns" || k.starts_with("xmlns:"));
-    let own_scope;
-    let scope = if declares {
-        let mut s = parent_scope.clone();
-        for (k, v) in &el.attrs {
-            if k == "xmlns" {
-                s.insert(String::new(), v.clone());
-            } else if let Some(p) = k.strip_prefix("xmlns:") {
-                s.insert(p.to_string(), v.clone());
-            }
-        }
-        own_scope = s;
-        &own_scope
-    } else {
-        parent_scope
-    };
+    let scope = Ns::layer(parent_scope, Ns::declared(&el.attrs));
     // The prefixes the element visibly uses ("" = the default namespace).
     let mut used: Vec<&str> = vec![el.name.split_once(':').map_or("", |(p, _)| p)];
     let mut attrs: Vec<(&str, &str, &str, &str)> = Vec::new(); // (ns, local, qname, value)
@@ -1182,7 +1243,10 @@ fn write_c14n_element(
     used.sort_unstable();
     used.dedup();
     attrs.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
-    let mut here = rendered.clone();
+    let mut here = Rendered {
+        own: HashMap::new(),
+        below: rendered,
+    };
     out.push('<');
     out.push_str(&el.name);
     for p in used {
@@ -1190,11 +1254,11 @@ fn write_c14n_element(
         if !p.is_empty() && uri.is_empty() {
             return Err(undefined(p));
         }
-        let before = rendered.get(p).map_or("", String::as_str);
+        let before = rendered_uri(rendered, p);
         let declared = if p.is_empty() {
-            uri != before
+            uri != before.unwrap_or("")
         } else {
-            rendered.get(p).map(String::as_str) != Some(uri)
+            before != Some(uri)
         };
         if declared {
             out.push_str(" xmlns");
@@ -1205,7 +1269,7 @@ fn write_c14n_element(
             out.push_str("=\"");
             push_c14n_attr(uri, out);
             out.push('"');
-            here.insert(p.to_string(), uri.to_string());
+            here.own.insert(p.to_string(), uri.to_string());
         }
     }
     for (_, _, qname, value) in attrs {
@@ -1216,7 +1280,7 @@ fn write_c14n_element(
         out.push('"');
     }
     out.push('>');
-    write_c14n_content(&el.children, scope, &here, out)?;
+    write_c14n_content(&el.children, &scope, Some(&here), out)?;
     out.push_str("</");
     out.push_str(&el.name);
     out.push('>');
@@ -1239,7 +1303,7 @@ fn push_c14n_attr(value: &str, out: &mut String) {
 }
 
 /// Expand an element/datatype qualified name to `(namespace, local)`.
-fn expand_name(qname: &str, ns: &HashMap<String, String>) -> Result<(String, String)> {
+fn expand_name(qname: &str, ns: &Ns) -> Result<(String, String)> {
     match qname.split_once(':') {
         Some((prefix, local)) => {
             let iri = ns.get(prefix).ok_or_else(|| GStoreError::RdfParse {
@@ -1257,7 +1321,7 @@ fn expand_name(qname: &str, ns: &HashMap<String, String>) -> Result<(String, Str
 
 /// Expand an *attribute* qualified name. Unprefixed attributes are not in the
 /// default namespace (XML namespaces rule); they get an empty namespace.
-fn expand_attr_name(qname: &str, ns: &HashMap<String, String>) -> Result<(String, String)> {
+fn expand_attr_name(qname: &str, ns: &Ns) -> Result<(String, String)> {
     match qname.split_once(':') {
         Some((prefix, local)) => {
             let iri = ns.get(prefix).ok_or_else(|| GStoreError::RdfParse {
@@ -1272,12 +1336,7 @@ fn expand_attr_name(qname: &str, ns: &HashMap<String, String>) -> Result<(String
 
 /// Find an RDF-syntax attribute's value by namespace+local, tolerating the
 /// common unprefixed spelling (`about` when the writer omitted the `rdf:`).
-fn attr_value(
-    el: &XmlElement,
-    want_ns: &str,
-    want_local: &str,
-    ns: &HashMap<String, String>,
-) -> Result<Option<String>> {
+fn attr_value(el: &XmlElement, want_ns: &str, want_local: &str, ns: &Ns) -> Result<Option<String>> {
     for (raw, value) in &el.attrs {
         let (a_ns, a_local) = expand_attr_name(raw, ns)?;
         let matches = (a_ns == want_ns && a_local == want_local)
