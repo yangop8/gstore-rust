@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §18.5.1.4 Avg (Sum(M) / Count(M); xsd:integer divided by
+# xsd:integer is an xsd:decimal, §17.3 op:numeric-divide) and AVG(DISTINCT)
+PREFIX : <http://example.org/>
+SELECT ?s (AVG(?v) AS ?avg) (AVG(DISTINCT ?v) AS ?davg) WHERE { ?s :v ?v } GROUP BY ?s

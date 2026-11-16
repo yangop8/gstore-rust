@@ -1,0 +1,6 @@
+{
+  "head": {"vars": ["min", "max"]},
+  "results": {"bindings": [
+    {"min": {"type": "literal", "value": "1", "datatype": "http://www.w3.org/2001/XMLSchema#int"}, "max": {"type": "literal", "value": "007", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}}
+  ]}
+}

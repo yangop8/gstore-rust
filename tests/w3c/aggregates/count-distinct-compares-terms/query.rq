@@ -1,0 +1,5 @@
+# spec: SPARQL 1.1 Query §18.5.1.1 Count and §18.5.1 (Aggregate with DISTINCT: the multiset
+# of RDF terms made a set, terms compared as RDF terms): "01" and "1" are two terms
+PREFIX : <http://example.org/>
+SELECT (COUNT(DISTINCT ?v) AS ?n) (COUNT(?v) AS ?all) (SUM(DISTINCT ?v) AS ?sum)
+WHERE { ?s :v ?v FILTER(isNumeric(?v) || ?v = "x") }

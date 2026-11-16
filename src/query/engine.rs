@@ -1101,9 +1101,13 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// targets bound by the WHERE pattern) and return every triple having one of
     /// them as subject (the outgoing description), de-duplicated.
     fn eval_describe(&self, d: &DescribeQuery) -> Result<Vec<Triple>> {
+        // The resources in first-seen order, de-duplicated through a hash
+        // set (a linear `contains` per solution was quadratic in the number
+        // of resources — review sparqlconf#10 / query#12).
         let mut ids: Vec<u32> = Vec::new();
-        let add = |id: u32, ids: &mut Vec<u32>| {
-            if !ids.contains(&id) {
+        let mut seen_ids: HashSet<u32> = HashSet::new();
+        let mut add = |id: u32, ids: &mut Vec<u32>| {
+            if seen_ids.insert(id) {
                 ids.push(id);
             }
         };
@@ -2217,16 +2221,14 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 sep,
             } = a
             {
-                gb[layout.len() + i] = self
-                    .eval_aggregate(
-                        *func,
-                        *distinct,
-                        arg.as_deref(),
-                        sep.as_deref(),
-                        sols,
-                        layout,
-                    )
-                    .map(|v| self.value_to_id(&v));
+                gb[layout.len() + i] = self.eval_aggregate(
+                    *func,
+                    *distinct,
+                    arg.as_deref(),
+                    sep.as_deref(),
+                    sols,
+                    layout,
+                );
             }
         }
         gb
@@ -2251,7 +2253,19 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             .all(|h| self.eval_ebv(h, &gb, &glayout) == Some(true))
     }
 
-    /// Compute one aggregate over a group's solutions.
+    /// Compute one aggregate over a group's solutions, as the id of its
+    /// value (`None`: an error, which leaves the column unbound).
+    ///
+    /// `DISTINCT` drops repeated RDF terms (hash-based; it compared values
+    /// pairwise, which was quadratic and counted `"01"` and `"1"` as one —
+    /// review query#12, sparqlconf#10). `MIN` / `MAX` pick by the `ORDER BY`
+    /// order (§18.5.1.7 / §18.5.1.8: blank nodes < IRIs < literals, then
+    /// by value, ties by the term), so the answer no longer depends on the
+    /// order of the input (review query#8, sparqlconf#7); they, `SAMPLE` and
+    /// `GROUP_CONCAT` keep the terms as stored (`"5"^^xsd:int` stays an
+    /// `xsd:int`, `"01"` stays `"01"`). `SUM` / `AVG` skip non-numeric
+    /// values — an extension: SPARQL makes the aggregate an error there —
+    /// and `AVG` divides by the number of values it summed (review query#7).
     fn eval_aggregate(
         &self,
         func: AggFunc,
@@ -2260,7 +2274,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         sep: Option<&str>,
         sols: &[&Binding],
         layout: &VarLayout,
-    ) -> Option<Value> {
+    ) -> Option<u32> {
         // COUNT(*) counts solutions; COUNT(DISTINCT *) counts the distinct
         // solution mappings (SPARQL 1.1 §18.5.1.1), so dedup bindings before
         // counting when the DISTINCT modifier is present. A mapping holds
@@ -2288,67 +2302,144 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                         )
                     })
                     .count();
-                return Some(Value::Int(n as i64));
+                return Some(self.value_to_id(&Value::Int(n as i64)));
             }
-            return Some(Value::Int(sols.len() as i64));
+            return Some(self.value_to_id(&Value::Int(sols.len() as i64)));
         }
         let arg = arg?;
-        let mut vals: Vec<Value> = sols
-            .iter()
-            .filter_map(|b| self.eval_value(arg, b, layout))
-            .collect();
-        if distinct {
-            let mut seen: Vec<Value> = Vec::new();
-            vals.retain(|v| {
-                if seen.contains(v) {
-                    false
-                } else {
-                    seen.push(v.clone());
-                    true
-                }
-            });
+        // COUNT / SUM / AVG over every value need only the values.
+        if !distinct && matches!(func, AggFunc::Count | AggFunc::Sum | AggFunc::Avg) {
+            let vals: Vec<Value> = sols
+                .iter()
+                .filter_map(|b| self.eval_value(arg, b, layout))
+                .collect();
+            return self
+                .numeric_aggregate(func, &vals)
+                .map(|v| self.value_to_id(&v));
         }
-        Some(match func {
-            AggFunc::Count => Value::Int(vals.len() as i64),
-            AggFunc::Sum => sum_values(&vals),
-            // Avg(S) = Sum(S) / Count(S) with the query's division (so an
-            // integer average is a decimal, or truncated in upstream mode);
-            // 0 for an empty group (§18.5.1.4).
-            AggFunc::Avg => {
-                if vals.is_empty() {
-                    Value::Int(0)
-                } else {
-                    sum_values(&vals).arith_with(
-                        ArithOp::Div,
-                        &Value::Int(vals.len() as i64),
-                        self.integer_division,
-                    )?
-                }
+        let items = self.aggregate_terms(arg, sols, layout);
+        let items: Vec<&AggTerm> = if distinct {
+            let mut seen: HashSet<&AggTerm> = HashSet::with_capacity(items.len());
+            items.iter().filter(|it| seen.insert(*it)).collect()
+        } else {
+            items.iter().collect()
+        };
+        match func {
+            AggFunc::Count | AggFunc::Sum | AggFunc::Avg => {
+                let vals: Vec<Value> = items.iter().filter_map(|it| self.agg_value(it)).collect();
+                self.numeric_aggregate(func, &vals)
+                    .map(|v| self.value_to_id(&v))
             }
-            AggFunc::Min => vals.into_iter().reduce(|a, b| {
-                if b.sparql_cmp(&a) == Some(std::cmp::Ordering::Less) {
-                    b
+            AggFunc::Min | AggFunc::Max => {
+                let want = if func == AggFunc::Min {
+                    std::cmp::Ordering::Less
                 } else {
-                    a
+                    std::cmp::Ordering::Greater
+                };
+                let mut best: Option<(_, &AggTerm)> = None;
+                for it in items {
+                    let Some(v) = self.agg_value(it) else {
+                        continue;
+                    };
+                    let key = order_key(&Some(v));
+                    let replace = match &best {
+                        None => true,
+                        Some((best_key, best_it)) => {
+                            key.cmp(best_key).then_with(|| {
+                                if it == *best_it {
+                                    std::cmp::Ordering::Equal
+                                } else {
+                                    self.agg_term(it).cmp(&self.agg_term(best_it))
+                                }
+                            }) == want
+                        }
+                    };
+                    if replace {
+                        best = Some((key, it));
+                    }
                 }
-            })?,
-            AggFunc::Max => vals.into_iter().reduce(|a, b| {
-                if b.sparql_cmp(&a) == Some(std::cmp::Ordering::Greater) {
-                    b
-                } else {
-                    a
-                }
-            })?,
-            AggFunc::Sample => vals.into_iter().next()?,
+                best.map(|(_, it)| self.agg_id(it))
+            }
+            AggFunc::Sample => items.first().map(|it| self.agg_id(it)),
+            // The lexical forms (`STR`) of the terms, as a simple literal.
             AggFunc::GroupConcat => {
-                let s = sep.unwrap_or(" ");
-                let joined = vals.iter().map(Value::lexical).collect::<Vec<_>>().join(s);
-                Value::Str {
-                    value: joined,
+                let parts: Vec<String> = items
+                    .iter()
+                    .filter_map(|it| self.agg_term(it))
+                    .map(|t| match t {
+                        Term::Literal { value, .. } => value,
+                        Term::Iri(s) | Term::Blank(s) => s,
+                    })
+                    .collect();
+                Some(self.value_to_id(&Value::Str {
+                    value: parts.join(sep.unwrap_or(" ")),
                     lang: None,
+                }))
+            }
+        }
+    }
+
+    /// `COUNT` / `SUM` / `AVG` of `vals` (`None` for another function, or
+    /// an arithmetic error). `AVG` is the sum of the numeric values divided
+    /// by how many there are, with the query's division (so an integer
+    /// average is a decimal, or truncated in upstream mode); 0 when there
+    /// are none (§18.5.1.4).
+    fn numeric_aggregate(&self, func: AggFunc, vals: &[Value]) -> Option<Value> {
+        match func {
+            AggFunc::Count => Some(Value::Int(vals.len() as i64)),
+            AggFunc::Sum => Some(sum_values(vals)),
+            AggFunc::Avg => {
+                let (sum, n) = sum_numeric(vals);
+                if n == 0 {
+                    Some(Value::Int(0))
+                } else {
+                    sum.arith_with(ArithOp::Div, &Value::Int(n as i64), self.integer_division)
                 }
             }
-        })
+            _ => None,
+        }
+    }
+
+    /// What an aggregate collects from each solution (errors skipped): the
+    /// ids a variable is bound to, or the terms an expression evaluates to.
+    fn aggregate_terms(&self, arg: &Expr, sols: &[&Binding], layout: &VarLayout) -> Vec<AggTerm> {
+        let column = match arg {
+            Expr::Var(v) => layout.index.get(v).copied().filter(|&i| !layout.is_pred[i]),
+            _ => None,
+        };
+        match column {
+            Some(i) => sols
+                .iter()
+                .filter_map(|b| b.get(i).copied().flatten())
+                .map(AggTerm::Id)
+                .collect(),
+            None => sols
+                .iter()
+                .filter_map(|b| self.eval_term(arg, b, layout))
+                .map(AggTerm::Term)
+                .collect(),
+        }
+    }
+
+    fn agg_value(&self, it: &AggTerm) -> Option<Value> {
+        match it {
+            AggTerm::Id(id) => self.id_to_value(*id, false),
+            AggTerm::Term(t) => Some(Value::from_term(t)),
+        }
+    }
+
+    fn agg_term(&self, it: &AggTerm) -> Option<Term> {
+        match it {
+            AggTerm::Id(id) => self.id_to_term(*id, false),
+            AggTerm::Term(t) => Some(t.clone()),
+        }
+    }
+
+    fn agg_id(&self, it: &AggTerm) -> u32 {
+        match it {
+            AggTerm::Id(id) => *id,
+            AggTerm::Term(t) => self.term_to_id(t),
+        }
     }
 
     // ---- property paths --------------------------------------------------
@@ -5767,18 +5858,37 @@ fn eval_in(
 
 /// Sum numeric values (integer-preserving until a double appears).
 fn sum_values(vals: &[Value]) -> Value {
-    // Accumulate through the numeric tower so decimals and big integers are
-    // summed exactly (not silently skipped) and any double promotes the result.
-    // Non-numeric values are not summable and are skipped (as before).
+    sum_numeric(vals).0
+}
+
+/// The sum of the numeric values of `vals` and how many were added.
+/// Accumulates through the numeric tower so decimals and big integers are
+/// summed exactly (not silently skipped) and any double promotes the result.
+/// Non-numeric values are not summable and are skipped (an extension:
+/// SPARQL makes `SUM` / `AVG` an error there), and so is a value whose
+/// addition fails; `AVG` divides by the count (review query#7: it divided
+/// by the number of all values, skipped ones included).
+fn sum_numeric(vals: &[Value]) -> (Value, usize) {
     let mut acc = Value::Int(0);
+    let mut n = 0;
     for v in vals {
         if v.is_numeric() {
             if let Some(next) = acc.arith(ArithOp::Add, v) {
                 acc = next;
+                n += 1;
             }
         }
     }
-    acc
+    (acc, n)
+}
+
+/// One value an aggregate collects (see [`Evaluator::eval_aggregate`]): the
+/// id a variable is bound to, or the term an expression evaluates to. Two
+/// are equal when they are the same RDF term (`DISTINCT`).
+#[derive(Debug, PartialEq, Eq, Hash)]
+enum AggTerm {
+    Id(u32),
+    Term(Term),
 }
 
 /// How a variable of a trailing `VALUES` block meets an aggregate query's

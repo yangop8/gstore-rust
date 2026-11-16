@@ -11,7 +11,12 @@
 //! * `REGEX` / `REPLACE` follow XPath `fn:matches` / `fn:replace` — the
 //!   flags, the replacement-string syntax, the empty-match error — and
 //!   compile a pattern once per query (§17.4.3.14 / §17.4.3.15; review
-//!   query#11, sparqlconf#8).
+//!   query#11, sparqlconf#8);
+//! * `MIN` / `MAX` use the `ORDER BY` order and, like `SAMPLE` and
+//!   `GROUP_CONCAT`, keep the terms as stored (§18.5.1; review query#8,
+//!   sparqlconf#7); `AVG` divides by the values it summed (review query#7);
+//!   `DISTINCT` aggregates and `DESCRIBE` de-duplicate in linear time
+//!   (review query#12, sparqlconf#10).
 //!
 //! The spec-defined answers of these functions that do not depend on
 //! randomness are also cases of the W3C-style subset (`tests/w3c/`).
@@ -579,8 +584,258 @@ fn a_regex_filter_costs_about_what_a_string_filter_costs() {
     let plain = best(
         r#"SELECT ?s WHERE { ?s <http://ex/v> ?o FILTER(STRSTARTS(?o, "1") && STRENDS(?o, "9")) }"#,
     );
+    eprintln!("REGEX filter {regex:?}, STRSTARTS/STRENDS filter {plain:?}");
     assert!(
         regex < plain * 10,
         "REGEX filter {regex:?} vs STRSTARTS/STRENDS filter {plain:?}"
     );
+}
+
+// ---- aggregates (review query#7, query#8, sparqlconf#7, query#12, sparqlconf#10)
+
+const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
+
+/// §18.5.1.7 / §18.5.1.8: MIN and MAX use the ORDER BY order (§15.1:
+/// blank nodes, then IRIs, then literals), whatever order the values come
+/// in. With the partial `<` the first value seen won whenever two values
+/// did not compare (an IRI and a literal, a number and a string).
+#[test]
+fn min_and_max_follow_the_order_by_order_whatever_the_input_order() {
+    let mut values_db = db("");
+    let values = ["<http://ex/z>", "3", "\"a\"", "\"b\"@en", "2.5"];
+    // Every rotation and its reverse.
+    let mut orders = Vec::new();
+    for r in 0..values.len() {
+        let mut v = values.to_vec();
+        v.rotate_left(r);
+        orders.push(v.clone());
+        v.reverse();
+        orders.push(v);
+    }
+    let sorted = select(
+        &mut values_db,
+        &format!(
+            "SELECT ?v WHERE {{ VALUES ?v {{ {} }} }} ORDER BY ?v",
+            values.join(" ")
+        ),
+    );
+    let first = cell(&sorted, 0, "v").map(str::to_string);
+    let last = cell(&sorted, sorted.row_count() - 1, "v").map(str::to_string);
+    assert_eq!(first.as_deref(), Some("<http://ex/z>"));
+    for order in orders {
+        let rs = select(
+            &mut values_db,
+            &format!(
+                "SELECT (MIN(?v) AS ?min) (MAX(?v) AS ?max) WHERE {{ VALUES ?v {{ {} }} }}",
+                order.join(" ")
+            ),
+        );
+        assert_eq!(cell(&rs, 0, "min").map(str::to_string), first, "{order:?}");
+        assert_eq!(cell(&rs, 0, "max").map(str::to_string), last, "{order:?}");
+    }
+    // Per group, over data whose objects mix kinds.
+    let mut db = db("<http://ex/g> <http://ex/v> <http://ex/zzz> .\n\
+                     <http://ex/g> <http://ex/v> \"3\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n\
+                     <http://ex/h> <http://ex/v> \"x\" .\n\
+                     <http://ex/h> <http://ex/v> \"7\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n");
+    let rs = select(
+        &mut db,
+        "SELECT ?g (MIN(?v) AS ?min) (MAX(?v) AS ?max) WHERE { ?g <http://ex/v> ?v } \
+         GROUP BY ?g ORDER BY ?g",
+    );
+    assert_eq!(cell(&rs, 0, "min"), Some("<http://ex/zzz>"), "{rs:?}");
+    assert_eq!(
+        cell(&rs, 0, "max"),
+        Some(format!("\"3\"^^<{XSD}integer>").as_str())
+    );
+    assert_eq!(
+        cell(&rs, 1, "min"),
+        Some(format!("\"7\"^^<{XSD}integer>").as_str())
+    );
+    assert_eq!(cell(&rs, 1, "max"), Some("\"x\""), "{rs:?}");
+}
+
+/// MIN / MAX / SAMPLE return a term of the group as it is stored, and
+/// GROUP_CONCAT joins the terms' lexical forms (`STR`): they went through
+/// the value and back, so `"5"^^xsd:int` came back an `xsd:integer`,
+/// `"01"` as `"1"` and `"1e3"^^xsd:double` as `"1000.0"`.
+#[test]
+fn min_max_sample_and_group_concat_keep_the_terms() {
+    let mut db = db(&format!(
+        "<http://ex/a> <http://ex/v> \"5\"^^<{XSD}int> .\n\
+         <http://ex/b> <http://ex/v> \"01\"^^<{XSD}integer> .\n\
+         <http://ex/c> <http://ex/v> \"1e3\"^^<{XSD}double> .\n"
+    ));
+    let rs = select(
+        &mut db,
+        "SELECT ?s (MIN(?v) AS ?min) (MAX(?v) AS ?max) (SAMPLE(?v) AS ?sample) \
+         (GROUP_CONCAT(?v) AS ?concat) WHERE { ?s <http://ex/v> ?v } GROUP BY ?s ORDER BY ?s",
+    );
+    let expect = [
+        (format!("\"5\"^^<{XSD}int>"), "\"5\""),
+        (format!("\"01\"^^<{XSD}integer>"), "\"01\""),
+        (format!("\"1e3\"^^<{XSD}double>"), "\"1e3\""),
+    ];
+    assert_eq!(rs.row_count(), 3, "{rs:?}");
+    for (row, (term, concat)) in expect.iter().enumerate() {
+        for var in ["min", "max", "sample"] {
+            assert_eq!(cell(&rs, row, var), Some(term.as_str()), "{var}: {rs:?}");
+        }
+        assert_eq!(cell(&rs, row, "concat"), Some(*concat), "{rs:?}");
+    }
+}
+
+/// AVG divided the sum of the numeric values by the number of all values,
+/// the non-numeric ones it skipped included: 10 and "x" averaged 5.0.
+/// Skipping non-numeric values is this engine's extension (SPARQL makes
+/// the aggregate an error); the divisor is now the number of values summed.
+#[test]
+fn avg_divides_by_the_number_of_values_it_summed() {
+    let mut db = db("<http://ex/g1> <http://ex/v> 10 .\n\
+                     <http://ex/g1> <http://ex/v> \"x\" .\n\
+                     <http://ex/g2> <http://ex/v> 10 .\n\
+                     <http://ex/g2> <http://ex/v> 20 .\n\
+                     <http://ex/g3> <http://ex/v> \"y\" .\n\
+                     <http://ex/g4> <http://ex/v> 4 .\n\
+                     <http://ex/g4> <http://ex/v> \"4\"^^<http://www.w3.org/2001/XMLSchema#int> .\n");
+    let rs = select(
+        &mut db,
+        "SELECT ?g (AVG(?v) AS ?avg) (AVG(DISTINCT ?v) AS ?davg) (SUM(?v) AS ?sum) \
+         (COUNT(?v) AS ?n) WHERE { ?g <http://ex/v> ?v } GROUP BY ?g ORDER BY ?g",
+    );
+    let dec = |v: &str| format!("\"{v}\"^^<{XSD}decimal>");
+    let int = |v: &str| format!("\"{v}\"^^<{XSD}integer>");
+    let want = [
+        (dec("10.0"), dec("10.0"), int("10"), int("2")),
+        (dec("15.0"), dec("15.0"), int("30"), int("2")),
+        // Nothing summed: 0, as for an empty group (§18.5.1.4).
+        (int("0"), int("0"), int("0"), int("1")),
+        (dec("4.0"), dec("4.0"), int("8"), int("2")),
+    ];
+    assert_eq!(rs.row_count(), 4, "{rs:?}");
+    for (row, (avg, davg, sum, n)) in want.iter().enumerate() {
+        assert_eq!(
+            cell(&rs, row, "avg"),
+            Some(avg.as_str()),
+            "row {row}: {rs:?}"
+        );
+        assert_eq!(
+            cell(&rs, row, "davg"),
+            Some(davg.as_str()),
+            "row {row}: {rs:?}"
+        );
+        assert_eq!(
+            cell(&rs, row, "sum"),
+            Some(sum.as_str()),
+            "row {row}: {rs:?}"
+        );
+        assert_eq!(cell(&rs, row, "n"), Some(n.as_str()), "row {row}: {rs:?}");
+    }
+}
+
+/// DISTINCT in an aggregate drops repeated RDF terms (§18.5.1: the
+/// multiset is made a set): `"01"` and `"1"` are two terms with one value,
+/// so COUNT(DISTINCT) counts both. They were compared as values.
+#[test]
+fn distinct_aggregates_compare_terms() {
+    let mut db = db(&format!(
+        "<http://ex/a> <http://ex/v> \"01\"^^<{XSD}integer> .\n\
+         <http://ex/b> <http://ex/v> \"1\"^^<{XSD}integer> .\n\
+         <http://ex/c> <http://ex/v> \"1\"^^<{XSD}integer> .\n\
+         <http://ex/d> <http://ex/v> \"x\" .\n\
+         <http://ex/e> <http://ex/v> \"x\" .\n"
+    ));
+    let rs = select(
+        &mut db,
+        "SELECT (COUNT(DISTINCT ?v) AS ?n) (SUM(DISTINCT ?v) AS ?sum) \
+         (GROUP_CONCAT(DISTINCT ?v; SEPARATOR=\"|\") AS ?all) (COUNT(DISTINCT STR(?v)) AS ?strs) \
+         WHERE { ?s <http://ex/v> ?v }",
+    );
+    assert_eq!(
+        cell(&rs, 0, "n"),
+        Some(format!("\"3\"^^<{XSD}integer>").as_str())
+    );
+    assert_eq!(
+        cell(&rs, 0, "sum"),
+        Some(format!("\"2\"^^<{XSD}integer>").as_str())
+    );
+    let all = cell(&rs, 0, "all").unwrap().trim_matches('"').to_string();
+    let mut parts: Vec<&str> = all.split('|').collect();
+    parts.sort();
+    assert_eq!(parts, ["01", "1", "x"], "{rs:?}");
+    assert_eq!(
+        cell(&rs, 0, "strs"),
+        Some(format!("\"3\"^^<{XSD}integer>").as_str())
+    );
+}
+
+/// The best of three runs of `q` against a fresh evaluator (no query cache).
+fn best_time(db: &Database, q: &str) -> std::time::Duration {
+    let parsed = gstore::parser::sparql::parse(q).expect("parse");
+    (0..3)
+        .map(|_| {
+            let t = std::time::Instant::now();
+            let r = Evaluator::new(db.dict(), db.store()).evaluate(&parsed);
+            assert!(r.is_ok(), "{q}: {r:?}");
+            t.elapsed()
+        })
+        .min()
+        .unwrap()
+}
+
+/// `n` subjects, each with one distinct string value.
+fn distinct_values(n: usize) -> Database {
+    let mut data = String::with_capacity(n * 48);
+    for i in 0..n {
+        data.push_str(&format!("<http://ex/s{i}> <http://ex/v> \"val{i}\" .\n"));
+    }
+    db(&data)
+}
+
+/// D9: an aggregate DISTINCT over four times the values takes about four
+/// times as long (the bound allows 12). A linear `contains` per value made
+/// it quadratic: 20,000 distinct values took 0.38 s, 80,000 took 13 s.
+#[test]
+fn distinct_aggregates_scale_linearly() {
+    let (small, large) = (distinct_values(20_000), distinct_values(80_000));
+    for q in [
+        "SELECT (COUNT(DISTINCT ?o) AS ?c) WHERE { ?s <http://ex/v> ?o }",
+        "SELECT (GROUP_CONCAT(DISTINCT ?o) AS ?c) WHERE { ?s <http://ex/v> ?o }",
+        "SELECT (COUNT(DISTINCT STR(?o)) AS ?c) WHERE { ?s <http://ex/v> ?o }",
+    ] {
+        let (a, b) = (best_time(&small, q), best_time(&large, q));
+        eprintln!("{q}: 20k values {a:?}, 80k values {b:?}");
+        assert!(b < a * 12, "{q}: 20k values {a:?}, 80k values {b:?}");
+    }
+}
+
+/// D9: DESCRIBE over four times the resources takes about four times as
+/// long (the bound allows 8). Its resource list was de-duplicated with a
+/// linear `contains` per solution, quadratic in the number of resources
+/// (about 15 times as long here).
+/// The described resources have no triples of their own, so the time is
+/// the WHERE clause and the de-duplication.
+#[test]
+fn describe_scales_linearly() {
+    let objects = |n: usize| {
+        let mut data = String::with_capacity(n * 48);
+        for i in 0..n {
+            data.push_str(&format!(
+                "<http://ex/s{i}> <http://ex/v> <http://ex/o{i}> .\n"
+            ));
+        }
+        db(&data)
+    };
+    let (small, large) = (objects(40_000), objects(160_000));
+    let q = "DESCRIBE ?o WHERE { ?s <http://ex/v> ?o }";
+    let (a, b) = (best_time(&small, q), best_time(&large, q));
+    eprintln!("{q}: 40k resources {a:?}, 160k resources {b:?}");
+    assert!(b < a * 8, "40k resources {a:?}, 160k resources {b:?}");
+    // DESCRIBE ?s: every subject's triple.
+    let parsed =
+        gstore::parser::sparql::parse("DESCRIBE ?s WHERE { ?s <http://ex/v> ?o }").unwrap();
+    match Evaluator::new(large.dict(), large.store()).evaluate(&parsed) {
+        Ok(QueryResult::Construct(ts)) => assert_eq!(ts.len(), 160_000),
+        other => panic!("expected a graph, got {other:?}"),
+    }
 }

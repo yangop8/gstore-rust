@@ -1,0 +1,7 @@
+{
+  "head": {"vars": ["s", "avg", "davg"]},
+  "results": {"bindings": [
+    {"s": {"type": "uri", "value": "http://example.org/a"}, "avg": {"type": "literal", "value": "1.5", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}, "davg": {"type": "literal", "value": "1.5", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}},
+    {"s": {"type": "uri", "value": "http://example.org/b"}, "avg": {"type": "literal", "value": "3.0", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}, "davg": {"type": "literal", "value": "3.0", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}}
+  ]}
+}

@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §18.5.1.7 Min / §18.5.1.8 Max use the ORDER BY ordering of §15.1:
+# blank nodes before IRIs before literals; the result is the term itself
+PREFIX : <http://example.org/>
+SELECT ?g (MIN(?v) AS ?min) (MAX(?v) AS ?max) WHERE { ?g :v ?v } GROUP BY ?g

@@ -1,0 +1,7 @@
+@prefix : <http://example.org/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+:a :v "01"^^xsd:integer .
+:b :v "1"^^xsd:integer .
+:c :v "1"^^xsd:integer .
+:d :v "x" .
+:e :v "x" .

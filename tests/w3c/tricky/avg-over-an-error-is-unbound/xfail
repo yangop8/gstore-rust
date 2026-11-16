@@ -1,2 +1,5 @@
 query#7
-AVG skips the non-numeric value but still counts it in the divisor (5.0).
+AVG divided the sum by the number of all values, the skipped non-numeric one included
+(5.0); query#7's divisor is fixed (10.0 now). What remains is the documented extension:
+SUM / AVG skip non-numeric values instead of making the aggregate an error (SPARQL 1.1
+§18.5.1.3 / §18.5.1.4), so g1 gets 10.0 where the spec leaves it unbound.
