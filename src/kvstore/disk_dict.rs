@@ -1065,18 +1065,30 @@ mod tests {
         std::fs::remove_file(wal(&path)).ok();
     }
 
+    /// Removes a test's store file and its log when dropped, also when the
+    /// test fails (declare it before the store, so it is dropped last).
+    struct Files(std::path::PathBuf);
+
+    impl Drop for Files {
+        fn drop(&mut self) {
+            std::fs::remove_file(&self.0).ok();
+            std::fs::remove_file(wal(&self.0)).ok();
+        }
+    }
+
     /// A writable backend over a fresh store with a free-id list holding
-    /// the entities `<x>`, `<keep>` and `<other>` (ids 0, 1, 2).
-    fn reclaiming(name: &str) -> (std::path::PathBuf, DiskStore, Arc<DiskDict>) {
-        let path = tmp(name);
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(wal(&path));
-        let mut ds = DiskStore::open_with(&path, 64, true).unwrap();
+    /// the entities `<x>`, `<keep>` and `<other>` (ids 0, 1, 2), and the
+    /// guard of its files.
+    fn reclaiming(name: &str) -> (Files, DiskStore, Arc<DiskDict>) {
+        let files = Files(tmp(name));
+        let _ = std::fs::remove_file(&files.0);
+        let _ = std::fs::remove_file(wal(&files.0));
+        let mut ds = DiskStore::open_with(&files.0, 64, true).unwrap();
         ds.insert_keys("<x>", "<p>", "<keep>", false).unwrap();
         ds.insert_keys("<other>", "<p>", "<keep>", false).unwrap();
         ds.flush().unwrap();
         let dd = DiskDict::open_shared(ds.shared_pager()).unwrap().writable();
-        (path, ds, Arc::new(dd))
+        (files, ds, Arc::new(dd))
     }
 
     /// A hook that parks the first read reaching it: it reports `parked`,
@@ -1105,7 +1117,7 @@ mod tests {
     /// hook: the read parks between the page read and the cache insert.
     #[test]
     fn a_term_read_before_a_free_is_not_cached_after_it() {
-        let (path, ds, dd) = reclaiming("race_terms");
+        let (_files, ds, dd) = reclaiming("race_terms");
         let x = dd.lookup(Space::Entity, "<x>").unwrap().unwrap();
         let other = dd.lookup(Space::Entity, "<other>").unwrap().unwrap();
         let mut dd = Arc::into_inner(dd).unwrap();
@@ -1129,8 +1141,6 @@ mod tests {
             "the reused id resolves to its new term"
         );
         drop((dd, ds));
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_file(wal(&path)).ok();
     }
 
     /// The `key → id` direction of the same race: a stale `<x> → id` cached
@@ -1139,7 +1149,7 @@ mod tests {
     /// one id.
     #[test]
     fn a_key_read_before_a_free_is_not_cached_after_it() {
-        let (path, ds, dd) = reclaiming("race_keys");
+        let (_files, ds, dd) = reclaiming("race_keys");
         let x = dd.lookup(Space::Entity, "<x>").unwrap().unwrap();
         let other = dd.lookup(Space::Entity, "<other>").unwrap().unwrap();
         // A fresh backend: nothing cached yet, so the reader reads the tree.
@@ -1169,8 +1179,6 @@ mod tests {
         );
         assert_eq!(dd.lookup(Space::Entity, "<x>").unwrap(), Some(again));
         drop((dd, ds));
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_file(wal(&path)).ok();
     }
 
     #[test]

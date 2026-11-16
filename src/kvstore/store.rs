@@ -4480,8 +4480,15 @@ mod tests {
     #[test]
     fn readers_run_while_a_commit_writes_its_log() {
         use std::sync::mpsc::channel;
+        /// Removes the test's files when dropped, also when it fails.
+        struct Files(std::path::PathBuf);
+        impl Drop for Files {
+            fn drop(&mut self) {
+                cleanup(&self.0);
+            }
+        }
         let path = tmp("commit_shared");
-        cleanup(&path);
+        let _files = Files(path.clone());
         let mut ds = DiskStore::open_with(&path, 64, true).unwrap();
         for i in 0..200 {
             ds.insert_keys(&format!("<s{i}>"), "<p>", &format!("<o{i}>"), false)
@@ -4519,8 +4526,6 @@ mod tests {
         drop((ds, shared));
         let back = DiskStore::open(&path, 64).unwrap();
         assert_eq!(back.triple_count(), 200, "the commit is durable");
-        drop(back);
-        cleanup(&path);
     }
 
     #[test]
