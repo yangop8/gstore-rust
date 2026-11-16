@@ -445,12 +445,17 @@ type BnodeKey = (Box<[Option<u32>]>, String);
 /// `REGEX` / `REPLACE`. One value per evaluator, shared (`Rc`) with its
 /// `GRAPH` sub-evaluators, so a `GRAPH` block sees the same `NOW()`, the
 /// same `BNODE(str)` nodes and the same pattern cache as the rest of the
-/// query.
+/// query. The execution-bound part (`NOW()`'s instant, the `BNODE` nodes)
+/// starts afresh with every [`Evaluator::evaluate`] /
+/// [`Evaluator::eval_update_modify`] call (see
+/// [`begin_execution`](Self::begin_execution)), so an evaluator a caller
+/// reuses for another query does not hand that query the first one's
+/// instant or nodes.
 #[derive(Default)]
 struct QueryCtx {
     /// `NOW()`: the instant of the first call (Unix seconds), returned by
     /// every later call of the query (§17.4.5.1; review query#16).
-    now: std::cell::OnceCell<i64>,
+    now: std::cell::Cell<Option<i64>>,
     /// `BNODE(str)`: the blank node minted for a string within one solution
     /// mapping, keyed by the solution (see [`QueryCtx::solution_key`]) and
     /// the string (§17.4.2.9; review query#5).
@@ -477,9 +482,25 @@ impl QueryCtx {
     /// How many random bytes [`uuid_bytes`](Self::uuid_bytes) reads at once.
     const ENTROPY_BLOCK: usize = 512;
 
+    /// A new query execution starts: forget the previous one's `NOW()`
+    /// instant and `BNODE` nodes. The generators and the pattern cache
+    /// carry over (they hold no answer of the previous query).
+    fn begin_execution(&self) {
+        self.now.set(None);
+        self.bnode_by_str.borrow_mut().clear();
+        self.minted.borrow_mut().clear();
+    }
+
     /// `NOW()`'s instant for this query.
     fn now(&self) -> i64 {
-        *self.now.get_or_init(now_unix_secs)
+        match self.now.get() {
+            Some(t) => t,
+            None => {
+                let t = now_unix_secs();
+                self.now.set(Some(t));
+                t
+            }
+        }
     }
 
     /// The next `RAND()` draw: 64 bits of the query's generator.
@@ -1025,6 +1046,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// Evaluate a read query (SELECT / ASK / CONSTRUCT). Updates are handled in
     /// the db layer.
     pub fn evaluate(&self, query: &Query) -> Result<QueryResult> {
+        self.ctx.begin_execution();
         self.check_cancel()?;
         self.check_calls(query)?;
         let result = match query {
@@ -1085,7 +1107,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 // A triple with a literal subject or a non-IRI predicate is
                 // not RDF and is left out (§16.2).
                 if let Some(t) = self
-                    .instantiate_template(tp, b, &layout, &mut fresh)
+                    .instantiate_template(tp, b, &layout, &mut fresh, true)
                     .filter(|t| !t.subject.is_literal() && matches!(t.predicate, Term::Iri(_)))
                 {
                     if seen.insert(t.to_string()) {
@@ -1207,6 +1229,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         insert: &[QuadPattern],
         pattern: &GraphPattern,
     ) -> Result<(Vec<(Option<String>, Triple)>, Vec<(Option<String>, Triple)>)> {
+        self.ctx.begin_execution();
         self.check_pattern_calls(pattern)?;
         let layout = VarLayout::build(pattern);
         let sols = self.eval_pattern(pattern, &layout);
@@ -1218,14 +1241,19 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         for b in &sols {
             // One map per solution: a `[ … ]` / `( … )` node of the
             // templates is the same fresh blank node across this solution's
-            // quads, and a new one for the next solution.
+            // quads, and a new one for the next solution. A labelled `_:v`
+            // is fresh in the INSERT template only: in the DELETE template
+            // (where SPARQL forbids blank nodes) it names the stored node,
+            // as in the WHERE pattern and `DELETE DATA`, so `DELETE WHERE
+            // { … _:v }` deletes what it matched.
             let mut fresh = HashMap::new();
-            for (templates, out, seen) in [
-                (delete, &mut dels, &mut seen_d),
-                (insert, &mut ins, &mut seen_i),
+            for (templates, out, seen, fresh_labels) in [
+                (delete, &mut dels, &mut seen_d, false),
+                (insert, &mut ins, &mut seen_i, true),
             ] {
                 for q in templates {
-                    let Some(quad) = self.instantiate_quad(q, b, &layout, &mut fresh) else {
+                    let Some(quad) = self.instantiate_quad(q, b, &layout, &mut fresh, fresh_labels)
+                    else {
                         continue;
                     };
                     if seen.insert((quad.0.clone(), quad.1.to_string())) {
@@ -1239,14 +1267,16 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
 
     /// Fill a quad template from a solution (see
     /// [`eval_update_modify`](Self::eval_update_modify)); `None` if a
-    /// variable is unbound or the result is not a legal quad. `fresh` is as
-    /// for [`instantiate_template`](Self::instantiate_template).
+    /// variable is unbound or the result is not a legal quad. `fresh` and
+    /// `fresh_labels` are as for
+    /// [`instantiate_template`](Self::instantiate_template).
     fn instantiate_quad(
         &self,
         q: &QuadPattern,
         b: &Binding,
         layout: &VarLayout,
         fresh: &mut HashMap<String, Term>,
+        fresh_labels: bool,
     ) -> Option<(Option<String>, Triple)> {
         let graph = match &q.graph {
             None => None,
@@ -1256,7 +1286,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 _ => return None,
             },
         };
-        let t = self.instantiate_template(&q.triple, b, layout, fresh)?;
+        let t = self.instantiate_template(&q.triple, b, layout, fresh, fresh_labels)?;
         if t.subject.is_literal() || !matches!(t.predicate, Term::Iri(_)) {
             return None;
         }
@@ -1273,24 +1303,27 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
 
     /// Fill a template triple from a solution; `None` if any position is
     /// unbound. A hidden blank-node variable (`[ … ]` / `( … )` in the
-    /// template, see [`ANON_VAR_PREFIX`]) the solution does not bind, and a
-    /// labelled blank node `_:v` of the template, become a fresh blank node,
-    /// the same one for every template triple of this solution (SPARQL 1.1
+    /// template, see [`ANON_VAR_PREFIX`]) the solution does not bind, and —
+    /// with `fresh_labels`, in a CONSTRUCT or INSERT template — a labelled
+    /// blank node `_:v` of the template, become a fresh blank node, the
+    /// same one for every template triple of this solution (SPARQL 1.1
     /// Query §16.2.1, Update §3.1.3; a labelled node was copied verbatim,
     /// so every solution and every request wrote the same stored node —
     /// review query#5): `fresh` holds them, and the caller starts a new map
-    /// per solution.
+    /// per solution. Without `fresh_labels` (a DELETE template) `_:v` is
+    /// the stored node of that label.
     fn instantiate_template(
         &self,
         tp: &TriplePattern,
         b: &Binding,
         layout: &VarLayout,
         fresh: &mut HashMap<String, Term>,
+        fresh_labels: bool,
     ) -> Option<Triple> {
         let mut resolve = |pt: &PatternTerm| -> Option<Term> {
             match pt {
                 // Keyed apart from the hidden variables (named `_:…`).
-                PatternTerm::Term(Term::Blank(label)) => Some(
+                PatternTerm::Term(Term::Blank(label)) if fresh_labels => Some(
                     fresh
                         .entry(format!("label {label}"))
                         .or_insert_with(|| Term::Blank(fresh_bnode_label()))

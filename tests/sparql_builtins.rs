@@ -283,6 +283,71 @@ fn template_blank_nodes_are_fresh_per_solution_and_request() {
     }
 }
 
+/// The fresh-per-solution rule is for the templates that create nodes
+/// (CONSTRUCT, INSERT). SPARQL 1.1 Update forbids blank nodes in DELETE
+/// templates; this engine reads a labelled `_:b` there as it does in the
+/// WHERE pattern and in `DELETE DATA`: the stored node of that label (the
+/// label a query returned). Made fresh, it deleted nothing — `DELETE WHERE
+/// { <a> <p> _:b }` matched the triple and then left it in place.
+#[test]
+fn delete_templates_keep_labelled_blank_nodes() {
+    let mut db = db("<http://ex/a> <http://ex/p> _:x .\n\
+                     <http://ex/a> <http://ex/q> \"1\" .\n\
+                     <http://ex/c> <http://ex/p> _:y .\n\
+                     <http://ex/c> <http://ex/q> \"2\" .\n");
+    let node = |db: &mut Database, s: &str| {
+        let rs = select(db, &format!("SELECT ?b WHERE {{ <{s}> <http://ex/p> ?b }}"));
+        assert_eq!(rs.row_count(), 1, "{rs:?}");
+        let b = cell(&rs, 0, "b").unwrap().to_string();
+        assert!(b.starts_with("_:"), "{b}");
+        b
+    };
+    let count = |db: &mut Database, q: &str| select(db, q).row_count();
+    // DELETE WHERE with the label a query returned.
+    let a = node(&mut db, "http://ex/a");
+    update(
+        &mut db,
+        &format!("DELETE WHERE {{ <http://ex/a> <http://ex/p> {a} }}"),
+    );
+    assert_eq!(
+        count(
+            &mut db,
+            "SELECT ?b WHERE { <http://ex/a> <http://ex/p> ?b }"
+        ),
+        0,
+        "DELETE WHERE matched {a} but did not delete it"
+    );
+    // DELETE … INSERT … WHERE: the DELETE template's label is the stored
+    // node, the INSERT template's a fresh one.
+    let c = node(&mut db, "http://ex/c");
+    update(
+        &mut db,
+        &format!(
+            "DELETE {{ ?s <http://ex/p> {c} }} INSERT {{ ?s <http://ex/r> {c} }} \
+             WHERE {{ ?s <http://ex/q> \"2\" }}"
+        ),
+    );
+    assert_eq!(
+        count(
+            &mut db,
+            "SELECT ?b WHERE { <http://ex/c> <http://ex/p> ?b }"
+        ),
+        0,
+        "the DELETE template's {c} is the stored node"
+    );
+    let rs = select(
+        &mut db,
+        "SELECT ?b WHERE { <http://ex/c> <http://ex/r> ?b }",
+    );
+    assert_eq!(rs.row_count(), 1, "{rs:?}");
+    assert!(is_blank(cell(&rs, 0, "b")), "{rs:?}");
+    assert_ne!(
+        cell(&rs, 0, "b"),
+        Some(c.as_str()),
+        "the INSERT template's {c} is a fresh node"
+    );
+}
+
 // ---- RAND / UUID / STRUUID / NOW (review conc#1, query#16) -----------------
 
 /// `UUID()` / `STRUUID()` / `RAND()` from four threads at once on one
@@ -406,6 +471,43 @@ fn now_inside_and_outside_a_graph_block_agree() {
     assert_eq!(rs.row_count(), 1, "{rs:?}");
     assert!(cell(&rs, 0, "in").is_some(), "{rs:?}");
     assert_eq!(cell(&rs, 0, "in"), cell(&rs, 0, "out"), "{rs:?}");
+}
+
+/// `NOW()` and the `BNODE(str)` nodes belong to one query *execution*: an
+/// `Evaluator` a library caller reuses for a second query must not hand it
+/// the first one's instant (frozen for the evaluator's lifetime) or nodes
+/// (`BNODE("x")` of the same solution mapping in both).
+#[test]
+fn a_reused_evaluator_starts_every_query_afresh() {
+    let db = db("");
+    let ev = Evaluator::new(db.dict(), db.store()).with_function("waitForNextSecond", |_| {
+        let start = unix_secs();
+        while unix_secs() == start {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        Some(Value::Bool(true))
+    });
+    let q = gstore::parser::sparql::parse(
+        "SELECT (NOW() AS ?now) (BNODE(\"x\") AS ?b) (waitForNextSecond(1) AS ?w) WHERE {}",
+    )
+    .expect("parse");
+    let run = || match ev.evaluate(&q).expect("evaluate") {
+        QueryResult::Select(rs) => {
+            assert_eq!(rs.row_count(), 1, "{rs:?}");
+            (
+                cell(&rs, 0, "now").unwrap().to_string(),
+                cell(&rs, 0, "b").unwrap().to_string(),
+            )
+        }
+        other => panic!("expected SELECT, got {other:?}"),
+    };
+    let (now1, b1) = run();
+    let (now2, b2) = run();
+    assert_ne!(now1, now2, "NOW() of the second query is the first one's");
+    assert_ne!(
+        b1, b2,
+        "BNODE(\"x\") of the second query is the first one's"
+    );
 }
 
 // ---- REGEX / REPLACE (review query#11, sparqlconf#8) -----------------------
@@ -558,7 +660,8 @@ fn a_pattern_is_compiled_once_per_query() {
 /// The time a REGEX FILTER takes against a STRSTARTS / STRENDS FILTER
 /// selecting the same rows: per-solution compilation made it about 30-100
 /// times slower (review sparqlconf#8); with the pattern compiled once the
-/// two cost about the same. The bound is generous (best of three runs).
+/// two cost about the same. The bound is generous (best of three runs,
+/// alternating, so a change of the machine's load hits both alike).
 #[test]
 fn a_regex_filter_costs_about_what_a_string_filter_costs() {
     let mut data = String::new();
@@ -566,25 +669,18 @@ fn a_regex_filter_costs_about_what_a_string_filter_costs() {
         data.push_str(&format!("<http://ex/s{i}> <http://ex/v> \"{i}\" .\n"));
     }
     let db = db(&data);
-    // A fresh evaluator per run: no query cache, no warm pattern cache.
-    let best = |q: &str| {
+    let regex_q = r#"SELECT ?s WHERE { ?s <http://ex/v> ?o FILTER(REGEX(?o, "^1.*9$")) }"#;
+    let plain_q =
+        r#"SELECT ?s WHERE { ?s <http://ex/v> ?o FILTER(STRSTARTS(?o, "1") && STRENDS(?o, "9")) }"#;
+    for q in [regex_q, plain_q] {
         let parsed = gstore::parser::sparql::parse(q).expect("parse");
-        (0..3)
-            .map(|_| {
-                let t = std::time::Instant::now();
-                match Evaluator::new(db.dict(), db.store()).evaluate(&parsed) {
-                    Ok(QueryResult::Select(rs)) => assert_eq!(rs.row_count(), 1111, "{q}"),
-                    other => panic!("{q}: {other:?}"),
-                }
-                t.elapsed()
-            })
-            .min()
-            .unwrap()
-    };
-    let regex = best(r#"SELECT ?s WHERE { ?s <http://ex/v> ?o FILTER(REGEX(?o, "^1.*9$")) }"#);
-    let plain = best(
-        r#"SELECT ?s WHERE { ?s <http://ex/v> ?o FILTER(STRSTARTS(?o, "1") && STRENDS(?o, "9")) }"#,
-    );
+        match Evaluator::new(db.dict(), db.store()).evaluate(&parsed) {
+            Ok(QueryResult::Select(rs)) => assert_eq!(rs.row_count(), 1111, "{q}"),
+            other => panic!("{q}: {other:?}"),
+        }
+    }
+    // A fresh evaluator per run: no query cache, no warm pattern cache.
+    let (regex, plain) = best_pair((&db, regex_q), (&db, plain_q));
     eprintln!("REGEX filter {regex:?}, STRSTARTS/STRENDS filter {plain:?}");
     assert!(
         regex < plain * 10,
