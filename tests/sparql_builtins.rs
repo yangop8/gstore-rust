@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
+use std::time::{Duration, Instant};
 
 use gstore::query::Evaluator;
 use gstore::{Database, QueryResult, ResultSet, Value};
@@ -769,18 +770,24 @@ fn distinct_aggregates_compare_terms() {
     );
 }
 
-/// The best of three runs of `q` against a fresh evaluator (no query cache).
-fn best_time(db: &Database, q: &str) -> std::time::Duration {
-    let parsed = gstore::parser::sparql::parse(q).expect("parse");
-    (0..3)
-        .map(|_| {
-            let t = std::time::Instant::now();
-            let r = Evaluator::new(db.dict(), db.store()).evaluate(&parsed);
-            assert!(r.is_ok(), "{q}: {r:?}");
-            t.elapsed()
-        })
-        .min()
-        .unwrap()
+/// The best times of two evaluations, each against a fresh evaluator (no
+/// query cache), run alternately so a change of the machine's load (other
+/// tests of this binary, other builds) hits both alike.
+fn best_pair(x: (&Database, &str), y: (&Database, &str)) -> (Duration, Duration) {
+    let run = |(db, q): (&Database, &str)| {
+        let parsed = gstore::parser::sparql::parse(q).expect("parse");
+        let t = Instant::now();
+        let r = Evaluator::new(db.dict(), db.store()).evaluate(&parsed);
+        let elapsed = t.elapsed();
+        assert!(r.is_ok(), "{q}: {r:?}");
+        elapsed
+    };
+    let (mut a, mut b) = (Duration::MAX, Duration::MAX);
+    for _ in 0..3 {
+        a = a.min(run(x));
+        b = b.min(run(y));
+    }
+    (a, b)
 }
 
 /// `n` subjects, each with one distinct string value.
@@ -792,27 +799,35 @@ fn distinct_values(n: usize) -> Database {
     db(&data)
 }
 
-/// D9: an aggregate DISTINCT over four times the values takes about four
-/// times as long (the bound allows 12). A linear `contains` per value made
-/// it quadratic: 20,000 distinct values took 0.38 s, 80,000 took 13 s.
+/// D9: an aggregate DISTINCT costs a constant factor over the same
+/// aggregate without DISTINCT (the bound allows 20 at 160,000 values), and
+/// 16 times the values cost about 16 times as long (the bound allows 160,
+/// for a loaded machine). A linear `contains` per value made it quadratic:
+/// 160,000 distinct values took 37 s against 0.11 s for 10,000, and some
+/// thousand times what COUNT without DISTINCT took.
 #[test]
 fn distinct_aggregates_scale_linearly() {
-    let (small, large) = (distinct_values(20_000), distinct_values(80_000));
+    let (small, large) = (distinct_values(10_000), distinct_values(160_000));
+    let plain = "SELECT (COUNT(?o) AS ?c) WHERE { ?s <http://ex/v> ?o }";
     for q in [
         "SELECT (COUNT(DISTINCT ?o) AS ?c) WHERE { ?s <http://ex/v> ?o }",
         "SELECT (GROUP_CONCAT(DISTINCT ?o) AS ?c) WHERE { ?s <http://ex/v> ?o }",
         "SELECT (COUNT(DISTINCT STR(?o)) AS ?c) WHERE { ?s <http://ex/v> ?o }",
     ] {
-        let (a, b) = (best_time(&small, q), best_time(&large, q));
-        eprintln!("{q}: 20k values {a:?}, 80k values {b:?}");
-        assert!(b < a * 12, "{q}: 20k values {a:?}, 80k values {b:?}");
+        let (d, p) = best_pair((&large, q), (&large, plain));
+        eprintln!("{q}: 160k values {d:?}, without DISTINCT {p:?}");
+        assert!(d < p * 20, "{q}: 160k values {d:?}, COUNT(?o) {p:?}");
+        let (a, b) = best_pair((&small, q), (&large, q));
+        eprintln!("{q}: 10k values {a:?}, 160k values {b:?}");
+        assert!(b < a * 160, "{q}: 10k values {a:?}, 160k values {b:?}");
     }
 }
 
-/// D9: DESCRIBE over four times the resources takes about four times as
-/// long (the bound allows 8). Its resource list was de-duplicated with a
-/// linear `contains` per solution, quadratic in the number of resources
-/// (about 15 times as long here).
+/// D9: DESCRIBE costs a constant factor over the SELECT of its WHERE clause
+/// (the bound allows 20 at 160,000 resources), and 16 times the resources
+/// cost about 16 times as long (the bound allows 160). Its resource list
+/// was de-duplicated with a linear `contains` per solution, quadratic in
+/// the number of resources: 3.8 s for 160,000 against 12.5 ms for 10,000.
 /// The described resources have no triples of their own, so the time is
 /// the WHERE clause and the de-duplication.
 #[test]
@@ -826,11 +841,17 @@ fn describe_scales_linearly() {
         }
         db(&data)
     };
-    let (small, large) = (objects(40_000), objects(160_000));
+    let (small, large) = (objects(10_000), objects(160_000));
     let q = "DESCRIBE ?o WHERE { ?s <http://ex/v> ?o }";
-    let (a, b) = (best_time(&small, q), best_time(&large, q));
-    eprintln!("{q}: 40k resources {a:?}, 160k resources {b:?}");
-    assert!(b < a * 8, "40k resources {a:?}, 160k resources {b:?}");
+    let (d, p) = best_pair(
+        (&large, q),
+        (&large, "SELECT ?o WHERE { ?s <http://ex/v> ?o }"),
+    );
+    eprintln!("{q}: 160k resources {d:?}, the SELECT {p:?}");
+    assert!(d < p * 20, "160k resources {d:?}, the SELECT {p:?}");
+    let (a, b) = best_pair((&small, q), (&large, q));
+    eprintln!("{q}: 10k resources {a:?}, 160k resources {b:?}");
+    assert!(b < a * 160, "10k resources {a:?}, 160k resources {b:?}");
     // DESCRIBE ?s: every subject's triple.
     let parsed =
         gstore::parser::sparql::parse("DESCRIBE ?s WHERE { ?s <http://ex/v> ?o }").unwrap();
