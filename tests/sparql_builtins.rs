@@ -7,7 +7,11 @@
 //!   (§17.4.2.9, §16.2.1, Update §3.1.3; review query#5);
 //! * `UUID()` / `STRUUID()` / `RAND()` are safe to call from concurrent
 //!   queries (review conc#1) and `NOW()` is one instant per query, `GRAPH`
-//!   blocks included (§17.4.5.1; review query#16).
+//!   blocks included (§17.4.5.1; review query#16);
+//! * `REGEX` / `REPLACE` follow XPath `fn:matches` / `fn:replace` — the
+//!   flags, the replacement-string syntax, the empty-match error — and
+//!   compile a pattern once per query (§17.4.3.14 / §17.4.3.15; review
+//!   query#11, sparqlconf#8).
 //!
 //! The spec-defined answers of these functions that do not depend on
 //! randomness are also cases of the W3C-style subset (`tests/w3c/`).
@@ -18,6 +22,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 
+use gstore::query::Evaluator;
 use gstore::{Database, QueryResult, ResultSet, Value};
 
 // ---- helpers ---------------------------------------------------------------
@@ -395,4 +400,187 @@ fn now_inside_and_outside_a_graph_block_agree() {
     assert_eq!(rs.row_count(), 1, "{rs:?}");
     assert!(cell(&rs, 0, "in").is_some(), "{rs:?}");
     assert_eq!(cell(&rs, 0, "in"), cell(&rs, 0, "out"), "{rs:?}");
+}
+
+// ---- REGEX / REPLACE (review query#11, sparqlconf#8) -----------------------
+
+/// The one row of `SELECT (e1 AS ?v1) … WHERE {}`: each cell, `None` when
+/// the expression is an error.
+fn exprs(db: &mut Database, exprs: &[&str]) -> Vec<Option<String>> {
+    let items: Vec<String> = exprs
+        .iter()
+        .enumerate()
+        .map(|(i, e)| format!("({e} AS ?v{i})"))
+        .collect();
+    let rs = select(db, &format!("SELECT {} WHERE {{}}", items.join(" ")));
+    assert_eq!(rs.row_count(), 1, "{rs:?}");
+    (0..exprs.len())
+        .map(|i| cell(&rs, 0, &format!("v{i}")).map(str::to_string))
+        .collect()
+}
+
+const TRUE: &str = "\"true\"^^<http://www.w3.org/2001/XMLSchema#boolean>";
+const FALSE: &str = "\"false\"^^<http://www.w3.org/2001/XMLSchema#boolean>";
+
+/// XPath flags (F&O §5.6.1.1): `s`, `m`, `x` and `q` were ignored (only
+/// `i` was honoured) and any other character was accepted; it is an error.
+#[test]
+fn regex_flags_follow_xpath() {
+    let mut db = db("");
+    let got = exprs(
+        &mut db,
+        &[
+            r#"REGEX("a\nb", "a.b", "s")"#,
+            r#"REGEX("a\nb", "a.b")"#,
+            r#"REGEX("a\nb", "^b$", "m")"#,
+            r#"REGEX("ab", "a b", "x")"#,
+            r#"REGEX("a b", "a[ ]b", "x")"#,
+            r#"REGEX("abc", "a.c", "q")"#,
+            r#"REGEX("xA.Cx", "a.c", "qi")"#,
+            r#"REGEX("Alice", "^ali", "i")"#,
+            r#"REGEX("ab", "a", "z")"#,
+            r#"REGEX("ab", "a", "is")"#,
+        ],
+    );
+    let want = [
+        Some(TRUE),
+        Some(FALSE),
+        Some(TRUE),
+        Some(TRUE),
+        Some(TRUE),
+        Some(FALSE),
+        Some(TRUE),
+        Some(TRUE),
+        None, // FORX0001
+        Some(TRUE),
+    ];
+    let got: Vec<Option<&str>> = got.iter().map(Option::as_deref).collect();
+    assert_eq!(got, want);
+    // An invalid flag is an error, so a FILTER over it keeps nothing.
+    let rs = select(
+        &mut db,
+        r#"SELECT ?x WHERE { VALUES ?x { "ab" } FILTER(REGEX(?x, "a", "u")) }"#,
+    );
+    assert_eq!(rs.row_count(), 0, "{rs:?}");
+}
+
+/// The replacement string is XPath's (F&O §5.6.3), not the regex crate's:
+/// `$1x` is group 1 then "x" (it was the group named "1x", so empty),
+/// `\$` a literal dollar, a group above the count up to 9 the empty string;
+/// a lone `$` or `\` and a pattern that matches the empty string are errors.
+#[test]
+fn replace_uses_the_xpath_replacement_syntax() {
+    let mut db = db("");
+    let got = exprs(
+        &mut db,
+        &[
+            r#"REPLACE("abc", "(b)", "$1x")"#,
+            r#"REPLACE("abc", "(b)", "[$1]")"#,
+            r#"REPLACE("a-b", "-", "\\$")"#,
+            r#"REPLACE("a-b", "-", "\\\\")"#,
+            r#"REPLACE("abc", "(b)", "$2")"#,
+            r#"REPLACE("abc", "(b)", "$12")"#,
+            r#"REPLACE("darted", "^(.*?)d(.*)$", "$1c$2")"#,
+            r#"REPLACE("abab", "B.", "Z", "i")"#,
+            r#"REPLACE("a.b.c", ".", "$", "q")"#,
+            r#"REPLACE("abc", "b", "$")"#,
+            r#"REPLACE("abc", "b", "\\n")"#,
+            r#"REPLACE("abc", "", "-")"#,
+            r#"REPLACE("abc", "x*", "-")"#,
+            r#"REPLACE("abc", "b", "z", "w")"#,
+        ],
+    );
+    let lit = |s: &str| Some(format!("\"{s}\""));
+    let want = vec![
+        lit("abxc"),
+        lit("a[b]c"),
+        lit("a$b"),
+        lit("a\\\\b"), // one backslash, escaped in the N-Triples cell
+        lit("ac"),
+        lit("ab2c"),
+        lit("carted"),
+        lit("aZb"),
+        lit("a$b$c"),
+        None, // FORX0004
+        None, // FORX0004
+        None, // FORX0003
+        None, // FORX0003
+        None, // FORX0001
+    ];
+    assert_eq!(got, want);
+}
+
+/// A pattern is compiled once per query, not once per solution: a REGEX
+/// FILTER over 20,000 rows compiled its pattern 20,000 times (most of the
+/// query's time), now once.
+#[test]
+fn a_pattern_is_compiled_once_per_query() {
+    let mut data = String::new();
+    for i in 0..20_000 {
+        data.push_str(&format!("<http://ex/s{i}> <http://ex/v> \"{i}\" .\n"));
+    }
+    let db = db(&data);
+    let q = gstore::parser::sparql::parse(
+        r#"SELECT ?s (REPLACE(?o, "(1)", "[$1]") AS ?r) WHERE { ?s <http://ex/v> ?o
+           FILTER(REGEX(?o, "^1.*9$") && !REGEX(?o, "^1.*9$", "i")) }"#,
+    )
+    .expect("parse");
+    let ev = Evaluator::new(db.dict(), db.store());
+    let rs = match ev.evaluate(&q).expect("evaluate") {
+        QueryResult::Select(rs) => rs,
+        other => panic!("expected SELECT, got {other:?}"),
+    };
+    // A && !A: nothing passes; the point is how often the patterns compiled.
+    assert_eq!(rs.row_count(), 0);
+    assert_eq!(ev.regex_compilations(), 2, "one per (pattern, flags)");
+
+    let q = gstore::parser::sparql::parse(
+        r#"SELECT (COUNT(*) AS ?n) WHERE { ?s <http://ex/v> ?o FILTER(REGEX(?o, "^1.*9$")) }"#,
+    )
+    .expect("parse");
+    let ev = Evaluator::new(db.dict(), db.store());
+    match ev.evaluate(&q).expect("evaluate") {
+        QueryResult::Select(rs) => assert_eq!(
+            rs.rows[0][0].as_deref(),
+            Some("\"1111\"^^<http://www.w3.org/2001/XMLSchema#integer>")
+        ),
+        other => panic!("expected SELECT, got {other:?}"),
+    }
+    assert_eq!(ev.regex_compilations(), 1);
+}
+
+/// The time a REGEX FILTER takes against a STRSTARTS / STRENDS FILTER
+/// selecting the same rows: per-solution compilation made it about 30-100
+/// times slower (review sparqlconf#8); with the pattern compiled once the
+/// two cost about the same. The bound is generous (best of three runs).
+#[test]
+fn a_regex_filter_costs_about_what_a_string_filter_costs() {
+    let mut data = String::new();
+    for i in 0..20_000 {
+        data.push_str(&format!("<http://ex/s{i}> <http://ex/v> \"{i}\" .\n"));
+    }
+    let db = db(&data);
+    // A fresh evaluator per run: no query cache, no warm pattern cache.
+    let best = |q: &str| {
+        let parsed = gstore::parser::sparql::parse(q).expect("parse");
+        (0..3)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                match Evaluator::new(db.dict(), db.store()).evaluate(&parsed) {
+                    Ok(QueryResult::Select(rs)) => assert_eq!(rs.row_count(), 1111, "{q}"),
+                    other => panic!("{q}: {other:?}"),
+                }
+                t.elapsed()
+            })
+            .min()
+            .unwrap()
+    };
+    let regex = best(r#"SELECT ?s WHERE { ?s <http://ex/v> ?o FILTER(REGEX(?o, "^1.*9$")) }"#);
+    let plain = best(
+        r#"SELECT ?s WHERE { ?s <http://ex/v> ?o FILTER(STRSTARTS(?o, "1") && STRENDS(?o, "9")) }"#,
+    );
+    assert!(
+        regex < plain * 10,
+        "REGEX filter {regex:?} vs STRSTARTS/STRENDS filter {plain:?}"
+    );
 }

@@ -171,8 +171,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use regex::Regex;
-
 use crate::analytics::csr::CsrGraph;
 use crate::analytics::gfun::{self, GCall, GFnKind, GFunCtx, GFunValue, GNode};
 use crate::analytics::{GraphView, Interrupt};
@@ -437,6 +435,10 @@ impl Extras {
     }
 }
 
+/// What identifies one `BNODE(str)` node: the solution mapping (see
+/// [`QueryCtx::solution_key`]) and the string.
+type BnodeKey = (Box<[Option<u32>]>, String);
+
 /// Per-query state of the built-ins whose answer belongs to the query
 /// execution rather than to their arguments — `NOW`, `BNODE`, `RAND`,
 /// `UUID` / `STRUUID` (SPARQL 1.1 §17.4) — and the compiled patterns of
@@ -452,7 +454,7 @@ struct QueryCtx {
     /// `BNODE(str)`: the blank node minted for a string within one solution
     /// mapping, keyed by the solution (see [`QueryCtx::solution_key`]) and
     /// the string (§17.4.2.9; review query#5).
-    bnode_by_str: std::cell::RefCell<HashMap<(Box<[Option<u32>]>, String), String>>,
+    bnode_by_str: std::cell::RefCell<HashMap<BnodeKey, String>>,
     /// The (synthetic) ids of the blank nodes `BNODE` minted in this query.
     /// They are left out of a solution's key, so `BIND(BNODE("x") AS ?a)
     /// BIND(BNODE("x") AS ?b)` — where the second call sees `?a` bound —
@@ -465,6 +467,10 @@ struct QueryCtx {
     /// `UUID()` / `STRUUID()`: OS randomness read ahead in blocks (see
     /// [`QueryCtx::uuid_bytes`]); the bytes not yet used and where they start.
     entropy: std::cell::RefCell<(Vec<u8>, usize)>,
+    /// `REGEX` / `REPLACE` patterns compiled for this query, so a pattern
+    /// is compiled once per query rather than once per solution (review
+    /// query#11).
+    regex: std::cell::RefCell<super::xpath_regex::RegexCache>,
 }
 
 impl QueryCtx {
@@ -479,11 +485,11 @@ impl QueryCtx {
     /// The next `RAND()` draw: 64 bits of the query's generator.
     fn next_u64(&self) -> u64 {
         let mut s = self.rng.get().unwrap_or_else(|| {
-            let mut seed = [0u8; 32];
-            os_random(&mut seed);
             let mut s = [0u64; 4];
-            for (w, chunk) in s.iter_mut().zip(seed.chunks_exact(8)) {
-                *w = u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
+            for w in &mut s {
+                let mut bytes = [0u8; 8];
+                os_random(&mut bytes);
+                *w = u64::from_le_bytes(bytes);
             }
             if s == [0; 4] {
                 s[0] = 0x9E37_79B9_7F4A_7C15; // xoshiro's state must not be all zero
@@ -513,6 +519,12 @@ impl QueryCtx {
         buf[*at..*at + 16].fill(0);
         *at += 16;
         out
+    }
+
+    /// `pattern` compiled under the XPath `flags` (from the query's cache);
+    /// `None` for an invalid pattern or flags.
+    fn regex(&self, pattern: &str, flags: &str) -> Option<Rc<super::xpath_regex::Compiled>> {
+        self.regex.borrow_mut().get(pattern, flags)
     }
 
     /// The key identifying the solution mapping `b` for `BNODE(str)`: its
@@ -914,6 +926,13 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     pub fn with_pfn(mut self, caller: crate::pfn::PfnCaller) -> Evaluator<'a, S> {
         self.pfn = Some(caller);
         self
+    }
+
+    /// How many `REGEX` / `REPLACE` patterns this evaluator compiled so far:
+    /// each distinct (pattern, flags) of the query once, however many
+    /// solutions call it (a work counter, like [`stats`](Self::stats)).
+    pub fn regex_compilations(&self) -> u64 {
+        self.ctx.regex.borrow().compiled()
     }
 
     /// The CSR for the advanced graph functions of this query (see
@@ -4293,6 +4312,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 Some(Value::Bool(same_term(&a, &c)))
             }
             "COALESCE" => args.iter().find_map(|a| self.eval_value(a, b, l)),
+            // XPath fn:matches: the s / m / i / x / q flags, any other flag
+            // an error; the pattern compiled once per query (review
+            // query#11, sparqlconf#8; see `xpath_regex`).
             "REGEX" => {
                 let text = self.eval_value(args.first()?, b, l)?.lexical();
                 let pat = self.eval_value(args.get(1)?, b, l)?.lexical();
@@ -4300,13 +4322,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     Some(a) => self.eval_value(a, b, l)?.lexical(),
                     None => String::new(),
                 };
-                let pat = if flags.contains('i') {
-                    format!("(?i){pat}")
-                } else {
-                    pat
-                };
-                let re = Regex::new(&pat).ok()?;
-                Some(Value::Bool(re.is_match(&text)))
+                let re = self.ctx.regex(&pat, &flags)?;
+                Some(Value::Bool(re.re.is_match(&text)))
             }
 
             // ---- strings (SPARQL 1.1) ------------------------------------
@@ -4335,6 +4352,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 };
                 Some(Value::Str { value, lang })
             }
+            // XPath fn:replace: the REGEX flags, the replacement string's
+            // `$N` / `\$` / `\\` syntax (`$1x` is group 1 then "x"), and a
+            // pattern matching the empty string is an error (review
+            // query#11, sparqlconf#8; see `xpath_regex`).
             "REPLACE" => {
                 let src = self.eval_value(args.first()?, b, l)?;
                 let (text, lang) = str_and_lang(&src);
@@ -4344,14 +4365,17 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     Some(a) => self.eval_value(a, b, l)?.lexical(),
                     None => String::new(),
                 };
-                let pat = if flags.contains('i') {
-                    format!("(?i){pat}")
-                } else {
-                    pat
-                };
-                let re = Regex::new(&pat).ok()?;
+                let re = self.ctx.regex(&pat, &flags)?;
+                if re.matches_empty {
+                    return None; // FORX0003
+                }
+                let rep = super::xpath_regex::Replacement::parse(
+                    &rep,
+                    re.re.captures_len() - 1,
+                    re.literal,
+                )?;
                 Some(Value::Str {
-                    value: re.replace_all(&text, rep.as_str()).into_owned(),
+                    value: rep.replace_all(&re.re, &text),
                     lang,
                 })
             }
@@ -7281,7 +7305,8 @@ mod builtin_tests {
             .expect("eval_custom_function follows eval_builtin");
         let body = &src[start..end];
         let re =
-            Regex::new(r#""([A-Z][A-Z0-9_]*)"\s*(?:=>|\|)|name == "([A-Z][A-Z0-9_]*)""#).unwrap();
+            regex::Regex::new(r#""([A-Z][A-Z0-9_]*)"\s*(?:=>|\|)|name == "([A-Z][A-Z0-9_]*)""#)
+                .unwrap();
         let handled: HashSet<&str> = re
             .captures_iter(body)
             .filter_map(|c| c.get(1).or_else(|| c.get(2)).map(|m| m.as_str()))

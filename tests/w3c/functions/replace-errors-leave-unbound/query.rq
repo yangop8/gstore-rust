@@ -1,0 +1,8 @@
+# spec: SPARQL 1.1 Query §17.4.3.15 REPLACE = XPath fn:replace (F&O §5.6.3): a pattern that
+# matches the empty string is an error (FORX0003), so is a $ not followed by a digit or a \
+# not followed by \ or $ (FORX0004) and an invalid flag (FORX0001); an error in a SELECT
+# expression leaves the variable unbound (§18.2.4.1 Extend). ?ok checks the row is there.
+SELECT (REPLACE("abracadabra", ".*?", "$1") AS ?empty) (REPLACE("abc", "x*", "-") AS ?star)
+       (REPLACE("abc", "b", "$") AS ?dollar) (REPLACE("abc", "b", "\\n") AS ?backslash)
+       (REPLACE("abc", "b", "z", "y") AS ?flag) (REPLACE("abc", "b", "z") AS ?ok)
+WHERE {}
