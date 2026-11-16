@@ -45,8 +45,10 @@
   back from an export)`. Before, UPDATE stored them, `gexport` wrote them,
   and `gbuild` (tolerant by default) dropped them. A strict import (the
   library default, `gbuild --strict`, SPARQL `LOAD`) still stores such a
-  literal as written. New library entry point:
-  `parser::import::check_update_literals`.
+  literal as written; an `INSERT … WHERE` that copies one of those stored
+  literals into a template fails as a whole, and a reasoning rule whose
+  inferred triples hold one reports that failure as its insert result.
+  New library entry point: `parser::import::check_update_literals`.
 - **Behaviour change (sparqlconf#12): `gbuild` exits with status 3** when the
   build completed but tolerant mode skipped statements (each one is still
   listed in `parse_error.log`, and `RDF parse error num N` is still printed).
@@ -204,12 +206,31 @@ none
   - `src/bin/gquery.rs` (`Construct` arm of the output match) and
     `src/console/local.rs` (`Construct` arm of `run_query`): `to_ntriples`
     instead of `Display` (sparqlconf#11).
-  - Tests changed per convention 13b:
+  - Tests changed per convention 13b, each with a `review <id>` comment:
     `tests/dt_phase3_review_fixes.rs` (the one sameTerm assertion that
-    pinned the xsd:string folding, sparqlconf#14) and
+    pinned the xsd:string folding, sparqlconf#14);
     `tests/dt_bulk_disk.rs::gbuild_disk_uses_the_bulk_build` (two exit-status
     assertions: the input's `not rdf` line now gives exit 3,
-    sparqlconf#12).
+    sparqlconf#12);
+    `tests/dt_rdf_import.rs::cli_tools_take_directories_are_tolerant_and_have_strict`
+    (one exit-status assertion, now 3, sparqlconf#12);
+    `tests/dt_sparql_semantics.rs::typed_db` and
+    `tests/dt_sparql_phase3_combo.rs::numbers` (fixture setup only: the
+    ill-typed literals now come in through a strict `build_from_str` import
+    instead of `INSERT DATA`, which refuses them; what the tests assert is
+    unchanged, sparqlconf#12);
+    `tests/dt_merge4_fixes.rs::a_language_tag_with_a_tab_is_retracted`
+    (setup only: the tab-holding tag is inserted with `insert_triple`, since
+    `STRLANG` now refuses it, sparqlconf#11).
+- Divergences for other packages (sparqlconf#12's literal rule covers SPARQL
+  UPDATE, as planned; these write paths still store such literals, and
+  `gbuild`'s exit status 3 now flags them when an export is reloaded):
+  the REST server's `POST /batchInsert` (`src/http_api.rs`'s
+  `handle_batch`, which applies parsed triples through
+  `Database::try_insert_triple`; r3-rest-parity's file in round 3) and the
+  library's `Database::insert_triple`. (The `/api` `batchInsert` is a
+  tolerant import and already applies the rule.) `gadd` is tolerant like `gbuild` but still
+  exits 0 when it skipped statements (CLI exit statuses: r4-cli-config).
 - Divergence for another package: `engine.rs::render_pattern_term` (the
   `SERVICE` query text, r3-sparql-joins' `eval_service` area) writes a
   constant term with `Display`, the stored form. A stored IRI holding `>`
