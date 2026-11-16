@@ -246,6 +246,47 @@ jobs at once):
   showed two `gstore_*` entries of the tls feature run going on in the
   other slot; they were gone once it ended.)
 
+Round-2 review fixes, verified at their head (4acd6aa; the same 4-vCPU
+machine, shared with up to three other agents' builds and tests, heavy
+jobs at most two at once):
+
+- Failing-before checks: each of these fixes was reverted in the worktree
+  and its tests run against the reverted code — all failed — then restored
+  and run again — all passed: the single-database `/update` timeout status,
+  the `/api` budget's escaped count, `backup_dir`'s ordering, the partial
+  UPDATE wording in a transaction, the commit/rollback-in-flight activity,
+  `query_timeout` arming after the guard (REST/`/api`/transaction and,
+  separately, the single-database server; `tests/query_limits.rs`'s two
+  queued-writer tests included), the address-lock exemption and
+  `refreshconf` (`tests/login_lockout_address_lock_and_refresh.rs`), the
+  reaper, runner and callback joins, and the cancellable `loadcsr`. (The
+  other fixes' failing-before runs were made when they were written.)
+- `cargo fmt --all -- --check`: clean. `cargo clippy --workspace
+  --all-targets -- -D warnings`: clean. `RUSTDOCFLAGS='-D warnings' cargo
+  doc -p gstore --no-deps --locked`: clean. `gstore-bench report --check
+  README.md CHANGELOG.md`: clean.
+- `cargo test --workspace`: `GSTORE_DISK_QUERY_MODE=memory` 2756 passed, 0
+  failed, 7 ignored; `GSTORE_DISK_QUERY_MODE=stream` 2756 passed, 0
+  failed, 7 ignored.
+- tls (the handshake deadline): `cargo build --locked --profile test -p
+  gstore --all-targets --features tls`, clippy `-D warnings` clean, `cargo
+  test -p gstore --features tls` 2538 passed, 0 failed, 6 ignored.
+- RocksDB: `cargo clippy -p gstore --all-targets --features rocksdb -- -D
+  warnings` clean; `cargo test -p gstore --features rocksdb` 2614 passed, 0
+  failed, 7 ignored (`a_rocksdb_build_left_as_new_is_refused_and_the_next_open_finishes_it`
+  and `tests/rocksdb_begins_copy_one_at_a_time.rs` included); `gbuild`
+  with RocksDB built, `cargo test -p gstore-bench --features rocksdb` 69
+  passed, 0 failed, 1 ignored.
+- `scripts/conformance.sh` (TMPDIR in the scratch directory): all six
+  suites pass (parser with the known failing cases 15 and 17, python
+  49/49).
+- Bench smoke gate: not re-run for the review fixes. They change no code
+  that `gstore-bench ci` measures (default-feature `gbuild` and the query
+  engine): the HTTP/`/api` request paths, the transaction lifecycle, the
+  lockout, the task manager, `http_client`, `Database::backup_dir`, the
+  RocksDB build's error path after a failed swap, and tests. The integration
+  head's run above stands.
+
 ## Requests/Not yet
 
 - Round-2 review fixes without a deterministic failing-before test: the
