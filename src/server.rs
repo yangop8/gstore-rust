@@ -3863,10 +3863,16 @@ pub fn load_tls_config(
     Ok(Arc::new(config))
 }
 
+/// CONSTRUCT / DESCRIBE triples as an `application/n-triples` body, one
+/// statement per line through the shared escaping serializer
+/// ([`Triple::to_ntriples`](crate::model::Triple::to_ntriples)), so no term
+/// — an IRI built by `IRI()` from text holding `>` and a newline, say — can
+/// end its line and forge a statement (review sparqlconf#11).
 pub(crate) fn ntriples_body(triples: &[crate::model::Triple]) -> Vec<u8> {
     let mut s = String::new();
     for t in triples {
-        s.push_str(&format!("{} {} {} .\n", t.subject, t.predicate, t.object));
+        s.push_str(&t.to_ntriples());
+        s.push('\n');
     }
     s.into_bytes()
 }

@@ -186,7 +186,12 @@ impl Processor {
                     match k.as_str() {
                         "@base" => ctx.base = as_opt_string(v),
                         "@vocab" => ctx.vocab = as_opt_string(v),
-                        "@language" => ctx.language = as_opt_string(v),
+                        "@language" => {
+                            ctx.language = match v {
+                                Json::Str(l) => language(l)?,
+                                _ => None,
+                            }
+                        }
                         _ if k.starts_with('@') => {}
                         // `"term": null` explicitly removes the mapping (JSON-LD
                         // context term deletion) rather than defining a dead term.
@@ -194,7 +199,7 @@ impl Processor {
                             ctx.terms.remove(k);
                         }
                         _ => {
-                            ctx.terms.insert(k.clone(), self.build_term_def(&ctx, v));
+                            ctx.terms.insert(k.clone(), self.build_term_def(&ctx, v)?);
                         }
                     }
                 }
@@ -204,7 +209,7 @@ impl Processor {
         Ok(ctx)
     }
 
-    fn build_term_def(&self, ctx: &Context, v: &Json) -> TermDef {
+    fn build_term_def(&self, ctx: &Context, v: &Json) -> Result<TermDef> {
         let mut def = TermDef::default();
         match v {
             Json::Str(s) => def.id = Some(expand_iri(ctx, s, true, false)),
@@ -223,12 +228,12 @@ impl Processor {
                     def.container = Some(c.clone());
                 }
                 if let Some(Json::Str(l)) = get(pairs, "@language") {
-                    def.language = Some(l.clone());
+                    def.language = language(l)?;
                 }
             }
             _ => {}
         }
-        def
+        Ok(def)
     }
 
     /// Process a node object, returning its subject term.
@@ -431,11 +436,7 @@ impl Processor {
             return Ok(Term::typed_literal(value, dt));
         }
         if let Some(Json::Str(l)) = get(pairs, "@language") {
-            return Ok(Term::Literal {
-                value,
-                datatype: None,
-                lang: Some(l.clone()),
-            });
+            return Ok(make_plain(&value, language(l)?));
         }
         // No explicit @type/@language: native scalars keep their xsd type.
         match v {
@@ -556,6 +557,14 @@ fn as_opt_string(v: &Json) -> Option<String> {
         Json::Str(s) => Some(s.clone()),
         _ => None,
     }
+}
+
+/// An `@language` value through the shared language-tag rule
+/// ([`normalize_lang_tag`](crate::model::term::normalize_lang_tag): `zh_CN`
+/// is `zh-CN`, `""` no language, anything else that is no tag an error;
+/// review parser#1).
+fn language(l: &str) -> Result<Option<String>> {
+    crate::model::term::normalize_lang_tag(l).map_err(|m| rdf_err(format!("@language: {m}")))
 }
 
 fn rdf_err(msg: impl Into<String>) -> GStoreError {

@@ -201,17 +201,17 @@ fn delete_forms_reject_anonymous_nodes_inside_graph_blocks() {
 // ---------------------------------------------------------------------------
 
 fn numbers() -> Database {
-    let mut db = Database::new("numbers");
-    update(
-        &mut db,
-        &format!(
-            "{P}INSERT DATA {{ \
-               :i01 :v \"01\"^^xsd:integer . :byte :v \"1\"^^xsd:byte . :dec :v 1.0 . \
-               :dbl :v \"1\"^^xsd:double . :flt :v \"1e0\"^^xsd:float . :two :v +2 . \
-               :bad :v \"abc\"^^xsd:integer . :str :v \"1\" . :iri :v :one }}"
-        ),
-    );
-    db
+    // review sparqlconf#12: SPARQL UPDATE now refuses the numeric literals
+    // the tolerant loader refuses ("abc"^^xsd:integer), so the data comes in
+    // through a strict import, which stores them as written.
+    Database::build_from_str(
+        "numbers",
+        "@prefix : <http://ex/> . @prefix xsd: <http://www.w3.org/2001/XMLSchema#> . \
+         :i01 :v \"01\"^^xsd:integer . :byte :v \"1\"^^xsd:byte . :dec :v 1.0 . \
+         :dbl :v \"1\"^^xsd:double . :flt :v \"1e0\"^^xsd:float . :two :v +2 . \
+         :bad :v \"abc\"^^xsd:integer . :str :v \"1\" . :iri :v :one .",
+    )
+    .unwrap()
 }
 
 #[test]

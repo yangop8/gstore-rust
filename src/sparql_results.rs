@@ -22,6 +22,16 @@ use crate::model::Term;
 use crate::parser::ntriples::parse_term;
 use crate::query::ResultSet;
 
+/// The term a result cell names. A cell is a dictionary key
+/// ([`Term::dict_key`]), so it is decoded as one first — exactly, an IRI a
+/// lenient reader let in (holding `>`, say) included, which the N-Triples
+/// reader would refuse and the serializers used to turn into a literal
+/// (review query#15) — else read as N-Triples. `None` for a cell that is
+/// neither (written as a plain literal of its text).
+fn cell_term(cell: &str) -> Option<Term> {
+    Term::from_dict_key(cell).or_else(|| parse_term(cell).ok())
+}
+
 /// A SPARQL Query Results serialization format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResultFormat {
@@ -171,10 +181,10 @@ fn write_select_json<W: Write>(rs: &ResultSet, w: &mut W) -> io::Result<()> {
 
 /// One result cell (an N-Triples surface term) as an RDF-term JSON object.
 fn binding_json(cell: &str) -> String {
-    match parse_term(cell) {
-        Ok(Term::Iri(s)) => format!("{{\"type\":\"uri\",\"value\":{}}}", json_str(&s)),
-        Ok(Term::Blank(l)) => format!("{{\"type\":\"bnode\",\"value\":{}}}", json_str(&l)),
-        Ok(Term::Literal {
+    match cell_term(cell) {
+        Some(Term::Iri(s)) => format!("{{\"type\":\"uri\",\"value\":{}}}", json_str(&s)),
+        Some(Term::Blank(l)) => format!("{{\"type\":\"bnode\",\"value\":{}}}", json_str(&l)),
+        Some(Term::Literal {
             value,
             datatype,
             lang,
@@ -195,7 +205,7 @@ fn binding_json(cell: &str) -> String {
                 format!("{{\"type\":\"literal\",\"value\":{}}}", json_str(&value))
             }
         }
-        Err(_) => format!("{{\"type\":\"literal\",\"value\":{}}}", json_str(cell)),
+        None => format!("{{\"type\":\"literal\",\"value\":{}}}", json_str(cell)),
     }
 }
 
@@ -251,10 +261,10 @@ fn write_select_xml<W: Write>(rs: &ResultSet, w: &mut W) -> io::Result<()> {
 
 /// One result cell as a SPARQL Results XML `<binding>` child element.
 fn binding_xml(cell: &str) -> String {
-    match parse_term(cell) {
-        Ok(Term::Iri(s)) => format!("<uri>{}</uri>", xml_text(&s)),
-        Ok(Term::Blank(l)) => format!("<bnode>{}</bnode>", xml_text(&l)),
-        Ok(Term::Literal {
+    match cell_term(cell) {
+        Some(Term::Iri(s)) => format!("<uri>{}</uri>", xml_text(&s)),
+        Some(Term::Blank(l)) => format!("<bnode>{}</bnode>", xml_text(&l)),
+        Some(Term::Literal {
             value,
             datatype,
             lang,
@@ -275,39 +285,52 @@ fn binding_xml(cell: &str) -> String {
                 format!("<literal>{}</literal>", xml_text(&value))
             }
         }
-        Err(_) => format!("<literal>{}</literal>", xml_text(cell)),
+        None => format!("<literal>{}</literal>", xml_text(cell)),
     }
 }
 
-/// Escape text content for XML (`&`, `<`, `>`).
+/// Escape text content for XML (`&`, `<`, `>`; see [`push_xml_char`]).
 fn xml_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            c => out.push(c),
-        }
+        push_xml_char(&mut out, c, false);
     }
     out
 }
 
-/// A double-quoted, escaped XML attribute value (`&`, `<`, `>`, `"`).
+/// A double-quoted, escaped XML attribute value (`&`, `<`, `>`, `"`, and
+/// tab / newline as character references; see [`push_xml_char`]).
 fn xml_attr(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            c => out.push(c),
-        }
+        push_xml_char(&mut out, c, true);
     }
     out.push('"');
     out
+}
+
+/// Append `c` to XML text (`attr`: to an attribute value) so the document
+/// stays well-formed XML 1.0 and reads back as written (review query#15):
+/// the markup characters as entities; a carriage return as `&#xD;` (and,
+/// in an attribute, a tab and a newline as `&#x9;` / `&#xA;`), which an XML
+/// parser would otherwise normalize away; and a character XML 1.0 cannot
+/// hold at all, even as a reference (the C0 controls but tab, newline and
+/// carriage return, U+FFFE, U+FFFF), as U+FFFD — the JSON format carries
+/// such a value exactly.
+fn push_xml_char(out: &mut String, c: char, attr: bool) {
+    match c {
+        '&' => out.push_str("&amp;"),
+        '<' => out.push_str("&lt;"),
+        '>' => out.push_str("&gt;"),
+        '"' if attr => out.push_str("&quot;"),
+        '\r' => out.push_str("&#xD;"),
+        '\t' if attr => out.push_str("&#x9;"),
+        '\n' if attr => out.push_str("&#xA;"),
+        '\t' | '\n' => out.push(c),
+        c if c < ' ' || c == '\u{FFFE}' || c == '\u{FFFF}' => out.push('\u{FFFD}'),
+        c => out.push(c),
+    }
 }
 
 // --- CSV ---------------------------------------------------------------------
@@ -343,11 +366,11 @@ fn write_select_csv<W: Write>(rs: &ResultSet, w: &mut W) -> io::Result<()> {
 /// A cell's bare CSV value: IRIs and literal lexical forms carry no syntax,
 /// blank nodes keep their `_:` prefix.
 fn csv_value(cell: &str) -> String {
-    match parse_term(cell) {
-        Ok(Term::Iri(s)) => s,
-        Ok(Term::Blank(l)) => format!("_:{l}"),
-        Ok(Term::Literal { value, .. }) => value,
-        Err(_) => cell.to_string(),
+    match cell_term(cell) {
+        Some(Term::Iri(s)) => s,
+        Some(Term::Blank(l)) => format!("_:{l}"),
+        Some(Term::Literal { value, .. }) => value,
+        None => cell.to_string(),
     }
 }
 
@@ -403,12 +426,12 @@ fn write_select_tsv<W: Write>(rs: &ResultSet, w: &mut W) -> io::Result<()> {
 }
 
 /// A cell as a Turtle/SPARQL term (`<iri>`, `"lit"^^<dt>` / `"lit"@lang`,
-/// `_:bnode`). The [`Term`] `Display` already escapes tabs/newlines/quotes.
+/// `_:bnode`), through the shared escaping serializer
+/// ([`Term::to_ntriples`]): no tab, newline or unescaped `>` inside a term.
 fn tsv_value(cell: &str) -> String {
-    match parse_term(cell) {
-        Ok(t) => t.to_string(),
-        Err(_) => Term::plain_literal(cell).to_string(),
-    }
+    cell_term(cell)
+        .unwrap_or_else(|| Term::plain_literal(cell))
+        .to_ntriples()
 }
 
 // --- upstream gStore's JSON shapes --------------------------------------------
@@ -441,10 +464,10 @@ const XSD_BOOLEAN: &str = "http://www.w3.org/2001/XMLSchema#boolean";
 /// One result cell (an N-Triples surface term) in upstream gStore's JSON
 /// encoding (see the section comment above).
 pub fn upstream_binding(cell: &str) -> Json {
-    let (kind, value, datatype, lang) = match parse_term(cell) {
-        Ok(Term::Iri(s)) => ("uri", s, None, None),
-        Ok(Term::Blank(l)) => ("bnode", format!("_:{l}"), None, None),
-        Ok(Term::Literal {
+    let (kind, value, datatype, lang) = match cell_term(cell) {
+        Some(Term::Iri(s)) => ("uri", s, None, None),
+        Some(Term::Blank(l)) => ("bnode", format!("_:{l}"), None, None),
+        Some(Term::Literal {
             value,
             datatype,
             lang,
@@ -453,7 +476,7 @@ pub fn upstream_binding(cell: &str) -> Json {
             (Some(dt), None) => ("typed-literal", value, Some(dt), None),
             (None, None) => ("literal", value, None, None),
         },
-        Err(_) => ("literal", cell.to_string(), None, None),
+        None => ("literal", cell.to_string(), None, None),
     };
     let mut b = Json::obj().with("type", kind);
     if let Some(dt) = datatype {
@@ -530,8 +553,8 @@ pub fn upstream_ntriple_json(rs: &ResultSet, limit: Option<usize>) -> Json {
 /// (The `n-triple-file` output escapes again, `NodeUtil::node2string`, as
 /// [`upstream_tsv`] does.)
 fn upstream_term_text(cell: &str) -> String {
-    match parse_term(cell) {
-        Ok(Term::Literal {
+    match cell_term(cell) {
+        Some(Term::Literal {
             value,
             datatype,
             lang,
@@ -560,7 +583,15 @@ pub fn upstream_tsv(rs: &ResultSet) -> String {
         .join("\t");
     out.push('\n');
     for row in &rs.rows {
-        let cells: Vec<&str> = row.iter().map(|c| c.as_deref().unwrap_or("")).collect();
+        // Each term through the escaping serializer, so no cell holds a
+        // tab or a newline (review query#15).
+        let cells: Vec<String> = row
+            .iter()
+            .map(|c| match c.as_deref() {
+                None => String::new(),
+                Some(c) => cell_term(c).map_or_else(|| c.to_string(), |t| t.to_ntriples()),
+            })
+            .collect();
         out.push_str(&cells.join("\t"));
         out.push('\n');
     }

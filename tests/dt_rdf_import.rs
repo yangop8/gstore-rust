@@ -1038,7 +1038,9 @@ fn cli_tools_take_directories_are_tolerant_and_have_strict() {
     );
     let s = src.to_string_lossy().into_owned();
     let out = run(env!("CARGO_BIN_EXE_gbuild"), &["cli", &s], &dir);
-    assert!(out.status.success(), "{out:?}");
+    // review sparqlconf#12: a build that skipped statements exits 3 (built,
+    // statements skipped); it used to exit 0.
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("RDF parse error num 4"), "{stdout}");
     assert!(stdout.contains("named-graph quads=1"), "{stdout}");

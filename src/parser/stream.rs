@@ -656,8 +656,13 @@ impl BlankLabeler {
     }
 
     /// The stored label for an explicit `_:label` of a reader that also mints
-    /// labels.
+    /// labels. A label outside BLANK_NODE_LABEL (a JSON-LD `"_:a b"`, an
+    /// RDF/XML `rdf:nodeID` ending in `.`, an RDFa `_:` CURIE holding a
+    /// control character) is first made one by
+    /// [`safe_blank_label`](crate::model::term::safe_blank_label), so every
+    /// stored label reads back (review parser#1).
     pub fn explicit(&self, label: &str) -> String {
+        let label = &*crate::model::term::safe_blank_label(label);
         match (&self.scope, &self.mint_scope) {
             (Some(s), _) => format!("{s}_{label}"),
             (None, Some(_)) => label.to_string(),

@@ -133,7 +133,10 @@ fn main() -> ExitCode {
     let written = match &result {
         QueryResult::Select(rs) => write!(out, "{}", rs.to_table_string()),
         QueryResult::Ask(b) => writeln!(out, "{b}"),
-        QueryResult::Construct(triples) => triples.iter().try_for_each(|t| writeln!(out, "{t}")),
+        // The escaping serializer (review sparqlconf#11).
+        QueryResult::Construct(triples) => triples
+            .iter()
+            .try_for_each(|t| writeln!(out, "{}", t.to_ntriples())),
         QueryResult::Update { .. } => Ok(()),
     };
     // A reader that stopped early (`gquery … | head`) is not an error.

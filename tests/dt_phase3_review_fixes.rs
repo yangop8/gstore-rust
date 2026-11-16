@@ -260,16 +260,15 @@ fn same_term_distinguishes_lexical_forms_and_datatypes() {
         col0(&mut db, &sel("sameTerm(?v, \"05\"^^xsd:unsignedByte)")),
         vec![ex("a")]
     );
-    // A simple literal and an xsd:string literal are the same RDF term.
-    assert_eq!(
-        col0(
-            &mut db,
-            &format!(
-                "{P} SELECT ?x WHERE {{ :a :v ?x FILTER(sameTerm(\"s\", \"s\"^^xsd:string)) }}"
-            )
-        ),
-        vec![typed("05", "unsignedByte")]
-    );
+    // review sparqlconf#14: sameTerm follows the store's term identity
+    // (the one BGP matching, joins and DISTINCT use), which keeps a simple
+    // literal and an xsd:string literal as two terms; this assertion pinned
+    // the RDF 1.1 folding, under which sameTerm disagreed with all of them.
+    assert!(col0(
+        &mut db,
+        &format!("{P} SELECT ?x WHERE {{ :a :v ?x FILTER(sameTerm(\"s\", \"s\"^^xsd:string)) }}")
+    )
+    .is_empty());
 }
 
 // ---------------------------------------------------------------------------

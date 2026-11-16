@@ -71,7 +71,7 @@ impl Database {
 
     /// Write the default graph as N-Triples to `out` (upstream
     /// `Database::export_db`; what `gexport` writes). Returns the number of
-    /// triples written. IRIs are written through
+    /// triples written. Every term is written through
     /// [`export_key`](crate::model::term::export_key), so the export loads back.
     ///
     /// The same writer as `gexport` and `/api export`

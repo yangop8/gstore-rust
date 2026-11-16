@@ -206,7 +206,8 @@ fn is_lenient_local_char(c: char) -> bool {
 
 /// A character a blank node label may contain besides `.`.
 fn is_blank_label_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_' || c == '-'
+    // The shared rule of every reader (review parser#1).
+    crate::model::term::is_blank_label_char(c)
 }
 
 /// Characters a `\`-escape may produce in a local name (`PN_LOCAL_ESC`).
@@ -998,6 +999,10 @@ impl<R: BufRead> Parser<R> {
                 // dictionary's readers, require).
                 if lang.is_empty() {
                     return Err(self.err("empty language tag after '@'"));
+                }
+                // The shared LANGTAG rule of every reader (review parser#1).
+                if !crate::model::term::is_valid_lang_tag(&lang) {
+                    return Err(self.err(format!("invalid language tag '@{lang}'")));
                 }
                 Ok(Term::Literal {
                     value,

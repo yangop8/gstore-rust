@@ -152,16 +152,24 @@ fn every_inferred_triple_is_retracted_whatever_its_terms_hold() {
     }
 }
 
-/// A language tag holding a tab (`STRLANG` does not check its tag) does not
+/// A language tag holding a tab (`STRLANG` did not check its tag) does not
 /// split the ledger line either.
 #[test]
 fn a_language_tag_with_a_tab_is_retracted() {
     let root = tmp_root("lang");
     let mut db = fresh(Some(&root));
-    db.query(
-        "INSERT { <http://ex/a> <http://ex/p> ?o } WHERE { BIND(STRLANG(\"v\", \"en\\tx\") AS ?o) }",
-    )
-    .unwrap();
+    // review sparqlconf#11: STRLANG now refuses a tag that is no LANGTAG,
+    // so the literal is stored the way an older version left it, through
+    // the library API.
+    assert!(db.insert_triple(&gstore::Triple::new(
+        gstore::Term::iri("http://ex/a"),
+        gstore::Term::iri("http://ex/p"),
+        gstore::Term::Literal {
+            value: "v".into(),
+            datatype: None,
+            lang: Some("en\tx".into()),
+        },
+    )));
     assert_eq!(run_rule(&mut db, ONE_HOP, "r"), (1, 1));
     assert_eq!(db.reason_disable("r").unwrap().removed, 1);
     assert!(!ask(&mut db, "?s <Rule:r> ?o"));

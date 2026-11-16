@@ -318,7 +318,7 @@ impl Lexer {
             self.bump(); // ':'
             let mut label = String::new();
             while let Some(c) = self.peek() {
-                if c.is_alphanumeric() || c == '_' || c == '-' || c == '.' {
+                if crate::model::term::is_blank_label_char(c) || c == '.' {
                     label.push(c);
                     self.pos += 1;
                 } else {
@@ -390,6 +390,11 @@ impl Lexer {
                 } else {
                     break;
                 }
+            }
+            // LANGTAG: `[a-zA-Z]+('-'[a-zA-Z0-9]+)*`, the shared rule of
+            // every reader (`"x"@` and `"x"@-` are not literals).
+            if !crate::model::term::is_valid_lang_tag(&tag) {
+                return Err(self.err(format!("invalid language tag '@{tag}'")));
             }
             (Some(tag), None)
         } else if self.peek() == Some('^') && self.peek2() == Some('^') {
@@ -621,6 +626,22 @@ mod tests {
 
     fn lex(s: &str) -> Vec<Token> {
         tokenize(s).unwrap()
+    }
+
+    #[test]
+    fn a_language_tag_is_langtag() {
+        // review parser#1: `"x"@` used to give an empty tag, `"x"@-` a `-`.
+        for bad in ["\"x\"@", "\"x\"@-", "\"x\"@-en", "\"x\"@en-", "\"x\"@1"] {
+            assert!(tokenize(bad).is_err(), "{bad}");
+        }
+        assert_eq!(
+            lex("\"x\"@en-GB")[0],
+            Token::Str {
+                value: "x".into(),
+                lang: Some("en-GB".into()),
+                datatype: None
+            }
+        );
     }
 
     /// Review H-14: the prefix look-ahead steps over each character of a

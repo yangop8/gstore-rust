@@ -772,7 +772,7 @@ impl Extractor {
     /// Walk the document root: either `rdf:RDF` (iterate its node children) or a
     /// single node element.
     fn run(&mut self, root: &XmlElement) -> Result<()> {
-        let ctx = self.child_ctx(&Ctx::root(), root);
+        let ctx = self.child_ctx(&Ctx::root(), root)?;
         let (ns, local) = expand_name(&root.name, &ctx.ns)?;
         if ns == RDF_NS && local == "RDF" {
             for child in root.elements() {
@@ -785,7 +785,11 @@ impl Extractor {
     }
 
     /// Build the child context: merge `xmlns` declarations, `xml:lang`, `xml:base`.
-    fn child_ctx(&self, parent: &Ctx, el: &XmlElement) -> Ctx {
+    /// `xml:lang` goes through the shared language-tag rule
+    /// ([`normalize_lang_tag`](crate::model::term::normalize_lang_tag):
+    /// `zh_CN` is `zh-CN`, `""` no language); a value that is no language
+    /// tag fails the document (review parser#1).
+    fn child_ctx(&self, parent: &Ctx, el: &XmlElement) -> Result<Ctx> {
         let mut ctx = parent.clone();
         for (k, v) in &el.attrs {
             if k == "xmlns" {
@@ -795,15 +799,20 @@ impl Extractor {
             } else if k == "xml:base" {
                 ctx.base = v.clone();
             } else if k == "xml:lang" {
-                ctx.lang = if v.is_empty() { None } else { Some(v.clone()) };
+                ctx.lang = crate::model::term::normalize_lang_tag(v).map_err(|msg| {
+                    GStoreError::RdfParse {
+                        line: 0,
+                        msg: format!("xml:lang: {msg}"),
+                    }
+                })?;
             }
         }
-        ctx
+        Ok(ctx)
     }
 
     /// Process a node element, returning its subject term.
     fn node(&mut self, el: &XmlElement, parent: &Ctx) -> Result<Term> {
-        let ctx = self.child_ctx(parent, el);
+        let ctx = self.child_ctx(parent, el)?;
         let (ns, local) = expand_name(&el.name, &ctx.ns)?;
 
         // Subject identity.
@@ -866,7 +875,7 @@ impl Extractor {
         parent: &Ctx,
         li: &mut usize,
     ) -> Result<()> {
-        let ctx = self.child_ctx(parent, pe);
+        let ctx = self.child_ctx(parent, pe)?;
         let (ns, local) = expand_name(&pe.name, &ctx.ns)?;
         let predicate = if ns == RDF_NS && local == "li" {
             let n = *li;

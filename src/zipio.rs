@@ -758,7 +758,8 @@ impl ExportFormat {
 /// .`), and for N-Quads then each named graph's (`<s> <p> <o> <g> .`, graphs
 /// in id order). Returns the number of statements written. A statement whose
 /// terms the dictionary cannot resolve is skipped (as `export_ntriples`).
-/// IRIs are written through [`export_key`], so the export loads back.
+/// Every term is written through [`export_key`] (the escaping N-Triples
+/// serializer, `Term::to_ntriples`), so the export loads back.
 ///
 /// The walk runs inside a [`ReadScope`] (contract C2): a read error a backend
 /// reports while exporting fails the export instead of silently dropping the

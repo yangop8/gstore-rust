@@ -26,7 +26,7 @@ use crate::dict::{Dictionary, TermStr};
 use crate::error::{GStoreError, Result};
 use crate::kvstore::StringIndex;
 use crate::model::id::{is_entity_id, EntityLiteralId};
-use crate::model::term::export_key;
+use crate::model::term::record_key;
 use crate::model::{IdTriple, Term, Triple};
 use crate::parser::import;
 use crate::parser::nquads::Quad;
@@ -2301,7 +2301,11 @@ impl Database {
         pfn: Option<&crate::pfn::PfnCaller>,
     ) -> Result<usize> {
         match op {
-            UpdateOp::InsertData(triples) => self.try_insert_data(&triples),
+            UpdateOp::InsertData(triples) => {
+                // The loader's literal rule (review sparqlconf#12).
+                import::check_update_literals(triples.iter().map(|g| &g.object))?;
+                self.try_insert_data(&triples)
+            }
             UpdateOp::DeleteData(triples) => Ok(self.delete_data(&triples)),
             UpdateOp::Modify {
                 with,
@@ -2327,6 +2331,9 @@ impl Database {
                     cancel,
                     pfn,
                 )?;
+                // The loader's literal rule, before anything is applied
+                // (review sparqlconf#12).
+                import::check_update_literals(ins.iter().map(|(_, t)| &t.object))?;
                 // A template triple outside `GRAPH { … }` targets the WITH
                 // graph, else the default graph.
                 let target = |g: &Option<String>| g.clone().or_else(|| with.clone());
@@ -3256,9 +3263,12 @@ impl Database {
         ) else {
             return;
         };
-        // Each term as the N-Triples reader reads it back: an IRI the
-        // lenient readers let in (holding `>`, `\`, a space…) is escaped.
-        let triple = format!("{} {} {} .", export_key(&s), export_key(&p), export_key(&o));
+        // Each term exactly as stored, in the `record_key` form
+        // `parse_record_triple` splits unambiguously (an IRI's excluded
+        // characters escaped, as before; a label or language tag the strict
+        // readers refuse escaped too), so replay names the stored terms,
+        // odd ones included (review parser#1).
+        let triple = format!("{} {} {} .", record_key(&s), record_key(&p), record_key(&o));
         let graph = graph
             .and_then(|g| self.dict.term(g))
             .map(|g| strip_angle(&g).to_owned());
@@ -3367,8 +3377,16 @@ impl Database {
                 }
                 _ => {}
             }
-            // N-Triples (verbatim blank labels: the record names stored nodes).
-            for t in crate::parser::ntriples::parse_str(triple_str)? {
+            // The record names stored terms (verbatim blank labels), in
+            // `record_key` form: read with the matching parser, so a term
+            // the strict N-Triples reader refuses (a language tag `zh_CN`,
+            // a label holding a space) replays as itself (review parser#1).
+            // A record of another shape is read as N-Triples, as before.
+            let triples = match crate::model::term::parse_record_triple(triple_str) {
+                Some(t) => vec![t],
+                None => crate::parser::ntriples::parse_str(triple_str)?,
+            };
+            for t in triples {
                 match op {
                     'I' => {
                         self.insert_quad(&t, graph_opt)?;
