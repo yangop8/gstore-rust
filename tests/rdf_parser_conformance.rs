@@ -340,3 +340,158 @@ fn resolving_a_long_relative_iri_is_linear_in_its_segments() {
         "8x the segments took {ratio:.1}x as long ({t_small:?} -> {t_large:?})"
     );
 }
+
+// ---- RDF/XML literals keep their data (parser#9) ------------------------------
+
+const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+
+/// An RDF/XML document with the `rdf:` and `ex:` namespaces (plus `extra`
+/// declarations on `rdf:RDF`) and one `rdf:Description` of `ex:s`.
+fn rdfxml_doc(extra: &str, body: &str) -> String {
+    format!(
+        "<rdf:RDF xmlns:rdf=\"{RDF}\" xmlns:ex=\"http://ex/\" {extra}>\
+         <rdf:Description rdf:about=\"http://ex/s\">{body}</rdf:Description></rdf:RDF>"
+    )
+}
+
+fn object_of(ts: &[Triple], p: &str) -> Term {
+    ts.iter()
+        .find(|t| t.predicate == iri(p))
+        .unwrap_or_else(|| panic!("no {p} in {ts:?}"))
+        .object
+        .clone()
+}
+
+/// RDF/XML §7.2.16 (literalPropertyElt): the literal is the element's text,
+/// whitespace included. Before, it was trimmed ("  two  spaces  " became
+/// "two  spaces", a whitespace-only value "").
+#[test]
+fn an_rdfxml_literal_keeps_its_whitespace() {
+    let cases = [
+        ("  two  spaces  ", "  two  spaces  "),
+        ("\nline1\n  line2\n", "\nline1\n  line2\n"),
+        ("   ", "   "),
+        ("a<!-- note -->b", "ab"),
+        ("<![CDATA[ <raw> ]]>", " <raw> "),
+        ("x &amp; y", "x & y"),
+    ];
+    for (content, want) in cases {
+        let doc = rdfxml_doc("", &format!("<ex:code>{content}</ex:code>"));
+        let ts = rdfxml::parse_str(&doc).unwrap();
+        assert_eq!(object_of(&ts, "http://ex/code"), lit(want), "{content:?}");
+    }
+    // With a language and a datatype.
+    let doc = rdfxml_doc(
+        "",
+        "<ex:a xml:lang=\"en\"> hi </ex:a>\
+         <ex:b rdf:datatype=\"http://www.w3.org/2001/XMLSchema#string\"> x </ex:b>",
+    );
+    let ts = rdfxml::parse_str(&doc).unwrap();
+    assert_eq!(
+        object_of(&ts, "http://ex/a"),
+        Term::Literal {
+            value: " hi ".into(),
+            datatype: None,
+            lang: Some("en".into())
+        }
+    );
+    assert_eq!(
+        object_of(&ts, "http://ex/b"),
+        Term::typed_literal(" x ", "http://www.w3.org/2001/XMLSchema#string")
+    );
+}
+
+/// RDF/XML §7.2.17 (parseTypeLiteralPropertyElt): the value is the content,
+/// markup included, as exclusive canonical XML with comments: each element
+/// declares the namespaces it visibly uses, declarations before attributes,
+/// attributes by namespace IRI then local name, `<br/>` as `<br></br>`,
+/// text escaped. Before, only the text children were kept (" text").
+#[test]
+fn an_rdfxml_xml_literal_keeps_its_markup() {
+    let xml_literal = |v: &str| Term::typed_literal(v, format!("{RDF}XMLLiteral"));
+    let doc = rdfxml_doc(
+        "xmlns:h=\"http://www.w3.org/1999/xhtml\"",
+        "<ex:xml rdf:parseType=\"Literal\"><h:b h:id=\"i\" class='x'>bold &amp; &lt;b&gt;</h:b> \
+         text<!-- c --><h:br/></ex:xml>",
+    );
+    let ts = rdfxml::parse_str(&doc).unwrap();
+    assert_eq!(
+        object_of(&ts, "http://ex/xml"),
+        xml_literal(
+            "<h:b xmlns:h=\"http://www.w3.org/1999/xhtml\" class=\"x\" h:id=\"i\">bold &amp; \
+             &lt;b&gt;</h:b> text<!-- c --><h:br xmlns:h=\"http://www.w3.org/1999/xhtml\"></h:br>"
+        )
+    );
+    // The default namespace in scope is declared on the outermost element
+    // that uses it, not again inside; one declared inside the literal stays
+    // where it is used.
+    let doc = rdfxml_doc(
+        "xmlns=\"http://ex/d/\"",
+        "<ex:xml rdf:parseType=\"Literal\"><p>a <i>b</i></p>\
+         <q xmlns:z=\"http://z/\" xmlns:unused=\"http://u/\"><z:r a=\"1&#10;2\"/></q></ex:xml>",
+    );
+    let ts = rdfxml::parse_str(&doc).unwrap();
+    assert_eq!(
+        object_of(&ts, "http://ex/xml"),
+        xml_literal(
+            "<p xmlns=\"http://ex/d/\">a <i>b</i></p><q xmlns=\"http://ex/d/\">\
+             <z:r xmlns:z=\"http://z/\" a=\"1&#xA;2\"></z:r></q>"
+        )
+    );
+    // Text only: the text, escaped as canonical XML.
+    let doc = rdfxml_doc("", "<ex:xml rdf:parseType=\"Literal\">a &lt; b &amp; c</ex:xml>");
+    let ts = rdfxml::parse_str(&doc).unwrap();
+    assert_eq!(
+        object_of(&ts, "http://ex/xml"),
+        xml_literal("a &lt; b &amp; c")
+    );
+}
+
+/// RDF/XML §7.2.21 (emptyPropertyElt): with property attributes the object
+/// is `rdf:resource`, `rdf:nodeID` or a fresh blank node, and the property
+/// attributes (and `rdf:type`) describe it; without any it is the literal
+/// "" (with the `xml:lang` in scope). Before, `<ex:empty ex:name="n"/>`
+/// gave the literal "" and `<ex:rel rdf:resource=… ex:name="n"/>` lost
+/// `ex:name`.
+#[test]
+fn an_empty_rdfxml_property_element_describes_its_object() {
+    let doc = rdfxml_doc(
+        "",
+        "<ex:empty ex:name=\"n\" rdf:type=\"http://ex/T\"/>\
+         <ex:rel rdf:resource=\"http://ex/o\" ex:name=\"m\"/>\
+         <ex:node rdf:nodeID=\"k\" ex:name=\"k1\"/>\
+         <ex:nothing/>\
+         <ex:tagged xml:lang=\"fr\"/>",
+    );
+    let ts = rdfxml::parse_str(&doc).unwrap();
+    let s = iri("http://ex/s");
+    let name = iri("http://ex/name");
+    let b = object_of(&ts, "http://ex/empty");
+    assert!(matches!(b, Term::Blank(_)), "{b:?}");
+    let k = object_of(&ts, "http://ex/node");
+    assert!(matches!(k, Term::Blank(_)), "{k:?}");
+    let want = [
+        Triple::new(s.clone(), iri("http://ex/empty"), b.clone()),
+        Triple::new(b.clone(), iri(&format!("{RDF}type")), iri("http://ex/T")),
+        Triple::new(b, name.clone(), lit("n")),
+        Triple::new(s.clone(), iri("http://ex/rel"), iri("http://ex/o")),
+        Triple::new(iri("http://ex/o"), name.clone(), lit("m")),
+        Triple::new(s.clone(), iri("http://ex/node"), k.clone()),
+        Triple::new(k, name, lit("k1")),
+        Triple::new(s.clone(), iri("http://ex/nothing"), lit("")),
+        Triple::new(
+            s,
+            iri("http://ex/tagged"),
+            Term::Literal {
+                value: String::new(),
+                datatype: None,
+                lang: Some("fr".into()),
+            },
+        ),
+    ];
+    let mut got = ts.clone();
+    let mut want = want.to_vec();
+    got.sort_by_key(|t| format!("{t:?}"));
+    want.sort_by_key(|t| format!("{t:?}"));
+    assert_eq!(got, want);
+}

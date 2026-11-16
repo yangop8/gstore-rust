@@ -9,9 +9,16 @@
 //!   `rdf:type` triple)
 //! * `rdf:about`, `rdf:ID` (resolved against `xml:base`), `rdf:nodeID`
 //! * property elements with `rdf:resource`, nested node elements (striped
-//!   syntax), or text content (with `rdf:datatype` / `xml:lang`)
-//! * property *attributes* (shorthand for literal-valued properties)
-//! * `rdf:parseType="Resource"` (anonymous blank node) and `="Literal"`
+//!   syntax), or text content (with `rdf:datatype` / `xml:lang`; the text
+//!   is the literal exactly, whitespace included)
+//! * property *attributes* (shorthand for literal-valued properties), also
+//!   on an empty property element, where they describe its object (its
+//!   `rdf:resource` / `rdf:nodeID`, else a fresh blank node)
+//! * `rdf:parseType="Resource"` (anonymous blank node) and `="Literal"` (an
+//!   `rdf:XMLLiteral` holding the content, markup included, as exclusive
+//!   canonical XML with comments)
+//! * relative IRIs resolved against `xml:base` per RFC 3986
+//!   ([`crate::parser::iri`])
 //! * `rdf:li` membership properties (lowered to `rdf:_1`, `rdf:_2`, …) and the
 //!   `rdf:Seq`/`rdf:Bag`/`rdf:Alt` container classes
 //! * `rdf:parseType="Collection"` (the node elements become an
@@ -123,14 +130,18 @@ struct XmlElement {
 #[derive(Debug)]
 enum XmlChild {
     Element(XmlElement),
+    /// Character data (text, CDATA sections and expanded references).
     Text(String),
+    /// A comment inside an element (kept for `rdf:parseType="Literal"`,
+    /// whose value is the content as canonical XML with comments).
+    Comment(String),
 }
 
 impl XmlElement {
     fn elements(&self) -> impl Iterator<Item = &XmlElement> {
         self.children.iter().filter_map(|c| match c {
             XmlChild::Element(e) => Some(e),
-            XmlChild::Text(_) => None,
+            XmlChild::Text(_) | XmlChild::Comment(_) => None,
         })
     }
 
@@ -236,14 +247,21 @@ impl XmlParser {
     }
 
     fn skip_comment(&mut self) -> Result<()> {
+        self.read_comment().map(drop)
+    }
+
+    /// A comment `<!-- … -->`: its text.
+    fn read_comment(&mut self) -> Result<String> {
         self.pos += 4; // "<!--"
+        let mut text = String::new();
         while !self.starts_with("-->") {
-            if self.bump().is_none() {
-                return Err(self.err("unterminated comment"));
+            match self.bump() {
+                Some(c) => text.push(c),
+                None => return Err(self.err("unterminated comment")),
             }
         }
         self.pos += 3;
-        Ok(())
+        Ok(text)
     }
 
     /// `<!DOCTYPE name ExternalID? [ internal subset ]? >`: the internal
@@ -607,7 +625,7 @@ impl XmlParser {
                         }
                         return Ok(children);
                     } else if self.starts_with("<!--") {
-                        self.skip_comment()?;
+                        children.push(XmlChild::Comment(self.read_comment()?));
                     } else if self.starts_with("<![CDATA[") {
                         self.pos += 9;
                         let mut cdata = String::new();
@@ -888,19 +906,40 @@ impl Extractor {
             Term::Iri(format!("{ns}{local}"))
         };
 
-        // rdf:resource ⇒ IRI object.
-        if let Some(res) = attr_value(pe, RDF_NS, "resource", &ctx.ns)? {
-            self.push(
-                subject.clone(),
-                predicate,
-                Term::Iri(resolve(&ctx.base, &res)),
-            );
-            return Ok(());
-        }
-        // rdf:nodeID ⇒ blank-node object.
-        if let Some(nid) = attr_value(pe, RDF_NS, "nodeID", &ctx.ns)? {
-            let obj = self.node_id(&nid);
-            self.push(subject.clone(), predicate, obj);
+        // rdf:resource ⇒ IRI object, rdf:nodeID ⇒ blank-node object; and
+        // an empty property element with property attributes ⇒ a fresh
+        // blank node (emptyPropertyElt, RDF/XML §7.2.21). Property
+        // attributes (and `rdf:type`) describe that object (review
+        // parser#9: they were dropped, and an element with only property
+        // attributes became the literal "").
+        let resource = attr_value(pe, RDF_NS, "resource", &ctx.ns)?;
+        let node_id = attr_value(pe, RDF_NS, "nodeID", &ctx.ns)?;
+        let (prop_attrs, rdf_type) = property_attributes(pe, &ctx)?;
+        let empty = !pe.has_element_children() && pe.text().trim().is_empty();
+        let described = !prop_attrs.is_empty() || rdf_type.is_some();
+        let no_literal_syntax = attr_value(pe, RDF_NS, "parseType", &ctx.ns)?.is_none()
+            && attr_value(pe, RDF_NS, "datatype", &ctx.ns)?.is_none();
+        if resource.is_some() || node_id.is_some() || (described && empty && no_literal_syntax) {
+            let obj = match (resource, node_id) {
+                (Some(res), _) => Term::Iri(resolve(&ctx.base, &res)),
+                (None, Some(nid)) => self.node_id(&nid),
+                (None, None) => self.fresh_blank(),
+            };
+            self.push(subject.clone(), predicate, obj.clone());
+            if let Some(ty) = rdf_type {
+                self.push(obj.clone(), iri_type(), Term::Iri(ty));
+            }
+            for (p, value) in prop_attrs {
+                self.push(
+                    obj.clone(),
+                    Term::Iri(p),
+                    Term::Literal {
+                        value,
+                        datatype: None,
+                        lang: ctx.lang.clone(),
+                    },
+                );
+            }
             return Ok(());
         }
 
@@ -933,11 +972,14 @@ impl Extractor {
                     return Ok(());
                 }
                 "Literal" => {
+                    // The content, markup included, as exclusive canonical
+                    // XML (review parser#9: only the text was kept).
+                    let value = xml_literal(pe, &ctx.ns)?;
                     self.push(
                         subject.clone(),
                         predicate,
                         Term::Literal {
-                            value: pe.text(),
+                            value,
                             datatype: Some(format!("{RDF_NS}XMLLiteral")),
                             lang: None,
                         },
@@ -995,11 +1037,14 @@ impl Extractor {
         } else {
             ctx.lang.clone()
         };
+        // The text exactly as written: whitespace is part of the value
+        // (literalPropertyElt, RDF/XML §7.2.16; review parser#9 — it was
+        // trimmed).
         self.push(
             subject.clone(),
             predicate,
             Term::Literal {
-                value: pe.text().trim().to_string(),
+                value: pe.text(),
                 datatype,
                 lang,
             },
@@ -1018,6 +1063,179 @@ impl Extractor {
 
 fn iri_type() -> Term {
     Term::Iri(format!("{RDF_NS}type"))
+}
+
+/// The property attributes of property element `pe` as `(predicate IRI,
+/// value)`, and its `rdf:type` attribute (resolved), for an
+/// emptyPropertyElt (RDF/XML §7.2.21).
+#[allow(clippy::type_complexity)]
+fn property_attributes(
+    pe: &XmlElement,
+    ctx: &Ctx,
+) -> Result<(Vec<(String, String)>, Option<String>)> {
+    let mut props = Vec::new();
+    let mut rdf_type = None;
+    for (raw, value) in &pe.attrs {
+        let (a_ns, a_local) = expand_attr_name(raw, &ctx.ns)?;
+        if a_ns == RDF_NS && a_local == "type" {
+            rdf_type = Some(resolve(&ctx.base, value));
+        } else if !is_syntax_attr(raw, &a_ns, &a_local) {
+            props.push((format!("{a_ns}{a_local}"), value.clone()));
+        }
+    }
+    Ok((props, rdf_type))
+}
+
+/// The value of an `rdf:parseType="Literal"` property element: its content
+/// as Exclusive XML Canonicalization with comments renders it (RDF 1.1 XML
+/// Syntax §7.2.17, parseTypeLiteralPropertyElt). Elements keep their
+/// markup; each element declares the namespaces it visibly uses (its own
+/// prefix and its attributes' prefixes) unless an enclosing element of the
+/// literal already declared them with the same value; namespace
+/// declarations come first, by prefix, then the attributes, by namespace
+/// IRI and local name; an empty element is written `<a></a>`; text escapes
+/// `&`, `<`, `>` and carriage returns, attribute values `&`, `<`, `"`,
+/// tabs, line feeds and carriage returns. CDATA sections are text, and DTD
+/// entity references are already expanded.
+fn xml_literal(pe: &XmlElement, ns: &HashMap<String, String>) -> Result<String> {
+    let mut out = String::new();
+    write_c14n_content(&pe.children, ns, &HashMap::new(), &mut out)?;
+    Ok(out)
+}
+
+fn write_c14n_content(
+    children: &[XmlChild],
+    scope: &HashMap<String, String>,
+    rendered: &HashMap<String, String>,
+    out: &mut String,
+) -> Result<()> {
+    for child in children {
+        match child {
+            XmlChild::Text(t) => {
+                for c in t.chars() {
+                    match c {
+                        '&' => out.push_str("&amp;"),
+                        '<' => out.push_str("&lt;"),
+                        '>' => out.push_str("&gt;"),
+                        '\r' => out.push_str("&#xD;"),
+                        c => out.push(c),
+                    }
+                }
+            }
+            XmlChild::Comment(t) => {
+                out.push_str("<!--");
+                out.push_str(t);
+                out.push_str("-->");
+            }
+            XmlChild::Element(e) => write_c14n_element(e, scope, rendered, out)?,
+        }
+    }
+    Ok(())
+}
+
+fn write_c14n_element(
+    el: &XmlElement,
+    parent_scope: &HashMap<String, String>,
+    rendered: &HashMap<String, String>,
+    out: &mut String,
+) -> Result<()> {
+    let undefined = |prefix: &str| GStoreError::RdfParse {
+        line: 0,
+        msg: format!("undefined namespace prefix '{prefix}:' in an XML literal"),
+    };
+    let declares = el
+        .attrs
+        .iter()
+        .any(|(k, _)| k == "xmlns" || k.starts_with("xmlns:"));
+    let own_scope;
+    let scope = if declares {
+        let mut s = parent_scope.clone();
+        for (k, v) in &el.attrs {
+            if k == "xmlns" {
+                s.insert(String::new(), v.clone());
+            } else if let Some(p) = k.strip_prefix("xmlns:") {
+                s.insert(p.to_string(), v.clone());
+            }
+        }
+        own_scope = s;
+        &own_scope
+    } else {
+        parent_scope
+    };
+    // The prefixes the element visibly uses ("" = the default namespace).
+    let mut used: Vec<&str> = vec![el.name.split_once(':').map_or("", |(p, _)| p)];
+    let mut attrs: Vec<(&str, &str, &str, &str)> = Vec::new(); // (ns, local, qname, value)
+    for (k, v) in &el.attrs {
+        if k == "xmlns" || k.starts_with("xmlns:") {
+            continue;
+        }
+        match k.split_once(':') {
+            Some(("xml", local)) => attrs.push((XML_NS, local, k, v)),
+            Some((p, local)) => {
+                let uri = scope.get(p).ok_or_else(|| undefined(p))?;
+                used.push(p);
+                attrs.push((uri, local, k, v));
+            }
+            None => attrs.push(("", k, k, v)),
+        }
+    }
+    used.sort_unstable();
+    used.dedup();
+    attrs.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    let mut here = rendered.clone();
+    out.push('<');
+    out.push_str(&el.name);
+    for p in used {
+        let uri = scope.get(p).map_or("", String::as_str);
+        if !p.is_empty() && uri.is_empty() {
+            return Err(undefined(p));
+        }
+        let before = rendered.get(p).map_or("", String::as_str);
+        let declared = if p.is_empty() {
+            uri != before
+        } else {
+            rendered.get(p).map(String::as_str) != Some(uri)
+        };
+        if declared {
+            out.push_str(" xmlns");
+            if !p.is_empty() {
+                out.push(':');
+                out.push_str(p);
+            }
+            out.push_str("=\"");
+            push_c14n_attr(uri, out);
+            out.push('"');
+            here.insert(p.to_string(), uri.to_string());
+        }
+    }
+    for (_, _, qname, value) in attrs {
+        out.push(' ');
+        out.push_str(qname);
+        out.push_str("=\"");
+        push_c14n_attr(value, out);
+        out.push('"');
+    }
+    out.push('>');
+    write_c14n_content(&el.children, scope, &here, out)?;
+    out.push_str("</");
+    out.push_str(&el.name);
+    out.push('>');
+    Ok(())
+}
+
+/// An attribute value escaped as canonical XML writes it.
+fn push_c14n_attr(value: &str, out: &mut String) {
+    for c in value.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '"' => out.push_str("&quot;"),
+            '\t' => out.push_str("&#x9;"),
+            '\n' => out.push_str("&#xA;"),
+            '\r' => out.push_str("&#xD;"),
+            c => out.push(c),
+        }
+    }
 }
 
 /// Expand an element/datatype qualified name to `(namespace, local)`.
