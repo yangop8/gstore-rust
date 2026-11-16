@@ -42,11 +42,15 @@ deamon=off
 # ip_allow_path first if both path are configured
 ip_allow_path=
 ip_deny_path="./conf/ipDeny.config"
-# (gstore-rust) failed logins are counted per account and address: after
-# login_lockout_failures failures that account is locked for that address,
-# first for 1 s, each further failure doubling the lock up to
-# login_lockout_max_seconds; a lock refuses only that account's password
-# checks (no password hash runs), and a success clears only its own count.
+# (gstore-rust) failed logins are counted per account and address (an IPv6
+# client by its /64 network): after more than login_lockout_failures failures
+# (the next failure locks; default: the 5th, as upstream's errornum > 4) that
+# account is locked for that address, first for 1 s, each further failure
+# doubling the lock up to login_lockout_max_seconds; a lock refuses only that
+# account's password checks (no password hash runs), and a success clears only
+# its own count. More than 8 x login_lockout_failures failures of any accounts
+# from one address lock that address too, except for accounts that logged in
+# from it successfully within the last hour. refreshconf applies these keys.
 # Turning upstream_login_lockout on restores upstream's rule instead (an
 # address with more than 4 failures is refused everything but login and
 # testConnect until a successful login or a restart): unlimited guessing

@@ -34,11 +34,16 @@
 //!
 //! **Default (review gapi#5 / sec#7 / http#6).** Failed authentications are
 //! counted per *account and address* ([`LoginLockout`]): with more than
-//! [`MAX_AUTH_FAILURES`] failures of one account from one address, that
+//! [`MAX_AUTH_FAILURES`] failures of one account from one address (the
+//! next failure after `login_lockout_failures` of them locks), that
 //! account is locked for that address — first for one second, each further
 //! failure doubling the lock up to 15 minutes ([`LockoutPolicy`];
 //! `conf.ini`'s `login_lockout_failures` / `login_lockout_max_seconds`) —
-//! and the counts are forgotten after an hour without a failure. Every path
+//! and the counts are forgotten after an hour without a failure. The
+//! address is the client's IPv4 address, or the /64 network of an IPv6 one
+//! (an IPv4-mapped IPv6 address counts as its IPv4 address,
+//! [`lockout_address`]): rotating addresses inside one's /64 gets no fresh
+//! counts. Every path
 //! that checks a password honours it before it runs the (deliberately slow)
 //! password hash: `/api` `login`, `testConnect` and every authenticated
 //! operation, the lifecycle routes, REST `/login` and Basic credentials, and
@@ -46,12 +51,17 @@
 //! answered `1101` (REST: `429` with `Retry-After`) and costs no hash. A
 //! successful authentication clears only its own account's count from that
 //! address, so one account's login never unlocks another. Failures of every
-//! account from one address also lock the address as a whole once there are
-//! more than [`LockoutPolicy::max_address_failures`] of them (the same
-//! back-off), so guessing across many user names gets no more hashes for
-//! free. Other operations — and an already logged-in session — are not
-//! affected by a lock: clients behind one proxy or NAT are not locked out of
-//! the server by someone else's failures.
+//! account from one address also lock the address once there are more than
+//! [`LockoutPolicy::max_address_failures`] of them (the same back-off), so
+//! guessing across many user names gets no more hashes for free — but that
+//! address-wide lock refuses only accounts not known good at the address:
+//! one that authenticated successfully from it within the last
+//! `forget_after` (an hour) keeps working, as do other operations of
+//! already logged-in sessions, so clients behind one proxy or NAT are not
+//! locked out of the server by someone else's guessing (round-2 review). It
+//! is answered "too many failed logins from this address" (an account's own
+//! lock: "… for this account from this address"). The key is the TCP peer's
+//! address: behind a reverse proxy every client shares the proxy's.
 //!
 //! **`upstream_login_lockout=on`** (an upstream-compat switch; `gserver`
 //! warns at startup) restores upstream's rule: every failed authentication
@@ -112,6 +122,59 @@ pub fn lockout_msg(wait: Duration) -> String {
     )
 }
 
+/// The message of an authentication refused by the default lockout's
+/// address-wide lock (guessing across many accounts from the address), for
+/// `wait` more (rounded up to whole seconds).
+pub fn address_lockout_msg(wait: Duration) -> String {
+    format!(
+        "{LOCKOUT_MSG_PREFIX} from this address: retry in {} s",
+        retry_after_secs(wait)
+    )
+}
+
+/// Why the default lockout refuses a password check, and for how long
+/// ([`LoginLockout::refusal_detail`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LockRefusal {
+    /// How much longer the lock lasts.
+    pub wait: Duration,
+    /// The address-wide lock (guessing across accounts), not the account's
+    /// own.
+    pub address_wide: bool,
+}
+
+impl LockRefusal {
+    /// The refused attempt's message ([`lockout_msg`] /
+    /// [`address_lockout_msg`]).
+    pub fn message(&self) -> String {
+        if self.address_wide {
+            address_lockout_msg(self.wait)
+        } else {
+            lockout_msg(self.wait)
+        }
+    }
+}
+
+/// The address a failed authentication from `ip` counts against: an IPv4
+/// address as it is, an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) as its
+/// IPv4 address, and any other IPv6 address as its /64 network
+/// (`2001:db8:1:2::/64`) — the block one subscriber is usually given, so
+/// rotating addresses inside it gets no fresh counts. Anything else (not an
+/// address) as given.
+pub fn lockout_address(ip: &str) -> String {
+    match ip.trim().parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => v4.to_string(),
+        Ok(IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => {
+                let s = v6.segments();
+                format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+            }
+        },
+        Err(_) => ip.to_string(),
+    }
+}
+
 /// `wait` in whole seconds, rounded up (at least 1): the `Retry-After` value
 /// of a refused attempt.
 pub fn retry_after_secs(wait: Duration) -> u64 {
@@ -124,8 +187,9 @@ pub fn retry_after_secs(wait: Duration) -> u64 {
 pub struct LockoutPolicy {
     /// Failed authentications of one account from one address that are let
     /// through: the next one locks the account for that address (default
-    /// [`MAX_AUTH_FAILURES`], upstream's count; `conf.ini`
-    /// `login_lockout_failures`). `0` locks after every failure.
+    /// [`MAX_AUTH_FAILURES`], upstream's count — the 5th failure locks, as
+    /// upstream's `errornum > 4`; `conf.ini` `login_lockout_failures`). `0`
+    /// locks after every failure.
     pub max_failures: u32,
     /// How long the first lock lasts (default 1 s). Every further failure
     /// once locked (an attempt let through after a lock ended, which failed
@@ -197,10 +261,16 @@ impl Failures {
 
 #[derive(Debug, Default)]
 struct LockoutState {
+    /// The policy in force (replaceable at run time, keeping the counts).
+    policy: LockoutPolicy,
     /// Per (address, account hash).
     accounts: HashMap<(String, u64), Failures>,
     /// Per address, every account.
     addresses: HashMap<String, Failures>,
+    /// (address, account hash) → its last successful authentication: an
+    /// account known good at an address is not refused by that address's
+    /// address-wide lock.
+    known: HashMap<(String, u64), Instant>,
 }
 
 /// The default failed-login lockout (see the module docs): failures counted
@@ -212,7 +282,6 @@ struct LockoutState {
 /// record the outcome after.
 #[derive(Debug)]
 pub struct LoginLockout {
-    policy: LockoutPolicy,
     state: Mutex<LockoutState>,
     /// Account names are kept as keyed hashes (an attempt may carry any
     /// name, of any length).
@@ -229,15 +298,23 @@ impl LoginLockout {
     /// A lockout with `policy`.
     pub fn new(policy: LockoutPolicy) -> LoginLockout {
         LoginLockout {
-            policy,
-            state: Mutex::new(LockoutState::default()),
+            state: Mutex::new(LockoutState {
+                policy,
+                ..LockoutState::default()
+            }),
             hasher: std::collections::hash_map::RandomState::new(),
         }
     }
 
     /// The policy in force.
     pub fn policy(&self) -> LockoutPolicy {
-        self.policy
+        self.state().policy
+    }
+
+    /// Replace the policy (`refreshconf`), keeping the counts and the locks
+    /// already set: the next failure is judged by the new policy.
+    pub fn set_policy(&self, policy: LockoutPolicy) {
+        self.state().policy = policy;
     }
 
     fn state(&self) -> MutexGuard<'_, LockoutState> {
@@ -245,7 +322,7 @@ impl LoginLockout {
     }
 
     fn key(&self, account: &str, ip: &str) -> (String, u64) {
-        (ip.to_string(), self.hasher.hash_one(account))
+        (lockout_address(ip), self.hasher.hash_one(account))
     }
 
     /// How much longer `account` is locked for address `ip` (its own lock
@@ -254,12 +331,40 @@ impl LoginLockout {
         self.refusal_at(account, ip, Instant::now())
     }
 
+    /// [`refusal`](Self::refusal) with which lock refuses it.
+    pub fn refusal_detail(&self, account: &str, ip: &str) -> Option<LockRefusal> {
+        self.refusal_detail_at(account, ip, Instant::now())
+    }
+
     fn refusal_at(&self, account: &str, ip: &str, now: Instant) -> Option<Duration> {
+        self.refusal_detail_at(account, ip, now).map(|r| r.wait)
+    }
+
+    fn refusal_detail_at(&self, account: &str, ip: &str, now: Instant) -> Option<LockRefusal> {
         let key = self.key(account, ip);
         let st = self.state();
         let own = st.accounts.get(&key).and_then(|f| f.locked_for(now));
-        let addr = st.addresses.get(ip).and_then(|f| f.locked_for(now));
-        own.max(addr)
+        // The address-wide lock spares an account known good there.
+        let known = st
+            .known
+            .get(&key)
+            .is_some_and(|t| now.duration_since(*t) < st.policy.forget_after);
+        let addr = if known {
+            None
+        } else {
+            st.addresses.get(&key.0).and_then(|f| f.locked_for(now))
+        };
+        match (own, addr) {
+            (own, Some(a)) if own.is_none_or(|o| a > o) => Some(LockRefusal {
+                wait: a,
+                address_wide: true,
+            }),
+            (Some(o), _) => Some(LockRefusal {
+                wait: o,
+                address_wide: false,
+            }),
+            _ => None,
+        }
     }
 
     /// The failures counted against `account` at `ip` (forgotten ones
@@ -267,10 +372,11 @@ impl LoginLockout {
     pub fn failures(&self, account: &str, ip: &str) -> u32 {
         let now = Instant::now();
         let key = self.key(account, ip);
-        self.state()
-            .accounts
+        let st = self.state();
+        let forget_after = st.policy.forget_after;
+        st.accounts
             .get(&key)
-            .filter(|f| now.duration_since(f.last) < self.policy.forget_after)
+            .filter(|f| now.duration_since(f.last) < forget_after)
             .map_or(0, |f| f.count)
     }
 
@@ -280,9 +386,9 @@ impl LoginLockout {
     }
 
     fn note_failure_at(&self, account: &str, ip: &str, now: Instant) {
-        let policy = self.policy;
         let key = self.key(account, ip);
         let mut st = self.state();
+        let policy = st.policy;
         let bump = |f: &mut Failures, threshold: u32| {
             if now.duration_since(f.last) >= policy.forget_after {
                 f.count = 0;
@@ -299,10 +405,10 @@ impl LoginLockout {
             last: now,
             locked_until: None,
         };
+        let ip_key = key.0.clone();
         if make_room(&mut st.accounts, &key, now, policy.forget_after) {
             bump(st.accounts.entry(key).or_insert(fresh), policy.max_failures);
         }
-        let ip_key = ip.to_string();
         if make_room(&mut st.addresses, &ip_key, now, policy.forget_after) {
             bump(
                 st.addresses.entry(ip_key).or_insert(fresh),
@@ -313,10 +419,25 @@ impl LoginLockout {
 
     /// Record a successful authentication of `account` from `ip`: that
     /// account's count at that address is cleared (no other account's, and
-    /// not the address's count across accounts).
+    /// not the address's count across accounts), and the account is known
+    /// good there — the address-wide lock does not refuse it for the next
+    /// `forget_after`.
     pub fn note_success(&self, account: &str, ip: &str) {
+        self.note_success_at(account, ip, Instant::now());
+    }
+
+    fn note_success_at(&self, account: &str, ip: &str, now: Instant) {
         let key = self.key(account, ip);
-        self.state().accounts.remove(&key);
+        let mut st = self.state();
+        st.accounts.remove(&key);
+        let forget_after = st.policy.forget_after;
+        if !st.known.contains_key(&key) && st.known.len() >= MAX_TRACKED {
+            st.known
+                .retain(|_, t| now.duration_since(*t) < forget_after);
+        }
+        if st.known.contains_key(&key) || st.known.len() < MAX_TRACKED {
+            st.known.insert(key, now);
+        }
     }
 
     #[cfg(test)]
@@ -510,7 +631,7 @@ pub struct IpFilter {
     /// The default lockout (per account and address).
     lockout: LoginLockout,
     /// `upstream_login_lockout`: upstream's per-address lockout instead.
-    upstream_lockout: bool,
+    upstream_lockout: std::sync::atomic::AtomicBool,
 }
 
 /// Why `ipmanage` could not save a list.
@@ -525,7 +646,14 @@ pub enum SaveError {
 }
 
 impl IpFilter {
-    /// A filter with the given list files (loaded now).
+    /// A filter with the given list files (loaded now) and the default
+    /// lockout ([`auth_refusal`](Self::auth_refusal) /
+    /// [`note_auth_failure`](Self::note_auth_failure)). Upstream's
+    /// per-address lockout ([`note_failure`](Self::note_failure) /
+    /// [`locked_out`](Self::locked_out)) counts but never locks out unless
+    /// the filter is built [`with_upstream_lockout(true)`](Self::with_upstream_lockout)
+    /// (round 2, review gapi#5: before, `locked_out` locked after more than
+    /// [`MAX_AUTH_FAILURES`] `note_failure`s on every filter).
     pub fn new(allow_path: Option<PathBuf>, deny_path: Option<PathBuf>) -> IpFilter {
         let load = |p: Option<PathBuf>| {
             p.map(|p| {
@@ -540,7 +668,7 @@ impl IpFilter {
                 failures: HashMap::new(),
             }),
             lockout: LoginLockout::default(),
-            upstream_lockout: false,
+            upstream_lockout: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -548,19 +676,18 @@ impl IpFilter {
     /// lockout of `upstream_login_lockout`, `login_lockout_failures` and
     /// `login_lockout_max_seconds`.
     pub fn from_config(config: &GStoreConfig) -> IpFilter {
+        let (policy, upstream) = IpFilter::lockout_of(config);
         IpFilter::new(config.ip_allow_path.clone(), config.ip_deny_path.clone())
-            .with_lockout_policy(LockoutPolicy::with_limits(
-                config.login_lockout_failures,
-                Duration::from_secs(config.login_lockout_max_seconds),
-            ))
-            .with_upstream_lockout(config.upstream_login_lockout)
+            .with_lockout_policy(policy)
+            .with_upstream_lockout(upstream)
     }
 
     /// Use upstream's per-address lockout (`on`; the
     /// `upstream_login_lockout` switch, see the module docs) instead of the
     /// default per-account one.
-    pub fn with_upstream_lockout(mut self, on: bool) -> IpFilter {
-        self.upstream_lockout = on;
+    pub fn with_upstream_lockout(self, on: bool) -> IpFilter {
+        self.upstream_lockout
+            .store(on, std::sync::atomic::Ordering::SeqCst);
         self
     }
 
@@ -570,10 +697,32 @@ impl IpFilter {
         self
     }
 
+    /// Replace the lockout in force at run time (`refreshconf`): `policy`
+    /// for the default lockout, `upstream` for `upstream_login_lockout`.
+    /// The counts and locks already set are kept.
+    pub fn set_lockout(&self, policy: LockoutPolicy, upstream: bool) {
+        self.lockout.set_policy(policy);
+        self.upstream_lockout
+            .store(upstream, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The lockout `config` asks for: the default lockout's policy and
+    /// whether `upstream_login_lockout` is on.
+    pub fn lockout_of(config: &GStoreConfig) -> (LockoutPolicy, bool) {
+        (
+            LockoutPolicy::with_limits(
+                config.login_lockout_failures,
+                Duration::from_secs(config.login_lockout_max_seconds),
+            ),
+            config.upstream_login_lockout,
+        )
+    }
+
     /// Whether upstream's per-address lockout is in force
     /// (`upstream_login_lockout`).
     pub fn upstream_lockout(&self) -> bool {
         self.upstream_lockout
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The default lockout (consulted only when
@@ -618,7 +767,7 @@ impl IpFilter {
     /// of a locked account ([`auth_refusal`](Self::auth_refusal)), not the
     /// address's other requests.
     pub fn locked_out(&self, ip: &str) -> bool {
-        self.upstream_lockout && self.failures(ip) > MAX_AUTH_FAILURES
+        self.upstream_lockout() && self.failures(ip) > MAX_AUTH_FAILURES
     }
 
     /// The failed authentications counted against `ip` by upstream's
@@ -633,10 +782,16 @@ impl IpFilter {
     /// refused by [`locked_out`](Self::locked_out) instead). Ask it before
     /// the password hash runs.
     pub fn auth_refusal(&self, account: &str, ip: &str) -> Option<Duration> {
-        if self.upstream_lockout {
+        self.auth_refusal_detail(account, ip).map(|r| r.wait)
+    }
+
+    /// [`auth_refusal`](Self::auth_refusal) with which lock refuses it (for
+    /// its message, [`LockRefusal::message`]).
+    pub fn auth_refusal_detail(&self, account: &str, ip: &str) -> Option<LockRefusal> {
+        if self.upstream_lockout() {
             None
         } else {
-            self.lockout.refusal(account, ip)
+            self.lockout.refusal_detail(account, ip)
         }
     }
 
@@ -644,7 +799,7 @@ impl IpFilter {
     /// account at that address (default), or against the address
     /// (`upstream_login_lockout`, upstream `update_access_ip_error_num`).
     pub fn note_auth_failure(&self, account: &str, ip: &str) {
-        if self.upstream_lockout {
+        if self.upstream_lockout() {
             self.note_failure(ip);
         } else {
             self.lockout.note_failure(account, ip);
@@ -655,7 +810,7 @@ impl IpFilter {
     /// that account's count at that address (default). Upstream clears an
     /// address only on a `login` ([`note_login_success`](Self::note_login_success)).
     pub fn note_auth_success(&self, account: &str, ip: &str) {
-        if !self.upstream_lockout {
+        if !self.upstream_lockout() {
             self.lockout.note_success(account, ip);
         }
     }
@@ -664,7 +819,7 @@ impl IpFilter {
     /// account's count at that address (default), or the address's count
     /// (`upstream_login_lockout`, upstream `reset_access_ip_error_num`).
     pub fn note_login_success(&self, account: &str, ip: &str) {
-        if self.upstream_lockout {
+        if self.upstream_lockout() {
             self.reset(ip);
         } else {
             self.lockout.note_success(account, ip);
@@ -1106,9 +1261,101 @@ mod tests {
             "the address is locked for every account"
         );
         assert_eq!(l.refusal_at("someone", "10.0.0.4", t0), None);
-        // A success does not lift the address's lock.
+        // review (round-2 land review, security-limits): a success does not
+        // lift the address's lock for the other accounts — but the account
+        // that authenticated is known good there now, and the address-wide
+        // lock no longer refuses it (before, every account behind a shared
+        // address stayed refused, this one included).
         l.note_success("someone", "10.0.0.3");
-        assert!(l.refusal_at("someone", "10.0.0.3", t0).is_some());
+        assert!(l.refusal_at("someone-else", "10.0.0.3", t0).is_some());
+        assert_eq!(l.refusal_at("someone", "10.0.0.3", t0), None);
+    }
+
+    /// Round-2 review (security-limits): the address-wide lock refuses only
+    /// accounts not known good at the address, says so in its own message,
+    /// and an account's own lock still applies to a known-good account.
+    #[test]
+    fn the_address_lock_spares_accounts_known_good_there() {
+        let l = LoginLockout::default();
+        let t0 = Instant::now();
+        l.note_success_at("alice", "10.0.0.5", t0);
+        for i in 0..=l.policy().max_address_failures {
+            l.note_failure_at(&format!("nobody{i}"), "10.0.0.5", t0);
+        }
+        let refused = l.refusal_detail_at("carol", "10.0.0.5", t0).unwrap();
+        assert!(refused.address_wide);
+        assert!(
+            refused
+                .message()
+                .starts_with("too many failed logins from this address"),
+            "{}",
+            refused.message()
+        );
+        assert_eq!(l.refusal_detail_at("alice", "10.0.0.5", t0), None);
+        // Known good, and still bounded by its own count.
+        for _ in 0..=MAX_AUTH_FAILURES {
+            l.note_failure_at("alice", "10.0.0.5", t0);
+        }
+        let own = l.refusal_detail_at("alice", "10.0.0.5", t0).unwrap();
+        assert!(!own.address_wide);
+        assert!(
+            own.message().contains("for this account"),
+            "{}",
+            own.message()
+        );
+        // Known good only for a while (`forget_after`).
+        let later = t0 + l.policy().forget_after;
+        l.note_failure_at("nobody", "10.0.0.5", later);
+        for i in 0..=l.policy().max_address_failures {
+            l.note_failure_at(&format!("again{i}"), "10.0.0.5", later);
+        }
+        assert!(l.refusal_at("alice", "10.0.0.5", later).is_some());
+    }
+
+    /// Round-2 review (security-limits): IPv6 clients count per /64 network
+    /// (rotating addresses inside it gets no fresh counts), an IPv4-mapped
+    /// address as its IPv4 address.
+    #[test]
+    fn ipv6_clients_are_counted_per_64_network() {
+        assert_eq!(lockout_address("2001:db8:1:2::7"), "2001:db8:1:2::/64");
+        assert_eq!(lockout_address("::ffff:10.1.2.3"), "10.1.2.3");
+        assert_eq!(lockout_address("10.1.2.3"), "10.1.2.3");
+        assert_eq!(lockout_address("unknown"), "unknown");
+        let l = LoginLockout::default();
+        let t0 = Instant::now();
+        for i in 1..=MAX_AUTH_FAILURES + 1 {
+            l.note_failure_at("root", &format!("2001:db8:1:2::{i:x}"), t0);
+        }
+        assert!(
+            l.refusal_at("root", "2001:db8:1:2:ffff:ffff:ffff:ffff", t0)
+                .is_some(),
+            "the whole /64 is locked for root"
+        );
+        assert_eq!(l.refusal_at("root", "2001:db8:1:3::1", t0), None);
+        for _ in 0..=MAX_AUTH_FAILURES {
+            l.note_failure_at("bob", "::ffff:10.9.9.9", t0);
+        }
+        assert!(l.refusal_at("bob", "10.9.9.9", t0).is_some());
+    }
+
+    /// Round-2 review (security-limits): `refreshconf`'s new lockout policy
+    /// applies to the next failure, and the counts so far are kept.
+    #[test]
+    fn a_new_policy_keeps_the_counts() {
+        let l = LoginLockout::default();
+        let t0 = Instant::now();
+        for _ in 0..2 {
+            l.note_failure_at("root", "10.0.0.6", t0);
+        }
+        assert_eq!(l.refusal_at("root", "10.0.0.6", t0), None);
+        l.set_policy(LockoutPolicy::with_limits(2, Duration::from_secs(60)));
+        assert_eq!(l.policy().max_failures, 2);
+        l.note_failure_at("root", "10.0.0.6", t0);
+        assert_eq!(
+            l.refusal_at("root", "10.0.0.6", t0),
+            Some(Duration::from_secs(1)),
+            "the 3rd failure locks under the new policy"
+        );
     }
 
     #[test]

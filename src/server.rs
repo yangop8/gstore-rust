@@ -453,9 +453,9 @@ pub(crate) enum SingleAuthCheck {
     Valid,
     /// Missing or wrong (a wrong one was counted).
     Invalid,
-    /// The presented user is locked out at this address for this long more
-    /// (nothing compared).
-    Locked(Duration),
+    /// The presented user is locked out at this address (nothing
+    /// compared): for how long, and by which lock.
+    Locked(crate::gapi::ipfilter::LockRefusal),
 }
 
 impl SingleAuth {
@@ -501,8 +501,8 @@ impl SingleAuth {
             return SingleAuthCheck::Invalid;
         };
         let user = Self::presented_user(&decoded);
-        if let Some(wait) = self.lockout.refusal(&user, ip) {
-            return SingleAuthCheck::Locked(wait);
+        if let Some(refusal) = self.lockout.refusal_detail(&user, ip) {
+            return SingleAuthCheck::Locked(refusal);
         }
         if ct_eq(&decoded, format!("{}:{}", self.user, self.pass).as_bytes()) {
             self.lockout.note_success(&user, ip);
@@ -3190,14 +3190,14 @@ impl ServerInner {
                     )?;
                     return Ok(true);
                 }
-                SingleAuthCheck::Locked(wait) => {
-                    let retry = crate::gapi::ipfilter::retry_after_secs(wait).to_string();
+                SingleAuthCheck::Locked(refusal) => {
+                    let retry = crate::gapi::ipfilter::retry_after_secs(refusal.wait).to_string();
                     write_response_ext(
                         stream,
                         429,
                         "text/plain",
                         &meta.headers(&[("Retry-After", retry.as_str())]),
-                        crate::gapi::ipfilter::lockout_msg(wait).as_bytes(),
+                        refusal.message().as_bytes(),
                     )?;
                     return Ok(true);
                 }

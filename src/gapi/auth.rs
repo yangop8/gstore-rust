@@ -68,8 +68,11 @@ pub fn check_ip(ctx: &Ctx<'_>, stage: IpStage) -> Result<(), GResp> {
 /// address that the default lockout refuses (none under
 /// `upstream_login_lockout`). Ask it before the password hash runs.
 pub fn locked_account(ctx: &Ctx<'_>, account: &str) -> Option<GResp> {
-    let wait = ctx.inner.ipfilter.auth_refusal(account, &ctx.remote_ip)?;
-    Some(GResp::error(Status::IpBlocked, ipfilter::lockout_msg(wait)))
+    let refusal = ctx
+        .inner
+        .ipfilter
+        .auth_refusal_detail(account, &ctx.remote_ip)?;
+    Some(GResp::error(Status::IpBlocked, refusal.message()))
 }
 
 /// Record a failed authentication of `account` from the caller's address:

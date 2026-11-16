@@ -2687,7 +2687,10 @@ impl ApiInner {
     /// `refreshconf`, `APIUtil::refresh_conf`) and apply what a running
     /// server can change: the settings request handlers read (database and
     /// user limits, upload, backup and log settings, `system_username`, …),
-    /// the IP allow / deny lists, and the `/api` layer's `max_output_size` and
+    /// the IP allow / deny lists, the failed-login lockout
+    /// (`upstream_login_lockout`, `login_lockout_failures`,
+    /// `login_lockout_max_seconds`; the counts are kept), and the `/api`
+    /// layer's `max_output_size` and
     /// `licensetype`, the `[query]` evaluation settings (applied to the
     /// loaded databases too), the log's `log_mode` / `[log]` configuration
     /// for a server that owns the diagnostic log
@@ -2714,6 +2717,15 @@ impl ApiInner {
         *self.config.write().unwrap_or_else(PoisonError::into_inner) = Arc::clone(&fresh);
         self.ipfilter
             .reconfigure(fresh.ip_allow_path.clone(), fresh.ip_deny_path.clone());
+        // The lockout keys (`upstream_login_lockout`, `login_lockout_failures`,
+        // `login_lockout_max_seconds`) take effect too, keeping the counts
+        // (round-2 review: they used to read back new values while the
+        // startup policy stayed in force).
+        let (policy, upstream) = crate::gapi::ipfilter::IpFilter::lockout_of(&fresh);
+        if upstream && !self.ipfilter.upstream_lockout() {
+            crate::gs_warn!("upstream-compat: upstream_login_lockout=on (applied by refreshconf)");
+        }
+        self.ipfilter.set_lockout(policy, upstream);
         {
             let mut st = locked(&self.state);
             st.gapi.max_output_size = fresh.max_output_size;
@@ -3236,6 +3248,13 @@ impl ApiServer {
         self.inner.config()
     }
 
+    /// The IP access control and failed-login lockout in force (for
+    /// monitoring and tests).
+    #[doc(hidden)]
+    pub fn ip_filter(&self) -> &IpFilter {
+        &self.inner.ipfilter
+    }
+
     /// Replace the connection settings (worker-pool size, keep-alive, CORS,
     /// timeouts, body cap; default [`HttpOptions::default`]).
     pub fn with_http_options(mut self, opts: HttpOptions) -> ApiServer {
@@ -3455,6 +3474,18 @@ impl ApiServer {
     /// and shutdown waits; default [`TaskConfig::default`]).
     pub fn with_task_config(self, config: TaskConfig) -> ApiServer {
         self.inner.tasks.set_config(config);
+        self
+    }
+
+    /// Test hook: the default failed-login lockout's `policy` (after
+    /// [`with_config`](Self::with_config), which sets it from `conf.ini`;
+    /// `refreshconf` sets it from the file again) — e.g. a long first lock,
+    /// so a test's assertion that an account is locked never depends on
+    /// how fast the test runs (round-2 review).
+    #[doc(hidden)]
+    pub fn with_lockout_policy(self, policy: crate::gapi::ipfilter::LockoutPolicy) -> ApiServer {
+        let upstream = self.inner.ipfilter.upstream_lockout();
+        self.inner.ipfilter.set_lockout(policy, upstream);
         self
     }
 
@@ -3897,8 +3928,8 @@ impl ApiInner {
         let basic = match parse_basic_auth(req) {
             None => None,
             Some((u, p)) => {
-                if let Some(wait) = self.ipfilter.auth_refusal(&u, &ip) {
-                    return (lockout_refused(wait), "-".to_string());
+                if let Some(refusal) = self.ipfilter.auth_refusal_detail(&u, &ip) {
+                    return (lockout_refused(refusal), "-".to_string());
                 }
                 let attempt = locked(&self.state)
                     .users
@@ -4425,8 +4456,8 @@ impl ApiInner {
             let ip = peer_ip(crate::server::current_peer());
             // A locked account is refused before the slow hash (review
             // http#6): guessing through `/login` gets no further.
-            if let Some(wait) = inner.ipfilter.auth_refusal(&username, &ip) {
-                return lockout_refused(wait);
+            if let Some(refusal) = inner.ipfilter.auth_refusal_detail(&username, &ip) {
+                return lockout_refused(refusal);
             }
             let attempt =
                 locked(&inner.state)
@@ -7670,11 +7701,11 @@ fn presents_default_root_password(req: &Request) -> bool {
 
 /// The answer to a password check the failed-login lockout refuses
 /// (`crate::gapi::ipfilter`): `429 Too Many Requests` with `Retry-After`.
-fn lockout_refused(wait: Duration) -> Resp {
-    let mut r = Resp::fail(429, &crate::gapi::ipfilter::lockout_msg(wait));
+fn lockout_refused(refusal: crate::gapi::ipfilter::LockRefusal) -> Resp {
+    let mut r = Resp::fail(429, &refusal.message());
     r.extra.push((
         "Retry-After".to_string(),
-        crate::gapi::ipfilter::retry_after_secs(wait).to_string(),
+        crate::gapi::ipfilter::retry_after_secs(refusal.wait).to_string(),
     ));
     r
 }

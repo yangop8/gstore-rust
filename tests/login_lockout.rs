@@ -17,9 +17,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use gstore::config::GStoreConfig;
-use gstore::gapi::ipfilter::{LOCKED_MSG, LOCKOUT_MSG_PREFIX, MAX_AUTH_FAILURES};
+use gstore::gapi::ipfilter::{LockoutPolicy, LOCKED_MSG, LOCKOUT_MSG_PREFIX, MAX_AUTH_FAILURES};
 use gstore::http_api::ApiServer;
 use gstore::http_users::test_hooks::count_verifications;
 use gstore::json::{self, Json};
@@ -52,11 +53,25 @@ impl Drop for TmpDir {
 }
 
 /// An `ApiServer` (root password `root`) with `config`, serving on a thread.
+///
+/// review (round-2 land review, tests-compat): its lockout's first lock lasts
+/// an hour instead of one second. The assertions that an account is locked
+/// run after one or two further password hashes (another account's login);
+/// with the default 1 s first lock they held only while the test ran fast
+/// enough, and failed under heavy CPU contention. What the tests check —
+/// which attempts are refused, and that no refused attempt hashes — is
+/// unchanged; the 1 s / doubling schedule itself is covered by the
+/// `LoginLockout` unit tests.
 fn api_server(dir: &TmpDir, config: GStoreConfig) -> (Arc<ApiServer>, SocketAddr) {
     let server = Arc::new(
         ApiServer::bind(dir.0.join("home"), "root", "127.0.0.1:0")
             .unwrap()
-            .with_config(config),
+            .with_config(config)
+            .with_lockout_policy(LockoutPolicy {
+                first_lock: Duration::from_secs(3600),
+                max_lock: Duration::from_secs(3600),
+                ..LockoutPolicy::default()
+            }),
     );
     let addr = server.local_addr().unwrap();
     let s2 = Arc::clone(&server);
