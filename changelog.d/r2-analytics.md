@@ -249,7 +249,10 @@ objects), now cancellably — review analytics#4.
   2.1 MB after.
 - Workspace tests (`cargo test --workspace`, debug): 140 test binaries,
   2578 tests passed, 0 failed, in `GSTORE_DISK_QUERY_MODE=memory` and in
-  `stream`.
+  `stream`. After the review's additions (stronger mid-run cancellation
+  cases, the free-sweep allowance, `bfs_with`'s marks guard): 2580 passed,
+  0 failed, in both modes; `tests/dt_pfn.rs` and `tests/gfun_limits.rs`
+  also pass with `--features pfn-wasm`.
 
 ## Requests/Not yet
 
