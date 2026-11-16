@@ -1,0 +1,9 @@
+{
+  "head": {"vars": ["s", "l", "m"]},
+  "results": {"bindings": [
+    {"s": {"type": "uri", "value": "http://example.org/a"}, "l": {"type": "literal", "value": "5", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}, "m": {"type": "literal", "value": "50", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}},
+    {"s": {"type": "uri", "value": "http://example.org/c"}, "l": {"type": "literal", "value": "5", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}, "m": {"type": "literal", "value": "50", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}},
+    {"s": {"type": "uri", "value": "http://example.org/d"}, "l": {"type": "literal", "value": "4", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}, "m": {"type": "literal", "value": "40", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}},
+    {"s": {"type": "uri", "value": "http://example.org/b"}, "l": {"type": "literal", "value": "3", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}, "m": {"type": "literal", "value": "30", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}}
+  ]}
+}

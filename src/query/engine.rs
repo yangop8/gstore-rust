@@ -1390,38 +1390,48 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                         }
                     }
                 }
-                // SPARQL evaluates ORDER BY over the *pre-projection* solution
-                // sequence, so it may sort by a pattern variable that is not selected
-                // (e.g. `SELECT ?x … ORDER BY DESC(?sal)`), or by a SELECT-clause
-                // alias. Extend the layout + bindings with the aliases, sort, then
-                // project — a stable sort preserves the resulting order.
-                if !q.order_by.is_empty() {
-                    if let Projection::Items(items) = &q.projection {
-                        for it in items {
-                            if let SelectItem::Expr(e, alias) = it {
-                                if !layout.index.contains_key(alias) {
-                                    let idx = layout.names.len();
-                                    layout.index.insert(alias.clone(), idx);
-                                    layout.names.push(alias.clone());
-                                    layout.is_pred.push(false);
-                                    for b in solutions.iter_mut() {
-                                        // The column exists (unbound) while its
-                                        // expression is evaluated, so a reference
-                                        // to the alias itself reads unbound
-                                        // instead of indexing past the end — as
-                                        // the Top-K path (`order_extend`) does.
-                                        b.push(None);
-                                        b[idx] = self.eval_id(e, b, &layout);
-                                    }
+                // The SELECT expressions extend the solutions left to right
+                // (SPARQL 1.1 §18.2.4.4): each becomes a column under its
+                // alias, evaluated once, seeing the aliases before it and
+                // only those — with or without ORDER BY (review query#6 /
+                // sparqlconf#6: without ORDER BY an expression could not see
+                // an earlier alias, with it every expression was evaluated
+                // again at projection, seeing later aliases too). An alias
+                // that is already a WHERE variable gets no column and is
+                // evaluated at projection, as before.
+                let where_len = layout.names.len();
+                if let Projection::Items(items) = &q.projection {
+                    for it in items {
+                        if let SelectItem::Expr(e, alias) = it {
+                            if !layout.index.contains_key(alias) {
+                                let idx = layout.names.len();
+                                layout.index.insert(alias.clone(), idx);
+                                layout.names.push(alias.clone());
+                                layout.is_pred.push(false);
+                                for b in solutions.iter_mut() {
+                                    // The column exists (unbound) while its
+                                    // expression is evaluated, so a reference
+                                    // to the alias itself reads unbound
+                                    // instead of indexing past the end — as
+                                    // the Top-K path (`order_extend`) does.
+                                    b.push(None);
+                                    b[idx] = self.eval_id(e, b, &layout);
                                 }
                             }
                         }
                     }
+                }
+                // SPARQL evaluates ORDER BY over the *pre-projection* solution
+                // sequence, so it may sort by a pattern variable that is not selected
+                // (e.g. `SELECT ?x … ORDER BY DESC(?sal)`), or by a SELECT-clause
+                // alias: sort the extended solutions, then project — a stable
+                // sort preserves the resulting order.
+                if !q.order_by.is_empty() {
                     self.sort_solutions(&mut solutions, &q.order_by, &layout);
                 }
                 solutions
                     .iter()
-                    .map(|b| self.project_items(b, &layout, q, &result_vars))
+                    .map(|b| self.project_items(b, &layout, where_len, q, &result_vars))
                     .collect::<Result<Vec<_>>>()?
             };
 
@@ -1539,10 +1549,19 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     }
 
     /// Project a single solution into result-variable order (no aggregation).
+    ///
+    /// `b` / `layout` hold the WHERE variables in their first `where_len`
+    /// columns, then the SELECT-expression columns the caller added (see
+    /// `eval_select_solutions`, and `OrderCtx` / `order_extend` in the
+    /// streaming executor): an expression item reads its column — so each
+    /// expression is evaluated once per solution, left to right — and only
+    /// one whose alias is a WHERE variable (no column of its own) is
+    /// evaluated here.
     fn project_items(
         &self,
         b: &Binding,
         layout: &VarLayout,
+        where_len: usize,
         q: &SelectQuery,
         result_vars: &[String],
     ) -> Result<Vec<Option<u32>>> {
@@ -1560,7 +1579,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     SelectItem::Expr(Expr::GraphFn { .. } | Expr::Pfn { .. }, alias) => {
                         Ok(layout.index.get(alias).and_then(|&i| b[i]))
                     }
-                    SelectItem::Expr(e, _) => Ok(self.eval_id(e, b, layout)),
+                    SelectItem::Expr(e, alias) => match layout.index.get(alias) {
+                        Some(&i) if i >= where_len && i < b.len() => Ok(b[i]),
+                        _ => Ok(self.eval_id(e, b, layout)),
+                    },
                 })
                 .collect(),
         }

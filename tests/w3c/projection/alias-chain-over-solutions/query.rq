@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §18.2.4.4 SELECT Expressions: Extend(Extend(Ω, ?l, STRLEN(?n)), ?m,
+# ?l * 10), so ?m sees the ?l of the same solution
+PREFIX : <http://example.org/>
+SELECT ?s (STRLEN(?n) AS ?l) (?l * 10 AS ?m) WHERE { ?s :name ?n }

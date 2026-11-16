@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §18.2.4.4 SELECT Expressions and §15.1 ORDER BY (the sort keys may use
+# the SELECT expressions' aliases)
+PREFIX : <http://example.org/>
+SELECT ?s (STRLEN(?n) AS ?l) (?l * 10 AS ?m) WHERE { ?s :name ?n } ORDER BY DESC(?m) ?s

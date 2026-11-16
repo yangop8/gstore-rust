@@ -571,6 +571,163 @@ fn exists_honours_outer_bindings_in_values_and_sub_selects() {
     assert!(!data.ask_everywhere("ASK { :x :p ?o FILTER EXISTS { VALUES ?o { :o1 } } }"));
 }
 
+// ---- SELECT expressions ----------------------------------------------------
+
+/// SELECT expressions extend the solution left to right (SPARQL 1.1
+/// §18.2.4.4 / §18.2.5): each sees the aliases before it, and only those —
+/// with or without ORDER BY, with or without LIMIT, in both executors
+/// (review query#6 / sparqlconf#6: without ORDER BY a later expression did
+/// not see an earlier alias; with it an earlier one saw later aliases).
+#[test]
+fn select_expressions_see_earlier_aliases_on_every_path() {
+    let data = Data::parse(
+        ":a :name \"Alice\" .
+         :b :name \"Bob\" .
+         :c :name \"Carol\" .
+         :d :name \"Dave\" .",
+    );
+    for q in [
+        "SELECT (1 AS ?a) (?a + 1 AS ?b) WHERE {}",
+        "SELECT (1 AS ?a) (?a + 1 AS ?b) WHERE {} ORDER BY ?a",
+        "SELECT (1 AS ?a) (?a + 1 AS ?b) WHERE {} ORDER BY ?b",
+    ] {
+        assert_eq!(data.rows_everywhere(q), vec![vec![int(1), int(2)]], "{q}");
+    }
+    // A later alias is not in scope for an earlier expression.
+    for q in [
+        "SELECT (?b + 1 AS ?a) (1 AS ?b) WHERE {}",
+        "SELECT (?b + 1 AS ?a) (1 AS ?b) WHERE {} ORDER BY ?a",
+        "SELECT (?b + 1 AS ?a) (1 AS ?b) WHERE {} ORDER BY ?b",
+    ] {
+        assert_eq!(data.rows_everywhere(q), vec![vec![None, int(1)]], "{q}");
+    }
+    let want = vec![
+        vec![iri("a"), int(5), int(50)],
+        vec![iri("b"), int(3), int(30)],
+        vec![iri("c"), int(5), int(50)],
+        vec![iri("d"), int(4), int(40)],
+    ];
+    let chain = "SELECT ?s (STRLEN(?n) AS ?l) (?l * 10 AS ?m) WHERE { ?s :name ?n }";
+    assert_eq!(sorted(data.rows_everywhere(chain)), want);
+    assert_eq!(data.rows_everywhere(&format!("{chain} ORDER BY ?s")), want);
+    assert_eq!(
+        data.rows_everywhere(&format!("{chain} ORDER BY DESC(?m) ?s")),
+        vec![
+            want[0].clone(),
+            want[2].clone(),
+            want[3].clone(),
+            want[1].clone()
+        ]
+    );
+    for opts in [TopKOptions::NONE, HEAP_ONLY, FORCE_DPB, TopKOptions::ALL] {
+        let two = data.rows(&format!("{chain} LIMIT 2"), opts);
+        assert_eq!(two.len(), 2);
+        for row in &two {
+            assert!(want.contains(row), "{row:?} ({opts:?})");
+        }
+        let two = data.rows(&format!("{chain} ORDER BY ?m ?s LIMIT 2"), opts);
+        assert_eq!(two, vec![want[1].clone(), want[3].clone()], "{opts:?}");
+    }
+    // DISTINCT over an alias chain.
+    let rows = data.rows_everywhere(
+        "SELECT DISTINCT (STRLEN(?n) AS ?l) (?l * 10 AS ?m) WHERE { ?s :name ?n } ORDER BY ?l",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![int(3), int(30)],
+            vec![int(4), int(40)],
+            vec![int(5), int(50)]
+        ]
+    );
+}
+
+/// Each SELECT expression is evaluated once per solution, so the projected
+/// value is the one ORDER BY sorted on (review query#6: with ORDER BY the
+/// projection evaluated every expression a second time — `RAND()` came out
+/// unsorted, and a function ran twice per row).
+#[test]
+fn select_expressions_are_evaluated_once_per_solution() {
+    let data = Data::parse(
+        ":a :name \"Alice\" .
+         :b :name \"Bob\" .
+         :c :name \"Carol\" .
+         :d :name \"Dave\" .",
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counting = || {
+        let calls = Arc::clone(&calls);
+        let mut reg = FunctionRegistry::new();
+        reg.register("TICK", move |_| {
+            Some(Value::Int(calls.fetch_add(1, Ordering::Relaxed) as i64))
+        });
+        reg
+    };
+    for (q, solutions) in [
+        ("SELECT ?s (TICK() AS ?t) WHERE { ?s :name ?n }", 4),
+        (
+            "SELECT ?s (TICK() AS ?t) WHERE { ?s :name ?n } ORDER BY ?s",
+            4,
+        ),
+        (
+            "SELECT ?s (TICK() AS ?t) WHERE { ?s :name ?n } ORDER BY DESC(?t)",
+            4,
+        ),
+        (
+            "SELECT ?s (TICK() AS ?t) WHERE { ?s :name ?n } ORDER BY ?s LIMIT 2",
+            4,
+        ),
+        ("SELECT ?s (TICK() AS ?t) WHERE { ?s :name ?n } LIMIT 2", 2),
+    ] {
+        for opts in [TopKOptions::NONE, HEAP_ONLY, TopKOptions::ALL] {
+            calls.store(0, Ordering::Relaxed);
+            let query = parse(&format!("{PREFIX}{q}")).unwrap();
+            let r = data
+                .evaluator(opts)
+                .with_functions(counting())
+                .evaluate(&query);
+            let Ok(QueryResult::Select(rs)) = r else {
+                panic!("{q}: {r:?}")
+            };
+            let ran = calls.load(Ordering::Relaxed);
+            let expect =
+                if opts == TopKOptions::NONE && q.contains("LIMIT 2") && !q.contains("ORDER") {
+                    4 // the materializing executor evaluates every solution
+                } else {
+                    solutions
+                };
+            assert_eq!(ran, expect, "{q} ({opts:?}): {:?}", rs.rows);
+            // ORDER BY DESC(?t): the projected ?t is in descending order.
+            if q.contains("DESC(?t)") {
+                let ts: Vec<String> = rs.rows.iter().map(|r| r[1].clone().unwrap()).collect();
+                let mut want = ts.clone();
+                want.sort_by(|a, b| b.cmp(a));
+                assert_eq!(ts, want, "{q} ({opts:?})");
+            }
+        }
+    }
+    // RAND(): the projected values are the sorted ones.
+    for opts in [TopKOptions::NONE, HEAP_ONLY, TopKOptions::ALL] {
+        for q in [
+            "SELECT ?s (RAND() AS ?r) WHERE { ?s :name ?n } ORDER BY ?r",
+            "SELECT ?s (RAND() AS ?r) WHERE { ?s :name ?n } ORDER BY ?r LIMIT 3",
+        ] {
+            let rows = data.rows(q, opts);
+            let rs: Vec<f64> = rows
+                .iter()
+                .map(|r| {
+                    let v = r[1].as_deref().unwrap();
+                    v[1..v.find("\"^^").unwrap()].parse().unwrap()
+                })
+                .collect();
+            assert!(
+                rs.windows(2).all(|w| w[0] <= w[1]),
+                "{q} ({opts:?}): {rs:?}"
+            );
+        }
+    }
+}
+
 // ---- the executors agree ---------------------------------------------------
 
 /// SplitMix64.

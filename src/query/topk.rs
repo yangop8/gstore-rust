@@ -725,26 +725,27 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             let mut rows = Vec::new();
             let mut seen = HashSet::new();
             let mut failed = None;
+            // The SELECT expressions extend each solution left to right, as
+            // in the full path (review query#6 / sparqlconf#6).
+            let exprs = OrderCtx::new(layout, &q.order_by, Some(&q.projection));
             if k > 0 {
-                let _ = self.stream_pattern(pattern, layout, &mut |b| match self.project_items(
-                    &b,
-                    layout,
-                    q,
-                    result_vars,
-                ) {
-                    Ok(row) => {
-                        if !q.distinct || seen.insert(row.clone()) {
-                            rows.push(row);
+                let _ = self.stream_pattern(pattern, layout, &mut |mut b| {
+                    self.order_extend(&exprs, &mut b);
+                    match self.project_items(&b, &exprs.full, layout.len(), q, result_vars) {
+                        Ok(row) => {
+                            if !q.distinct || seen.insert(row.clone()) {
+                                rows.push(row);
+                            }
+                            if rows.len() >= k {
+                                STOP
+                            } else {
+                                GO
+                            }
                         }
-                        if rows.len() >= k {
+                        Err(e) => {
+                            failed = Some(e);
                             STOP
-                        } else {
-                            GO
                         }
-                    }
-                    Err(e) => {
-                        failed = Some(e);
-                        STOP
                     }
                 });
             }
@@ -766,7 +767,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 self.bump(|s| s.dpb_topk += 1);
                 return sols
                     .iter()
-                    .map(|b| self.project_items(b, &ctx.full, q, result_vars))
+                    .map(|b| self.project_items(b, &ctx.full, layout.len(), q, result_vars))
                     .collect::<Result<Vec<_>>>()
                     .map(Some);
             }
@@ -781,7 +782,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             let best = self.heap_top_k(pattern, layout, &ctx, k);
             self.check_cancel()?;
             best.iter()
-                .map(|b| self.project_items(b, &ctx.full, q, result_vars))
+                .map(|b| self.project_items(b, &ctx.full, layout.len(), q, result_vars))
                 .collect::<Result<Vec<_>>>()?
         };
         Ok(Some(rows))
@@ -905,7 +906,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         let _ = self.stream_pattern(pattern, layout, &mut |mut b| {
             self.order_extend(ctx, &mut b);
             let key = std::rc::Rc::new(self.sort_key(ctx.order_by, &b, &ctx.full));
-            let row = match self.project_items(&b, &ctx.full, q, result_vars) {
+            let row = match self.project_items(&b, &ctx.full, layout.len(), q, result_vars) {
                 Ok(row) => row,
                 Err(e) => {
                     failed = Some(e);
@@ -1032,7 +1033,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             }
             self.order_extend(ctx, &mut b);
             if q.distinct {
-                if seen.insert(self.project_items(&b, &ctx.full, q, result_vars)?) {
+                if seen.insert(self.project_items(&b, &ctx.full, layout.len(), q, result_vars)?) {
                     counted += 1;
                 }
             } else {
