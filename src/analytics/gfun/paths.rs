@@ -114,21 +114,21 @@ const CANCEL_POLL_MASK: u32 = 0xFFF;
 
 /// A cancellation poll that only looks at the flag every
 /// `CANCEL_POLL_MASK + 1` calls.
-struct Poll<'c, 'a> {
+pub(super) struct Poll<'c, 'a> {
     ctx: &'c GFunCtx<'a>,
     n: u32,
 }
 
 impl<'c, 'a> Poll<'c, 'a> {
-    fn new(ctx: &'c GFunCtx<'a>) -> Self {
+    pub(super) fn new(ctx: &'c GFunCtx<'a>) -> Self {
         Poll { ctx, n: 0 }
     }
 
     #[inline]
-    fn tick(&mut self) -> Result<()> {
+    pub(super) fn tick(&mut self) -> Result<()> {
         self.n = self.n.wrapping_add(1);
         if self.n & CANCEL_POLL_MASK == 0 {
-            self.ctx.check_cancel()
+            self.ctx.poll("paths")
         } else {
             Ok(())
         }
@@ -2106,7 +2106,7 @@ fn k_hop_enumerate_guarded(
 /// `PathQueryHandler::kHopNeighbor(u, directed, k, preds, retNum)`
 /// (kHopNeighbor.cpp:14-76) from a CSR node.
 #[allow(clippy::too_many_arguments)]
-fn k_hop_neighbor_nodes(
+pub(super) fn k_hop_neighbor_nodes(
     g: &CsrGraph,
     visited: &mut NodeMarks,
     poll: &mut Poll<'_, '_>,

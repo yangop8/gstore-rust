@@ -42,9 +42,15 @@ use crate::error::{GStoreError, Result};
 type Ept = i64;
 
 /// Largest ego network (vertices) the `Searcher` loads: it allocates an
-/// `n × n` byte matrix and an `n × n` `int` matrix (upstream has no limit
-/// and is killed by the OOM killer instead).
+/// `n × n` adjacency bit matrix and an `n × n` matrix of 16-bit
+/// common-neighbour counts, about `2.1 n²` bytes (136 MiB at the limit;
+/// upstream keeps a byte and an `int` per pair, `5 n²` bytes, and has no
+/// limit — it is killed by the OOM killer instead; review gap-gfun-fuzz#3).
 const MAX_SEARCHER_N: i32 = 8_192;
+
+// The common-neighbour counts of an ego network are at most its vertex
+// count, so 16 bits hold them.
+const _: () = assert!(MAX_SEARCHER_N < i16::MAX as i32);
 
 /// Largest fake solution `2k - 2` accepted (upstream allocates and prints it).
 pub(super) const MAX_FAKE_KPLEX: i64 = 1 << 20;
@@ -195,8 +201,11 @@ impl LinearHeap {
 #[derive(Default)]
 struct Searcher<'a> {
     n: i32,
-    matrix: Vec<u8>,
-    comm_neis: Vec<i32>,
+    /// Upstream's `char *matrix` (adjacency), one bit per pair.
+    matrix: Vec<u64>,
+    /// Upstream's `int *comm_neis` (common neighbours in `C` per pair);
+    /// never beyond `n` in magnitude, so 16 bits (see [`MAX_SEARCHER_N`]).
+    comm_neis: Vec<i16>,
     nei_in_g: Vec<i32>,
     nei_in_p: Vec<i32>,
     k: i32,
@@ -235,13 +244,35 @@ impl<'a> Searcher<'a> {
 
     #[inline]
     fn mx(&self, a: i32, b: i32) -> bool {
-        self.matrix[(a * self.n + b) as usize] != 0
+        let i = (a * self.n + b) as usize;
+        self.matrix[i >> 6] >> (i & 63) & 1 != 0
+    }
+
+    /// `matrix[a*n + b] = v`.
+    #[inline]
+    fn set_mx(&mut self, a: i32, b: i32, v: bool) {
+        let i = (a * self.n + b) as usize;
+        if v {
+            self.matrix[i >> 6] |= 1 << (i & 63);
+        } else {
+            self.matrix[i >> 6] &= !(1 << (i & 63));
+        }
     }
 
     #[inline]
-    fn cn(&mut self, a: i32, b: i32) -> &mut i32 {
+    fn cn(&mut self, a: i32, b: i32) -> &mut i16 {
         let n = self.n;
         &mut self.comm_neis[(a * n + b) as usize]
+    }
+
+    /// Poll cancellation from inside `init` (its loops are `O(n²)` and
+    /// `O(Σ deg²)` before the search's own polls start; review
+    /// gap-gfun-fuzz#3). Returns whether the run must stop.
+    fn init_cancelled(&mut self) -> bool {
+        if !self.cancelled && self.ctx.is_some_and(|c| c.poll("kplex-init").is_err()) {
+            self.cancelled = true;
+        }
+        self.cancelled
     }
 
     fn push_removed(&mut self, p: (i32, i32)) {
@@ -256,7 +287,7 @@ impl<'a> Searcher<'a> {
     fn load(&mut self, n: i32, vp: &[(i32, i32)]) {
         self.n = n;
         let nu = n as usize;
-        self.matrix = vec![0; nu * nu];
+        self.matrix = vec![0; (nu * nu).div_ceil(64)];
         self.comm_neis = vec![0; nu * nu];
         self.nei_in_g = vec![0; nu];
         self.nei_in_p = vec![0; nu];
@@ -269,8 +300,8 @@ impl<'a> Searcher<'a> {
         for &(a, b) in vp {
             self.nei_in_g[a as usize] += 1;
             self.nei_in_g[b as usize] += 1;
-            self.matrix[(a * n + b) as usize] = 1;
-            self.matrix[(b * n + a) as usize] = 1;
+            self.set_mx(a, b, true);
+            self.set_mx(b, a, true);
         }
     }
 
@@ -281,6 +312,9 @@ impl<'a> Searcher<'a> {
         self.c_end = 0;
         self.lvl = 0;
         self.init();
+        if self.cancelled {
+            return;
+        }
         if self.n > 0
             && self.pc_rid[0] < self.c_end
             && !self.move_c2p_r(0)
@@ -307,6 +341,9 @@ impl<'a> Searcher<'a> {
         let mut vis = vec![0i32; nu];
         let (mut max_core, mut idx) = (0, n);
         for i in 0..n {
+            if self.init_cancelled() {
+                return;
+            }
             let (mut u, mut min_degree) = (0, n);
             for j in 0..n {
                 if vis[j as usize] == 0 && self.nei_in_g[j as usize] < min_degree {
@@ -354,6 +391,9 @@ impl<'a> Searcher<'a> {
             return;
         }
         for i in 0..self.c_end {
+            if self.init_cancelled() {
+                return;
+            }
             let u = self.pc[i as usize];
             let mut cnt = 0;
             for j in 0..self.c_end {
@@ -364,6 +404,9 @@ impl<'a> Searcher<'a> {
             self.nei_in_g[u as usize] = cnt;
         }
         for i in 0..self.c_end {
+            if self.init_cancelled() {
+                return;
+            }
             let mut neighbors_n = 0usize;
             let pi = self.pc[i as usize];
             for j in 0..self.c_end {
@@ -387,6 +430,9 @@ impl<'a> Searcher<'a> {
             self.lvl_id[p as usize] = n;
         }
         for i in 0..self.c_end {
+            if self.init_cancelled() {
+                return;
+            }
             for j in i + 1..self.c_end {
                 let (a, b) = (self.pc[i as usize], self.pc[j as usize]);
                 if self.mx(a, b) && self.upper_bound_based_prune(0, a, b) {
@@ -473,7 +519,7 @@ impl<'a> Searcher<'a> {
 
     fn reduce(&mut self, beg_idx: i32, mut end_idx: i32) {
         self.steps += 1;
-        if self.steps & 0xffff == 0 && self.ctx.is_some_and(|c| c.is_cancelled()) {
+        if self.steps & 0xffff == 0 && self.ctx.is_some_and(|c| c.poll("kplex-search").is_err()) {
             self.cancelled = true;
         }
         if self.cancelled {
@@ -767,9 +813,8 @@ impl<'a> Searcher<'a> {
                 if !self.qv.is_empty() {
                     continue;
                 }
-                let n = self.n;
-                self.matrix[(v * n + w) as usize] = 0;
-                self.matrix[(w * n + v) as usize] = 0;
+                self.set_mx(v, w, false);
+                self.set_mx(w, v, false);
                 self.nei_in_g[v as usize] -= 1;
                 self.nei_in_g[w as usize] -= 1;
                 self.push_removed((v, w));
@@ -829,9 +874,8 @@ impl<'a> Searcher<'a> {
                     }
                 }
             } else {
-                let n = self.n;
-                self.matrix[(v * n + w) as usize] = 1;
-                self.matrix[(w * n + v) as usize] = 1;
+                self.set_mx(v, w, true);
+                self.set_mx(w, v, true);
                 self.nei_in_g[v as usize] += 1;
                 self.nei_in_g[w as usize] += 1;
                 for (a, b) in [(v, w), (w, v)] {
@@ -1013,7 +1057,7 @@ impl<'a> Searcher<'a> {
         let n = self.n;
         let mut ub = 2 * self.k + self.nei_in_p[u as usize] - p_end
             + self.nei_in_p[v as usize]
-            + self.comm_neis[(u * n + v) as usize];
+            + i32::from(self.comm_neis[(u * n + v) as usize]);
         if self.pc_rid[u as usize] >= p_end {
             ub -= 1;
             if self.mx(u, v) {
@@ -1782,6 +1826,9 @@ fn extract_subgraph(
 struct Graph<'a> {
     ctx: GFunCtx<'a>,
     k: i32,
+    /// The largest ego network the `Searcher` may load
+    /// ([`MAX_SEARCHER_N`]; lowered by tests).
+    searcher_limit: i32,
     n: i32,
     m: Ept,
     pstart: Vec<Ept>,
@@ -1809,6 +1856,7 @@ impl<'a> Graph<'a> {
         Graph {
             ctx,
             k,
+            searcher_limit: MAX_SEARCHER_N,
             n: 0,
             m: 0,
             pstart: Vec::new(),
@@ -2526,9 +2574,10 @@ impl<'a> Graph<'a> {
             }
             let pre_size = self.kplex.len();
             if sz(i64::from(ids_n)) > sz(ksz(self)) {
-                if ids_n > MAX_SEARCHER_N {
+                if ids_n > self.searcher_limit {
                     return Err(kerr(format!(
-                        "maximumKplex: a neighbourhood of {ids_n} vertices exceeds the search limit ({MAX_SEARCHER_N})"
+                        "maximumKplex: a neighbourhood of {ids_n} vertices exceeds the search limit ({})",
+                        self.searcher_limit
                     )));
                 }
                 solver.ctx = Some(self.ctx);
@@ -2762,4 +2811,84 @@ pub(super) fn core_truss(
         return Ok(Vec::new());
     }
     g.peel(alpha, beta)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dict::Dictionary;
+    use crate::model::IdTriple;
+
+    /// A pseudo-random simple graph (`n` vertices, edge probability
+    /// `p_percent`) over predicate 0.
+    fn random_graph(n: u32, p_percent: u64, seed: u64) -> CsrGraph {
+        let mut x = seed;
+        let mut t = Vec::new();
+        for a in 0..n {
+            for b in a + 1..n {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                if (x >> 33) % 100 < p_percent {
+                    t.push(IdTriple::new(a, 0, b));
+                }
+            }
+        }
+        CsrGraph::from_id_triples(t).unwrap()
+    }
+
+    /// The `Searcher` keeps an ego network in about `2.1 n²` bytes (an
+    /// adjacency bit matrix and 16-bit common-neighbour counts) instead of
+    /// upstream's `5 n²` (review gap-gfun-fuzz#3: 320 MiB at the 8192-vertex
+    /// limit, now 136 MiB).
+    #[test]
+    fn searcher_matrices_take_about_two_bytes_per_pair() {
+        let n = 1000i32;
+        let vp: Vec<(i32, i32)> = (0..n - 1).map(|i| (i, i + 1)).collect();
+        let mut s = Searcher::new();
+        s.load(n, &vp);
+        let nn = (n * n) as usize;
+        let bytes = std::mem::size_of_val(&*s.matrix) + std::mem::size_of_val(&*s.comm_neis);
+        assert!(bytes <= nn * 17 / 8 + 8, "{bytes} bytes for {n} vertices");
+        assert!(s.mx(3, 4) && s.mx(4, 3) && !s.mx(3, 5));
+    }
+
+    /// The bit matrix and the 16-bit counts behave like upstream's arrays.
+    #[test]
+    fn searcher_bit_matrix_and_counts() {
+        let n = 70i32;
+        let mut s = Searcher::new();
+        s.load(n, &[(3, 4)]);
+        assert!(s.mx(3, 4) && s.mx(4, 3) && !s.mx(3, 5));
+        s.set_mx(3, 5, true);
+        assert!(s.mx(3, 5) && !s.mx(5, 3));
+        s.set_mx(3, 5, false);
+        assert!(!s.mx(3, 5));
+        *s.cn(7, 9) -= 1;
+        assert_eq!(s.comm_neis[(7 * n + 9) as usize], -1);
+    }
+
+    /// An ego network beyond the `Searcher` limit is an error, not an `n²`
+    /// allocation (the real limit is 8192; lowered here).
+    #[test]
+    fn an_ego_network_beyond_the_search_limit_is_an_error() {
+        let g = random_graph(40, 50, 12345);
+        let d = Dictionary::new();
+        let ctx = GFunCtx::new(&g, &d);
+        let f = PredFilter::from_ids([0]);
+        let run = |limit: i32| {
+            let mut gr = Graph::new(ctx, 2);
+            gr.searcher_limit = limit;
+            gr.read(&g, &f);
+            gr.search().map(|()| gr.kplex)
+        };
+        let full = run(MAX_SEARCHER_N).unwrap();
+        assert!(full.len() >= 2, "{full:?}");
+        match run(5) {
+            Err(GStoreError::Query(m)) => {
+                assert!(m.contains("exceeds the search limit (5)"), "{m}")
+            }
+            r => panic!("expected the search limit, got {r:?}"),
+        }
+    }
 }

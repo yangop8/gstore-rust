@@ -148,6 +148,7 @@ pub mod traverse;
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, PoisonError, RwLock};
 
 pub use crate::analytics::csr::{CsrGraph, Direction, EdgeDir, Node, PredFilter};
 use crate::dict::{Dictionary, TermStr};
@@ -650,8 +651,68 @@ pub enum GFunValue {
     ResultsJson(String),
 }
 
+/// The default bound on the work of the iterative functions whose number of
+/// sweeps the query chooses (`PR`'s `maxIter` with `tol`, `louvain`'s
+/// `maxIter` with `increase`, `labelProp`'s `maxIter`): about this many
+/// vertex / edge / community visits per call, summed over all sweeps
+/// ([`GFunCtx::max_iteration_work`]). Upstream runs up to `2^31` sweeps
+/// (`tol < 0` never converges, `increase < 0` keeps moving vertices); a call
+/// that reaches the bound before it converges fails with a
+/// [`GStoreError::Query`] naming it instead of running for hours (review
+/// gap-gfun-fuzz#2). `2^34` steps are tens of seconds to minutes of CPU.
+/// The first [`FREE_ITERATION_SWEEPS`] sweeps of a call are never charged,
+/// so an ordinary `maxIter` (up to 1024) runs to the end on a graph of any
+/// size, whatever `tol` / `increase` say; only a call that keeps sweeping
+/// beyond them is bounded.
+pub const MAX_ITERATION_WORK: u64 = 1 << 34;
+
+/// The sweeps of an iterative graph function that are never charged against
+/// [`MAX_ITERATION_WORK`]: a call asking for at most this many sweeps
+/// (`maxIter`) always runs them all, as upstream does — on a graph with
+/// 10^8 edges one `PR` sweep alone costs about 10^8 steps, so a smaller
+/// free allowance would fail ordinary converging runs there.
+pub const FREE_ITERATION_SWEEPS: u32 = 1024;
+
+/// The test hook of [`debug_poll_hook`].
+type PollHook = Arc<dyn Fn(&'static str) + Send + Sync>;
+
+static POLL_HOOK_SET: AtomicBool = AtomicBool::new(false);
+
+fn poll_hook() -> &'static RwLock<Option<PollHook>> {
+    static HOOK: RwLock<Option<PollHook>> = RwLock::new(None);
+    &HOOK
+}
+
+/// Install (or, with `None`, remove) a process-wide hook that every
+/// cancellation poll of a graph function's long loops calls — with the name
+/// of the loop (`"wcc"`, `"pr"`, `"kplex-init"`, …) — right before it reads
+/// the cancellation flag. A test hook: a test parks the computation inside
+/// a loop, raises the flag (as `/cancel` does) and checks that the call
+/// stops at that poll. It costs one atomic load per poll while unset.
+#[doc(hidden)]
+pub fn debug_poll_hook(hook: Option<Arc<dyn Fn(&'static str) + Send + Sync>>) {
+    let mut h = poll_hook().write().unwrap_or_else(PoisonError::into_inner);
+    POLL_HOOK_SET.store(hook.is_some(), Ordering::SeqCst);
+    *h = hook;
+}
+
+/// Run the [`debug_poll_hook`], if one is installed.
+#[inline]
+pub(crate) fn run_poll_hook(site: &'static str) {
+    if POLL_HOOK_SET.load(Ordering::Relaxed) {
+        let hook = poll_hook()
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(h) = hook {
+            h(site);
+        }
+    }
+}
+
 /// Everything a graph function may read: the CSR, the dictionary (id ↔
-/// string), a cooperative cancellation flag and the output size limit.
+/// string), a cooperative cancellation flag, the output size limit and the
+/// iteration-work limit.
 #[derive(Debug, Clone, Copy)]
 pub struct GFunCtx<'a> {
     /// The graph.
@@ -660,18 +721,33 @@ pub struct GFunCtx<'a> {
     pub dict: &'a Dictionary,
     cancel: Option<&'a AtomicBool>,
     max_output_bytes: usize,
+    max_iteration_work: u64,
 }
 
 impl<'a> GFunCtx<'a> {
     /// A context without cancellation, with the default output limit
-    /// [`paths::MAX_OUTPUT_BYTES`].
+    /// [`paths::MAX_OUTPUT_BYTES`] and iteration-work limit
+    /// [`MAX_ITERATION_WORK`].
     pub fn new(csr: &'a CsrGraph, dict: &'a Dictionary) -> GFunCtx<'a> {
         GFunCtx {
             csr,
             dict,
             cancel: None,
             max_output_bytes: paths::MAX_OUTPUT_BYTES,
+            max_iteration_work: MAX_ITERATION_WORK,
         }
+    }
+
+    /// Set the work bound of the iterative functions (see
+    /// [`MAX_ITERATION_WORK`]).
+    pub fn with_max_iteration_work(mut self, steps: u64) -> GFunCtx<'a> {
+        self.max_iteration_work = steps;
+        self
+    }
+
+    /// The bound set by [`with_max_iteration_work`](Self::with_max_iteration_work).
+    pub fn max_iteration_work(&self) -> u64 {
+        self.max_iteration_work
     }
 
     /// Attach a cancellation flag (the engine's `Arc<AtomicBool>`).
@@ -709,6 +785,13 @@ impl<'a> GFunCtx<'a> {
         }
     }
 
+    /// [`check_cancel`](Self::check_cancel) from inside the long loop named
+    /// `site`, after running the [`debug_poll_hook`] (if any).
+    pub fn poll(&self, site: &'static str) -> Result<()> {
+        run_poll_hook(site);
+        self.check_cancel()
+    }
+
     /// An entity's printed form (`<iri>`, `_:b`, or a literal's key); `""`
     /// for an unknown id, like upstream `getStringByID`.
     ///
@@ -740,6 +823,86 @@ impl<'a> GFunCtx<'a> {
     }
 }
 
+/// A weighted cancellation poll for the inner loops of the metric family:
+/// each [`step`](Ticker::step) adds the work just done (a vertex expansion
+/// counts its degree), and the flag is read ([`GFunCtx::poll`]) once
+/// [`TICK_WORK`](Ticker::TICK_WORK) units have passed — so one giant
+/// component or hub vertex cannot run unpolled (review analytics#8).
+pub(crate) struct Ticker<'c, 'a> {
+    ctx: &'c GFunCtx<'a>,
+    site: &'static str,
+    work: usize,
+}
+
+impl<'c, 'a> Ticker<'c, 'a> {
+    /// Work units between two polls.
+    pub(crate) const TICK_WORK: usize = 4096;
+
+    pub(crate) fn new(ctx: &'c GFunCtx<'a>, site: &'static str) -> Ticker<'c, 'a> {
+        Ticker { ctx, site, work: 0 }
+    }
+
+    /// Account `units` of work; poll when enough has accumulated.
+    #[inline]
+    pub(crate) fn step(&mut self, units: usize) -> Result<()> {
+        self.work = self.work.saturating_add(units.max(1));
+        if self.work >= Self::TICK_WORK {
+            self.work = 0;
+            self.ctx.poll(self.site)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// The work account of an iterative function whose sweep count the query
+/// chooses (see [`MAX_ITERATION_WORK`]).
+pub(crate) struct IterationBudget {
+    kind: GFnKind,
+    left: u64,
+    limit: u64,
+    sweeps: u32,
+}
+
+impl IterationBudget {
+    /// Sweeps that are never charged ([`FREE_ITERATION_SWEEPS`]), so an
+    /// ordinary `maxIter` runs to the end on a graph of any size.
+    pub(crate) const FREE_SWEEPS: u32 = FREE_ITERATION_SWEEPS;
+
+    pub(crate) fn new(ctx: &GFunCtx<'_>, kind: GFnKind) -> IterationBudget {
+        IterationBudget {
+            kind,
+            left: ctx.max_iteration_work(),
+            limit: ctx.max_iteration_work(),
+            sweeps: 0,
+        }
+    }
+
+    /// Charge one sweep of `work` steps; an error once the bound is spent.
+    pub(crate) fn charge(&mut self, work: u64) -> Result<()> {
+        if self.sweeps < Self::FREE_SWEEPS {
+            self.sweeps += 1;
+            return Ok(());
+        }
+        let work = work.max(1);
+        if work > self.left {
+            let hint = match self.kind {
+                GFnKind::Pr => "lower maxIter or use a positive tol",
+                GFnKind::Louvain => "lower maxIter or use a non-negative increase",
+                _ => "lower maxIter",
+            };
+            return Err(GStoreError::Query(format!(
+                "{}: not converged within the iteration bound of {} steps \
+                 (vertex, edge and community visits summed over the sweeps); {hint}",
+                self.kind.name(),
+                self.limit
+            )));
+        }
+        self.left -= work;
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // dispatch
 // ---------------------------------------------------------------------------
@@ -753,14 +916,33 @@ pub(crate) fn output_bound_exceeded(kind: GFnKind, max_bytes: usize) -> GStoreEr
     ))
 }
 
+/// The error of a query whose graph-function output — every graph-function
+/// and PFN call of it together, GROUP BY groups and `GRAPH` blocks included
+/// — passed `max_bytes` (the engine's per-query budget, review
+/// gap-gfun-fuzz#5). `label` names the call that crossed it.
+pub(crate) fn query_output_budget_exceeded(label: &str, max_bytes: usize) -> GStoreError {
+    GStoreError::Query(format!(
+        "{label}: more than {max_bytes} bytes of output in this query (the graph-function \
+         output bound is shared by every graph-function and PFN call of a query, GROUP BY \
+         groups and GRAPH blocks included); narrow the query"
+    ))
+}
+
 /// Evaluate `kind` over `ctx` with `args`, producing the full upstream output.
 ///
 /// Every function's JSON is bounded by [`GFunCtx::max_output_bytes`] while
 /// it is built: the path family checks it as it streams its entries, the
 /// metric family's lists as they grow (`PPR` and `JaccardSimilarity` write
-/// up to `retNum` entries per source), so a call fails at the bound instead
-/// of building an output of any size first. A scalar or fixed-shape output
-/// is checked here once computed.
+/// up to `retNum` entries per source; `maximumKplex`'s fake solution names
+/// vertex 0 up to 2^20 times), so a call fails at the bound instead of
+/// building an output of any size first. A scalar output is checked here
+/// once computed. (The query engine passes what is left of the query's
+/// budget, so the bound holds per query; review gap-gfun-fuzz#4, #5.)
+///
+/// Every long loop polls the cancellation flag ([`GFunCtx::poll`]) — inside
+/// a component's BFS, a hub's neighbourhood, a sweep — and the iterative
+/// functions whose sweep count the query chooses stop at
+/// [`GFunCtx::max_iteration_work`] (review analytics#8, gap-gfun-fuzz#2).
 pub fn eval(kind: GFnKind, ctx: &GFunCtx<'_>, args: &GArgs) -> Result<GFunValue> {
     ctx.check_cancel()?;
     let value = match kind {

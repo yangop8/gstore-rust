@@ -175,7 +175,7 @@ use regex::Regex;
 
 use crate::analytics::csr::CsrGraph;
 use crate::analytics::gfun::{self, GCall, GFnKind, GFunCtx, GFunValue, GNode};
-use crate::analytics::GraphView;
+use crate::analytics::{GraphView, Interrupt};
 use crate::dict::{Dictionary, Space, TermStr};
 use crate::error::{GStoreError, Result};
 use crate::kvstore::{string_index, StringIndex};
@@ -460,9 +460,11 @@ pub struct Evaluator<'a, S: TripleSource = TripleStore> {
     /// e.g. a BGP repeated across sub-SELECTs — reuse the DP-optimized plan
     /// instead of re-running plan enumeration. Keyed by the compiled patterns.
     plan_cache: std::cell::RefCell<HashMap<u64, ExecPlan>>,
-    /// Lazily-built CSR adjacency view, shared across rows so the graph
-    /// built-ins (`SHORTESTPATHLEN`, `KHOPREACHABLE`, `CYCLEBOOLEAN`, …) pay the
-    /// O(E) build cost once per query rather than once per solution.
+    /// Lazily-built full adjacency view (literal objects as nodes), shared
+    /// across rows so the legacy graph built-ins that need it (`rs:WCC`,
+    /// `rs:BFSCOUNT`, …) pay the O(E) build cost once per query rather than
+    /// once per solution; the literal-independent ones use the entity view
+    /// of the query's CSR instead (see [`graph_view`](Self::graph_view)).
     graph_cache: std::cell::RefCell<Option<Rc<GraphView>>>,
     /// User-defined scalar functions (gStore's `pfnQuery`, but a safe in-process
     /// closure registry rather than dlopen/.so plugins). Consulted by the
@@ -528,9 +530,16 @@ pub struct Evaluator<'a, S: TripleSource = TripleStore> {
     /// Work counters ([`stats`](Self::stats)), shared with `GRAPH`
     /// sub-evaluators so their work counts too.
     stats: Rc<std::cell::Cell<EvalStats>>,
-    /// The most bytes of JSON one graph-function call may produce
+    /// The most bytes of JSON the graph-function and PFN calls of one query
+    /// may produce together
     /// ([`with_gfun_max_output_bytes`](Self::with_gfun_max_output_bytes)).
     gfun_max_output: usize,
+    /// The graph-function output this query produced so far (bytes): every
+    /// graph-function and PFN call charges its text against
+    /// `gfun_max_output` — each GROUP BY group, and calls inside `GRAPH`
+    /// sub-evaluators (shared `Rc`) — so the bound is a per-query budget
+    /// (review gap-gfun-fuzz#5).
+    gfun_spent: Rc<std::cell::Cell<usize>>,
     /// Who calls `PFN.name(…)` functions, from which registry
     /// ([`with_pfn`](Self::with_pfn)); `None` = PFN calls fail.
     pfn: Option<crate::pfn::PfnCaller>,
@@ -550,11 +559,15 @@ pub type StringIndexProvider<'a> = dyn Fn() -> Option<Arc<StringIndex>> + 'a;
 /// ([`EntityLiteralId`](crate::model::id::EntityLiteralId) = `u32`).
 #[derive(Default)]
 struct AlgoCache {
+    /// The entity view of the query's CSR ([`Evaluator::entity_view`]).
+    entity_view: Option<Rc<GraphView>>,
+    has_cycle: Option<bool>,
     wcc: Option<Rc<HashMap<u32, u32>>>,
     louvain: Option<Rc<HashMap<u32, usize>>>,
     labelprop: Option<Rc<HashMap<u32, usize>>>,
     betweenness: Option<Rc<HashMap<u32, f64>>>,
-    closeness: Option<Rc<HashMap<u32, f64>>>,
+    /// Per node (one BFS each; `None`: not a node).
+    closeness: HashMap<u32, Option<f64>>,
     ppr: HashMap<u32, Rc<HashMap<u32, f64>>>,
     degree_assortativity: Option<f64>,
     diameter: Option<u32>,
@@ -589,6 +602,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             topk: TopKOptions::default(),
             stats: Rc::default(),
             gfun_max_output: crate::analytics::gfun::paths::MAX_OUTPUT_BYTES,
+            gfun_spent: Rc::default(),
             pfn: None,
         }
     }
@@ -620,6 +634,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             topk: TopKOptions::default(),
             stats: Rc::default(),
             gfun_max_output: crate::analytics::gfun::paths::MAX_OUTPUT_BYTES,
+            gfun_spent: Rc::default(),
             pfn: None,
         }
     }
@@ -732,11 +747,14 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         self
     }
 
-    /// Bound the JSON one call of a gStore advanced graph function may
-    /// produce (default
-    /// [`paths::MAX_OUTPUT_BYTES`](crate::analytics::gfun::paths::MAX_OUTPUT_BYTES));
-    /// a call that would exceed it fails the query (see
-    /// [`GFunCtx::with_max_output_bytes`]).
+    /// Bound the JSON the gStore advanced graph functions (and `PFN.name`
+    /// calls) of one query may produce together (default
+    /// [`paths::MAX_OUTPUT_BYTES`](crate::analytics::gfun::paths::MAX_OUTPUT_BYTES)):
+    /// a per-query budget that every call is charged against — each GROUP
+    /// BY group and every call inside a `GRAPH` block — and that each call
+    /// also checks while it builds its text (see
+    /// [`GFunCtx::with_max_output_bytes`]). A query that would exceed it
+    /// fails.
     pub fn with_gfun_max_output_bytes(mut self, bytes: usize) -> Evaluator<'a, S> {
         self.gfun_max_output = bytes;
         self
@@ -1584,15 +1602,31 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     lang: None,
                 },
             };
+            self.charge_gfun_output(call.kind.name(), value.lexical().len())?;
             return Ok(Some(self.value_to_id(&value)));
         }
         let mut args = call.to_gargs(srcs, dsts, self.dict);
         args.where_empty = constant;
-        let mut ctx = GFunCtx::new(&csr, self.dict).with_max_output_bytes(self.gfun_max_output);
+        // The call is bounded by what is left of the query's budget.
+        let left = self.gfun_output_left();
+        let mut ctx = GFunCtx::new(&csr, self.dict).with_max_output_bytes(left);
         if let Some(flag) = &self.cancel {
             ctx = ctx.with_cancel(flag);
         }
-        let value = match gfun::eval(call.kind, &ctx, &args)? {
+        let out = gfun::eval(call.kind, &ctx, &args).map_err(|e| {
+            // The call's own bound error, once earlier calls of the query
+            // spent part of the budget, is the query's budget error.
+            let at_budget = matches!(&e, GStoreError::Query(m)
+                if m.starts_with(&format!("{}: more than ", call.kind.name()))
+                    && m.contains(&format!(" {left} bytes of output"))
+                    && !m.contains(" paths or "));
+            if left < self.gfun_max_output && at_budget {
+                gfun::query_output_budget_exceeded(call.kind.name(), self.gfun_max_output)
+            } else {
+                e
+            }
+        })?;
+        let value = match out {
             // Upstream stores the JSON text as a plain literal (GE:1578,
             // GE:2019). `confidenceDegree`'s `pfn_type` result replaces the
             // whole upstream response with `{"results": …}`; this engine has
@@ -1605,7 +1639,32 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             GFunValue::Int(v) => Value::Int(v),
             GFunValue::Num(v) => Value::Double(v),
         };
+        let bytes = match &value {
+            Value::Str { value, .. } => value.len(),
+            v => v.lexical().len(),
+        };
+        self.charge_gfun_output(call.kind.name(), bytes)?;
         Ok(Some(self.value_to_id(&value)))
+    }
+
+    /// The graph-function output this query may still produce (see
+    /// [`with_gfun_max_output_bytes`](Self::with_gfun_max_output_bytes)).
+    fn gfun_output_left(&self) -> usize {
+        self.gfun_max_output.saturating_sub(self.gfun_spent.get())
+    }
+
+    /// Charge `bytes` of graph-function / PFN output (by the call `label`)
+    /// to the query's budget; an error once the query's output passes it.
+    fn charge_gfun_output(&self, label: &str, bytes: usize) -> Result<()> {
+        let spent = self.gfun_spent.get().saturating_add(bytes);
+        if spent > self.gfun_max_output {
+            return Err(gfun::query_output_budget_exceeded(
+                label,
+                self.gfun_max_output,
+            ));
+        }
+        self.gfun_spent.set(spent);
+        Ok(())
     }
 
     /// Evaluate a projected graph function or PFN call (see
@@ -1668,6 +1727,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         })?;
         let csr = self.gfun_csr()?;
         let graph = crate::pfn::CsrGraphCtx::new(&csr, self.dict);
+        // Bounded by what is left of the query's graph-function budget.
+        let left = self.gfun_output_left();
         let var_values = |var: &str| -> Option<Vec<String>> {
             let &idx = layout.index.get(var)?;
             if bind_only.contains(var) {
@@ -1692,27 +1753,15 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             // (`SLOG_ERROR("run dynamic function fail: …")`).
             crate::gs_debug!("PFN.{name}: calling with {params}");
             caller
-                .run(
-                    &func,
-                    params,
-                    &graph,
-                    self.cancel.as_deref(),
-                    self.gfun_max_output,
-                )
+                .run(&func, params, &graph, self.cancel.as_deref(), left)
                 .inspect_err(|e| {
                     if !matches!(e, GStoreError::Cancelled) {
                         crate::gs_warn!("PFN.{name}: the call failed: {e}");
                     }
                 })
         };
-        let text = crate::pfn::call::evaluate(
-            name,
-            &args,
-            constant,
-            var_values,
-            run,
-            self.gfun_max_output,
-        )?;
+        let text = crate::pfn::call::evaluate(name, &args, constant, var_values, run, left)?;
+        self.charge_gfun_output(&format!("PFN.{name}"), text.len())?;
         Ok(Some(self.value_to_id(&Value::Str {
             value: text,
             lang: None,
@@ -1876,6 +1925,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         };
 
         let mut grows: Vec<Binding> = Vec::new();
+        // Variable-free graph-function values: item index → (id, bytes).
+        let mut fixed_gfn: HashMap<usize, (Option<u32>, usize)> = HashMap::new();
         for key in &order {
             let sols: Vec<&Binding> = groups[key].iter().map(|&i| &solutions[i]).collect();
             let gb = self.group_row(&sols, layout, &glayout, &aggs);
@@ -1887,13 +1938,34 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 continue;
             }
             // An advanced graph function over the group's solutions
-            // (upstream: once per GROUP BY group, GE:2546-2620).
+            // (upstream: once per GROUP BY group, GE:2546-2620). One whose
+            // vertex arguments name no variable has the same value in every
+            // group: it is computed once, and its output is charged to the
+            // query's budget for every group that shows it (review
+            // gap-gfun-fuzz#5).
             let mut gfn_values: Vec<Option<Option<u32>>> = Vec::with_capacity(items.len());
-            for it in items {
+            for (idx, it) in items.iter().enumerate() {
                 gfn_values.push(match it {
                     SelectItem::Expr(Expr::GraphFn { func, args }, _) => {
                         let call = GCall::from_ast(*func, args)?;
-                        Some(self.eval_graph_fn(&call, &sols, layout, bind_only, false)?)
+                        let fixed = !matches!(call.src, Some(VarOrIri::Var(_)))
+                            && !matches!(call.dst, Some(VarOrIri::Var(_)));
+                        match fixed_gfn.get(&idx) {
+                            Some(&(id, bytes)) if fixed => {
+                                self.check_cancel()?;
+                                self.charge_gfun_output(call.kind.name(), bytes)?;
+                                Some(id)
+                            }
+                            _ => {
+                                let before = self.gfun_spent.get();
+                                let id =
+                                    self.eval_graph_fn(&call, &sols, layout, bind_only, false)?;
+                                if fixed {
+                                    fixed_gfn.insert(idx, (id, self.gfun_spent.get() - before));
+                                }
+                                Some(id)
+                            }
+                        }
                     }
                     SelectItem::Expr(Expr::Pfn { name, json }, _) => {
                         Some(self.eval_pfn(name, json, &sols, layout, bind_only, false)?)
@@ -2496,6 +2568,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             topk: self.topk,
             stats: Rc::clone(&self.stats),
             gfun_max_output: self.gfun_max_output,
+            gfun_spent: Rc::clone(&self.gfun_spent),
             pfn: self.pfn.clone(),
         }
     }
@@ -3701,7 +3774,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 self.dict.term_id(&value_to_term(&av)),
                 self.dict.term_id(&value_to_term(&cv)),
             ) {
-                if let Some(sim) = self.graph_view().neighbor_cosine_similarity(a, c) {
+                if let Some(sim) = self
+                    .legacy_ok(self.graph_view())?
+                    .neighbor_cosine_similarity(a, c)
+                {
                     return Some(Value::Double(sim));
                 }
             }
@@ -4174,12 +4250,15 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 // legacy gstore-rust node/string similarity is `rs:SIMILARITY`.
                 let av = self.eval_value(args.first()?, b, l)?;
                 let cv = self.eval_value(args.get(1)?, b, l)?;
-                Some(Value::Double(
-                    crate::analytics::gfun::metrics::jaro_similarity(
+                // Two long literals cost O(|a|·|b|) per row: cancellable
+                // (review analytics#5).
+                Some(Value::Double(self.legacy_ok(
+                    crate::analytics::gfun::metrics::jaro_similarity_cancellable(
                         &value_to_term(&av).dict_key(),
                         &value_to_term(&cv).dict_key(),
+                        self.cancel.as_deref(),
                     ),
-                ))
+                )?))
             }
 
             // ---- numeric -------------------------------------------------
@@ -4263,15 +4342,26 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             "SHA512" => self.hash1(args, b, l, hash::sha512_hex),
 
             // ---- gStore graph built-ins ----------------------------------
+            // The legacy gstore-rust analytics (`rs:` namespace, review
+            // analytics#4). Those whose answer cannot involve a literal —
+            // cycles, and paths between two entities — run on the entity
+            // view built from the query's CSR (`entity_view`, shared with
+            // the advanced graph functions: no store scan with a CSR
+            // provider); the others count literal objects as nodes and run
+            // on the full view built from the store once per query
+            // (`graph_view`). Both builds and every algorithm poll the
+            // cancel flag: a cancel leaves the built-in unbound and fails
+            // the query (`legacy_ok`).
             "CYCLEBOOLEAN" | "SIMPLECYCLEBOOLEAN" => {
-                Some(Value::Bool(self.graph_view().has_cycle()))
+                Some(Value::Bool(self.legacy_ok(self.has_cycle_cached())?))
             }
-            "SHORTESTPATHLEN" => {
+            // SHORTESTPATHLEN(a, b) / SSSPLEN(a, b): #edges of a shortest
+            // directed path a⇝b, -1 when unreachable (documented sentinel).
+            "SHORTESTPATHLEN" | "SSSPLEN" => {
                 let a = self.node_id(args.first()?, b, l)?;
                 let c = self.node_id(args.get(1)?, b, l)?;
-                let len = self.graph_view().shortest_path_len(a, c);
-                // Unreachable ⇒ -1 sentinel (documented), reachable ⇒ #edges.
-                Some(Value::Int(len.map(|x| x as i64).unwrap_or(-1)))
+                let path = self.legacy_ok(self.legacy_shortest_path(a, c))?;
+                Some(Value::Int(path.map_or(-1, |p| p.len() as i64 - 1)))
             }
             "KHOPREACHABLE" => {
                 let a = self.node_id(args.first()?, b, l)?;
@@ -4279,7 +4369,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 let kf = self.eval_value(args.get(2)?, b, l)?.as_f64()?;
                 let k = if kf < 0.0 { u32::MAX } else { kf as u32 };
                 Some(Value::Bool(
-                    self.graph_view().khop_reachable(a, c, k).unwrap_or(false),
+                    self.legacy_ok(self.legacy_khop_reachable(a, c, k))?,
                 ))
             }
 
@@ -4294,24 +4384,17 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             "SSSP" => {
                 let a = self.node_id(args.first()?, b, l)?;
                 let c = self.node_id(args.get(1)?, b, l)?;
-                let path = self.graph_view().shortest_path(a, c).unwrap_or_default();
+                let path = self.legacy_ok(self.legacy_shortest_path(a, c))?;
                 Some(Value::Str {
-                    value: self.serialize_nodes(&path),
+                    value: self.serialize_nodes(&path.unwrap_or_default()),
                     lang: None,
                 })
-            }
-            // SSSPLEN(a, b): alias of SHORTESTPATHLEN — #edges, -1 if unreachable.
-            "SSSPLEN" => {
-                let a = self.node_id(args.first()?, b, l)?;
-                let c = self.node_id(args.get(1)?, b, l)?;
-                let len = self.graph_view().shortest_path_len(a, c);
-                Some(Value::Int(len.map(|x| x as i64).unwrap_or(-1)))
             }
             // SHORTESTPATHS(a, b): number of distinct shortest paths a⇝b.
             "SHORTESTPATHS" => {
                 let a = self.node_id(args.first()?, b, l)?;
                 let c = self.node_id(args.get(1)?, b, l)?;
-                let n = self.graph_view().count_shortest_paths(a, c)?;
+                let n = self.legacy_ok(self.legacy_count_shortest_paths(a, c))??;
                 // The number of distinct shortest paths grows combinatorially and
                 // can exceed i64::MAX; saturate rather than wrap to a negative.
                 Some(Value::Int(n.min(i64::MAX as u64) as i64))
@@ -4320,13 +4403,14 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             "KHOPCOUNT" => {
                 let a = self.node_id(args.first()?, b, l)?;
                 let k = self.hop_arg(args.get(1)?, b, l)?;
-                Some(Value::Int(self.graph_view().khop_count(a, k) as i64))
+                let ids = self.with_full_view(|g, it| g.khop_neighbors_cancellable(a, k, it))?;
+                Some(Value::Int(ids.len() as i64))
             }
             // KHOPNEIGHBOR(a, k): nodes at exactly k out-hops, serialised.
             "KHOPNEIGHBOR" => {
                 let a = self.node_id(args.first()?, b, l)?;
                 let k = self.hop_arg(args.get(1)?, b, l)?;
-                let ids = self.graph_view().khop_neighbors(a, k);
+                let ids = self.with_full_view(|g, it| g.khop_neighbors_cancellable(a, k, it))?;
                 Some(Value::Str {
                     value: self.serialize_nodes(&ids),
                     lang: None,
@@ -4336,7 +4420,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             "KHOPALLNEIGHBORS" => {
                 let a = self.node_id(args.first()?, b, l)?;
                 let k = self.hop_arg(args.get(1)?, b, l)?;
-                let ids = self.graph_view().khop_all_neighbors(a, k);
+                let ids =
+                    self.with_full_view(|g, it| g.khop_all_neighbors_cancellable(a, k, it))?;
                 Some(Value::Str {
                     value: self.serialize_nodes(&ids),
                     lang: None,
@@ -4347,7 +4432,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             "KHOPENUMERATEPATH" => {
                 let a = self.node_id(args.first()?, b, l)?;
                 let k = self.hop_arg(args.get(1)?, b, l)?;
-                let paths = self.graph_view().khop_enumerate_paths(a, k, 1024);
+                let paths = self
+                    .with_full_view(|g, it| g.khop_enumerate_paths_cancellable(a, k, 1024, it))?;
                 let s = paths
                     .iter()
                     .map(|p| self.serialize_nodes(p))
@@ -4366,13 +4452,14 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     Some(e) => self.hop_arg(e, b, l)?,
                     None => u32::MAX,
                 };
-                Some(Value::Int(self.graph_view().bfs_count(a, k) as i64))
+                let n = self.with_full_view(|g, it| g.bfs_count_cancellable(a, k, it))?;
+                Some(Value::Int(n as i64))
             }
             // WCC(a, b) ⇒ same weakly-connected component (bool);
             // WCC(a) ⇒ size of a's weakly-connected component (int).
             "WCC" => {
                 let a = self.node_id(args.first()?, b, l)?;
-                let comp = self.wcc_cached();
+                let comp = self.legacy_ok(self.wcc_cached())?;
                 match args.get(1) {
                     Some(e) => {
                         let c = self.node_id(e, b, l)?;
@@ -4393,7 +4480,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             // LOUVAIN(a) ⇒ size of a's community (int).
             "LOUVAIN" => {
                 let a = self.node_id(args.first()?, b, l)?;
-                let comm = self.louvain_cached();
+                let comm = self.legacy_ok(self.louvain_cached())?;
                 match args.get(1) {
                     Some(e) => {
                         let c = self.node_id(e, b, l)?;
@@ -4414,7 +4501,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             // LABELPROP(a) ⇒ size of a's community (int).
             "LABELPROP" => {
                 let a = self.node_id(args.first()?, b, l)?;
-                let comm = self.labelprop_cached();
+                let comm = self.legacy_ok(self.labelprop_cached())?;
                 match args.get(1) {
                     Some(e) => {
                         let c = self.node_id(e, b, l)?;
@@ -4431,40 +4518,46 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     }
                 }
             }
-            // BETWEENNESSCENTRALITY(a): Brandes betweenness of node a.
+            // BETWEENNESSCENTRALITY(a): Brandes betweenness of node a
+            // (inherently O(V·(V+E)) for the first call of a query, then
+            // memoized for every node).
             "BETWEENNESSCENTRALITY" => {
                 let a = self.node_id(args.first()?, b, l)?;
-                let bc = self.betweenness_cached();
+                let bc = self.legacy_ok(self.betweenness_cached())?;
                 Some(Value::Double(bc.get(&a).copied().unwrap_or(0.0)))
             }
-            // CLOSENESSCENTRALITY(a): Wasserman–Faust closeness of node a.
+            // CLOSENESSCENTRALITY(a): Wasserman–Faust closeness of node a (one
+            // BFS from a, memoized per node).
             "CLOSENESSCENTRALITY" => {
                 let a = self.node_id(args.first()?, b, l)?;
-                let cc = self.closeness_cached();
-                Some(Value::Double(cc.get(&a).copied().unwrap_or(0.0)))
+                let cc = self.legacy_ok(self.closeness_cached(a))?;
+                Some(Value::Double(cc.unwrap_or(0.0)))
             }
             // TRIANGLECOUNTING(): global triangle count;
             // TRIANGLECOUNTING(a): triangles through node a.
             "TRIANGLECOUNTING" => match args.first() {
-                None => Some(Value::Int(self.triangle_count_cached() as i64)),
+                None => Some(Value::Int(
+                    self.legacy_ok(self.triangle_count_cached())? as i64
+                )),
                 Some(e) => {
                     let a = self.node_id(e, b, l)?;
-                    Some(Value::Int(
-                        self.graph_view().node_triangle_count(a).unwrap_or(0) as i64,
-                    ))
+                    let t =
+                        self.with_full_view(|g, it| g.node_triangle_count_cancellable(a, it))?;
+                    Some(Value::Int(t.unwrap_or(0) as i64))
                 }
             },
             // CLUSTERINGCOEFF(): global transitivity;
             // CLUSTERINGCOEFF(a): local clustering coefficient of node a.
             "CLUSTERINGCOEFF" => match args.first() {
-                None => Some(Value::Double(self.global_clustering_cached())),
+                None => Some(Value::Double(
+                    self.legacy_ok(self.global_clustering_cached())?,
+                )),
                 Some(e) => {
                     let a = self.node_id(e, b, l)?;
-                    Some(Value::Double(
-                        self.graph_view()
-                            .local_clustering_coefficient(a)
-                            .unwrap_or(0.0),
-                    ))
+                    let x = self.with_full_view(|g, it| {
+                        g.local_clustering_coefficient_cancellable(a, it)
+                    })?;
+                    Some(Value::Double(x.unwrap_or(0.0)))
                 }
             },
             // PPR(src, target): personalized-PageRank score of `target` when the
@@ -4472,21 +4565,24 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             "PPR" => {
                 let src = self.node_id(args.first()?, b, l)?;
                 let target = self.node_id(args.get(1)?, b, l)?;
-                let ppr = self.ppr_cached(src);
+                let ppr = self.legacy_ok(self.ppr_cached(src))?;
                 Some(Value::Double(ppr.get(&target).copied().unwrap_or(0.0)))
             }
             // JACCARDSIMILARITY(a, b): Jaccard index of the two neighbour sets.
             "JACCARDSIMILARITY" => {
                 let a = self.node_id(args.first()?, b, l)?;
                 let c = self.node_id(args.get(1)?, b, l)?;
-                Some(Value::Double(
-                    self.graph_view().jaccard_similarity(a, c).unwrap_or(0.0),
-                ))
+                let g = self.legacy_ok(self.graph_view())?;
+                Some(Value::Double(g.jaccard_similarity(a, c).unwrap_or(0.0)))
             }
             // DEGREECORRELATION(): Newman degree assortativity of the graph.
-            "DEGREECORRELATION" => Some(Value::Double(self.degree_assortativity_cached())),
+            "DEGREECORRELATION" => Some(Value::Double(
+                self.legacy_ok(self.degree_assortativity_cached())?,
+            )),
             // DIAMETERESTIMATION(): double-sweep BFS diameter estimate.
-            "DIAMETERESTIMATION" => Some(Value::Int(self.diameter_cached() as i64)),
+            "DIAMETERESTIMATION" => {
+                Some(Value::Int(self.legacy_ok(self.diameter_cached())? as i64))
+            }
 
             // Every name in `builtins::BUILTINS` has an arm above (pinned by
             // the `every_table_builtin_has_an_engine_arm` test); this arm only
@@ -4588,102 +4684,263 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         self.dict.term_id(&value_to_term(&v))
     }
 
-    /// The lazily-built, query-scoped CSR adjacency view backing graph built-ins.
-    fn graph_view(&self) -> Rc<GraphView> {
-        if let Some(g) = self.graph_cache.borrow().as_ref() {
-            return Rc::clone(g);
+    /// The legacy GraphView algorithms' cancellation: this evaluator's flag.
+    fn legacy_interrupt(&self) -> Interrupt<'_> {
+        Interrupt::new(self.cancel.as_deref())
+    }
+
+    /// A legacy graph built-in's outcome: on an error (a cancel during the
+    /// computation) the built-in is unbound and the error becomes the
+    /// query's ([`check_cancel`](Self::check_cancel) reports it).
+    fn legacy_ok<T>(&self, r: Result<T>) -> Option<T> {
+        match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                let mut failed = self.failed.borrow_mut();
+                if failed.is_none() {
+                    *failed = Some(e);
+                }
+                None
+            }
         }
-        let g = Rc::new(GraphView::from_source(self.store));
+    }
+
+    /// Run `f` on the full view ([`graph_view`](Self::graph_view)) under
+    /// this evaluator's cancellation (see [`legacy_ok`](Self::legacy_ok)).
+    fn with_full_view<T>(
+        &self,
+        f: impl FnOnce(&GraphView, &mut Interrupt<'_>) -> Result<T>,
+    ) -> Option<T> {
+        let r = self
+            .graph_view()
+            .and_then(|g| f(&g, &mut self.legacy_interrupt()));
+        self.legacy_ok(r)
+    }
+
+    /// The lazily-built, query-scoped *full* view backing the legacy graph
+    /// built-ins that count literal objects as nodes: every triple of this
+    /// evaluator's store, read one predicate at a time under the cancel
+    /// flag. The CSR has no literal objects, so these keep their own
+    /// per-query build (review analytics#4).
+    fn graph_view(&self) -> Result<Rc<GraphView>> {
+        if let Some(g) = self.graph_cache.borrow().as_ref() {
+            return Ok(Rc::clone(g));
+        }
+        let preds = crate::dict::Space::Predicate.first_id()
+            ..self.dict.id_limit(crate::dict::Space::Predicate);
+        let g = Rc::new(GraphView::from_source_cancellable(
+            self.store,
+            preds,
+            &mut self.legacy_interrupt(),
+        )?);
         *self.graph_cache.borrow_mut() = Some(Rc::clone(&g));
-        g
+        Ok(g)
+    }
+
+    /// The query-scoped *entity* view: [`GraphView::from_csr`] of the CSR the
+    /// advanced graph functions use ([`gfun_csr`](Self::gfun_csr) — with a
+    /// CSR provider the database's, cached per data version), so the
+    /// literal-independent legacy built-ins never rescan the store.
+    fn entity_view(&self) -> Result<Rc<GraphView>> {
+        if let Some(g) = self.algo_cache.borrow().entity_view.clone() {
+            return Ok(g);
+        }
+        let csr = self.gfun_csr()?;
+        let g = Rc::new(GraphView::from_csr_cancellable(
+            &csr,
+            &mut self.legacy_interrupt(),
+        )?);
+        self.algo_cache.borrow_mut().entity_view = Some(Rc::clone(&g));
+        Ok(g)
+    }
+
+    /// Whether `id` is a node of the full view — it is the subject or object
+    /// of some triple — told from the entity view `ev` and two index probes,
+    /// without building the full view.
+    fn legacy_node_exists(&self, ev: &GraphView, id: u32) -> bool {
+        ev.contains(id) || self.store.has_subject(id) || self.store.has_object(id)
+    }
+
+    /// The legacy shortest directed path `a ⇝ c` (`GraphView::shortest_path`
+    /// of the full view). Between two entities on the entity view: a literal
+    /// object has no out-edges, so it is never inside a path, and an entity
+    /// without entity edges reaches nothing but itself — a node of the full
+    /// view iff some triple names it.
+    fn legacy_shortest_path(&self, a: u32, c: u32) -> Result<Option<Vec<u32>>> {
+        let mut it = self.legacy_interrupt();
+        if !(is_entity_id(a) && is_entity_id(c)) {
+            return self.graph_view()?.shortest_path_cancellable(a, c, &mut it);
+        }
+        let ev = self.entity_view()?;
+        if a == c {
+            return Ok(self.legacy_node_exists(&ev, a).then(|| vec![a]));
+        }
+        ev.shortest_path_cancellable(a, c, &mut it)
+    }
+
+    /// The legacy `GraphView::khop_reachable(a, c, k)` (absent nodes →
+    /// `false`), on the entity view between two entities (see
+    /// [`legacy_shortest_path`](Self::legacy_shortest_path)).
+    fn legacy_khop_reachable(&self, a: u32, c: u32, k: u32) -> Result<bool> {
+        let mut it = self.legacy_interrupt();
+        if !(is_entity_id(a) && is_entity_id(c)) {
+            let g = self.graph_view()?;
+            return Ok(g
+                .khop_reachable_cancellable(a, c, k, &mut it)?
+                .unwrap_or(false));
+        }
+        let ev = self.entity_view()?;
+        if a == c {
+            return Ok(self.legacy_node_exists(&ev, a));
+        }
+        Ok(ev
+            .khop_reachable_cancellable(a, c, k, &mut it)?
+            .unwrap_or(false))
+    }
+
+    /// The legacy `GraphView::count_shortest_paths(a, c)` (`None` when either
+    /// is not a node of the full view), on the entity view between two
+    /// entities (see [`legacy_shortest_path`](Self::legacy_shortest_path)).
+    fn legacy_count_shortest_paths(&self, a: u32, c: u32) -> Result<Option<u64>> {
+        let mut it = self.legacy_interrupt();
+        if !(is_entity_id(a) && is_entity_id(c)) {
+            return self
+                .graph_view()?
+                .count_shortest_paths_cancellable(a, c, &mut it);
+        }
+        let ev = self.entity_view()?;
+        Ok(match ev.count_shortest_paths_cancellable(a, c, &mut it)? {
+            Some(n) => Some(n),
+            None => (self.legacy_node_exists(&ev, a) && self.legacy_node_exists(&ev, c))
+                .then_some(u64::from(a == c)),
+        })
     }
 
     // ---- memoized whole-graph analytics (computed once per query) ------------
     // Each computes its full-graph pass on first use and caches the result, so a
     // graph built-in inside a per-row FILTER/projection doesn't rerun it per row.
 
-    fn wcc_cached(&self) -> Rc<HashMap<u32, u32>> {
+    /// Whether the graph has a cycle, once per query (literal objects are
+    /// sinks, so the entity view decides it).
+    fn has_cycle_cached(&self) -> Result<bool> {
+        if let Some(v) = self.algo_cache.borrow().has_cycle {
+            return Ok(v);
+        }
+        let v = self
+            .entity_view()?
+            .has_cycle_cancellable(&mut self.legacy_interrupt())?;
+        self.algo_cache.borrow_mut().has_cycle = Some(v);
+        Ok(v)
+    }
+    fn wcc_cached(&self) -> Result<Rc<HashMap<u32, u32>>> {
         if let Some(r) = self.algo_cache.borrow().wcc.clone() {
-            return r;
-        }
-        let r = Rc::new(self.graph_view().weakly_connected_components().0);
-        self.algo_cache.borrow_mut().wcc = Some(Rc::clone(&r));
-        r
-    }
-    fn louvain_cached(&self) -> Rc<HashMap<u32, usize>> {
-        if let Some(r) = self.algo_cache.borrow().louvain.clone() {
-            return r;
-        }
-        let r = Rc::new(self.graph_view().louvain());
-        self.algo_cache.borrow_mut().louvain = Some(Rc::clone(&r));
-        r
-    }
-    fn labelprop_cached(&self) -> Rc<HashMap<u32, usize>> {
-        if let Some(r) = self.algo_cache.borrow().labelprop.clone() {
-            return r;
-        }
-        let r = Rc::new(self.graph_view().label_propagation());
-        self.algo_cache.borrow_mut().labelprop = Some(Rc::clone(&r));
-        r
-    }
-    fn betweenness_cached(&self) -> Rc<HashMap<u32, f64>> {
-        if let Some(r) = self.algo_cache.borrow().betweenness.clone() {
-            return r;
-        }
-        let r = Rc::new(self.graph_view().betweenness_centrality());
-        self.algo_cache.borrow_mut().betweenness = Some(Rc::clone(&r));
-        r
-    }
-    fn closeness_cached(&self) -> Rc<HashMap<u32, f64>> {
-        if let Some(r) = self.algo_cache.borrow().closeness.clone() {
-            return r;
-        }
-        let r = Rc::new(self.graph_view().closeness_centrality());
-        self.algo_cache.borrow_mut().closeness = Some(Rc::clone(&r));
-        r
-    }
-    fn ppr_cached(&self, src: u32) -> Rc<HashMap<u32, f64>> {
-        if let Some(r) = self.algo_cache.borrow().ppr.get(&src).cloned() {
-            return r;
+            return Ok(r);
         }
         let r = Rc::new(
-            self.graph_view()
-                .personalized_pagerank(&[src], 0.85, 100, 1e-9),
+            self.graph_view()?
+                .weakly_connected_components_cancellable(&mut self.legacy_interrupt())?
+                .0,
         );
+        self.algo_cache.borrow_mut().wcc = Some(Rc::clone(&r));
+        Ok(r)
+    }
+    fn louvain_cached(&self) -> Result<Rc<HashMap<u32, usize>>> {
+        if let Some(r) = self.algo_cache.borrow().louvain.clone() {
+            return Ok(r);
+        }
+        let r = Rc::new(
+            self.graph_view()?
+                .louvain_cancellable(&mut self.legacy_interrupt())?,
+        );
+        self.algo_cache.borrow_mut().louvain = Some(Rc::clone(&r));
+        Ok(r)
+    }
+    fn labelprop_cached(&self) -> Result<Rc<HashMap<u32, usize>>> {
+        if let Some(r) = self.algo_cache.borrow().labelprop.clone() {
+            return Ok(r);
+        }
+        let r = Rc::new(
+            self.graph_view()?
+                .label_propagation_cancellable(&mut self.legacy_interrupt())?,
+        );
+        self.algo_cache.borrow_mut().labelprop = Some(Rc::clone(&r));
+        Ok(r)
+    }
+    fn betweenness_cached(&self) -> Result<Rc<HashMap<u32, f64>>> {
+        if let Some(r) = self.algo_cache.borrow().betweenness.clone() {
+            return Ok(r);
+        }
+        let r = Rc::new(
+            self.graph_view()?
+                .betweenness_centrality_cancellable(&mut self.legacy_interrupt())?,
+        );
+        self.algo_cache.borrow_mut().betweenness = Some(Rc::clone(&r));
+        Ok(r)
+    }
+    /// One node's closeness (one BFS), memoized per node.
+    fn closeness_cached(&self, id: u32) -> Result<Option<f64>> {
+        if let Some(v) = self.algo_cache.borrow().closeness.get(&id) {
+            return Ok(*v);
+        }
+        let v = self
+            .graph_view()?
+            .closeness_of_cancellable(id, &mut self.legacy_interrupt())?;
+        self.algo_cache.borrow_mut().closeness.insert(id, v);
+        Ok(v)
+    }
+    fn ppr_cached(&self, src: u32) -> Result<Rc<HashMap<u32, f64>>> {
+        if let Some(r) = self.algo_cache.borrow().ppr.get(&src).cloned() {
+            return Ok(r);
+        }
+        let r = Rc::new(self.graph_view()?.personalized_pagerank_cancellable(
+            &[src],
+            0.85,
+            100,
+            1e-9,
+            &mut self.legacy_interrupt(),
+        )?);
         self.algo_cache.borrow_mut().ppr.insert(src, Rc::clone(&r));
-        r
+        Ok(r)
     }
-    fn degree_assortativity_cached(&self) -> f64 {
+    fn degree_assortativity_cached(&self) -> Result<f64> {
         if let Some(v) = self.algo_cache.borrow().degree_assortativity {
-            return v;
+            return Ok(v);
         }
-        let v = self.graph_view().degree_assortativity();
+        let v = self
+            .graph_view()?
+            .degree_assortativity_cancellable(&mut self.legacy_interrupt())?;
         self.algo_cache.borrow_mut().degree_assortativity = Some(v);
-        v
+        Ok(v)
     }
-    fn diameter_cached(&self) -> u32 {
+    fn diameter_cached(&self) -> Result<u32> {
         if let Some(v) = self.algo_cache.borrow().diameter {
-            return v;
+            return Ok(v);
         }
-        let v = self.graph_view().diameter_estimate();
+        let v = self
+            .graph_view()?
+            .diameter_estimate_cancellable(&mut self.legacy_interrupt())?;
         self.algo_cache.borrow_mut().diameter = Some(v);
-        v
+        Ok(v)
     }
-    fn global_clustering_cached(&self) -> f64 {
+    fn global_clustering_cached(&self) -> Result<f64> {
         if let Some(v) = self.algo_cache.borrow().global_clustering {
-            return v;
+            return Ok(v);
         }
-        let v = self.graph_view().global_clustering_coefficient();
+        let v = self
+            .graph_view()?
+            .global_clustering_coefficient_cancellable(&mut self.legacy_interrupt())?;
         self.algo_cache.borrow_mut().global_clustering = Some(v);
-        v
+        Ok(v)
     }
-    fn triangle_count_cached(&self) -> u64 {
+    fn triangle_count_cached(&self) -> Result<u64> {
         if let Some(v) = self.algo_cache.borrow().triangle_count {
-            return v;
+            return Ok(v);
         }
-        let v = self.graph_view().triangle_count();
+        let v = self
+            .graph_view()?
+            .triangle_count_cancellable(&mut self.legacy_interrupt())?;
         self.algo_cache.borrow_mut().triangle_count = Some(v);
-        v
+        Ok(v)
     }
 
     /// Render a graph node's entity id back to its dictionary term string

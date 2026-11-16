@@ -1489,6 +1489,10 @@ fn sssp_per_source_and_special_cases() {
 // cancellation
 // ---------------------------------------------------------------------------
 
+/// The flag is raised *before* the call here, so this only checks the
+/// entry check (`gfun::eval` polls once first). review analytics#11: the
+/// polls inside the long loops are checked mid-run, with the flag raised
+/// from inside a loop, in `tests/gfun_limits.rs` (`stops_at_the_next_poll`).
 #[test]
 fn every_path_function_honours_cancellation() {
     let fx = Fx::social();

@@ -17,8 +17,8 @@
 //! For predicate-labeled / weighted analysis, [`WeightedGraphView`] keeps a
 //! predicate id and a numeric weight on every edge and adds weighted
 //! single-source shortest paths (Dijkstra), predicate-filtered traversal,
-//! weighted PageRank, and a branch-and-bound top-k subgraph query (mirroring
-//! gStore's `topk` module).  The unweighted [`GraphView`] API is unchanged.
+//! weighted PageRank, and a branch-and-bound top-k subgraph query.  The
+//! unweighted [`GraphView`] API is unchanged.
 //!
 //! # Two graph layers
 //!
@@ -32,19 +32,125 @@
 //!   namespace (`rs:SSSP(<a>, <b>)`, `rs:WCC(<a>, <b>)`, …) and keep their
 //!   semantics.
 //!
+//! The legacy built-ins whose answer cannot involve a literal — `rs:CYCLEBOOLEAN`
+//! and the paths between two entities (`rs:SHORTESTPATHLEN`, `rs:SSSP`,
+//! `rs:SSSPLEN`, `rs:KHOPREACHABLE`, `rs:SHORTESTPATHS`) — run on
+//! [`GraphView::from_csr`] of the query's CSR (the database's, cached per
+//! data version), the others on a view built from the store once per query
+//! (the CSR has no literal objects). Both builds and every algorithm the
+//! engine runs poll the query's cancellation flag ([`Interrupt`]).
+//!
+//! # Cost of the legacy algorithms
+//!
+//! Inherently quadratic (documented, cancellable): betweenness
+//! (`O(V·(V+E))` even for one node: every source's shortest-path DAG),
+//! [`GraphView::closeness_centrality`] for all nodes (the engine asks
+//! [`GraphView::closeness_of`] one BFS per requested node), local
+//! clustering / per-node triangles (`O(d² log d)` for degree `d`), and the
+//! top-k subgraph matcher (memory `O(matches)`, not `O(k)`).
+//!
+//! # Library-only APIs
+//!
+//! [`WeightedGraphView`] (Dijkstra, weighted PageRank, the top-k subgraph
+//! matcher and its pattern types), [`GraphView::k_core`],
+//! [`GraphView::louvain_directed`], [`GraphView::pagerank`],
+//! [`GraphView::strongly_connected_components`] and
+//! [`GraphView::bfs_distances`] have no caller in the query engine or the
+//! servers: they are kept as public library API (review analytics#10 /
+//! design#15) and covered by this module's tests only. (The top-k matcher is
+//! *not* upstream's `src/Query/topk`, which is `ORDER BY … LIMIT` query
+//! top-k and lives in `src/query/topk.rs`.)
+//!
 //! # Deferred work
-//! * (none currently tracked here)
+//! * The two graph layers are not unified: the legacy view keeps literal
+//!   objects as nodes and merges predicates, the CSR does neither (recorded
+//!   for the refactor backlog, review analytics#10 / design#15).
 
 pub mod csr;
 pub mod gfun;
 
 use std::cmp::{Ordering, Reverse};
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
+use std::sync::atomic::AtomicBool;
 
+use crate::analytics::csr::CsrGraph;
+use crate::error::{GStoreError, Result};
 use crate::model::id::{EntityLiteralId, PredId};
 use crate::model::IdTriple;
 use crate::store::{TripleSource, TripleStore};
+
+// ---------------------------------------------------------------------------
+// Cooperative cancellation of the GraphView algorithms
+// ---------------------------------------------------------------------------
+
+/// Cooperative cancellation for [`GraphView`]'s construction and long loops
+/// (the crate-internal `*_cancellable` methods the legacy `rs:` built-ins
+/// run): each [`step`](Interrupt::step) adds the work just done (a vertex
+/// expansion counts its degree) and the flag is read every
+/// [`TICK_WORK`](Interrupt::TICK_WORK) units, so a query's `/cancel` stops
+/// even a whole-graph pass (review analytics#4). The public methods run
+/// with [`Interrupt::none`] and cannot fail.
+pub struct Interrupt<'a> {
+    flag: Option<&'a AtomicBool>,
+    work: usize,
+}
+
+impl<'a> Interrupt<'a> {
+    /// Work units between two polls.
+    pub const TICK_WORK: usize = 4096;
+
+    /// No cancellation: every step succeeds.
+    pub fn none() -> Interrupt<'static> {
+        Interrupt {
+            flag: None,
+            work: 0,
+        }
+    }
+
+    /// Poll `flag` (if any).
+    pub fn new(flag: Option<&'a AtomicBool>) -> Interrupt<'a> {
+        Interrupt { flag, work: 0 }
+    }
+
+    /// Account `units` of work; poll when enough has accumulated.
+    #[inline]
+    pub fn step(&mut self, units: usize) -> Result<()> {
+        self.work = self.work.saturating_add(units.max(1));
+        if self.work >= Self::TICK_WORK {
+            self.work = 0;
+            self.check()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Poll now: `Err(GStoreError::Cancelled)` once the flag is up. (Runs
+    /// the graph functions' test hook, [`gfun::debug_poll_hook`], with the
+    /// loop name `"graph-view"`.)
+    pub fn check(&self) -> Result<()> {
+        match self.flag {
+            Some(f) => {
+                gfun::run_poll_hook("graph-view");
+                if f.load(std::sync::atomic::Ordering::Relaxed) {
+                    Err(GStoreError::Cancelled)
+                } else {
+                    Ok(())
+                }
+            }
+            None => Ok(()),
+        }
+    }
+}
+
+/// The value of a `*_cancellable` method run with [`Interrupt::none`], which
+/// never fails.
+fn infallible<T>(r: Result<T>) -> T {
+    match r {
+        Ok(v) => v,
+        Err(_) => unreachable!("an Interrupt without a flag never fails"),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Union-find helpers (iterative path-halving + union-by-rank)
@@ -129,33 +235,117 @@ impl GraphView {
             .into_iter()
             .map(|t| (t.sub, t.obj))
             .collect();
-        Self::from_raw_pairs(raw_pairs)
+        infallible(Self::from_raw_pairs_cancellable(
+            raw_pairs,
+            &mut Interrupt::none(),
+        ))
+    }
+
+    /// [`from_source`](Self::from_source), reading the store one predicate
+    /// at a time (`so_by_p` of each id of `preds`, which must cover every
+    /// predicate `store` holds — the dictionary's predicates do) and polling
+    /// `cancel` between predicates and while it assembles the graph. The
+    /// graph is the one `from_source` builds.
+    pub(crate) fn from_source_cancellable<S: TripleSource + ?Sized>(
+        store: &S,
+        preds: impl IntoIterator<Item = PredId>,
+        cancel: &mut Interrupt<'_>,
+    ) -> Result<Self> {
+        let mut raw_pairs: Vec<(EntityLiteralId, EntityLiteralId)> = Vec::new();
+        for p in preds {
+            cancel.check()?;
+            let pairs = store.so_by_p(p);
+            cancel.step(pairs.len())?;
+            raw_pairs.extend(pairs);
+        }
+        Self::from_raw_pairs_cancellable(raw_pairs, cancel)
+    }
+
+    /// The entity graph of a gStore per-predicate [`CsrGraph`]: its vertices
+    /// (entities with an entity→entity edge, ascending — so a CSR node index
+    /// is the view's dense index) and every `s → o` edge of any predicate,
+    /// de-duplicated. This is exactly [`from_source`](Self::from_source) of
+    /// the store's triples *without* the literal-object ones; the legacy
+    /// built-ins whose answer cannot involve a literal (cycles, and paths
+    /// between two entities) run on it, sharing the database's CSR instead
+    /// of rescanning the store (review analytics#4).
+    pub fn from_csr(csr: &CsrGraph) -> Self {
+        infallible(Self::from_csr_cancellable(csr, &mut Interrupt::none()))
+    }
+
+    /// [`from_csr`](Self::from_csr), polling `cancel`.
+    pub(crate) fn from_csr_cancellable(csr: &CsrGraph, cancel: &mut Interrupt<'_>) -> Result<Self> {
+        let n = csr.num_nodes();
+        let nodes: Vec<EntityLiteralId> = csr.entities().to_vec();
+        let mut id_to_idx: HashMap<EntityLiteralId, usize> = HashMap::with_capacity(n);
+        for (i, &id) in nodes.iter().enumerate() {
+            cancel.step(1)?;
+            id_to_idx.insert(id, i);
+        }
+        let mut adjacency =
+            |edges: &dyn Fn(u32) -> (Vec<usize>, usize)| -> Result<(Vec<usize>, Vec<usize>)> {
+                let mut ptr = Vec::with_capacity(n + 1);
+                let mut adj = Vec::new();
+                ptr.push(0);
+                for v in 0..n {
+                    let (mut nbrs, work) = edges(v as u32);
+                    cancel.step(work)?;
+                    nbrs.sort_unstable();
+                    nbrs.dedup();
+                    adj.extend_from_slice(&nbrs);
+                    ptr.push(adj.len());
+                }
+                Ok((ptr, adj))
+            };
+        let (out_ptr, out_adj) = adjacency(&|v| {
+            let (_, nbrs) = csr.out_edges(v);
+            (nbrs.iter().map(|&x| x as usize).collect(), nbrs.len())
+        })?;
+        let (in_ptr, in_adj) = adjacency(&|v| {
+            let (_, nbrs) = csr.in_edges(v);
+            (nbrs.iter().map(|&x| x as usize).collect(), nbrs.len())
+        })?;
+        Ok(GraphView {
+            nodes,
+            id_to_idx,
+            out_ptr,
+            out_adj,
+            in_ptr,
+            in_adj,
+        })
     }
 
     /// Assemble the CSR adjacency from raw `(subject, object)` pairs.
-    fn from_raw_pairs(raw_pairs: Vec<(EntityLiteralId, EntityLiteralId)>) -> Self {
+    fn from_raw_pairs_cancellable(
+        raw_pairs: Vec<(EntityLiteralId, EntityLiteralId)>,
+        cancel: &mut Interrupt<'_>,
+    ) -> Result<Self> {
         // 1. Build sorted, de-duplicated node list.
         let mut id_set: Vec<EntityLiteralId> =
             raw_pairs.iter().flat_map(|&(s, o)| [s, o]).collect();
+        cancel.check()?;
         id_set.sort_unstable();
         id_set.dedup();
         let n = id_set.len();
+        cancel.check()?;
 
         // 2. Sparse → dense lookup.
-        let id_to_idx: HashMap<EntityLiteralId, usize> = id_set
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(i, id)| (id, i))
-            .collect();
+        let mut id_to_idx: HashMap<EntityLiteralId, usize> = HashMap::with_capacity(n);
+        for (i, &id) in id_set.iter().enumerate() {
+            cancel.step(1)?;
+            id_to_idx.insert(id, i);
+        }
 
         // 3. De-duplicate directed edges (multiple predicates can share (s,o)).
-        let mut raw_edges: Vec<(usize, usize)> = raw_pairs
-            .iter()
-            .map(|&(s, o)| (id_to_idx[&s], id_to_idx[&o]))
-            .collect();
+        let mut raw_edges: Vec<(usize, usize)> = Vec::with_capacity(raw_pairs.len());
+        for &(s, o) in &raw_pairs {
+            cancel.step(1)?;
+            raw_edges.push((id_to_idx[&s], id_to_idx[&o]));
+        }
+        drop(raw_pairs);
         raw_edges.sort_unstable();
         raw_edges.dedup();
+        cancel.check()?;
         let m = raw_edges.len();
 
         // 4. Count out- and in-degrees.
@@ -165,6 +355,7 @@ impl GraphView {
             out_deg[s] += 1;
             in_deg[o] += 1;
         }
+        cancel.check()?;
 
         // 5. Build CSR out-adjacency.
         let mut out_ptr = vec![0usize; n + 1];
@@ -194,14 +385,20 @@ impl GraphView {
             }
         }
 
-        GraphView {
+        cancel.check()?;
+        Ok(GraphView {
             nodes: id_set,
             id_to_idx,
             out_ptr,
             out_adj,
             in_ptr,
             in_adj,
-        }
+        })
+    }
+
+    /// Whether `id` is a node of the graph.
+    pub fn contains(&self, id: EntityLiteralId) -> bool {
+        self.id_to_idx.contains_key(&id)
     }
 
     /// Number of nodes in the graph.
@@ -302,11 +499,23 @@ impl GraphView {
         src: EntityLiteralId,
         dst: EntityLiteralId,
     ) -> Option<Vec<EntityLiteralId>> {
-        let src_i = *self.id_to_idx.get(&src)?;
-        let dst_i = *self.id_to_idx.get(&dst)?;
+        infallible(self.shortest_path_cancellable(src, dst, &mut Interrupt::none()))
+    }
+
+    /// [`shortest_path`](Self::shortest_path), polling `c`.
+    pub(crate) fn shortest_path_cancellable(
+        &self,
+        src: EntityLiteralId,
+        dst: EntityLiteralId,
+        c: &mut Interrupt<'_>,
+    ) -> Result<Option<Vec<EntityLiteralId>>> {
+        let (Some(&src_i), Some(&dst_i)) = (self.id_to_idx.get(&src), self.id_to_idx.get(&dst))
+        else {
+            return Ok(None);
+        };
 
         if src_i == dst_i {
-            return Some(vec![src]);
+            return Ok(Some(vec![src]));
         }
 
         let n = self.nodes.len();
@@ -316,6 +525,7 @@ impl GraphView {
         let mut queue = VecDeque::new();
         queue.push_back(src_i);
         'bfs: while let Some(u) = queue.pop_front() {
+            c.step(1 + self.out_ptr[u + 1] - self.out_ptr[u])?;
             for &v in &self.out_adj[self.out_ptr[u]..self.out_ptr[u + 1]] {
                 if !visited[v] {
                     visited[v] = true;
@@ -328,7 +538,7 @@ impl GraphView {
             }
         }
         if !visited[dst_i] {
-            return None;
+            return Ok(None);
         }
         // Reconstruct path by walking prev[] back from dst to src.
         let mut path = Vec::new();
@@ -339,7 +549,7 @@ impl GraphView {
         }
         path.push(self.nodes[src_i]);
         path.reverse();
-        Some(path)
+        Ok(Some(path))
     }
 
     // ---- thin wrappers backing the gStore graph SPARQL built-ins ----------
@@ -360,10 +570,23 @@ impl GraphView {
         dst: EntityLiteralId,
         max_hops: u32,
     ) -> Option<bool> {
-        let src_i = *self.id_to_idx.get(&src)?;
-        let dst_i = *self.id_to_idx.get(&dst)?;
+        infallible(self.khop_reachable_cancellable(src, dst, max_hops, &mut Interrupt::none()))
+    }
+
+    /// [`khop_reachable`](Self::khop_reachable), polling `c`.
+    pub(crate) fn khop_reachable_cancellable(
+        &self,
+        src: EntityLiteralId,
+        dst: EntityLiteralId,
+        max_hops: u32,
+        c: &mut Interrupt<'_>,
+    ) -> Result<Option<bool>> {
+        let (Some(&src_i), Some(&dst_i)) = (self.id_to_idx.get(&src), self.id_to_idx.get(&dst))
+        else {
+            return Ok(None);
+        };
         if src_i == dst_i {
-            return Some(true);
+            return Ok(Some(true));
         }
         let n = self.nodes.len();
         let mut dist = vec![u32::MAX; n];
@@ -375,36 +598,47 @@ impl GraphView {
             if d >= max_hops {
                 continue; // budget exhausted — do not expand further
             }
+            c.step(1 + self.out_ptr[u + 1] - self.out_ptr[u])?;
             for &v in &self.out_adj[self.out_ptr[u]..self.out_ptr[u + 1]] {
                 if dist[v] == u32::MAX {
                     if v == dst_i {
-                        return Some(true);
+                        return Ok(Some(true));
                     }
                     dist[v] = d + 1;
                     queue.push_back(v);
                 }
             }
         }
-        Some(false)
+        Ok(Some(false))
     }
 
     /// Whether the directed graph contains any cycle, backing the
     /// `CYCLEBOOLEAN` / `SIMPLECYCLEBOOLEAN` built-ins. True iff some strongly
     /// connected component spans more than one node, or any node has a
     /// self-loop edge (`x → x`).
+    ///
+    /// Only edges between nodes that have out-edges can lie on a cycle, so
+    /// the answer is the same on [`from_csr`](Self::from_csr)'s entity view
+    /// (literal objects are sinks).
     pub fn has_cycle(&self) -> bool {
+        infallible(self.has_cycle_cancellable(&mut Interrupt::none()))
+    }
+
+    /// [`has_cycle`](Self::has_cycle), polling `c`.
+    pub(crate) fn has_cycle_cancellable(&self, c: &mut Interrupt<'_>) -> Result<bool> {
         // A self-loop is a one-node cycle that Tarjan leaves as a singleton SCC.
         for (i, _) in self.nodes.iter().enumerate() {
+            c.step(1 + self.out_ptr[i + 1] - self.out_ptr[i])?;
             if self.out_adj[self.out_ptr[i]..self.out_ptr[i + 1]].contains(&i) {
-                return true;
+                return Ok(true);
             }
         }
-        let (comp_map, num_comp) = self.strongly_connected_components();
+        let (comp_id, num_comp) = self.scc_dense(c)?;
         let mut sizes = vec![0usize; num_comp];
-        for &c in comp_map.values() {
-            sizes[c] += 1;
+        for &k in &comp_id {
+            sizes[k] += 1;
         }
-        sizes.iter().any(|&s| s > 1)
+        Ok(sizes.iter().any(|&s| s > 1))
     }
 
     // ---- Weakly connected components --------------------------------------
@@ -422,12 +656,22 @@ impl GraphView {
     pub fn weakly_connected_components(
         &self,
     ) -> (HashMap<EntityLiteralId, EntityLiteralId>, usize) {
+        infallible(self.weakly_connected_components_cancellable(&mut Interrupt::none()))
+    }
+
+    /// [`weakly_connected_components`](Self::weakly_connected_components),
+    /// polling `c`.
+    pub(crate) fn weakly_connected_components_cancellable(
+        &self,
+        c: &mut Interrupt<'_>,
+    ) -> Result<(HashMap<EntityLiteralId, EntityLiteralId>, usize)> {
         let n = self.nodes.len();
         let mut parent: Vec<usize> = (0..n).collect();
         let mut rank = vec![0u8; n];
 
         // Union over the undirected graph: each directed edge (u→v) merges WCCs.
         for u in 0..n {
+            c.step(1 + self.out_ptr[u + 1] - self.out_ptr[u])?;
             for &v in &self.out_adj[self.out_ptr[u]..self.out_ptr[u + 1]] {
                 uf_union(&mut parent, &mut rank, u, v);
             }
@@ -439,6 +683,7 @@ impl GraphView {
         let mut num_components = 0usize;
         let mut comp_map: HashMap<EntityLiteralId, EntityLiteralId> = HashMap::with_capacity(n);
         for i in 0..n {
+            c.step(1)?;
             let root = uf_find(&mut parent, i);
             let rep = *root_to_rep.entry(root).or_insert_with(|| {
                 num_components += 1;
@@ -447,7 +692,7 @@ impl GraphView {
             comp_map.insert(self.nodes[i], rep);
         }
 
-        (comp_map, num_components)
+        Ok((comp_map, num_components))
     }
 
     // ---- PageRank ---------------------------------------------------------
@@ -524,10 +769,16 @@ impl GraphView {
     /// intersection total equals three times the triangle count (each triangle
     /// appears once per edge), so the result is divided by three.
     pub fn triangle_count(&self) -> u64 {
+        infallible(self.triangle_count_cancellable(&mut Interrupt::none()))
+    }
+
+    /// [`triangle_count`](Self::triangle_count), polling `c`.
+    pub(crate) fn triangle_count_cancellable(&self, c: &mut Interrupt<'_>) -> Result<u64> {
         let n = self.nodes.len();
         // Build undirected adjacency (dense indices, no self-loops).
         let mut udj: Vec<Vec<usize>> = vec![Vec::new(); n];
         for u in 0..n {
+            c.step(1 + self.out_ptr[u + 1] - self.out_ptr[u])?;
             for &v in &self.out_adj[self.out_ptr[u]..self.out_ptr[u + 1]] {
                 if u != v {
                     udj[u].push(v);
@@ -536,6 +787,7 @@ impl GraphView {
             }
         }
         for adj in udj.iter_mut() {
+            c.step(adj.len())?;
             adj.sort_unstable();
             adj.dedup();
         }
@@ -549,6 +801,7 @@ impl GraphView {
                     continue; // process each undirected edge once
                 }
                 let (au, av) = (&udj[u], &udj[v]);
+                c.step(au.len() + av.len())?;
                 let (mut i, mut j) = (0, 0);
                 while i < au.len() && j < av.len() {
                     match au[i].cmp(&av[j]) {
@@ -563,7 +816,7 @@ impl GraphView {
                 }
             }
         }
-        raw / 3
+        Ok(raw / 3)
     }
 
     // ---- Strongly-connected components (iterative Tarjan) ------------------
@@ -582,6 +835,20 @@ impl GraphView {
     /// nodes yields `N` singleton SCCs.  Self-loops do not merge a node with
     /// any other, so a self-looping node remains a singleton SCC.
     pub fn strongly_connected_components(&self) -> (HashMap<EntityLiteralId, usize>, usize) {
+        let (comp_id, num_comp) = infallible(self.scc_dense(&mut Interrupt::none()));
+        let comp_map = self
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| (id, comp_id[i]))
+            .collect();
+        (comp_map, num_comp)
+    }
+
+    /// Tarjan's SCCs by dense index (see
+    /// [`strongly_connected_components`](Self::strongly_connected_components)),
+    /// polling `c` once per edge examined.
+    fn scc_dense(&self, c: &mut Interrupt<'_>) -> Result<(Vec<usize>, usize)> {
         let n = self.nodes.len();
         const UNVISITED: usize = usize::MAX;
 
@@ -612,6 +879,7 @@ impl GraphView {
             work.push((start, self.out_ptr[start]));
 
             while let Some(&(v, cursor)) = work.last() {
+                c.step(1)?;
                 if cursor < self.out_ptr[v + 1] {
                     let w = self.out_adj[cursor];
                     work.last_mut().unwrap().1 = cursor + 1; // advance edge cursor
@@ -650,13 +918,7 @@ impl GraphView {
             }
         }
 
-        let comp_map = self
-            .nodes
-            .iter()
-            .enumerate()
-            .map(|(i, &id)| (id, comp_id[i]))
-            .collect();
-        (comp_map, num_comp)
+        Ok((comp_id, num_comp))
     }
 
     // ---- Betweenness centrality (Brandes) ---------------------------------
@@ -669,8 +931,18 @@ impl GraphView {
     /// endpoints).  Scores are **not** divided by two: this is a directed graph,
     /// so each ordered pair contributes once.
     ///
-    /// Complexity is `O(V · (V + E))` time and `O(V + E)` extra space.
+    /// Complexity is `O(V · (V + E))` time and `O(V + E)` extra space —
+    /// inherently quadratic: one node's score needs every source's
+    /// shortest-path DAG.
     pub fn betweenness_centrality(&self) -> HashMap<EntityLiteralId, f64> {
+        infallible(self.betweenness_centrality_cancellable(&mut Interrupt::none()))
+    }
+
+    /// [`betweenness_centrality`](Self::betweenness_centrality), polling `c`.
+    pub(crate) fn betweenness_centrality_cancellable(
+        &self,
+        c: &mut Interrupt<'_>,
+    ) -> Result<HashMap<EntityLiteralId, f64>> {
         let n = self.nodes.len();
         let mut bc = vec![0.0f64; n];
 
@@ -686,6 +958,7 @@ impl GraphView {
             let mut queue = VecDeque::new();
             queue.push_back(s);
             while let Some(v) = queue.pop_front() {
+                c.step(1 + self.out_ptr[v + 1] - self.out_ptr[v])?;
                 stack.push(v);
                 for &w in &self.out_adj[self.out_ptr[v]..self.out_ptr[v + 1]] {
                     if dist[w] < 0 {
@@ -712,11 +985,12 @@ impl GraphView {
             }
         }
 
-        self.nodes
+        Ok(self
+            .nodes
             .iter()
             .enumerate()
             .map(|(i, &id)| (id, bc[i]))
-            .collect()
+            .collect())
     }
 
     // ---- Closeness centrality ---------------------------------------------
@@ -745,40 +1019,88 @@ impl GraphView {
             }
             return result;
         }
-
         let mut dist = vec![-1i64; n];
-        let mut queue = VecDeque::new();
+        let mut touched = Vec::new();
         for s in 0..n {
-            // BFS from `s` over out-edges.
-            dist[s] = 0;
-            queue.push_back(s);
-            let mut sum_dist: i64 = 0;
-            let mut reach: i64 = 0; // reachable nodes excluding `s`
-            while let Some(v) = queue.pop_front() {
-                for &w in &self.out_adj[self.out_ptr[v]..self.out_ptr[v + 1]] {
-                    if dist[w] < 0 {
-                        dist[w] = dist[v] + 1;
-                        sum_dist += dist[w];
-                        reach += 1;
-                        queue.push_back(w);
-                    }
-                }
-            }
-
-            let score = if sum_dist > 0 {
-                let r1 = reach as f64; // (r - 1): reachable excluding self
-                (r1 / sum_dist as f64) * (r1 / (n as f64 - 1.0))
-            } else {
-                0.0
-            };
+            let score =
+                infallible(self.closeness_from(s, &mut dist, &mut touched, &mut Interrupt::none()));
             result.insert(self.nodes[s], score);
-
-            // Reset distances for the next source's BFS.
-            for d in dist.iter_mut() {
-                *d = -1;
-            }
         }
         result
+    }
+
+    /// The closeness centrality of one node (see
+    /// [`closeness_centrality`](Self::closeness_centrality); the same value,
+    /// from one BFS instead of one per node). `None` if `id` is not a node.
+    pub fn closeness_of(&self, id: EntityLiteralId) -> Option<f64> {
+        infallible(self.closeness_of_cancellable(id, &mut Interrupt::none()))
+    }
+
+    /// [`closeness_of`](Self::closeness_of), polling `c`.
+    pub(crate) fn closeness_of_cancellable(
+        &self,
+        id: EntityLiteralId,
+        c: &mut Interrupt<'_>,
+    ) -> Result<Option<f64>> {
+        let Some(&s) = self.id_to_idx.get(&id) else {
+            return Ok(None);
+        };
+        if self.nodes.len() <= 1 {
+            return Ok(Some(0.0));
+        }
+        let mut dist = vec![-1i64; self.nodes.len()];
+        Ok(Some(self.closeness_from(
+            s,
+            &mut dist,
+            &mut Vec::new(),
+            c,
+        )?))
+    }
+
+    /// The closeness score of dense node `s` (`n >= 2`): a BFS over
+    /// out-edges. `dist` must be all `-1`; it is left so (the BFS resets
+    /// the entries it set, listed in `touched`).
+    fn closeness_from(
+        &self,
+        s: usize,
+        dist: &mut [i64],
+        touched: &mut Vec<usize>,
+        c: &mut Interrupt<'_>,
+    ) -> Result<f64> {
+        let n = self.nodes.len();
+        let mut queue = VecDeque::new();
+        dist[s] = 0;
+        touched.push(s);
+        queue.push_back(s);
+        let mut sum_dist: i64 = 0;
+        let mut reach: i64 = 0; // reachable nodes excluding `s`
+        let mut outcome = Ok(());
+        while let Some(v) = queue.pop_front() {
+            if let Err(e) = c.step(1 + self.out_ptr[v + 1] - self.out_ptr[v]) {
+                outcome = Err(e);
+                break;
+            }
+            for &w in &self.out_adj[self.out_ptr[v]..self.out_ptr[v + 1]] {
+                if dist[w] < 0 {
+                    dist[w] = dist[v] + 1;
+                    touched.push(w);
+                    sum_dist += dist[w];
+                    reach += 1;
+                    queue.push_back(w);
+                }
+            }
+        }
+        for &t in touched.iter() {
+            dist[t] = -1;
+        }
+        touched.clear();
+        outcome?;
+        Ok(if sum_dist > 0 {
+            let r1 = reach as f64; // (r - 1): reachable excluding self
+            (r1 / sum_dist as f64) * (r1 / (n as f64 - 1.0))
+        } else {
+            0.0
+        })
     }
 
     // ---- Louvain community detection --------------------------------------
@@ -805,16 +1127,32 @@ impl GraphView {
     /// `k_{i,in}(C)` the weight of edges from `i` into `C`.
     ///
     /// Returns `entity_id → community id` (0-based, opaque).
+    ///
+    /// Deterministic: nodes are visited in dense (= entity-id) order, their
+    /// adjacency is kept sorted, and among neighbouring communities of equal
+    /// gain the smallest community id wins (it broke ties by `HashMap`
+    /// iteration order, so the partition changed from run to run; review
+    /// analytics#3).
     pub fn louvain(&self) -> HashMap<EntityLiteralId, usize> {
+        infallible(self.louvain_cancellable(&mut Interrupt::none()))
+    }
+
+    /// [`louvain`](Self::louvain), polling `c`.
+    pub(crate) fn louvain_cancellable(
+        &self,
+        c: &mut Interrupt<'_>,
+    ) -> Result<HashMap<EntityLiteralId, usize>> {
         let n = self.nodes.len();
         if n == 0 {
-            return HashMap::new();
+            return Ok(HashMap::new());
         }
 
         // --- build the initial undirected weighted graph (dense indices) ---
-        let mut edge_w: HashMap<(usize, usize), f64> = HashMap::new();
+        // (ordered maps: the adjacency lists come out sorted)
+        let mut edge_w: BTreeMap<(usize, usize), f64> = BTreeMap::new();
         let mut self_w = vec![0.0f64; n];
         for (u, span) in self.out_ptr.windows(2).enumerate() {
+            c.step(1 + span[1] - span[0])?;
             for &v in &self.out_adj[span[0]..span[1]] {
                 if u == v {
                     self_w[u] += 1.0;
@@ -828,15 +1166,15 @@ impl GraphView {
         let m: f64 = edge_w.values().sum::<f64>() + self_w.iter().sum::<f64>();
         if m == 0.0 {
             // No edges: every node is its own community.
-            return self
+            return Ok(self
                 .nodes
                 .iter()
                 .enumerate()
                 .map(|(i, &id)| (id, i))
-                .collect();
+                .collect());
         }
 
-        // Symmetric adjacency for the working graph.
+        // Symmetric adjacency for the working graph (sorted by neighbour).
         let mut adj: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
         for (&(a, b), &w) in &edge_w {
             adj[a].push((b, w));
@@ -852,7 +1190,7 @@ impl GraphView {
         let mut cur_n = n;
 
         loop {
-            let comm = Self::louvain_one_level(&adj, &deg, m);
+            let comm = Self::louvain_one_level(&adj, &deg, m, c)?;
             let (renumbered, k) = Self::renumber(&comm);
 
             // Fold this level's assignment into the original→super mapping.
@@ -866,8 +1204,9 @@ impl GraphView {
 
             // --- aggregate communities into super-nodes ---
             let mut new_self = vec![0.0f64; k];
-            let mut new_edge: HashMap<(usize, usize), f64> = HashMap::new();
+            let mut new_edge: BTreeMap<(usize, usize), f64> = BTreeMap::new();
             for u in 0..cur_n {
+                c.step(1 + adj[u].len())?;
                 let cu = renumbered[u];
                 new_self[cu] += self_loops[u];
                 for &(v, w) in &adj[u] {
@@ -898,49 +1237,72 @@ impl GraphView {
             cur_n = k;
         }
 
-        self.nodes
+        Ok(self
+            .nodes
             .iter()
             .enumerate()
             .map(|(i, &id)| (id, orig_to_super[i]))
-            .collect()
+            .collect())
     }
 
     /// One Louvain local-moving pass: repeatedly sweep all nodes, moving each
     /// into the neighbouring community of maximum modularity gain, until a full
-    /// sweep makes no move.  Returns the community label per node.
-    fn louvain_one_level(adj: &[Vec<(usize, f64)>], deg: &[f64], m: f64) -> Vec<usize> {
+    /// sweep makes no move.  Returns the community label per node. Candidate
+    /// communities are tried in ascending id order, so equal gains resolve
+    /// to the smallest id (deterministic).
+    fn louvain_one_level(
+        adj: &[Vec<(usize, f64)>],
+        deg: &[f64],
+        m: f64,
+        c: &mut Interrupt<'_>,
+    ) -> Result<Vec<usize>> {
         let n = adj.len();
         let mut comm: Vec<usize> = (0..n).collect();
         let mut sigma_tot: Vec<f64> = deg.to_vec(); // Σ degrees per community
         let two_m_sq = 2.0 * m * m;
+        // Weight from the current node to each community (sparse reset).
+        let mut k_in = vec![0.0f64; n];
+        let mut seen = vec![false; n];
+        let mut touched: Vec<usize> = Vec::new();
 
         loop {
             let mut moved = false;
             for i in 0..n {
+                c.step(1 + adj[i].len())?;
                 let ci = comm[i];
                 // Tentatively remove `i` from its community.
                 sigma_tot[ci] -= deg[i];
 
                 // Weight from `i` to each neighbouring community.
-                let mut k_in: HashMap<usize, f64> = HashMap::new();
                 for &(j, w) in &adj[i] {
                     if j != i {
-                        *k_in.entry(comm[j]).or_insert(0.0) += w;
+                        let cj = comm[j];
+                        if !seen[cj] {
+                            seen[cj] = true;
+                            touched.push(cj);
+                        }
+                        k_in[cj] += w;
                     }
                 }
+                touched.sort_unstable();
 
                 // Baseline gain: re-joining the original community.
-                let base = k_in.get(&ci).copied().unwrap_or(0.0);
+                let base = if seen[ci] { k_in[ci] } else { 0.0 };
                 let mut best_comm = ci;
                 let mut best_gain = base / m - sigma_tot[ci] * deg[i] / two_m_sq;
 
-                for (&c, &w) in &k_in {
-                    let gain = w / m - sigma_tot[c] * deg[i] / two_m_sq;
+                for &cc in &touched {
+                    let gain = k_in[cc] / m - sigma_tot[cc] * deg[i] / two_m_sq;
                     if gain > best_gain + 1e-12 {
                         best_gain = gain;
-                        best_comm = c;
+                        best_comm = cc;
                     }
                 }
+                for &cc in &touched {
+                    k_in[cc] = 0.0;
+                    seen[cc] = false;
+                }
+                touched.clear();
 
                 sigma_tot[best_comm] += deg[i];
                 comm[i] = best_comm;
@@ -952,7 +1314,7 @@ impl GraphView {
                 break;
             }
         }
-        comm
+        Ok(comm)
     }
 
     // ---- directed-modularity Louvain --------------------------------------
@@ -1048,8 +1410,9 @@ impl GraphView {
             }
 
             // --- aggregate communities into directed super-nodes ---
+            // (an ordered map: the adjacency lists come out sorted)
             let mut new_self = vec![0.0f64; k];
-            let mut new_edge: HashMap<(usize, usize), f64> = HashMap::new();
+            let mut new_edge: BTreeMap<(usize, usize), f64> = BTreeMap::new();
             for u in 0..cur_n {
                 let cu = renumbered[u];
                 new_self[cu] += self_w[u];
@@ -1109,6 +1472,10 @@ impl GraphView {
         let mut sigma_out: Vec<f64> = k_out.to_vec(); // Σ out-degree per community
         let mut sigma_in: Vec<f64> = k_in.to_vec(); // Σ in-degree per community
         let m_sq = m * m;
+        // Weight between the current node and each community (sparse reset).
+        let mut k_to = vec![0.0f64; n];
+        let mut seen = vec![false; n];
+        let mut touched: Vec<usize> = Vec::new();
 
         loop {
             let mut moved = false;
@@ -1121,31 +1488,39 @@ impl GraphView {
                 // Combined directed weight between `i` and each neighbouring
                 // community: out-edges i→C plus in-edges C→i (j == i excluded;
                 // `i` is now isolated).
-                let mut k_to: HashMap<usize, f64> = HashMap::new();
-                for &(j, w) in &out[i] {
+                for &(j, w) in out[i].iter().chain(&in_[i]) {
                     if j != i {
-                        *k_to.entry(comm[j]).or_insert(0.0) += w;
+                        let cj = comm[j];
+                        if !seen[cj] {
+                            seen[cj] = true;
+                            touched.push(cj);
+                        }
+                        k_to[cj] += w;
                     }
                 }
-                for &(j, w) in &in_[i] {
-                    if j != i {
-                        *k_to.entry(comm[j]).or_insert(0.0) += w;
-                    }
-                }
+                // Ascending community ids: equal gains go to the smallest
+                // (deterministic; review analytics#3).
+                touched.sort_unstable();
 
                 // Baseline: re-joining the original community.
-                let base = k_to.get(&ci).copied().unwrap_or(0.0);
+                let base = if seen[ci] { k_to[ci] } else { 0.0 };
                 let mut best_comm = ci;
                 let mut best_gain =
                     base / m - (k_out[i] * sigma_in[ci] + k_in[i] * sigma_out[ci]) / m_sq;
 
-                for (&c, &w) in &k_to {
-                    let gain = w / m - (k_out[i] * sigma_in[c] + k_in[i] * sigma_out[c]) / m_sq;
+                for &cc in &touched {
+                    let gain =
+                        k_to[cc] / m - (k_out[i] * sigma_in[cc] + k_in[i] * sigma_out[cc]) / m_sq;
                     if gain > best_gain + 1e-12 {
                         best_gain = gain;
-                        best_comm = c;
+                        best_comm = cc;
                     }
                 }
+                for &cc in &touched {
+                    k_to[cc] = 0.0;
+                    seen[cc] = false;
+                }
+                touched.clear();
 
                 sigma_out[best_comm] += k_out[i];
                 sigma_in[best_comm] += k_in[i];
@@ -1310,15 +1685,15 @@ impl GraphView {
         ns
     }
 
-    /// Unbounded single-source BFS over out-edges; dense distances, `u32::MAX`
-    /// for unreachable nodes.
-    fn out_bfs_dist(&self, src_i: usize) -> Vec<u32> {
-        self.bounded_out_bfs(src_i, u32::MAX)
-    }
-
-    /// Single-source BFS over out-edges expanding at most `max_hops` levels.
-    /// Nodes beyond the budget keep `u32::MAX`.
-    fn bounded_out_bfs(&self, src_i: usize, max_hops: u32) -> Vec<u32> {
+    /// Single-source BFS over out-edges expanding at most `max_hops` levels
+    /// (`u32::MAX`: unbounded), polling `c`. Nodes beyond the budget keep
+    /// `u32::MAX`.
+    fn bounded_out_bfs_cancellable(
+        &self,
+        src_i: usize,
+        max_hops: u32,
+        c: &mut Interrupt<'_>,
+    ) -> Result<Vec<u32>> {
         let n = self.nodes.len();
         let mut dist = vec![u32::MAX; n];
         dist[src_i] = 0;
@@ -1329,6 +1704,7 @@ impl GraphView {
             if d >= max_hops {
                 continue; // budget exhausted — do not expand further
             }
+            c.step(1 + self.out_ptr[u + 1] - self.out_ptr[u])?;
             for &v in &self.out_adj[self.out_ptr[u]..self.out_ptr[u + 1]] {
                 if dist[v] == u32::MAX {
                     dist[v] = d + 1;
@@ -1336,19 +1712,22 @@ impl GraphView {
                 }
             }
         }
-        dist
+        Ok(dist)
     }
 
     /// Undirected BFS from dense `src`; returns `(farthest_dense, farthest_dist,
     /// distances)` with `u32::MAX` for unreachable nodes. The farthest node is
     /// the smallest dense index attaining the maximum distance (deterministic).
-    fn undirected_bfs(&self, src: usize) -> (usize, u32, Vec<u32>) {
+    fn undirected_bfs(&self, src: usize, c: &mut Interrupt<'_>) -> Result<(usize, u32, Vec<u32>)> {
         let n = self.nodes.len();
         let mut dist = vec![u32::MAX; n];
         dist[src] = 0;
         let mut queue = VecDeque::new();
         queue.push_back(src);
         while let Some(u) = queue.pop_front() {
+            c.step(
+                1 + self.out_ptr[u + 1] - self.out_ptr[u] + self.in_ptr[u + 1] - self.in_ptr[u],
+            )?;
             let d = dist[u];
             for &v in self.out_adj[self.out_ptr[u]..self.out_ptr[u + 1]]
                 .iter()
@@ -1367,7 +1746,7 @@ impl GraphView {
                 far = i;
             }
         }
-        (far, far_d, dist)
+        Ok((far, far_d, dist))
     }
 
     // ---- clustering coefficient -------------------------------------------
@@ -1375,54 +1754,89 @@ impl GraphView {
     /// Local clustering coefficient of `id`: the fraction of pairs among `id`'s
     /// undirected neighbours that are themselves adjacent. `Some(0.0)` when `id`
     /// has fewer than two neighbours; `None` if `id` is not a node.
+    ///
+    /// `O(d² log d)` for a node of degree `d` (every neighbour pair).
     pub fn local_clustering_coefficient(&self, id: EntityLiteralId) -> Option<f64> {
-        let i = *self.id_to_idx.get(&id)?;
+        infallible(self.local_clustering_coefficient_cancellable(id, &mut Interrupt::none()))
+    }
+
+    /// [`local_clustering_coefficient`](Self::local_clustering_coefficient),
+    /// polling `c`.
+    pub(crate) fn local_clustering_coefficient_cancellable(
+        &self,
+        id: EntityLiteralId,
+        c: &mut Interrupt<'_>,
+    ) -> Result<Option<f64>> {
+        let Some(&i) = self.id_to_idx.get(&id) else {
+            return Ok(None);
+        };
         let nbrs = self.undirected_neighbors(i);
         let k = nbrs.len();
         if k < 2 {
-            return Some(0.0);
+            return Ok(Some(0.0));
         }
-        let mut links = 0usize;
+        let links = self.linked_neighbor_pairs(&nbrs, c)?;
+        let possible = k * (k - 1) / 2;
+        Ok(Some(links as f64 / possible as f64))
+    }
+
+    /// The number of adjacent pairs among `nbrs` (polling `c`).
+    fn linked_neighbor_pairs(&self, nbrs: &[usize], c: &mut Interrupt<'_>) -> Result<u64> {
+        let mut links = 0u64;
         for (ai, &a) in nbrs.iter().enumerate() {
+            c.step(nbrs.len() - ai)?;
             for &b in &nbrs[ai + 1..] {
                 if self.undirected_adjacent(a, b) {
                     links += 1;
                 }
             }
         }
-        let possible = k * (k - 1) / 2;
-        Some(links as f64 / possible as f64)
+        Ok(links)
     }
 
     /// Global clustering coefficient (transitivity): `3 · triangles / wedges`,
     /// where a wedge is an undirected path of length two centred on a node.
     /// `0.0` when the graph has no wedges.
     pub fn global_clustering_coefficient(&self) -> f64 {
+        infallible(self.global_clustering_coefficient_cancellable(&mut Interrupt::none()))
+    }
+
+    /// [`global_clustering_coefficient`](Self::global_clustering_coefficient),
+    /// polling `c`.
+    pub(crate) fn global_clustering_coefficient_cancellable(
+        &self,
+        c: &mut Interrupt<'_>,
+    ) -> Result<f64> {
         let n = self.nodes.len();
         let mut wedges = 0u64;
         for i in 0..n {
             let k = self.undirected_neighbors(i).len() as u64;
+            c.step(k as usize)?;
             wedges += k * k.saturating_sub(1) / 2;
         }
         if wedges == 0 {
-            return 0.0;
+            return Ok(0.0);
         }
-        (3 * self.triangle_count()) as f64 / wedges as f64
+        Ok((3 * self.triangle_count_cancellable(c)?) as f64 / wedges as f64)
     }
 
     /// Number of triangles through `id` (undirected). `None` if `id` is absent.
+    /// `O(d² log d)` for a node of degree `d`.
     pub fn node_triangle_count(&self, id: EntityLiteralId) -> Option<u64> {
-        let i = *self.id_to_idx.get(&id)?;
+        infallible(self.node_triangle_count_cancellable(id, &mut Interrupt::none()))
+    }
+
+    /// [`node_triangle_count`](Self::node_triangle_count), polling `c`.
+    pub(crate) fn node_triangle_count_cancellable(
+        &self,
+        id: EntityLiteralId,
+        c: &mut Interrupt<'_>,
+    ) -> Result<Option<u64>> {
+        let Some(&i) = self.id_to_idx.get(&id) else {
+            return Ok(None);
+        };
         let nbrs = self.undirected_neighbors(i);
-        let mut t = 0u64;
-        for (ai, &a) in nbrs.iter().enumerate() {
-            for &b in &nbrs[ai + 1..] {
-                if self.undirected_adjacent(a, b) {
-                    t += 1;
-                }
-            }
-        }
-        Some(t)
+        Ok(Some(self.linked_neighbor_pairs(&nbrs, c)?))
     }
 
     // ---- diameter estimation ----------------------------------------------
@@ -1433,20 +1847,25 @@ impl GraphView {
     /// diameter (usually tight); exact computation is O(V·(V+E)) and avoided.
     /// Returns 0 for an empty or single-node graph.
     pub fn diameter_estimate(&self) -> u32 {
+        infallible(self.diameter_estimate_cancellable(&mut Interrupt::none()))
+    }
+
+    /// [`diameter_estimate`](Self::diameter_estimate), polling `c`.
+    pub(crate) fn diameter_estimate_cancellable(&self, c: &mut Interrupt<'_>) -> Result<u32> {
         let n = self.nodes.len();
         if n <= 1 {
-            return 0;
+            return Ok(0);
         }
         let mut best = 0u32;
         let samples = 4usize.min(n);
         let step = (n / samples).max(1);
         for s in 0..samples {
             let seed = (s * step).min(n - 1);
-            let (u, _, _) = self.undirected_bfs(seed);
-            let (_, d, _) = self.undirected_bfs(u);
+            let (u, _, _) = self.undirected_bfs(seed, c)?;
+            let (_, d, _) = self.undirected_bfs(u, c)?;
             best = best.max(d);
         }
-        best
+        Ok(best)
     }
 
     // ---- neighbour-set similarity -----------------------------------------
@@ -1516,16 +1935,22 @@ impl GraphView {
     /// attach to high-degree nodes. Returns 0.0 for an edgeless graph or when
     /// every endpoint has identical degree (undefined correlation).
     pub fn degree_assortativity(&self) -> f64 {
+        infallible(self.degree_assortativity_cancellable(&mut Interrupt::none()))
+    }
+
+    /// [`degree_assortativity`](Self::degree_assortativity), polling `c`.
+    pub(crate) fn degree_assortativity_cancellable(&self, c: &mut Interrupt<'_>) -> Result<f64> {
         let n = self.nodes.len();
         let deg = |i: usize| -> f64 {
             ((self.out_ptr[i + 1] - self.out_ptr[i]) + (self.in_ptr[i + 1] - self.in_ptr[i])) as f64
         };
         let m = self.out_adj.len() as f64;
         if m == 0.0 {
-            return 0.0;
+            return Ok(0.0);
         }
         let (mut s_jk, mut s_sum, mut s_sq) = (0.0f64, 0.0f64, 0.0f64);
         for u in 0..n {
+            c.step(1 + self.out_ptr[u + 1] - self.out_ptr[u])?;
             let j = deg(u);
             for &v in &self.out_adj[self.out_ptr[u]..self.out_ptr[u + 1]] {
                 let k = deg(v);
@@ -1537,11 +1962,11 @@ impl GraphView {
         let mean = s_sum / m;
         let num = s_jk / m - mean * mean;
         let den = s_sq / m - mean * mean;
-        if den.abs() < f64::EPSILON {
+        Ok(if den.abs() < f64::EPSILON {
             0.0
         } else {
             num / den
-        }
+        })
     }
 
     // ---- label propagation communities ------------------------------------
@@ -1555,9 +1980,17 @@ impl GraphView {
     /// iteration cap). Final labels are compacted to 0-based community ids in
     /// first-seen order. Returns `entity_id → community id`.
     pub fn label_propagation(&self) -> HashMap<EntityLiteralId, usize> {
+        infallible(self.label_propagation_cancellable(&mut Interrupt::none()))
+    }
+
+    /// [`label_propagation`](Self::label_propagation), polling `c`.
+    pub(crate) fn label_propagation_cancellable(
+        &self,
+        c: &mut Interrupt<'_>,
+    ) -> Result<HashMap<EntityLiteralId, usize>> {
         let n = self.nodes.len();
         if n == 0 {
-            return HashMap::new();
+            return Ok(HashMap::new());
         }
         let mut label: Vec<usize> = (0..n).collect();
         const MAX_ITERS: usize = 100;
@@ -1565,6 +1998,7 @@ impl GraphView {
             let mut changed = false;
             for u in 0..n {
                 let nbrs = self.undirected_neighbors(u);
+                c.step(nbrs.len())?;
                 if nbrs.is_empty() {
                     continue;
                 }
@@ -1606,7 +2040,7 @@ impl GraphView {
             let cid = *remap.entry(label[i]).or_insert(next);
             result.insert(id, cid);
         }
-        result
+        Ok(result)
     }
 
     // ---- personalized PageRank --------------------------------------------
@@ -1623,16 +2057,34 @@ impl GraphView {
         max_iters: usize,
         tol: f64,
     ) -> HashMap<EntityLiteralId, f64> {
+        infallible(self.personalized_pagerank_cancellable(
+            sources,
+            damping,
+            max_iters,
+            tol,
+            &mut Interrupt::none(),
+        ))
+    }
+
+    /// [`personalized_pagerank`](Self::personalized_pagerank), polling `c`.
+    pub(crate) fn personalized_pagerank_cancellable(
+        &self,
+        sources: &[EntityLiteralId],
+        damping: f64,
+        max_iters: usize,
+        tol: f64,
+        c: &mut Interrupt<'_>,
+    ) -> Result<HashMap<EntityLiteralId, f64>> {
         let n = self.nodes.len();
         if n == 0 {
-            return HashMap::new();
+            return Ok(HashMap::new());
         }
         let src_idx: Vec<usize> = sources
             .iter()
             .filter_map(|s| self.id_to_idx.get(s).copied())
             .collect();
         if src_idx.is_empty() {
-            return HashMap::new();
+            return Ok(HashMap::new());
         }
         let mut teleport = vec![0.0f64; n];
         let share = 1.0 / src_idx.len() as f64;
@@ -1652,6 +2104,7 @@ impl GraphView {
                 next[i] = base * teleport[i];
             }
             for u in 0..n {
+                c.step(1 + out_deg[u])?;
                 if out_deg[u] > 0 {
                     let contrib = damping * rank[u] / out_deg[u] as f64;
                     for &v in &self.out_adj[self.out_ptr[u]..self.out_ptr[u + 1]] {
@@ -1669,11 +2122,12 @@ impl GraphView {
                 break;
             }
         }
-        self.nodes
+        Ok(self
+            .nodes
             .iter()
             .enumerate()
             .map(|(i, &id)| (id, rank[i]))
-            .collect()
+            .collect())
     }
 
     // ---- k-hop neighbourhood queries --------------------------------------
@@ -1682,39 +2136,61 @@ impl GraphView {
     /// depth `k`), in ascending id order. `k == 0` yields `[src]`. Empty when
     /// `src` is absent or the frontier is empty.
     pub fn khop_neighbors(&self, src: EntityLiteralId, k: u32) -> Vec<EntityLiteralId> {
+        infallible(self.khop_neighbors_cancellable(src, k, &mut Interrupt::none()))
+    }
+
+    /// [`khop_neighbors`](Self::khop_neighbors), polling `c`.
+    pub(crate) fn khop_neighbors_cancellable(
+        &self,
+        src: EntityLiteralId,
+        k: u32,
+        c: &mut Interrupt<'_>,
+    ) -> Result<Vec<EntityLiteralId>> {
         // `u32::MAX` is `bounded_out_bfs`'s unreachable-distance sentinel; an
         // exact frontier at that depth is meaningless (matching it would return
         // the *unreachable* set instead), so treat it as an empty frontier. This
         // also handles a caller passing a negative/overflowing hop count that
         // saturates to `u32::MAX`.
         if k == u32::MAX {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let Some(&si) = self.id_to_idx.get(&src) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
-        let dist = self.bounded_out_bfs(si, k);
-        self.nodes
+        let dist = self.bounded_out_bfs_cancellable(si, k, c)?;
+        Ok(self
+            .nodes
             .iter()
             .enumerate()
             .filter(|&(i, _)| dist[i] == k)
             .map(|(_, &id)| id)
-            .collect()
+            .collect())
     }
 
     /// Entity ids **within** `k` out-hops of `src` (distances `1..=k`), excluding
     /// `src`, in ascending id order. Empty when `src` is absent.
     pub fn khop_all_neighbors(&self, src: EntityLiteralId, k: u32) -> Vec<EntityLiteralId> {
+        infallible(self.khop_all_neighbors_cancellable(src, k, &mut Interrupt::none()))
+    }
+
+    /// [`khop_all_neighbors`](Self::khop_all_neighbors), polling `c`.
+    pub(crate) fn khop_all_neighbors_cancellable(
+        &self,
+        src: EntityLiteralId,
+        k: u32,
+        c: &mut Interrupt<'_>,
+    ) -> Result<Vec<EntityLiteralId>> {
         let Some(&si) = self.id_to_idx.get(&src) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
-        let dist = self.bounded_out_bfs(si, k);
-        self.nodes
+        let dist = self.bounded_out_bfs_cancellable(si, k, c)?;
+        Ok(self
+            .nodes
             .iter()
             .enumerate()
             .filter(|&(i, _)| dist[i] != u32::MAX && dist[i] >= 1)
             .map(|(_, &id)| id)
-            .collect()
+            .collect())
     }
 
     /// Number of entities at exactly `k` out-hops of `src`. `0` if `src` absent.
@@ -1726,17 +2202,24 @@ impl GraphView {
     /// excluding `src`. `max_hops == u32::MAX` ⇒ every reachable node. `0` if
     /// `src` is absent.
     pub fn bfs_count(&self, src: EntityLiteralId, max_hops: u32) -> usize {
+        infallible(self.bfs_count_cancellable(src, max_hops, &mut Interrupt::none()))
+    }
+
+    /// [`bfs_count`](Self::bfs_count), polling `c`.
+    pub(crate) fn bfs_count_cancellable(
+        &self,
+        src: EntityLiteralId,
+        max_hops: u32,
+        c: &mut Interrupt<'_>,
+    ) -> Result<usize> {
         let Some(&si) = self.id_to_idx.get(&src) else {
-            return 0;
+            return Ok(0);
         };
-        let dist = if max_hops == u32::MAX {
-            self.out_bfs_dist(si)
-        } else {
-            self.bounded_out_bfs(si, max_hops)
-        };
-        (0..self.nodes.len())
+        // (`u32::MAX` hops is the unbounded BFS of `out_bfs_dist`.)
+        let dist = self.bounded_out_bfs_cancellable(si, max_hops, c)?;
+        Ok((0..self.nodes.len())
             .filter(|&i| i != si && dist[i] != u32::MAX)
-            .count()
+            .count())
     }
 
     /// Every simple directed path starting at `src` with `1..=k` edges, each as
@@ -1750,23 +2233,35 @@ impl GraphView {
         k: u32,
         max_paths: usize,
     ) -> Vec<Vec<EntityLiteralId>> {
+        infallible(self.khop_enumerate_paths_cancellable(src, k, max_paths, &mut Interrupt::none()))
+    }
+
+    /// [`khop_enumerate_paths`](Self::khop_enumerate_paths), polling `c`.
+    pub(crate) fn khop_enumerate_paths_cancellable(
+        &self,
+        src: EntityLiteralId,
+        k: u32,
+        max_paths: usize,
+        c: &mut Interrupt<'_>,
+    ) -> Result<Vec<Vec<EntityLiteralId>>> {
         let mut out = Vec::new();
         let Some(&si) = self.id_to_idx.get(&src) else {
-            return out;
+            return Ok(out);
         };
         if k == 0 || max_paths == 0 {
-            return out;
+            return Ok(out);
         }
         let n = self.nodes.len();
         let mut visited = vec![false; n];
         let mut stack = vec![si];
         visited[si] = true;
-        self.enum_paths_dfs(si, k, &mut visited, &mut stack, &mut out, max_paths);
-        out
+        self.enum_paths_dfs(si, k, &mut visited, &mut stack, &mut out, max_paths, c)?;
+        Ok(out)
     }
 
     /// Recursive helper for [`GraphView::khop_enumerate_paths`]. Emits the path
     /// to each newly visited descendant before recursing deeper.
+    #[allow(clippy::too_many_arguments)]
     fn enum_paths_dfs(
         &self,
         u: usize,
@@ -1775,13 +2270,15 @@ impl GraphView {
         stack: &mut Vec<usize>,
         out: &mut Vec<Vec<EntityLiteralId>>,
         max_paths: usize,
-    ) {
+        c: &mut Interrupt<'_>,
+    ) -> Result<()> {
         if remaining == 0 || out.len() >= max_paths {
-            return;
+            return Ok(());
         }
         for &v in &self.out_adj[self.out_ptr[u]..self.out_ptr[u + 1]] {
+            c.step(1)?;
             if out.len() >= max_paths {
-                return;
+                return Ok(());
             }
             if visited[v] {
                 continue;
@@ -1789,10 +2286,11 @@ impl GraphView {
             visited[v] = true;
             stack.push(v);
             out.push(stack.iter().map(|&d| self.nodes[d]).collect());
-            self.enum_paths_dfs(v, remaining - 1, visited, stack, out, max_paths);
+            self.enum_paths_dfs(v, remaining - 1, visited, stack, out, max_paths, c)?;
             stack.pop();
             visited[v] = false;
         }
+        Ok(())
     }
 
     // ---- shortest-path counting -------------------------------------------
@@ -1802,10 +2300,21 @@ impl GraphView {
     /// `dst` is unreachable; `None` if either node is absent. Saturates rather
     /// than overflowing on pathological fan-out.
     pub fn count_shortest_paths(&self, src: EntityLiteralId, dst: EntityLiteralId) -> Option<u64> {
-        let si = *self.id_to_idx.get(&src)?;
-        let di = *self.id_to_idx.get(&dst)?;
+        infallible(self.count_shortest_paths_cancellable(src, dst, &mut Interrupt::none()))
+    }
+
+    /// [`count_shortest_paths`](Self::count_shortest_paths), polling `c`.
+    pub(crate) fn count_shortest_paths_cancellable(
+        &self,
+        src: EntityLiteralId,
+        dst: EntityLiteralId,
+        c: &mut Interrupt<'_>,
+    ) -> Result<Option<u64>> {
+        let (Some(&si), Some(&di)) = (self.id_to_idx.get(&src), self.id_to_idx.get(&dst)) else {
+            return Ok(None);
+        };
         if si == di {
-            return Some(1);
+            return Ok(Some(1));
         }
         let n = self.nodes.len();
         let mut dist = vec![-1i64; n];
@@ -1815,6 +2324,7 @@ impl GraphView {
         let mut queue = VecDeque::new();
         queue.push_back(si);
         while let Some(u) = queue.pop_front() {
+            c.step(1 + self.out_ptr[u + 1] - self.out_ptr[u])?;
             for &v in &self.out_adj[self.out_ptr[u]..self.out_ptr[u + 1]] {
                 if dist[v] < 0 {
                     dist[v] = dist[u] + 1;
@@ -1825,7 +2335,7 @@ impl GraphView {
                 }
             }
         }
-        Some(if dist[di] < 0 { 0 } else { sigma[di] })
+        Ok(Some(if dist[di] < 0 { 0 } else { sigma[di] }))
     }
 }
 
@@ -2046,7 +2556,12 @@ struct TopkState {
 /// deterministic iteration.
 ///
 /// Construction is O(E log E).  Dijkstra is O(E log V); weighted PageRank is
-/// O(V + E) per iteration; top-k complexity is documented on the query methods.
+/// O(V + E) per iteration; top-k complexity is documented on the query methods
+/// (the matcher keeps every complete match until it sorts: memory
+/// `O(matches)`, not `O(k)`).
+///
+/// Library API only: no SPARQL function or server path uses it (see the
+/// module docs, "Library-only APIs").
 pub struct WeightedGraphView {
     nodes: Vec<EntityLiteralId>,
     id_to_idx: HashMap<EntityLiteralId, usize>,
@@ -4157,5 +4672,188 @@ mod tests {
         // Sanity: v0=1, (v1,v2) an ordered pair of distinct children ⇒ 5·4 = 20
         // matches (the unconstrained injective enumeration over the fan-out).
         assert_eq!(memo_res.len(), 20);
+    }
+
+    /// A star `1 → 2..=5`, each leaf `l → l + 4`: several communities give
+    /// the same modularity gain, which `louvain` used to pick by `HashMap`
+    /// iteration order (review analytics#3).
+    fn tie_star() -> TripleStore {
+        let mut s = TripleStore::new();
+        for l in 2u32..=5 {
+            s.insert(IdTriple::new(1, 7, l));
+            s.insert(IdTriple::new(l, 7, l + 4));
+        }
+        s
+    }
+
+    #[test]
+    fn louvain_ties_break_the_same_way_every_run() {
+        let s = tie_star();
+        let first = GraphView::from_store(&s).louvain();
+        let first_d = GraphView::from_store(&s).louvain_directed();
+        for run in 0..32 {
+            // a fresh view (and fresh hash maps) every run
+            let g = GraphView::from_store(&s);
+            assert_eq!(g.louvain(), first, "louvain, run {run}");
+            assert_eq!(g.louvain_directed(), first_d, "louvain_directed, run {run}");
+        }
+        // The hub joins the community of its smallest equal-gain neighbour.
+        assert_eq!(first[&1], first[&2], "{first:?}");
+    }
+
+    /// Entity edges (two predicates on one pair, a self-loop, a cycle), and
+    /// literal objects, of which the entity view knows nothing.
+    fn mixed_store() -> TripleStore {
+        use crate::model::id::LITERAL_FIRST_ID;
+        let lit = |i: u32| LITERAL_FIRST_ID + i;
+        let mut s = TripleStore::new();
+        for (a, p, b) in [
+            (1, 1, 2),
+            (1, 2, 2),
+            (2, 1, 3),
+            (3, 1, 1),
+            (4, 1, 4),
+            (5, 1, 6),
+            (6, 2, 7),
+        ] {
+            s.insert(IdTriple::new(a, p, b));
+        }
+        for (a, p, l) in [(1, 3, 0), (2, 3, 0), (8, 3, 1), (7, 3, 2)] {
+            s.insert(IdTriple::new(a, p, lit(l)));
+        }
+        s
+    }
+
+    #[test]
+    fn entity_view_is_the_store_view_without_literal_objects() {
+        let s = mixed_store();
+        let csr = CsrGraph::build(&s).unwrap();
+        let ev = GraphView::from_csr(&csr);
+        let pairs: Vec<(EntityLiteralId, EntityLiteralId)> = s
+            .iter_all()
+            .filter(|t| crate::model::id::is_entity_id(t.obj))
+            .map(|t| (t.sub, t.obj))
+            .collect();
+        let want = infallible(GraphView::from_raw_pairs_cancellable(
+            pairs,
+            &mut Interrupt::none(),
+        ));
+        assert_eq!(ev.nodes, want.nodes);
+        assert_eq!(ev.id_to_idx, want.id_to_idx);
+        assert_eq!((&ev.out_ptr, &ev.out_adj), (&want.out_ptr, &want.out_adj));
+        assert_eq!((&ev.in_ptr, &ev.in_adj), (&want.in_ptr, &want.in_adj));
+        // CSR node index == dense index
+        for (i, &e) in ev.nodes.iter().enumerate() {
+            assert_eq!(csr.node_of(e), Some(i as u32));
+        }
+        // Literal objects are sinks: cycles and entity-to-entity paths agree.
+        let full = GraphView::from_store(&s);
+        assert_eq!(ev.has_cycle(), full.has_cycle());
+        for a in 1..=8 {
+            for b in 1..=8 {
+                if ev.contains(a) && ev.contains(b) {
+                    assert_eq!(ev.shortest_path(a, b), full.shortest_path(a, b), "{a} {b}");
+                    assert_eq!(
+                        ev.count_shortest_paths(a, b),
+                        full.count_shortest_paths(a, b),
+                        "{a} {b}"
+                    );
+                }
+            }
+        }
+        assert!(!ev.contains(8), "8 has only a literal object");
+        assert!(full.contains(8));
+    }
+
+    #[test]
+    fn cancellable_store_build_is_from_source() {
+        let s = mixed_store();
+        let a = GraphView::from_source(&s);
+        let b = GraphView::from_source_cancellable(&s, 0..8, &mut Interrupt::none()).unwrap();
+        assert_eq!(a.nodes, b.nodes);
+        assert_eq!((&a.out_ptr, &a.out_adj), (&b.out_ptr, &b.out_adj));
+        assert_eq!((&a.in_ptr, &a.in_adj), (&b.in_ptr, &b.in_adj));
+    }
+
+    #[test]
+    fn closeness_of_one_node_is_the_whole_graph_value() {
+        for s in [make_store(), mixed_store(), tie_star()] {
+            let g = GraphView::from_store(&s);
+            let all = g.closeness_centrality();
+            for (&id, &x) in &all {
+                assert_eq!(g.closeness_of(id), Some(x), "{id}");
+            }
+            assert_eq!(g.closeness_of(999), None);
+        }
+    }
+
+    /// Every cancellable algorithm stops with `Cancelled` once it polls a
+    /// raised flag (the engine-level tests raise it mid-run).
+    #[test]
+    fn graph_view_algorithms_poll_the_flag() {
+        let mut s = TripleStore::new();
+        for i in 0..20_000u32 {
+            s.insert(IdTriple::new(i, 1, i + 1));
+        }
+        let g = GraphView::from_store(&s);
+        let flag = AtomicBool::new(true);
+        let it = || Interrupt::new(Some(&flag));
+        let cancelled = |r: Result<()>| matches!(r, Err(GStoreError::Cancelled));
+        assert!(cancelled(g.has_cycle_cancellable(&mut it()).map(drop)));
+        assert!(cancelled(
+            g.weakly_connected_components_cancellable(&mut it())
+                .map(drop)
+        ));
+        assert!(cancelled(g.louvain_cancellable(&mut it()).map(drop)));
+        assert!(cancelled(
+            g.label_propagation_cancellable(&mut it()).map(drop)
+        ));
+        assert!(cancelled(
+            g.betweenness_centrality_cancellable(&mut it()).map(drop)
+        ));
+        assert!(cancelled(
+            g.closeness_of_cancellable(0, &mut it()).map(drop)
+        ));
+        assert!(cancelled(g.triangle_count_cancellable(&mut it()).map(drop)));
+        assert!(cancelled(
+            g.global_clustering_coefficient_cancellable(&mut it())
+                .map(drop)
+        ));
+        assert!(cancelled(
+            g.diameter_estimate_cancellable(&mut it()).map(drop)
+        ));
+        assert!(cancelled(
+            g.degree_assortativity_cancellable(&mut it()).map(drop)
+        ));
+        assert!(cancelled(
+            g.personalized_pagerank_cancellable(&[0], 0.85, 100, 1e-9, &mut it())
+                .map(drop)
+        ));
+        assert!(cancelled(
+            g.shortest_path_cancellable(0, 20_000, &mut it()).map(drop)
+        ));
+        assert!(cancelled(
+            g.khop_reachable_cancellable(0, 20_000, u32::MAX, &mut it())
+                .map(drop)
+        ));
+        assert!(cancelled(
+            g.count_shortest_paths_cancellable(0, 20_000, &mut it())
+                .map(drop)
+        ));
+        assert!(cancelled(
+            g.bfs_count_cancellable(0, u32::MAX, &mut it()).map(drop)
+        ));
+        assert!(cancelled(
+            g.khop_neighbors_cancellable(0, 19_999, &mut it()).map(drop)
+        ));
+        assert!(cancelled(
+            GraphView::from_source_cancellable(&s, 0..2, &mut it()).map(drop)
+        ));
+        let csr = CsrGraph::build(&s).unwrap();
+        assert!(cancelled(
+            GraphView::from_csr_cancellable(&csr, &mut it()).map(drop)
+        ));
+        // Without a flag nothing fails.
+        assert_eq!(g.bfs_count(0, u32::MAX), 20_000);
     }
 }

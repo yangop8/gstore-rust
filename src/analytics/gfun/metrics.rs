@@ -42,7 +42,18 @@
 //! [`pr`]). `PPR`, `maximumKplex` and `coreTruss` keep upstream's costs
 //! (random-walk counts, the exponential branch and bound per ego network,
 //! bounded to ego networks of 8192 vertices; see [`maximum_kplex`]).
-//! Every long loop polls the cancellation flag ([`GFunCtx::check_cancel`]).
+//! Every long loop polls the cancellation flag ([`GFunCtx::poll`]), inside
+//! a component's BFS or a hub's neighbourhood too: a weighted ticker charges
+//! each vertex expansion with its degree and polls every 4096 units (review
+//! analytics#8). `PR`, `louvain` and `labelProp` charge every sweep beyond
+//! the first [`FREE_ITERATION_SWEEPS`](super::FREE_ITERATION_SWEEPS)
+//! against [`GFunCtx::max_iteration_work`] (default
+//! [`MAX_ITERATION_WORK`](super::MAX_ITERATION_WORK)) and fail with a query
+//! error when it is spent before they converge — upstream runs up to 2^31
+//! sweeps for `tol < 0` / `increase < 0` (review gap-gfun-fuzz#2). The
+//! per-source functions keep one `n`-sized working set per call, reset
+//! sparsely (review analytics#7; `PPR`'s per-source `O(n)` scan is
+//! upstream's algorithm).
 
 mod grisu;
 mod kplex;
@@ -58,8 +69,11 @@ use super::fmt::{
     push_vert_list_json, JsonList,
 };
 use super::output_bound_exceeded;
-use super::traverse::{for_each_nbr, NbrOrder, NodeMarks};
-use super::{CsrGraph, Direction, GArgs, GFnKind, GFunCtx, GFunValue, Node, PredFilter};
+use super::traverse::{bfs_with, for_each_nbr, NbrOrder, NodeMarks};
+use super::{
+    CsrGraph, Direction, GArgs, GFnKind, GFunCtx, GFunValue, IterationBudget, Node, PredFilter,
+    Ticker,
+};
 use crate::dict::TermStr;
 use crate::error::{GStoreError, Result};
 use crate::model::id::EntityLiteralId;
@@ -127,16 +141,6 @@ impl BoundedList {
 // ---------------------------------------------------------------------------
 // small shared helpers
 // ---------------------------------------------------------------------------
-
-/// Poll cancellation every 1024 steps.
-#[inline]
-fn tick(ctx: &GFunCtx<'_>, i: usize) -> Result<()> {
-    if i & 0x3ff == 0 {
-        ctx.check_cancel()
-    } else {
-        Ok(())
-    }
-}
 
 /// An `i64` argument as the C `int` upstream parses it into (`stoi`),
 /// saturated instead of throwing.
@@ -330,6 +334,17 @@ pub fn pr(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
         .collect();
     let dangling: Vec<usize> = (0..n).filter(|&v| nei[v] == 0).collect();
     let exact = dangling.len().saturating_mul(n) <= PR_EXACT_DANGLING_WORK;
+    // One sweep's work: every vertex, every edge it spreads over, and the
+    // exact dangling additions (see `IterationBudget`).
+    let sweep_work = (n as u64 + 16)
+        .saturating_add(nei.iter().map(|&d| d as u64).sum::<u64>())
+        .saturating_add(if exact {
+            (dangling.len() as u64).saturating_mul(n as u64)
+        } else {
+            n as u64
+        });
+    let mut budget = IterationBudget::new(ctx, kind);
+    let mut ticker = Ticker::new(ctx, "pr");
     let nf = n as f64;
     let offset = (1.0 - alpha) / nf;
     let mut old = vec![1.0 / nf; n];
@@ -342,10 +357,11 @@ pub fn pr(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
         c <= i64::from(max_iter)
     } {
         ctx.check_cancel()?;
+        budget.charge(sweep_work)?;
         stop = true;
         let mut dangling_mass = 0.0;
         for vid in 0..n {
-            tick(ctx, vid)?;
+            ticker.step(1 + if nei[vid] == 0 && exact { n } else { nei[vid] })?;
             if nei[vid] == 0 {
                 let add = alpha * old[vid] / nf;
                 if exact {
@@ -428,20 +444,27 @@ fn triangle_count(ctx: &GFunCtx<'_>, f: &PredFilter, directed: bool) -> Result<i
     let mut s = NodeMarks::new(n);
     let mut nb = NodeMarks::new(n);
     let mut total: i64 = 0;
+    let mut ticker = Ticker::new(ctx, "triangleCounting");
+    let mut outs: Vec<Node> = Vec::new();
     for vid in 0..n as Node {
-        tick(ctx, vid as usize)?;
+        ticker.step(1)?;
         s.clear();
         if directed {
             g.for_each_in(vid, f, |x, _| {
                 s.mark(x);
             });
-            g.for_each_out(vid, f, |w, _| {
+            outs.clear();
+            g.for_each_out(vid, f, |w, _| outs.push(w));
+            for &w in &outs {
+                let mut work = 0;
                 g.for_each_out(w, f, |x, _| {
+                    work += 1;
                     if s.is_marked(x) {
                         total += 1;
                     }
                 });
-            });
+                ticker.step(work)?;
+            }
         } else {
             let set = nbr_set(g, vid, f);
             for &x in &set {
@@ -449,11 +472,14 @@ fn triangle_count(ctx: &GFunCtx<'_>, f: &PredFilter, directed: bool) -> Result<i
             }
             for &w in &set {
                 nb.clear();
+                let mut work = 0;
                 g.for_each_both(w, f, |x, _, _| {
+                    work += 1;
                     if nb.mark(x) && s.is_marked(x) {
                         total += 1;
                     }
                 });
+                ticker.step(work)?;
             }
         }
     }
@@ -484,13 +510,16 @@ fn triangle_count(ctx: &GFunCtx<'_>, f: &PredFilter, directed: bool) -> Result<i
 pub fn closeness_centrality(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     let g = ctx.csr;
     let mut out = BoundedList::new(ctx, GFnKind::ClosenessCentrality);
+    let mut marks = NodeMarks::new(g.num_nodes());
+    let mut ticker = Ticker::new(ctx, "closenessCentrality");
     for src in a.distinct_srcs() {
         ctx.check_cancel()?;
         let (mut cnt, mut sum) = (1i32, 0i32);
         if let Some(u) = src.node {
             cnt = 0;
-            let _ = super::traverse::bfs(
+            let r = bfs_with(
                 g,
+                &mut marks,
                 u,
                 &a.preds,
                 Direction::from_directed(a.directed),
@@ -499,9 +528,15 @@ pub fn closeness_centrality(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
                 |_, d| {
                     cnt = cnt.wrapping_add(1);
                     sum = sum.wrapping_add(d as i32);
-                    std::ops::ControlFlow::<()>::Continue(())
+                    match ticker.step(1) {
+                        Ok(()) => std::ops::ControlFlow::Continue(()),
+                        Err(e) => std::ops::ControlFlow::Break(e),
+                    }
                 },
             );
+            if let std::ops::ControlFlow::Break(e) = r {
+                return Err(e);
+            }
         }
         let mut x = f64::from(cnt.wrapping_sub(1)) / f64::from(sum);
         if x.is_nan() {
@@ -557,13 +592,17 @@ pub fn closeness_centrality(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
 /// `{}`, the value is the doc's 6.5).
 pub fn betweenness_centrality(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     let mut out = BoundedList::new(ctx, GFnKind::BetweennessCentrality);
+    // One scratch for every source (review analytics#7: no `n`-sized
+    // allocation per binding; it is reset sparsely).
+    let mut scratch = ScaleScratch::new(ctx.csr.num_nodes());
+    let mut ticker = Ticker::new(ctx, "betweennessCentrality");
     for src in a.distinct_srcs() {
         ctx.check_cancel()?;
         if src.is_missing() {
             continue;
         }
         let x = match src.node {
-            Some(u) => betweenness_value(ctx, &a.preds, u, a.directed)?,
+            Some(u) => betweenness_value(ctx, &a.preds, u, a.directed, &mut scratch, &mut ticker)?,
             None => 0.0,
         };
         let e = out.item()?;
@@ -576,26 +615,49 @@ pub fn betweenness_centrality(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue>
     Ok(GFunValue::Json(out.into_paths()?))
 }
 
-fn betweenness_value(ctx: &GFunCtx<'_>, f: &PredFilter, id: Node, directed: bool) -> Result<f64> {
+fn betweenness_value(
+    ctx: &GFunCtx<'_>,
+    f: &PredFilter,
+    id: Node,
+    directed: bool,
+    scratch: &mut ScaleScratch,
+    ticker: &mut Ticker<'_, '_>,
+) -> Result<f64> {
     if f.is_empty() {
         return Ok(0.0);
     }
     let g = ctx.csr;
-    let mut vertex: Vec<Node> =
-        super::traverse::bfs_order(g, id, f, Direction::Both, NbrOrder::PerPredOutThenIn)
-            .into_iter()
-            .map(|(v, _)| v)
-            .filter(|&v| v != id)
-            .collect();
+    // The undirected component of `id` (distances do not matter here).
+    let mut vertex: Vec<Node> = Vec::new();
+    let r = bfs_with(
+        g,
+        &mut scratch.marks,
+        id,
+        f,
+        Direction::Both,
+        NbrOrder::PerPredOutThenIn,
+        None,
+        |v, _| {
+            if v != id {
+                vertex.push(v);
+            }
+            match ticker.step(1) {
+                Ok(()) => std::ops::ControlFlow::Continue(()),
+                Err(e) => std::ops::ControlFlow::Break(e),
+            }
+        },
+    );
+    if let std::ops::ControlFlow::Break(e) = r {
+        return Err(e);
+    }
     if vertex.len() <= 1 {
         return Ok(0.0);
     }
     vertex.sort_unstable();
     let mut ret = 0.0;
-    let mut scratch = ScaleScratch::new(g.num_nodes());
     for s in vertex {
         ctx.check_cancel()?;
-        ret += shortest_path_scale_pass_id(g, f, s, id, directed, &mut scratch);
+        ret += shortest_path_scale_pass_id(g, f, s, id, directed, scratch, ticker)?;
     }
     if !directed {
         ret /= 2.0;
@@ -609,6 +671,7 @@ struct ScaleScratch {
     wp: Vec<i32>,
     reach: Vec<bool>,
     touched: Vec<Node>,
+    marks: NodeMarks,
 }
 
 impl ScaleScratch {
@@ -619,6 +682,7 @@ impl ScaleScratch {
             wp: vec![0; n],
             reach: vec![false; n],
             touched: Vec::new(),
+            marks: NodeMarks::new(n),
         }
     }
 }
@@ -632,9 +696,10 @@ fn shortest_path_scale_pass_id(
     pass: Node,
     directed: bool,
     sc: &mut ScaleScratch,
-) -> f64 {
+    ticker: &mut Ticker<'_, '_>,
+) -> Result<f64> {
     if s == pass {
-        return 0.0;
+        return Ok(0.0);
     }
     for &t in &sc.touched {
         sc.dist[t as usize] = u32::MAX;
@@ -653,13 +718,16 @@ fn shortest_path_scale_pass_id(
         let v = order[head];
         head += 1;
         let d = sc.dist[v as usize];
+        let mut work = 0;
         for_each_nbr(g, v, f, dir, NbrOrder::PerPredOutThenIn, |t, _, _| {
+            work += 1;
             if sc.dist[t as usize] == u32::MAX {
                 sc.dist[t as usize] = d + 1;
                 sc.touched.push(t);
                 order.push(t);
             }
         });
+        ticker.step(work)?;
     }
     // Predecessors of t with the hop weight (number of distinct predicates
     // joining them), from t's side: p -x-> t is an in-edge of t; when
@@ -695,6 +763,7 @@ fn shortest_path_scale_pass_id(
         sc.reach[pass as usize] = true;
     }
     for &t in order.iter().skip(1) {
+        ticker.step(1)?;
         let ps = preds_of(t, &sc.dist);
         let (mut w, mut wp, mut reach) = (0i32, 0i32, false);
         for (p, c) in ps {
@@ -726,7 +795,7 @@ fn shortest_path_scale_pass_id(
         }
         ret += f64::from(pass_num) / f64::from(total_num);
     }
-    ret
+    Ok(ret)
 }
 
 // ---------------------------------------------------------------------------
@@ -770,6 +839,7 @@ pub fn cluster_coeff(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     }
     let mut out = BoundedList::new(ctx, GFnKind::ClusterCoeff);
     let mut done_once = false;
+    let mut marks = NodeMarks::new(ctx.csr.num_nodes());
     for src in srcs {
         ctx.check_cancel()?;
         if src.is_missing() {
@@ -780,7 +850,7 @@ pub fn cluster_coeff(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
             }
             continue;
         }
-        let x = local_cluster_coeff(ctx.csr, &a.preds, src.node, a.directed);
+        let x = local_cluster_coeff(ctx, &a.preds, src.node, a.directed, &mut marks)?;
         let e = out.item()?;
         e.push_str("{\"src\":");
         push_json_quoted(e, &ctx.gnode_str(&src));
@@ -799,15 +869,18 @@ fn global_cluster_coeff(ctx: &GFunCtx<'_>, f: &PredFilter) -> Result<f64> {
     let n = g.num_nodes();
     let mut in_s = NodeMarks::new(n);
     let (mut closed, mut open) = (0i32, 0i32);
+    let mut ticker = Ticker::new(ctx, "clusterCoeff");
     for c in 0..n as Node {
-        tick(ctx, c as usize)?;
+        ticker.step(1)?;
         in_s.clear();
         let set = nbr_set(g, c, f);
         for &x in &set {
             in_s.mark(x);
         }
         for &w in &set {
-            for x in nbr_set(g, w, f) {
+            let nw = nbr_set(g, w, f);
+            ticker.step(nw.len())?;
+            for x in nw {
                 if in_s.is_marked(x) {
                     closed = closed.wrapping_add(1);
                 } else if x != c {
@@ -826,28 +899,40 @@ fn global_cluster_coeff(ctx: &GFunCtx<'_>, f: &PredFilter) -> Result<f64> {
     })
 }
 
-fn local_cluster_coeff(g: &CsrGraph, f: &PredFilter, u: Option<Node>, directed: bool) -> f64 {
+fn local_cluster_coeff(
+    ctx: &GFunCtx<'_>,
+    f: &PredFilter,
+    u: Option<Node>,
+    directed: bool,
+    marks: &mut NodeMarks,
+) -> Result<f64> {
     if f.is_empty() {
-        return -1.0;
+        return Ok(-1.0);
     }
     let Some(u) = u else {
-        return 0.0;
+        return Ok(0.0);
     };
-    let n = g.num_nodes();
-    let mut marks = NodeMarks::new(n);
+    let g = ctx.csr;
+    let mut ticker = Ticker::new(ctx, "clusterCoeff");
+    marks.clear();
     let (dins, maxns): (i32, i32) = if directed {
         let ins = g.distinct_neighbors(u, f, Direction::In);
         for &x in &ins {
             marks.mark(x);
         }
         let mut d = 0i32;
-        g.for_each_out(u, f, |w, _| {
+        let mut outs: Vec<Node> = Vec::new();
+        g.for_each_out(u, f, |w, _| outs.push(w));
+        for &w in &outs {
+            let mut work = 0;
             g.for_each_out(w, f, |x, _| {
+                work += 1;
                 if marks.is_marked(x) {
                     d = d.wrapping_add(1);
                 }
             });
-        });
+            ticker.step(work)?;
+        }
         let ns = nbr_set(g, u, f).len() as i32;
         (d, ns.wrapping_mul(ns.wrapping_sub(1)))
     } else {
@@ -857,7 +942,9 @@ fn local_cluster_coeff(g: &CsrGraph, f: &PredFilter, u: Option<Node>, directed: 
         }
         let mut d = 0i32;
         for &w in &set {
-            for x in nbr_set(g, w, f) {
+            let nw = nbr_set(g, w, f);
+            ticker.step(nw.len())?;
+            for x in nw {
                 if marks.is_marked(x) {
                     d = d.wrapping_add(1);
                 }
@@ -866,11 +953,11 @@ fn local_cluster_coeff(g: &CsrGraph, f: &PredFilter, u: Option<Node>, directed: 
         let ns = set.len() as i32;
         (d / 2, ns.wrapping_mul(ns.wrapping_sub(1)) / 2)
     };
-    if maxns == 0 {
+    Ok(if maxns == 0 {
         0.0
     } else {
         f64::from(dins) / f64::from(maxns)
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -931,12 +1018,18 @@ pub fn label_prop(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     let dbl_m = 2.0 * n as f64;
     let (mut old_q, mut old_num) = (-1.0f64, -1.0f64);
     let mut stable = 0i32;
+    // One iteration visits every vertex and edge twice (propagation, then
+    // modularity); see `IterationBudget`.
+    let sweep_work = 2 * (n as u64 + g.num_edges_with(f).saturating_mul(2)) + 16;
+    let mut budget = IterationBudget::new(ctx, GFnKind::LabelProp);
+    let mut ticker = Ticker::new(ctx, "labelProp");
     for _ in 1..=max_iter.max(0) {
         ctx.check_cancel()?;
+        budget.charge(sweep_work)?;
         // propagate
         for vid in 0..n {
-            tick(ctx, vid)?;
             let mut max_cnt = 0;
+            let mut work = 0;
             for_each_nbr(
                 g,
                 vid as Node,
@@ -944,6 +1037,7 @@ pub fn label_prop(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
                 dir,
                 NbrOrder::PerPredInThenOut,
                 |to, _, _| {
+                    work += 1;
                     let l = labels[to as usize] as usize;
                     if cnt[l] == 0 {
                         touched.push(l as u32);
@@ -954,6 +1048,7 @@ pub fn label_prop(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
                     }
                 },
             );
+            ticker.step(work)?;
             if max_cnt > 0 {
                 max_lbl.clear();
                 max_lbl.extend(
@@ -978,6 +1073,7 @@ pub fn label_prop(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
         let mut edge = vec![0i32; n];
         let mut deg = vec![0i32; n];
         for v in 0..n as Node {
+            ticker.step(1)?;
             let l = labels[v as usize];
             let li = l as usize;
             g.for_each_out(v, f, |to, _| {
@@ -1059,8 +1155,11 @@ pub fn wcc(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     let mut order = CxxUnorderedOrder::new();
     let mut ncomp = 0u32;
     let mut queue: VecDeque<Node> = VecDeque::new();
+    // Polled inside each component's BFS too: a giant component is one
+    // outer step (review analytics#8).
+    let mut ticker = Ticker::new(ctx, "wcc");
     for start in 0..n as Node {
-        tick(ctx, start as usize)?;
+        ticker.step(1)?;
         if comp[start as usize] != u32::MAX {
             continue;
         }
@@ -1068,6 +1167,7 @@ pub fn wcc(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
         order.insert(i64::from(cxx_int_id(g.entity_of(start))));
         queue.push_back(start);
         while let Some(u) = queue.pop_front() {
+            let mut work = 0;
             for_each_nbr(
                 g,
                 u,
@@ -1075,6 +1175,7 @@ pub fn wcc(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
                 Direction::Both,
                 NbrOrder::PerPredInThenOut,
                 |v, _, _| {
+                    work += 1;
                     if comp[v as usize] == u32::MAX {
                         comp[v as usize] = ncomp;
                         order.insert(i64::from(cxx_int_id(g.entity_of(v))));
@@ -1082,6 +1183,7 @@ pub fn wcc(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
                     }
                 },
             );
+            ticker.step(work)?;
         }
         ncomp += 1;
     }
@@ -1156,6 +1258,9 @@ pub fn louvain(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
             s.push_str(&cxx_int_id(m).to_string());
         }
         s.push(']');
+        if s.len() > ctx.max_output_bytes() {
+            return Err(output_bound_exceeded(kind, ctx.max_output_bytes()));
+        }
     }
     s.push_str("]}");
     Ok(GFunValue::Json(paths_json(&s)))
@@ -1207,6 +1312,8 @@ fn louvain_communities(
         }
     }
     let wget = |w: &Weights, a: u32, b: u32| w.get(&a).and_then(|x| x.get(&b)).copied();
+    let mut budget = IterationBudget::new(ctx, GFnKind::Louvain);
+    let mut ticker = Ticker::new(ctx, "louvain");
     loop {
         ctx.check_cancel()?;
         let mut s_in: BTreeMap<u32, f64> = BTreeMap::new();
@@ -1223,11 +1330,19 @@ fn louvain_communities(
                 *k_in.entry(*in_id).or_insert(0.0) += w;
             }
         }
+        let weight_entries: u64 = weights.values().map(|w| w.len() as u64).sum();
         for _ in 0..phase1_loop_num.max(0) {
             let mut phase1_finished = true;
             let keys: Vec<u32> = super_nodes.keys().copied().collect();
-            for (step, i) in keys.into_iter().enumerate() {
-                tick(ctx, step)?;
+            // A sweep tries every super-node against every community (plus
+            // a constant per super-node for its maps).
+            budget.charge(
+                (keys.len() as u64)
+                    .saturating_mul(community.len() as u64 + 16)
+                    .saturating_add(weight_entries),
+            )?;
+            for i in keys {
+                ticker.step(community.len() + weights.get(&i).map_or(0, |w| w.len()))?;
                 let own = super_nodes[&i];
                 let k_i = k_in.get(&i).copied().unwrap_or(0.0);
                 let mut acc: HashMap<u32, f64> = HashMap::new();
@@ -1375,12 +1490,13 @@ pub fn jaccard_similarity(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     let k = a.hop_limit();
     let r = a.ret_num_or(10);
     let mut out = BoundedList::new(ctx, GFnKind::JaccardSimilarity);
+    let mut visited = NodeMarks::new(ctx.csr.num_nodes());
     for src in a.distinct_srcs() {
         ctx.check_cancel()?;
         let Some(u) = src.node else {
             continue; // missing: wrapper returns; isolated: N(u) is empty
         };
-        for (v, js) in jaccard(ctx, &a.preds, u, k, r)? {
+        for (v, js) in jaccard(ctx, &a.preds, u, k, r, &mut visited)? {
             let e = out.item()?;
             e.push_str("{\"dst\":");
             e.push_str(&node_name(ctx, v));
@@ -1410,6 +1526,7 @@ fn jaccard(
     u: Node,
     k: i64,
     ret_num: i64,
+    visited: &mut NodeMarks,
 ) -> Result<Vec<(Node, f32)>> {
     let g = ctx.csr;
     let uids = nbr_set(g, u, f);
@@ -1422,7 +1539,7 @@ fn jaccard(
     let mut no_used: BTreeSet<Node> = BTreeSet::new();
     for &w in &uids {
         // per candidate: a hub's neighbour may itself be a hub
-        ctx.check_cancel()?;
+        ctx.poll("jaccard")?;
         let comp = nbr_set(g, w, f);
         let mut num: f32 = 0.0;
         let mut total = (uids.len() + comp.len()) as f32;
@@ -1449,7 +1566,7 @@ fn jaccard(
     }
     if k > 1 {
         for &w in &no_used {
-            ctx.check_cancel()?;
+            ctx.poll("jaccard")?;
             let comp = nbr_set(g, w, f);
             let mut num: f32 = 0.0;
             let mut total = (uids.len() + comp.len()) as f32;
@@ -1476,7 +1593,11 @@ fn jaccard(
     }
     sort_like_binary_insert(&mut js_list);
     if (js_list.len() as u64) < ret_num as u64 {
-        let khop = k_hop_neighbor(g, u, false, k, f, ret_num);
+        // The `kHopNeighbor` primitive the path family uses (one port,
+        // cancellable; review analytics#10).
+        let mut poll = super::paths::Poll::new(ctx);
+        let khop =
+            super::paths::k_hop_neighbor_nodes(g, visited, &mut poll, u, false, k, f, ret_num)?;
         let mut others: BTreeSet<Node> = BTreeSet::new();
         for v in khop {
             if !in_uids(v) && !no_used.contains(&v) && others.insert(v) {
@@ -1486,74 +1607,6 @@ fn jaccard(
     }
     js_list.truncate(ret_num.max(0) as usize);
     Ok(js_list)
-}
-
-/// `PathQueryHandler::kHopNeighbor` (kHopNeighbor.cpp:12-76): the vertices
-/// first reached at exactly `k` hops, level-synchronous BFS expanding (when
-/// undirected) all predicates' in-edges, then all out-edges; returns as
-/// soon as `retNum >= 0` vertices were collected (note `retNum = 0` still
-/// returns the first one). `k == 0` → empty.
-fn k_hop_neighbor(
-    g: &CsrGraph,
-    s: Node,
-    directed: bool,
-    k: i64,
-    f: &PredFilter,
-    ret_num: i64,
-) -> Vec<Node> {
-    let mut cnt: Vec<Node> = Vec::new();
-    let mut visited = vec![false; g.num_nodes()];
-    if s as usize >= visited.len() {
-        return cnt;
-    }
-    let mut cur: Vec<Node> = vec![s];
-    let mut next: Vec<Node> = Vec::new();
-    visited[s as usize] = true;
-    let mut k = k;
-    while k != 0 && !cur.is_empty() {
-        for &v in &cur {
-            for d in usize::from(directed)..=1 {
-                let mut hit = |n: Node| -> bool {
-                    if !visited[n as usize] {
-                        if k == 1 {
-                            cnt.push(n);
-                            if ret_num >= 0 && cnt.len() as u64 >= ret_num as u64 {
-                                return true;
-                            }
-                        } else {
-                            next.push(n);
-                        }
-                        visited[n as usize] = true;
-                    }
-                    false
-                };
-                let stop = if d == 1 {
-                    g.try_for_each_out(v, f, |n, _| {
-                        if hit(n) {
-                            std::ops::ControlFlow::Break(())
-                        } else {
-                            std::ops::ControlFlow::Continue(())
-                        }
-                    })
-                } else {
-                    g.try_for_each_in(v, f, |n, _| {
-                        if hit(n) {
-                            std::ops::ControlFlow::Break(())
-                        } else {
-                            std::ops::ControlFlow::Continue(())
-                        }
-                    })
-                };
-                if stop.is_break() {
-                    return cnt;
-                }
-            }
-        }
-        k -= 1;
-        std::mem::swap(&mut cur, &mut next);
-        next.clear();
-    }
-    cnt
 }
 
 // ---------------------------------------------------------------------------
@@ -1582,13 +1635,17 @@ fn k_hop_neighbor(
 pub fn degree_correlation(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     let k = a.hop_limit();
     let mut out = BoundedList::new(ctx, GFnKind::DegreeCorrelation);
+    let mut scratch = DegreeScratch::new(ctx.csr.num_nodes());
+    let mut ticker = Ticker::new(ctx, "degreeCorrelation");
     for src in a.distinct_srcs() {
         ctx.check_cancel()?;
         if src.is_missing() {
             continue;
         }
         let x = match src.node {
-            Some(u) if !a.preds.is_empty() => degree_correlation_value(ctx.csr, &a.preds, u, k),
+            Some(u) if !a.preds.is_empty() => {
+                degree_correlation_value(ctx.csr, &a.preds, u, k, &mut scratch, &mut ticker)?
+            }
             _ => 0.0,
         };
         let e = out.item()?;
@@ -1601,15 +1658,57 @@ pub fn degree_correlation(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     Ok(GFunValue::Json(out.into_paths()?))
 }
 
-fn degree_correlation_value(g: &CsrGraph, f: &PredFilter, u: Node, k: i64) -> f64 {
-    let n = g.num_nodes();
-    let mut dis: Vec<i64> = vec![-1; n];
-    let mut deg: Vec<i32> = vec![0; n];
-    let mut visited = NodeMarks::new(n);
+/// The per-source working set of [`degree_correlation`], allocated once per
+/// call and reset sparsely (only the entries a source touched), so many
+/// bindings do not cost `O(sources × n)` (review analytics#7).
+struct DegreeScratch {
+    dis: Vec<i64>,
+    deg: Vec<i32>,
+    visited: NodeMarks,
+    /// Nodes whose `dis` / `deg` the last source set.
+    touched: Vec<Node>,
+}
+
+impl DegreeScratch {
+    fn new(n: usize) -> DegreeScratch {
+        DegreeScratch {
+            dis: vec![-1; n],
+            deg: vec![0; n],
+            visited: NodeMarks::new(n),
+            touched: Vec::new(),
+        }
+    }
+
+    fn reset(&mut self) {
+        for &t in &self.touched {
+            self.dis[t as usize] = -1;
+            self.deg[t as usize] = 0;
+        }
+        self.touched.clear();
+        self.visited.clear();
+    }
+}
+
+fn degree_correlation_value(
+    g: &CsrGraph,
+    f: &PredFilter,
+    u: Node,
+    k: i64,
+    sc: &mut DegreeScratch,
+    ticker: &mut Ticker<'_, '_>,
+) -> Result<f64> {
+    sc.reset();
+    let DegreeScratch {
+        dis,
+        deg,
+        visited,
+        touched,
+    } = sc;
     let mut visited_list: Vec<Node> = Vec::new();
     let mut q: VecDeque<Node> = VecDeque::new();
     q.push_back(u);
     dis[u as usize] = 0;
+    touched.push(u);
     visited.mark(u);
     visited_list.push(u);
     let mut nl: Vec<Node> = Vec::new();
@@ -1621,10 +1720,14 @@ fn degree_correlation_value(g: &CsrGraph, f: &PredFilter, u: Node, k: i64) -> f6
             degree_num = degree_num.wrapping_add(1);
             nl.push(x);
             let dx = &mut dis[x as usize];
+            if *dx == -1 {
+                touched.push(x);
+            }
             if *dx == -1 || *dx > distance {
                 *dx = distance;
             }
         });
+        ticker.step(nl.len())?;
         deg[t as usize] = deg[t as usize].wrapping_add(degree_num);
         if dis[t as usize] <= k {
             nl.sort_unstable();
@@ -1639,7 +1742,7 @@ fn degree_correlation_value(g: &CsrGraph, f: &PredFilter, u: Node, k: i64) -> f6
         }
     }
     if visited_list.len() <= 1 {
-        return 0.0;
+        return Ok(0.0);
     }
     visited_list.sort_unstable();
     let mut pairs: Vec<(f64, f64)> = Vec::new();
@@ -1670,11 +1773,7 @@ fn degree_correlation_value(g: &CsrGraph, f: &PredFilter, u: Node, k: i64) -> f6
     let half = std::hint::black_box(0.5f64);
     s1 = s1.powf(half);
     s2 = s2.powf(half);
-    if s1 * s2 == 0.0 {
-        0.0
-    } else {
-        ret / (s1 * s2)
-    }
+    Ok(if s1 * s2 == 0.0 { 0.0 } else { ret / (s1 * s2) })
 }
 
 // ---------------------------------------------------------------------------
@@ -1703,6 +1802,7 @@ pub fn diameter_estimation(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     let mut best: u32 = 0;
     let mut marks = NodeMarks::new(n);
     let mut queue: VecDeque<(Node, u32)> = VecDeque::new();
+    let mut ticker = Ticker::new(ctx, "diameterEstimation");
     for s in 0..n as Node {
         if g.out_degree(s, f) == 0 {
             continue;
@@ -1712,12 +1812,15 @@ pub fn diameter_estimation(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
         marks.mark(s);
         queue.push_back((s, 0));
         while let Some((v, d)) = queue.pop_front() {
+            let mut work = 0;
             g.for_each_out(v, f, |t, _| {
+                work += 1;
                 if marks.mark(t) {
                     best = best.max(d + 1);
                     queue.push_back((t, d + 1));
                 }
             });
+            ticker.step(work)?;
         }
     }
     Ok(GFunValue::Json(paths_json(&best.to_string())))
@@ -1758,6 +1861,7 @@ pub fn confidence_degree(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     let mut marks = NodeMarks::new(n);
     let mut queue: VecDeque<(Node, u32)> = VecDeque::new();
     let mut s = String::from("[");
+    let mut ticker = Ticker::new(ctx, "confidenceDegree");
     for v in 0..n as Node {
         ctx.check_cancel()?;
         marks.clear();
@@ -1766,12 +1870,15 @@ pub fn confidence_degree(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
         let (mut cnt, mut sum) = (0u32, 0u32);
         while let Some((x, d)) = queue.pop_front() {
             cnt = cnt.wrapping_add(1);
+            let mut work = 0;
             g.for_each_both(x, &a.preds, |t, _, _| {
+                work += 1;
                 if marks.mark(t) {
                     sum = sum.wrapping_add(d + 1);
                     queue.push_back((t, d + 1));
                 }
             });
+            ticker.step(work)?;
         }
         let mut res = f64::from(cnt.wrapping_sub(1)) / f64::from(sum);
         if res.is_nan() {
@@ -1785,6 +1892,12 @@ pub fn confidence_degree(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
         s.push(',');
         s.push_str(&nlohmann_dump_f64(res));
         s.push(']');
+        if s.len() > ctx.max_output_bytes() {
+            return Err(output_bound_exceeded(
+                GFnKind::ConfidenceDegree,
+                ctx.max_output_bytes(),
+            ));
+        }
     }
     s.push(']');
     Ok(GFunValue::ResultsJson(s))
@@ -1827,9 +1940,12 @@ pub fn maximum_kplex(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     let k = i32::try_from(k)
         .map_err(|_| GStoreError::Query(format!("maximumKplex: k out of range ({k})")))?;
     let res = kplex::maximum_kplex(ctx, &a.preds, k)?;
-    Ok(GFunValue::Json(paths_json(&vertex_list_unquoted(
-        ctx, "kplex", &res,
-    ))))
+    Ok(GFunValue::Json(vertex_list_unquoted(
+        ctx,
+        GFnKind::MaximumKplex,
+        "kplex",
+        &res,
+    )?))
 }
 
 /// `coreTruss(preds, alpha, beta)` — the (alpha-core, beta-truss) remainder.
@@ -1861,19 +1977,27 @@ pub fn maximum_kplex(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
 pub fn core_truss(ctx: &GFunCtx<'_>, a: &GArgs) -> Result<GFunValue> {
     let num = |i: usize| a.nums.get(i).map_or(0, |&x| d2i(x));
     let res = kplex::core_truss(ctx, &a.preds, num(0), num(1))?;
-    Ok(GFunValue::Json(paths_json(&vertex_list_unquoted(
+    Ok(GFunValue::Json(vertex_list_unquoted(
         ctx,
+        GFnKind::CoreTruss,
         "coreTruss",
         &res,
-    ))))
+    )?))
 }
 
-/// `{"<key>":[a,b,…]}` with the vertices' strings spliced in unquoted.
-/// Vertex ids are upstream vertex ids (= node indices); an id without a node
-/// (the fake `0` of a graph without CSR vertices) prints entity id `v`'s
-/// string, as upstream's `getStringByID(v)` does.
-fn vertex_list_unquoted(ctx: &GFunCtx<'_>, key: &str, vs: &[i32]) -> String {
-    let mut s = format!("{{\"{key}\":[");
+/// `{"paths":[{"<key>":[a,b,…]}]}` with the vertices' strings spliced in
+/// unquoted. Vertex ids are upstream vertex ids (= node indices); an id
+/// without a node (the fake `0` of a graph without CSR vertices) prints
+/// entity id `v`'s string, as upstream's `getStringByID(v)` does.
+///
+/// Bounded while it is built: the call fails as soon as the text passes
+/// [`GFunCtx::max_output_bytes`] (review gap-gfun-fuzz#4) — `maximumKplex`'s
+/// fake solution alone can name vertex 0 up to 2^20 times, `coreTruss`
+/// once per peeled vertex — and the envelope is written in place (no second
+/// copy).
+fn vertex_list_unquoted(ctx: &GFunCtx<'_>, kind: GFnKind, key: &str, vs: &[i32]) -> Result<String> {
+    let max = ctx.max_output_bytes();
+    let mut s = format!("{{\"paths\":[{{\"{key}\":[");
     for (i, &v) in vs.iter().enumerate() {
         if i > 0 {
             s.push(',');
@@ -1884,9 +2008,12 @@ fn vertex_list_unquoted(ctx: &GFunCtx<'_>, key: &str, vs: &[i32]) -> String {
             ctx.entity_str(v as u32)
         };
         s.push_str(&name);
+        if s.len() > max {
+            return Err(output_bound_exceeded(kind, max));
+        }
     }
-    s.push_str("]}");
-    s
+    s.push_str("]}]}");
+    Ok(s)
 }
 
 // ---------------------------------------------------------------------------
@@ -1904,26 +2031,59 @@ fn vertex_list_unquoted(ctx: &GFunCtx<'_>, key: &str, vs: &[i32]) -> String {
 /// a match takes the first unmatched `t[j]` in the window; transpositions are
 /// counted between the match *ranks* and halved with integer division. All
 /// arithmetic is in `f32` (as upstream), widened to `f64` at the end.
+///
+/// Cost: the containment test is a linear substring search and the match
+/// loop only visits each `s[i]`'s window `[i - w, i + w]` of `t` (upstream
+/// scans all of `t` and skips the rest; same result). The window is about
+/// `|t|` wide, so the work stays `O(|s| · |t|)` — see
+/// [`jaro_similarity_cancellable`] for a cancellable form.
 pub fn jaro_similarity(a: &str, b: &str) -> f64 {
-    f64::from(jaro_f32(a.as_bytes(), b.as_bytes()))
+    match jaro_f32(a.as_bytes(), b.as_bytes(), None) {
+        Ok(x) => f64::from(x),
+        Err(_) => unreachable!("no cancellation flag"),
+    }
 }
 
-fn jaro_f32(s: &[u8], t: &[u8]) -> f32 {
+/// [`jaro_similarity`] that polls `cancel` every few thousand character
+/// comparisons (review analytics#5: two long literals cost `O(|s| · |t|)`
+/// per row), failing with [`GStoreError::Cancelled`] once it is raised.
+pub fn jaro_similarity_cancellable(
+    a: &str,
+    b: &str,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<f64> {
+    Ok(f64::from(jaro_f32(a.as_bytes(), b.as_bytes(), cancel)?))
+}
+
+fn jaro_f32(s: &[u8], t: &[u8], cancel: Option<&std::sync::atomic::AtomicBool>) -> Result<f32> {
     if s == t {
-        return 1.0;
+        return Ok(1.0);
     }
     let (s_len, t_len) = (s.len() as i64, t.len() as i64);
     if s_len == 0 || t_len == 0 {
-        return 0.0;
+        return Ok(0.0);
     }
     if s_len < t_len {
-        return jaro_f32(t, s);
+        return jaro_f32(t, s, cancel);
     }
-    if s.windows(t.len()).any(|w| w == t) {
+    if memchr::memmem::find(s, t).is_some() {
         // Upstream: `((float)t_len/(float)s_len + (float)t_len/(float)t_len + 1)/3`;
         // `x / x` is exactly 1.0 in IEEE arithmetic for the non-zero `t_len`.
-        return (t_len as f32 / s_len as f32 + 1.0 + 1.0) / 3.0;
+        return Ok((t_len as f32 / s_len as f32 + 1.0 + 1.0) / 3.0);
     }
+    let poll = |work: &mut usize| -> Result<()> {
+        if *work >= 4096 {
+            *work = 0;
+            if let Some(c) = cancel {
+                super::run_poll_hook("similarity");
+                if c.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(GStoreError::Cancelled);
+                }
+            }
+        }
+        Ok(())
+    };
+    let mut work = 0usize;
     let match_dt = t_len / 2 - 1;
     let mut sv = vec![-1i64; s.len()];
     let mut tv = vec![-1i64; t.len()];
@@ -1932,10 +2092,12 @@ fn jaro_f32(s: &[u8], t: &[u8]) -> f32 {
         if i - match_dt > t_len {
             break;
         }
-        for j in 0..t_len {
-            if j < i - match_dt || j > i + match_dt {
-                continue;
-            }
+        // upstream: `for j in 0..t_len`, skipping `j < i - w || j > i + w`
+        let lo = (i - match_dt).max(0);
+        let hi = (i + match_dt).min(t_len - 1);
+        work += 1 + (hi - lo + 1).max(0) as usize;
+        poll(&mut work)?;
+        for j in lo..=hi {
             if s[i as usize] == t[j as usize] && tv[j as usize] == -1 {
                 sv[i as usize] = m;
                 tv[j as usize] = m;
@@ -1945,13 +2107,13 @@ fn jaro_f32(s: &[u8], t: &[u8]) -> f32 {
         }
     }
     if m == 0 {
-        return 0.0;
+        return Ok(0.0);
     }
     let sm: Vec<i64> = sv.into_iter().filter(|&x| x != -1).collect();
     let tm: Vec<i64> = tv.into_iter().filter(|&x| x != -1).collect();
     let num = sm.iter().zip(&tm).filter(|(x, y)| x != y).count() as i64 / 2;
     let mf = m as f32;
-    (mf / s_len as f32 + mf / t_len as f32 + (mf - num as f32) / mf) / 3.0
+    Ok((mf / s_len as f32 + mf / t_len as f32 + (mf - num as f32) / mf) / 3.0)
 }
 
 #[cfg(test)]
@@ -2003,10 +2165,11 @@ mod tests {
         let f = PredFilter::from_ids([0]);
         let ctx = GFunCtx::new(&g, &d);
         let hub = g.node_of(0).unwrap();
-        assert_eq!(jaccard(&ctx, &f, hub, 2, 10).unwrap().len(), 10);
+        let mut marks = NodeMarks::new(g.num_nodes());
+        assert_eq!(jaccard(&ctx, &f, hub, 2, 10, &mut marks).unwrap().len(), 10);
         let flag = std::sync::atomic::AtomicBool::new(true);
         assert!(matches!(
-            jaccard(&ctx.with_cancel(&flag), &f, hub, 2, 10),
+            jaccard(&ctx.with_cancel(&flag), &f, hub, 2, 10, &mut marks),
             Err(GStoreError::Cancelled)
         ));
     }
@@ -2033,5 +2196,82 @@ mod tests {
             assert_eq!(jaro_similarity(a, b), f64::from(want), "{a:?} vs {b:?}");
             assert_eq!(jaro_similarity(b, a), f64::from(want), "symmetric {a:?}");
         }
+    }
+
+    /// The windowed match loop and the linear containment test give
+    /// upstream's full-scan results exactly (review analytics#5).
+    #[test]
+    fn jaro_window_matches_the_full_scan() {
+        fn upstream(s: &[u8], t: &[u8]) -> f32 {
+            if s == t {
+                return 1.0;
+            }
+            let (s_len, t_len) = (s.len() as i64, t.len() as i64);
+            if s_len == 0 || t_len == 0 {
+                return 0.0;
+            }
+            if s_len < t_len {
+                return upstream(t, s);
+            }
+            if s.windows(t.len()).any(|w| w == t) {
+                return (t_len as f32 / s_len as f32 + 1.0 + 1.0) / 3.0;
+            }
+            let match_dt = t_len / 2 - 1;
+            let mut sv = vec![-1i64; s.len()];
+            let mut tv = vec![-1i64; t.len()];
+            let mut m: i64 = 0;
+            for i in 0..s_len {
+                if i - match_dt > t_len {
+                    break;
+                }
+                for j in 0..t_len {
+                    if j < i - match_dt || j > i + match_dt {
+                        continue;
+                    }
+                    if s[i as usize] == t[j as usize] && tv[j as usize] == -1 {
+                        sv[i as usize] = m;
+                        tv[j as usize] = m;
+                        m += 1;
+                        break;
+                    }
+                }
+            }
+            if m == 0 {
+                return 0.0;
+            }
+            let sm: Vec<i64> = sv.into_iter().filter(|&x| x != -1).collect();
+            let tm: Vec<i64> = tv.into_iter().filter(|&x| x != -1).collect();
+            let num = sm.iter().zip(&tm).filter(|(x, y)| x != y).count() as i64 / 2;
+            let mf = m as f32;
+            (mf / s_len as f32 + mf / t_len as f32 + (mf - num as f32) / mf) / 3.0
+        }
+        let mut rng = GlibcRand::new(11);
+        for _ in 0..3000 {
+            let len = |r: &mut GlibcRand| (r.rand() % 12) as usize;
+            let (ls, lt) = (len(&mut rng), len(&mut rng));
+            let alpha = 1 + (rng.rand() % 4) as u8;
+            let s: Vec<u8> = (0..ls).map(|_| b'a' + (rng.rand() as u8 % alpha)).collect();
+            let t: Vec<u8> = (0..lt).map(|_| b'a' + (rng.rand() as u8 % alpha)).collect();
+            assert_eq!(
+                jaro_f32(&s, &t, None).unwrap().to_bits(),
+                upstream(&s, &t).to_bits(),
+                "{s:?} {t:?}"
+            );
+        }
+    }
+
+    /// Two long literals: the comparison polls the flag.
+    #[test]
+    fn jaro_polls_cancellation() {
+        let a = "a".repeat(20_000);
+        let b = "b".repeat(20_000);
+        let flag = std::sync::atomic::AtomicBool::new(true);
+        assert!(matches!(
+            jaro_similarity_cancellable(&a, &b, Some(&flag)),
+            Err(GStoreError::Cancelled)
+        ));
+        assert_eq!(jaro_similarity_cancellable(&a, &b, None).unwrap(), 0.0);
+        // short strings finish before the first poll
+        assert!(jaro_similarity_cancellable("MARTHA", "MARHTA", Some(&flag)).is_ok());
     }
 }
