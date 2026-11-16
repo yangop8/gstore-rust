@@ -30,7 +30,13 @@
 //!   are written only inside the server's backup directory (`<root>/backups`,
 //!   or `conf.ini`'s `backup_path`) and never over another database's files;
 //!   `/restore` reads from there, or from a directory the [`LoadPolicy`]
-//!   allows.
+//!   allows. `/export` shares the `/api` `export`'s serializer (N-Quads when
+//!   a named graph holds a triple) and streams it as a cancellable task.
+//! * **Errors** — one classification for every protocol layer
+//!   (`OpErrorKind::of`, review design#3): a lock another process holds
+//!   is `409` on every endpoint, a storage failure `500`, a cancelled or
+//!   timed-out statement `503`, a syntax error `400`; `/api` keeps HTTP 200
+//!   and its `StatusCode`s.
 //! * **Batch operations** — `/batchInsert`, `/batchRemove`: the payload is
 //!   parsed as RDF (N-Triples, or Turtle) and the ground triples are applied
 //!   directly — no SPARQL text is ever built from user input.
