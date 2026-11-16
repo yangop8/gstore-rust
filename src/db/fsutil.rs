@@ -1370,9 +1370,9 @@ mod tests {
              <http://ex/b> <http://ex/p> <http://ex/c> .\n",
         );
         FAIL_RENAME_INTO_PLACE.with(|n| n.set(0));
-        let err = built
-            .err()
-            .expect("a build whose store is not in place is refused");
+        let Err(err) = built else {
+            panic!("a build whose store is not in place is refused");
+        };
         assert!(
             err.to_string().contains("could not be moved into place"),
             "{err}"
