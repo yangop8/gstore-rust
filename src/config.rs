@@ -1601,12 +1601,13 @@ fn parse_seconds(v: &str) -> Option<Duration> {
 }
 
 /// A duration as [`parse_seconds`] reads it: whole seconds as an integer,
-/// otherwise with the fraction (to the millisecond).
+/// otherwise with the fraction (to the nanosecond, trailing zeros dropped —
+/// a sub-millisecond timeout must not read back as `0`, which is "off").
 fn seconds(d: Duration) -> String {
     if d.subsec_nanos() == 0 {
         d.as_secs().to_string()
     } else {
-        let s = format!("{:.3}", d.as_secs_f64());
+        let s = format!("{}.{:09}", d.as_secs(), d.subsec_nanos());
         s.trim_end_matches('0').to_string()
     }
 }
@@ -1730,6 +1731,26 @@ upload_allow_extensions = "nt|ttl|n3|rdf|txt"
 # allow compress package
 upload_allow_compress_packages = "zip"
 "#;
+
+    /// `query_timeout` reads back as it was set — also below a millisecond,
+    /// which used to print as `0.` and so read back as `0`, "no limit".
+    #[test]
+    fn query_timeout_values_round_trip() {
+        for (set, shown) in [
+            ("2.5", "2.5"),
+            ("0.0005", "0.0005"),
+            ("1.125", "1.125"),
+            ("60", "60"),
+            ("0", "0"),
+        ] {
+            let mut c = GStoreConfig::default();
+            c.set("query_timeout", set).unwrap();
+            assert_eq!(c.value("query_timeout").as_deref(), Some(shown), "{set}");
+            let mut again = GStoreConfig::default();
+            again.set("query_timeout", shown).unwrap();
+            assert_eq!(again.query_timeout, c.query_timeout, "{set}");
+        }
+    }
 
     #[test]
     fn ini_sections_comments_trimming_and_quotes() {

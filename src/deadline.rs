@@ -178,7 +178,9 @@ pub fn arm(cancel: &Arc<AtomicBool>, timeout: Duration) -> Option<Deadline> {
 
 /// A fresh flag for one statement, raised by its deadline after `timeout`
 /// or as soon as `parent` is raised (checked every [`LINK_POLL`]), and the
-/// deadline. With a zero timeout: `parent` itself and no deadline.
+/// deadline. With no deadline — a zero timeout, one too large to represent,
+/// or a timer that could not start — `parent` itself, so the statement
+/// still stops when `parent` is raised.
 pub fn arm_linked(
     parent: &Arc<AtomicBool>,
     timeout: Duration,
@@ -187,8 +189,11 @@ pub fn arm_linked(
         return (Arc::clone(parent), None);
     }
     let flag = Arc::new(AtomicBool::new(parent.load(Ordering::SeqCst)));
-    let deadline = insert(Arc::downgrade(&flag), Some(Arc::downgrade(parent)), timeout);
-    (flag, deadline)
+    match insert(Arc::downgrade(&flag), Some(Arc::downgrade(parent)), timeout) {
+        Some(deadline) => (flag, Some(deadline)),
+        // Nothing would link the fresh flag to `parent`.
+        None => (Arc::clone(parent), None),
+    }
 }
 
 fn insert(
@@ -211,7 +216,13 @@ fn insert(
             .name("gstore-deadline".to_string())
             .spawn(|| timer().run());
         if let Err(e) = spawned {
-            crate::gs_error!("cannot start the query deadline timer: {e}; query_timeout is off");
+            // The next `arm` tries again: no deadline is kept that nothing
+            // would ever fire.
+            st.started = false;
+            crate::gs_error!(
+                "cannot start the query deadline timer: {e}; this statement runs without \
+                 query_timeout"
+            );
             return None;
         }
     }
@@ -298,6 +309,17 @@ mod tests {
         drop(d);
         let (same, none) = arm_linked(&parent, Duration::ZERO);
         assert!(Arc::ptr_eq(&same, &parent) && none.is_none());
+    }
+
+    /// A timeout too large to be a deadline arms none — and the statement's
+    /// flag is then the parent itself, so a shutdown still stops it (it
+    /// used to get a fresh flag that nothing linked to the parent).
+    #[test]
+    fn a_timeout_too_large_for_a_deadline_still_follows_the_parent() {
+        let parent = Arc::new(AtomicBool::new(false));
+        let (flag, d) = arm_linked(&parent, Duration::MAX);
+        assert!(d.is_none(), "no deadline");
+        assert!(Arc::ptr_eq(&flag, &parent), "the parent's own flag");
     }
 
     #[test]

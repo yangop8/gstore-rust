@@ -1121,8 +1121,6 @@ mIjSMKbBFgquUgIhAPHupNklmfNjoKbt7eKBPIKOTzsJbKSpBaMVuL/X4bNv
 -----END CERTIFICATE-----
 ";
 
-    /// `post_with` speaks https (feature `tls`), trusting the given CA file
-    /// and refusing a certificate it cannot verify.
     /// review gapi#12: an `https://` peer that accepts the connection and
     /// never answers the TLS handshake is bounded by the deadline too (the
     /// handshake reads inside the first write, before any read timeout used
@@ -1177,6 +1175,8 @@ mIjSMKbBFgquUgIhAPHupNklmfNjoKbt7eKBPIKOTzsJbKSpBaMVuL/X4bNv
         assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
     }
 
+    /// `post_with` speaks https (feature `tls`), trusting the given CA file
+    /// and refusing a certificate it cannot verify.
     #[cfg(feature = "tls")]
     #[test]
     fn post_over_https_verifies_the_server() {
