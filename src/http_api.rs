@@ -973,8 +973,9 @@ mod cancel_bridge {
     }
 
     /// Join the bridge thread if it has nothing left to forward (it ends at
-    /// its next poll then). A thread still forwarding for someone — another
-    /// server's reads in this process — is left running.
+    /// its next poll then), waiting at most a few polls. A thread still
+    /// forwarding for someone — another server's reads in this process,
+    /// also ones registered meanwhile — is left running.
     pub(super) fn quiesce() {
         let thread = {
             let mut g = bridge().lock().unwrap_or_else(PoisonError::into_inner);
@@ -983,8 +984,21 @@ mod cancel_bridge {
             }
             g.thread.take()
         };
-        if let Some(t) = thread {
+        let Some(t) = thread else {
+            return;
+        };
+        let deadline = std::time::Instant::now() + 20 * POLL;
+        while !t.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(POLL / 5);
+        }
+        if t.is_finished() {
             let _ = t.join();
+        } else {
+            // Busy again: give the handle back (unless a newer one is there).
+            let mut g = bridge().lock().unwrap_or_else(PoisonError::into_inner);
+            if g.thread.is_none() {
+                g.thread = Some(t);
+            }
         }
     }
 

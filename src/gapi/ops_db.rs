@@ -1116,6 +1116,9 @@ struct Inspection {
 /// 100 ms a monitoring request may take).
 const STATS_REFRESH_WAIT: Duration = Duration::from_millis(40);
 
+/// Set (and notified) when a background refresh ended.
+type DoneLatch = Arc<(Mutex<bool>, Condvar)>;
+
 /// A statistics refresh running in the background (see
 /// [`refresh_stats_in_background`]).
 struct Refresh {
@@ -1124,7 +1127,7 @@ struct Refresh {
     /// Its thread, once spawned (taken by whoever waits for it).
     thread: Option<std::thread::JoinHandle<()>>,
     /// Set (and notified) when it ended, also by a panic.
-    done: Arc<(Mutex<bool>, Condvar)>,
+    done: DoneLatch,
 }
 
 /// Statistics refreshes running in the background (by the slot's address),
@@ -1178,7 +1181,7 @@ fn refresh_stats_in_background(db: &str, h: &DbHandle) {
         .name("gstore-stats-refresh".into())
         .spawn(move || {
             /// Ends the refresh, also when computing it panicked.
-            struct Done(usize, Arc<(Mutex<bool>, Condvar)>);
+            struct Done(usize, DoneLatch);
             impl Drop for Done {
                 fn drop(&mut self) {
                     locked(refreshing()).remove(&self.0);
@@ -1321,9 +1324,7 @@ pub mod stats_refresh_hook {
 
 /// The background statistics refreshes of a shutdown's databases, asked to
 /// stop (see [`stop_stats_refreshes`]).
-pub(crate) struct StoppingRefreshes(
-    Vec<(std::thread::JoinHandle<()>, Arc<(Mutex<bool>, Condvar)>)>,
-);
+pub(crate) struct StoppingRefreshes(Vec<(std::thread::JoinHandle<()>, DoneLatch)>);
 
 impl StoppingRefreshes {
     /// Wait (at most `wait` in all) for the refreshes to end and join their
