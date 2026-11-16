@@ -6388,31 +6388,59 @@ const STRING_INDEX_MIN_ENTRIES: usize = 64;
 /// run without the prefilter, which is still exact) or one too small for
 /// indexing to beat a linear scan.
 ///
-/// The index is keyed by each term's **`STR()`/lexical value** — the exact
-/// string a substring `FILTER` compares against — NOT the raw N-Triples dict
-/// key. This keeps candidate pruning sound: indexing the escaped/quoted dict
-/// form would miss a needle containing an escaped character (`"`, `\`, a
-/// newline) or a numeric whose canonical lexical differs from its stored form,
-/// silently dropping true matches. A term whose dict string somehow fails to
-/// re-parse falls back to its raw form (a term the dictionary stored always
-/// re-parses, so this is only a safety net).
+/// The index is keyed by the strings a substring `FILTER` compares — NOT the
+/// raw N-Triples dict key, whose escaped/quoted form would miss a needle
+/// holding an escaped character (`"`, `\`, a newline). A filter compares one
+/// of two strings (see [`substr_target_var`]): through `STR(?v)` the term's
+/// own lexical form (`"0012"^^xsd:integer` is `"0012"`, an IRI its text), and
+/// through a bare `?v` its value's canonical form (`12`). The two differ for
+/// numbers and booleans with a non-canonical lexical form (leading zeros, a
+/// sign, an exponent, padding, a derived integer type, `"1"` for `true`), so
+/// such a term is indexed under both — the candidates of either target stay
+/// a sound superset (review query#1, gap-accel-soundness#2). A term whose dict
+/// string somehow fails to re-parse falls back to its raw form (a term the
+/// dictionary stored always re-parses, so this is only a safety net).
 pub fn dictionary_string_index(dict: &Dictionary) -> Option<Arc<StringIndex>> {
     if dict.is_disk_backed() || dict.entity_num() + dict.literal_num() < STRING_INDEX_MIN_ENTRIES {
         return None;
     }
     let mut lexical: Vec<(u32, String)> =
         Vec::with_capacity(dict.entity_num() + dict.literal_num());
+    // The `STR()` forms that differ from the canonical one (few: numbers and
+    // booleans written non-canonically).
+    let mut raw_forms: Vec<(u32, String)> = Vec::new();
     for space in [Space::Entity, Space::Literal] {
         // In memory: cannot fail.
         let _ = dict.for_each_term(space, space.first_id(), |id, s| {
-            let key = key_term(s)
-                .map(|t| Value::from_term(&t).lexical())
-                .unwrap_or_else(|| s.to_string());
-            lexical.push((id, key));
+            let (canonical, raw) = substring_forms(s);
+            if let Some(raw) = raw {
+                raw_forms.push((id, raw));
+            }
+            lexical.push((id, canonical));
             ControlFlow::Continue(())
         });
     }
-    Some(Arc::new(StringIndex::build(lexical)))
+    let mut idx = StringIndex::build(lexical);
+    for (id, raw) in raw_forms {
+        idx.add_grams(id, &raw);
+    }
+    Some(Arc::new(idx))
+}
+
+/// The strings a substring filter may compare for the term of dict key `s`:
+/// its value's canonical form (a bare `?v`), and — only when it differs —
+/// its own lexical form (`STR(?v)`; see [`dictionary_string_index`]).
+fn substring_forms(s: &str) -> (String, Option<String>) {
+    let Some(t) = key_term(s) else {
+        return (s.to_string(), None);
+    };
+    let canonical = Value::from_term(&t).lexical();
+    let raw = match t {
+        Term::Literal { value, .. } => value,
+        Term::Iri(v) | Term::Blank(v) => v,
+    };
+    let raw = (raw != canonical).then_some(raw);
+    (canonical, raw)
 }
 
 /// Walk a `FILTER` expression collecting mandatory-substring constraints for
@@ -6452,9 +6480,11 @@ fn collect_substr_constraints(e: &Expr, layout: &VarLayout, out: &mut HashMap<us
 }
 
 /// The variable index a substring builtin's first argument denotes, if it is a
-/// bare variable or `STR(?v)` (both preserve the value's bytes). Case-folding
-/// wrappers (`LCASE`/`UCASE`) yield `None`: their substring is not the variable's
-/// own bytes, so index pruning would be unsound.
+/// bare variable or `STR(?v)`. The two compare different strings (a bare
+/// variable its value's canonical form, `STR` the term's lexical form); the
+/// index holds both wherever they differ (see [`dictionary_string_index`]).
+/// Case-folding wrappers (`LCASE`/`UCASE`) yield `None`: their substring is
+/// not either form's bytes, so index pruning would be unsound.
 fn substr_target_var(e: &Expr, layout: &VarLayout) -> Option<usize> {
     match e {
         Expr::Var(v) => layout.index.get(v).copied(),

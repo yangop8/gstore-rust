@@ -98,6 +98,14 @@ impl StringIndex {
         }
     }
 
+    /// Post `id` under every trigram of `s` as well, without changing the
+    /// string kept for `id`: a candidate filter then also finds `id` for a
+    /// needle of `s` (an id that a filter may compare through two different
+    /// strings, see [`dictionary_string_index`](crate::query::engine::dictionary_string_index)).
+    pub(crate) fn add_grams(&mut self, id: u32, s: &str) {
+        self.index_grams(id, s);
+    }
+
     /// Number of indexed strings.
     pub fn len(&self) -> usize {
         self.by_id.len()
