@@ -224,6 +224,16 @@ two other agents' builds):
     and with `stream`.
   - `scripts/conformance.sh`: all six suites pass. The parser suite fails
     only the known cases 15 and 17; Python 49/49.
+- **Verification after the review follow-ups** (JSON-LD / RDFa / RDF/XML
+  only; Turtle, the SPARQL lexer and the HTTP paths are unchanged since the
+  conformance run above): fmt, workspace clippy `-D warnings` and rustdoc
+  `-D warnings` clean; `cargo test --workspace --no-fail-fast` 2764 passed,
+  0 failed, 7 ignored in both `GSTORE_DISK_QUERY_MODE=memory` and `stream`;
+  `cargo test -p gstore --features gzip` on the lib, `dt_rdf_import`,
+  `dt_merge5_review`, `rdf_parser_conformance` and
+  `parser_limits_from_config`: all pass. Every new review test was run
+  against the code before its fix and failed there (the scoping guards
+  excepted, which pass on both).
 
 ## Requests/Not yet
 - Edits outside the owned files, all inside the plan's shared regions:
