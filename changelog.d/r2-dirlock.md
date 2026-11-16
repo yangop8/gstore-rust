@@ -22,7 +22,11 @@
   two saves of one process into the same directory are serialized (the
   second waits) and never install a mix. A new or empty save target now
   holds a `LOCK` file afterwards, as every directory a database was
-  opened from already does.
+  opened from already does — so does a backup directory written by
+  `Database::backup` (REST `/backup` and `/api` `backup` of a loaded
+  database, `gbackup` of a snapshot database), and a zipped backup of
+  one carries a `LOCK` entry (a few bytes holding the writer's pid;
+  no restore path copies it).
 - **Behaviour change: `Database::load_disk` / `load_disk_with` take the
   directory lock** (review db#17). These public functions open — and
   write: WAL replay, legacy-shadow reconcile, VS-tree rebuild,
@@ -56,7 +60,10 @@
   and maintenance operation — `INSERT`/`DELETE DATA` (default and named
   graphs), `DELETE`/`INSERT … WHERE`, `LOAD` (also `INTO GRAPH`),
   `ADD`/`COPY`/`MOVE`, `CLEAR`/`DROP` (`GRAPH`, `DEFAULT`, `NAMED`,
-  `ALL`), the direct API, `begin`/`commit`/`rollback`, `save` into
+  `ALL`), the direct API, the batch imports `insert_sources` /
+  `remove_sources` (`gadd`, `gsub`, `/api` `batchInsert` /
+  `batchRemove`, with their RocksDB statement journal),
+  `begin`/`commit`/`rollback`, `save` into
   another directory, `checkpoint`, `sync`, `backup`/`restore`/
   `restore_into`, `reclaim_unused`, `materialize_rdfs`, `run_rules` and
   the upstream `reason_*` rule lifecycle — on every layout: snapshot,
@@ -186,7 +193,15 @@ opt-level 1 test profile in the shared rocksdb target dir);
 - **For r4-cli-config** (next editor of `dirlock.rs`, bulk locking):
   `DirLock` now carries a registry key and a writer mutex; a bulk build
   that wants the in-process serialization of saves can hold
-  `DirLock::writing()` as well as its `BuildGuard`.
+  `DirLock::writing()` as well as its `BuildGuard`. For bulkcli#2
+  (gbuild's `CreatedDir` cleanup without the lock): two `gbuild` runs of
+  one new name both pass the "did not exist" check; the second one's
+  save is now refused while the first one saves (db#11) — no longer a
+  silent mix — and its failure cleanup then removes the directory the
+  first one is still filling. bulkcli#2's fix (take the directory's lock
+  for the cleanup, and remove nothing when it cannot be taken) closes
+  that window; until then the outcome is a failed build on both sides
+  or a removed database instead of an unopenable one.
 - **For integrators**: a new or empty directory a database is saved or
   backed up into now holds a `LOCK` file afterwards; no test in the
   workspace depended on its absence. The layout-matrix guard runs

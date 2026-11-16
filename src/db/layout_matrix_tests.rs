@@ -19,7 +19,9 @@
 //! * the operations: `INSERT DATA` / `DELETE DATA` (default and named
 //!   graphs), `DELETE`/`INSERT … WHERE`, `LOAD` (into the default and a named
 //!   graph), `CLEAR` / `DROP` / `COPY` / `MOVE` / `ADD`, the direct API
-//!   (`insert_triple`, `remove_triple`, `insert_data`, `delete_data`),
+//!   (`insert_triple`, `remove_triple`, `insert_data`, `delete_data`), the
+//!   batch imports (`insert_sources` / `remove_sources`: `gadd`, `gsub`,
+//!   `/api` `batchInsert` / `batchRemove`),
 //!   transactions (`begin` / `commit` / `rollback`), `save` (into another
 //!   directory) / `checkpoint` / `sync`, `backup` / `restore` /
 //!   `restore_into`, `reclaim_unused`, and inference (`materialize_rdfs`,
@@ -44,6 +46,7 @@ use std::path::{Path, PathBuf};
 
 use super::{Database, DiskQueryMode, OpenOptions, StorageKind};
 use crate::model::{Term, Triple};
+use crate::parser::import;
 use crate::query::QueryResult;
 
 /// Every [`StorageKind`]. Exhaustive on purpose: a new variant fails to
@@ -159,6 +162,23 @@ const BASE: &str = "\
 const EXTRA: &str = "\
 <http://ex/l1> <http://ex/p> <http://ex/m1> .
 <http://ex/l2> <http://ex/q> \"loaded\"@en .
+";
+
+/// `gadd` / `/api` `batchInsert` input: default and named graph, one
+/// statement already present (from the `insert_data` step).
+const ADD_NQ: &str = "\
+<http://ex/n1> <http://ex/p> <http://ex/n2> .
+<http://ex/n1> <http://ex/p> <http://ex/n2> <http://ex/gs> .
+<http://ex/n3> <http://ex/q> \"source\" <http://ex/gs> .
+<http://ex/i2> <http://ex/p> <http://ex/j2> .
+";
+
+/// `gsub` / `/api` `batchRemove` input: one statement of each graph, one
+/// that is absent.
+const REMOVE_NQ: &str = "\
+<http://ex/n1> <http://ex/p> <http://ex/n2> <http://ex/gs> .
+<http://ex/i2> <http://ex/p> <http://ex/j2> .
+<http://ex/absent> <http://ex/p> <http://ex/none> .
 ";
 
 const PARENT_RULE: &str = r#"{"rulename":"R","type":1,"logic":1,
@@ -372,6 +392,36 @@ fn steps() -> Vec<Step> {
             let a = db.insert_data(&[gt("i1", "j1"), gt("i2", "j2")]);
             let b = db.delete_data(&[gt("i1", "j1"), gt("nope", "j1")]);
             format!("{a} {b}")
+        }),
+        ("insert sources (gadd)", |db, ctx| {
+            let file = ctx.scratch.join("add.nq");
+            fs::write(&file, ADD_NQ).unwrap();
+            let mut applied = 0;
+            let r = db
+                .insert_sources(
+                    &[import::Source::File(file)],
+                    &import::ImportOptions::strict(),
+                    &mut (),
+                    &mut applied,
+                )
+                .map(|r| (r.statements, r.named))
+                .map_err(|e| e.to_string());
+            format!("{r:?} applied={applied}")
+        }),
+        ("remove sources (gsub)", |db, ctx| {
+            let file = ctx.scratch.join("remove.nq");
+            fs::write(&file, REMOVE_NQ).unwrap();
+            let mut applied = 0;
+            let r = db
+                .remove_sources(
+                    &[import::Source::File(file)],
+                    &import::ImportOptions::strict().for_removal(),
+                    &mut (),
+                    &mut applied,
+                )
+                .map(|r| (r.statements, r.named))
+                .map_err(|e| e.to_string());
+            format!("{r:?} applied={applied}")
         }),
         ("save, checkpoint, sync", |db, ctx| {
             let copy = ctx.scratch.join("saved_copy");
