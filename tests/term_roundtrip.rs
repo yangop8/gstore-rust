@@ -623,6 +623,33 @@ fn gbuild_exits_3_when_it_skipped_statements() {
     assert_eq!(out.status.code(), Some(0), "{out:?}");
 }
 
+/// The RocksDB builds exit 3 as well: the bulk build and `--incremental`
+/// (which returns through `build_rocksdb`) both report the skipped statement.
+#[cfg(feature = "rocksdb")]
+#[test]
+fn gbuild_rocksdb_exits_3_when_it_skipped_statements() {
+    let tmp = TmpDir::new("gbuild_rocks");
+    std::fs::write(
+        tmp.join("d.nt"),
+        format!(
+            "<http://ex/s> <http://ex/p> <http://ex/o> .\n\
+             <http://ex/s> <http://ex/p> \"x\"^^<{XSD}integer> .\n"
+        ),
+    )
+    .unwrap();
+    for (name, flags) in [
+        ("b", &["--rocksdb"][..]),
+        ("i", &["--rocksdb", "--incremental"][..]),
+    ] {
+        let mut args = flags.to_vec();
+        args.extend([name, "d.nt"]);
+        let out = run(env!("CARGO_BIN_EXE_gbuild"), &args, &tmp.0);
+        assert_eq!(out.status.code(), Some(3), "{flags:?}: {out:?}");
+        let mut db = Database::open(tmp.join(&format!("{name}.db"))).unwrap();
+        assert_eq!(all_keys(&mut db).len(), 1, "{flags:?}: the build finished");
+    }
+}
+
 // ---- sparqlconf#11: IRI() / STRLANG() and N-Triples output -------------------
 
 /// The review's injection IRI: `>` ends the term, the newline the statement.
