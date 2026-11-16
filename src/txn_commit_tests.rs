@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::db::CommitFailure;
 use crate::kvstore::pager::failpoints;
-use crate::{Database, DiskQueryMode, OpenOptions, QueryResult};
+use crate::{ConcurrentDb, Database, DiskQueryMode, OpenOptions, QueryResult, Term, Triple};
 
 /// A temporary directory, removed when dropped (also when a test fails).
 struct TmpDir(PathBuf);
@@ -172,6 +172,42 @@ fn commit_reports_the_rolled_back_commit_as_an_error() {
     ));
 }
 
+/// A [`ConcurrentDb`] transaction whose commit point fails is rolled back
+/// by the database it applies to, so it fails as a whole and publishes
+/// nothing. Review (r2-txn): the binary commit reached `ConcurrentDb`, which
+/// still treated such a failure as "applied but not durable" — it published
+/// a new version and recorded the writes in its version chains, so a
+/// version-pinned reader saw writes the database had rolled back.
+#[test]
+fn a_concurrent_commit_rolled_back_at_its_commit_point_publishes_nothing() {
+    let tmp = TmpDir::new("concurrent");
+    let dir = disk_db(&tmp.0);
+    let cdb = ConcurrentDb::new(open(&dir, DiskQueryMode::Materialize));
+    let v0 = cdb.version();
+    let t = Triple::new(
+        Term::iri("http://ex/t/0"),
+        Term::iri("http://ex/value"),
+        Term::plain_literal("t"),
+    );
+    let mut txn = cdb.begin();
+    txn.insert(t.clone());
+    let res = {
+        let _fp = failpoints::fail_wal_write_after(10);
+        txn.commit()
+    };
+    assert!(res.is_err(), "{res:?}");
+    assert!(
+        !cdb.version_view().contains(&t),
+        "a version-pinned reader sees the rolled-back write"
+    );
+    assert!(!cdb.snapshot().contains(&t));
+    assert_eq!(
+        cdb.version(),
+        v0,
+        "a rolled-back commit published a version"
+    );
+}
+
 /// RocksDB (review gap-rocksdb-exec#5): a commit whose journal cannot be
 /// deleted is rolled back through the journal — not left for the next
 /// write to commit or for the next open to undo — and its redo records are
@@ -241,20 +277,33 @@ fn a_rocksdb_commit_that_cannot_be_undone_yet_is_not_durable_and_undone_at_open(
     let mut db = Database::open(&dir).unwrap();
     db.begin().unwrap();
     db.query(&insert("t", 5)).unwrap();
+    // Its newest write is a named-graph quad: undoing it is a `gspo` write,
+    // which the side-write failpoint fails, so the replay stops there.
+    db.query("INSERT DATA { GRAPH <http://ex/g> { <http://ex/q> <http://ex/p> <http://ex/r> } }")
+        .unwrap();
     let fp = db.backend().as_rocks().unwrap().inject_failures();
     fp.journal_clear.store(true, Ordering::SeqCst);
-    // The replay writes triples back: fail those too (the `gspo` / `dict`
-    // side writes and the journal's own deletion).
     fp.side_writes.store(true, Ordering::SeqCst);
     let outcome = db.commit_checked();
-    match &outcome {
-        // The replay of plain triple writes may succeed (only the side
-        // column families fail): then it is rolled back.
-        Err(CommitFailure::RolledBack(_)) => assert!(!ask(&db, "t")),
-        Err(CommitFailure::NotDurable(_)) => {}
-        other => panic!("{other:?}"),
-    }
+    // Review (r2-txn): this test used to accept a rolled-back outcome as
+    // well, and with default-graph writes only the replay always succeeded,
+    // so the not-durable path it is named after never ran.
+    assert!(
+        matches!(outcome, Err(CommitFailure::NotDurable(_))),
+        "{outcome:?}"
+    );
+    assert!(!db.in_transaction());
+    assert!(ask(&db, "t"), "left applied, as reported");
+    let fp = db.backend().as_rocks().unwrap().inject_failures();
+    fp.journal_clear.store(false, Ordering::SeqCst);
+    fp.side_writes.store(false, Ordering::SeqCst);
     drop(db);
     let db = Database::open(&dir).unwrap();
     assert!(!ask(&db, "t"), "the failed commit became durable");
+    let q = "ASK { GRAPH <http://ex/g> { <http://ex/q> <http://ex/p> <http://ex/r> } }";
+    assert_eq!(
+        db.query_read(q, None, None).unwrap(),
+        QueryResult::Ask(false),
+        "the failed commit's quad became durable"
+    );
 }

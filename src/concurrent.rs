@@ -114,7 +114,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::analytics::csr::{CsrCache, CsrGraph};
-use crate::db::Database;
+use crate::db::{CommitFailure, Database};
 use crate::dict::Dictionary;
 use crate::error::{GStoreError, Result};
 use crate::model::{IdTriple, Triple};
@@ -1009,7 +1009,9 @@ impl Txn<'_> {
 
         // No conflict: apply the buffered writes to the authoritative database,
         // all or nothing (an insert can fail once a dictionary id space is
-        // exhausted; the ops applied before it are then undone).
+        // exhausted; the ops applied before it are then undone — as are all
+        // of them when the commit point fails and the database rolls the
+        // transaction back).
         let persist_failure = match apply_txn_ops(&mut db, &self.ops) {
             Ok(failure) => failure,
             Err(e) => {
@@ -1051,8 +1053,9 @@ impl Txn<'_> {
         occ.gc();
         self.db.gc_versions(occ.gc_floor());
         self.registered = false;
-        // The writes are committed and published either way; a persistence
-        // failure at the commit point is reported like an auto-commit UPDATE's.
+        // The writes are applied and published either way; a commit point
+        // that failed once they could no longer be undone is reported like an
+        // auto-commit UPDATE's persistence failure.
         match persist_failure {
             Some(e) => Err(e),
             None => Ok(new_version),
@@ -1071,8 +1074,10 @@ impl Txn<'_> {
 /// opened one through [`ConcurrentDb::write`]), so an insert that cannot be
 /// encoded — a dictionary id space is exhausted — undoes the ops applied before
 /// it and is returned as `Err`. Committing that transaction is a commit point
-/// (durable on an on-disk / RocksDB layout); a persistence failure there leaves
-/// the writes applied and is returned as `Ok(Some(error))`.
+/// (durable on an on-disk / RocksDB layout): when it fails, the database rolls
+/// the transaction back and that is returned as `Err` too, unless the writes
+/// could no longer be undone ([`Database::commit_checked`]) — then they stay
+/// applied and the failure is returned as `Ok(Some(error))`.
 fn apply_txn_ops(db: &mut Database, ops: &[TxnOp]) -> Result<Option<GStoreError>> {
     let own_txn = !db.in_transaction();
     if own_txn {
@@ -1098,7 +1103,17 @@ fn apply_txn_ops(db: &mut Database, ops: &[TxnOp]) -> Result<Option<GStoreError>
     });
     drop(scope);
     match applied {
-        Ok(()) if own_txn => Ok(db.commit().err()),
+        // Review (r2-txn): a commit the database rolled back must not be
+        // published — its writes would live on in the version chains.
+        Ok(()) if own_txn => match db.commit_checked() {
+            Ok(()) => Ok(None),
+            Err(CommitFailure::RolledBack(e)) => Err(e),
+            Err(CommitFailure::NotCommitted(e)) => {
+                db.rollback()?;
+                Err(e)
+            }
+            Err(applied) => Ok(Some(applied.into_error())),
+        },
         Ok(()) => Ok(None),
         Err(e) => {
             if own_txn {
