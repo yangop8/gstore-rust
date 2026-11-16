@@ -244,3 +244,61 @@ fn pushdown_agrees_with_the_no_index_oracle_on_every_layout() {
         assert!(matched > 100, "{layout:?}: {matched} rows matched");
     }
 }
+
+/// review gap-accel-soundness#3: the substring index a database prunes
+/// with keeps no second copy of the term strings (the engine resolves them
+/// from the dictionary and checks every candidate with the real filter):
+/// it is clearly smaller than an index keeping them, with the same
+/// candidates.
+#[test]
+fn the_database_index_keeps_no_copy_of_the_strings() {
+    use gstore::dict::Space;
+    use gstore::kvstore::StringIndex;
+    use std::ops::ControlFlow;
+
+    let mut text = String::new();
+    for i in 0..2000 {
+        text.push_str(&format!(
+            "<http://example.org/resource/item{i}> <http://example.org/label> \
+             \"the label text of item number {i}\" .\n"
+        ));
+    }
+    let db = Database::build_from_str("lean", &text).unwrap();
+    let idx = db
+        .string_index()
+        .expect("an in-memory dictionary is indexed");
+    // The strings the engine indexes: the literals' lexical forms, the IRIs'
+    // text.
+    let mut pairs: Vec<(u32, String)> = Vec::new();
+    for space in [Space::Entity, Space::Literal] {
+        db.dict()
+            .for_each_term(space, space.first_id(), |id, key| {
+                let lexical = key
+                    .strip_prefix('<')
+                    .and_then(|k| k.strip_suffix('>'))
+                    .or_else(|| key.strip_prefix('"').and_then(|k| k.strip_suffix('"')))
+                    .unwrap_or(key);
+                pairs.push((id, lexical.to_string()));
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+    }
+    let with_strings = StringIndex::build(pairs.iter().map(|(id, s)| (*id, s.as_str())));
+    assert_eq!(idx.len(), with_strings.len());
+    for needle in ["item12", "number 1999", "resource/item7", "label text"] {
+        assert_eq!(
+            idx.contains_candidates(needle),
+            with_strings.contains_candidates(needle),
+            "{needle}"
+        );
+    }
+    for (id, _) in pairs.iter().step_by(97) {
+        assert_eq!(idx.string_of(*id), None, "id {id} keeps a string copy");
+    }
+    assert!(
+        idx.heap_bytes() * 4 < with_strings.heap_bytes() * 3,
+        "database index {} bytes vs an index with strings {} bytes",
+        idx.heap_bytes(),
+        with_strings.heap_bytes()
+    );
+}

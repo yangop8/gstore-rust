@@ -6404,27 +6404,31 @@ pub fn dictionary_string_index(dict: &Dictionary) -> Option<Arc<StringIndex>> {
     if dict.is_disk_backed() || dict.entity_num() + dict.literal_num() < STRING_INDEX_MIN_ENTRIES {
         return None;
     }
-    let mut lexical: Vec<(u32, String)> =
-        Vec::with_capacity(dict.entity_num() + dict.literal_num());
-    // The `STR()` forms that differ from the canonical one (few: numbers and
-    // booleans written non-canonically).
-    let mut raw_forms: Vec<(u32, String)> = Vec::new();
+    // A candidates-only index (the FILTER checks every candidate): each form
+    // is posted as it is computed, and no copy of it is kept.
+    let mut idx = StringIndex::candidates_only();
+    let mut ids: Vec<u32> = Vec::with_capacity(dict.entity_num() + dict.literal_num());
     for space in [Space::Entity, Space::Literal] {
         // In memory: cannot fail.
         let _ = dict.for_each_term(space, space.first_id(), |id, s| {
-            let (canonical, raw) = substring_forms(s);
-            if let Some(raw) = raw {
-                raw_forms.push((id, raw));
-            }
-            lexical.push((id, canonical));
+            index_substring_forms(&mut idx, id, s);
+            ids.push(id);
             ControlFlow::Continue(())
         });
     }
-    let mut idx = StringIndex::build(lexical);
-    for (id, raw) in raw_forms {
-        idx.add_grams(id, &raw);
-    }
+    idx.add_ids(ids);
+    idx.shrink();
     Some(Arc::new(idx))
+}
+
+/// Post `id` (dict key `s`) under the strings a substring filter may compare
+/// for it (see [`substring_forms`]).
+fn index_substring_forms(idx: &mut StringIndex, id: u32, s: &str) {
+    let (canonical, raw) = substring_forms(s);
+    idx.post(id, &canonical);
+    if let Some(raw) = raw {
+        idx.post(id, &raw);
+    }
 }
 
 /// The strings a substring filter may compare for the term of dict key `s`:

@@ -8,28 +8,44 @@
 //! `STRSTARTS` filter (O(N · |string|)), it asks this index for a small
 //! candidate set first.
 //!
-//! Two complementary structures over `(id, string)` pairs:
+//! The index is a **trigram inverted index** over `(id, string)` pairs: every
+//! 3-byte window of a string posts that string's id under that trigram. A
+//! `CONTAINS(needle)` becomes the *intersection* of the postings of
+//! `needle`'s trigrams: any string holding the needle must hold all of its
+//! trigrams, so the intersection is a **sound superset** of the true matches
+//! ([`contains_candidates`](StringIndex::contains_candidates)). An id may be
+//! posted under more than one string (the candidates are then a superset for
+//! each), and postings of a string that is gone are harmless (one more
+//! candidate the exact check drops).
 //!
-//! * **Trigram inverted index** — every 3-byte window of a string posts that
-//!   string's id under that trigram. A `CONTAINS(needle)` becomes the
-//!   *intersection* of the postings of `needle`'s trigrams: any string holding
-//!   the needle must hold all of its trigrams, so the intersection is a **sound
-//!   superset** of the true matches. [`search_contains`](StringIndex::search_contains)
-//!   then verifies each candidate exactly; [`contains_candidates`](StringIndex::contains_candidates)
-//!   exposes the unverified superset for a query planner to intersect into a join.
-//! * **Id list ordered by string** — supports exact, sound `STRSTARTS` /
-//!   prefix-range lookups by binary search ([`prefix`](StringIndex::prefix)).
+//! It comes in two kinds:
+//!
+//! * **With strings** ([`new`](StringIndex::new), [`build`](StringIndex::build),
+//!   [`insert`](StringIndex::insert)) — it also keeps `id → string`, so
+//!   [`search_contains`](StringIndex::search_contains) and
+//!   [`prefix`](StringIndex::prefix) answer exactly (candidates, then a check
+//!   of each string) and [`string_of`](StringIndex::string_of) resolves.
+//! * **Candidates only** ([`candidates_only`](StringIndex::candidates_only),
+//!   [`build_candidates`](StringIndex::build_candidates)) — postings and the id
+//!   list, no strings: what the query engine prunes with, because it checks
+//!   every candidate with the real `FILTER` anyway (and resolves strings from
+//!   its dictionary). Keeping a second copy of every term string there was
+//!   about a third of the index (review gap-accel-soundness#3).
 //!
 //! Matching is byte-exact (case-sensitive), as SPARQL `CONTAINS`/`STRSTARTS`
 //! are by default; a case-insensitive or regex filter can extract its mandatory
 //! literal substrings and use [`contains_candidates`](StringIndex::contains_candidates)
 //! on each, then verify with the real matcher.
 //!
-//! ## Wiring (follow-up)
-//! This provides and tests the index structure only; hooking it into the query
-//! planner (so a `FILTER` over a dictionary-backed variable consults the index
-//! instead of scanning) is left as a follow-up, since the planner lives outside
-//! the storage engine this module belongs to.
+//! ## Wiring
+//! The query engine uses it: `query::engine::dictionary_string_index` builds a
+//! candidates-only index of an in-memory dictionary (each term under the
+//! strings a substring filter may compare), a [`Database`](crate::Database)
+//! caches it per dictionary state (extending it when terms are added), and
+//! the BGP planner intersects [`contains_candidates`](StringIndex::contains_candidates)
+//! of every mandatory needle into the variable's candidate set
+//! (`query::candidates`). An out-of-core dictionary has no index (its filters
+//! scan, still exactly).
 
 use std::collections::HashMap;
 
@@ -38,85 +54,177 @@ use serde::{Deserialize, Serialize};
 /// Substring length used for the trigram inverted index.
 const GRAM: usize = 3;
 
-/// A secondary index over `(id, string)` pairs for substring / prefix lookups.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+/// A secondary index over `(id, string)` pairs for substring / prefix lookups
+/// (see the module docs for its two kinds).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StringIndex {
-    /// `id → string`, for exact verification and id→string resolution.
+    /// `id → string`, for exact verification and id→string resolution; empty
+    /// for a candidates-only index (see [`keeps_strings`](Self::keeps_strings)).
     by_id: HashMap<u32, String>,
     /// Packed trigram (`b0<<16 | b1<<8 | b2`) → sorted, unique ids whose string
     /// contains that 3-byte window.
     trigrams: HashMap<u32, Vec<u32>>,
-    /// All ids, kept ordered by their string, for prefix / range queries.
-    ordered: Vec<u32>,
+    /// Every indexed id, ascending and unique (the superset a needle shorter
+    /// than a trigram gets).
+    ids: Vec<u32>,
+    /// Whether `by_id` holds the strings.
+    keeps_strings: bool,
+}
+
+impl Default for StringIndex {
+    /// An empty index that keeps its strings (as [`new`](Self::new)).
+    fn default() -> StringIndex {
+        StringIndex {
+            by_id: HashMap::new(),
+            trigrams: HashMap::new(),
+            ids: Vec::new(),
+            keeps_strings: true,
+        }
+    }
 }
 
 impl StringIndex {
+    /// An empty index that keeps its strings.
     pub fn new() -> StringIndex {
         StringIndex::default()
     }
 
-    /// Build an index from `(id, string)` pairs in one pass (ids should be
-    /// unique). Cheaper than repeated [`insert`](Self::insert) because the
-    /// ordered id list is sorted once at the end.
+    /// An empty candidates-only index: postings and ids, no strings (see the
+    /// module docs).
+    pub fn candidates_only() -> StringIndex {
+        StringIndex {
+            keeps_strings: false,
+            ..StringIndex::default()
+        }
+    }
+
+    /// Build an index that keeps its strings from `(id, string)` pairs in one
+    /// pass (ids should be unique). Cheaper than repeated
+    /// [`insert`](Self::insert) because the id list is sorted once at the end.
     pub fn build<I, S>(pairs: I) -> StringIndex
     where
         I: IntoIterator<Item = (u32, S)>,
         S: AsRef<str>,
     {
         let mut idx = StringIndex::new();
+        let mut ids = Vec::new();
         for (id, s) in pairs {
             idx.index_grams(id, s.as_ref());
             idx.by_id.insert(id, s.as_ref().to_string());
-            idx.ordered.push(id);
+            ids.push(id);
         }
-        idx.sort_ordered();
-        // A built index is kept (a database caches it per dictionary
-        // generation): give back the growth slack of every list.
-        for list in idx.trigrams.values_mut() {
-            list.shrink_to_fit();
+        idx.add_ids(ids);
+        idx.shrink();
+        idx
+    }
+
+    /// Build a candidates-only index from `(id, string)` pairs in one pass:
+    /// each string is read once and not kept (an id may come more than once,
+    /// with different strings — it is posted under each).
+    pub fn build_candidates<I, S>(pairs: I) -> StringIndex
+    where
+        I: IntoIterator<Item = (u32, S)>,
+        S: AsRef<str>,
+    {
+        let mut idx = StringIndex::candidates_only();
+        let mut ids = Vec::new();
+        for (id, s) in pairs {
+            idx.index_grams(id, s.as_ref());
+            ids.push(id);
         }
-        idx.trigrams.shrink_to_fit();
-        idx.by_id.shrink_to_fit();
+        idx.add_ids(ids);
+        idx.shrink();
         idx
     }
 
     /// Add one `(id, string)` pair, keeping every structure current. Re-adding
-    /// an existing id overwrites its string but does not remove its old trigram
-    /// postings, so prefer [`build`](Self::build) for a fresh index.
+    /// an existing id keeps its old trigram postings (a superset still): an
+    /// index with strings then checks against the new string only, so prefer
+    /// [`build`](Self::build) for a fresh index.
     pub fn insert(&mut self, id: u32, s: &str) {
         self.index_grams(id, s);
-        let existed = self.by_id.insert(id, s.to_string()).is_some();
-        if !existed {
-            let key = s.to_string();
-            let pos = self
-                .ordered
-                .partition_point(|oid| self.by_id[oid].as_str() < key.as_str());
-            self.ordered.insert(pos, id);
-        } else {
-            // String may have changed; re-sort to restore the ordering invariant.
-            self.sort_ordered();
+        if self.keeps_strings {
+            self.by_id.insert(id, s.to_string());
+        }
+        if let Err(pos) = self.ids.binary_search(&id) {
+            self.ids.insert(pos, id);
         }
     }
 
-    /// Post `id` under every trigram of `s` as well, without changing the
-    /// string kept for `id`: a candidate filter then also finds `id` for a
-    /// needle of `s` (an id that a filter may compare through two different
-    /// strings, see [`dictionary_string_index`](crate::query::engine::dictionary_string_index)).
-    pub(crate) fn add_grams(&mut self, id: u32, s: &str) {
+    /// Post `id` under every trigram of `s`, without touching the id list or
+    /// the strings (with [`add_ids`](Self::add_ids): a build or an extension
+    /// in batches).
+    pub(crate) fn post(&mut self, id: u32, s: &str) {
         self.index_grams(id, s);
     }
 
-    /// Number of indexed strings.
+    /// Merge `ids` into the id list (any order, duplicates allowed): one sort
+    /// of the new ids and one merge, however many there are.
+    pub(crate) fn add_ids(&mut self, mut ids: Vec<u32>) {
+        if ids.is_empty() {
+            return;
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        if self.ids.last().is_none_or(|&last| last < ids[0]) {
+            self.ids.extend_from_slice(&ids);
+            return;
+        }
+        let old = std::mem::take(&mut self.ids);
+        let mut merged = Vec::with_capacity(old.len() + ids.len());
+        let (mut i, mut j) = (0, 0);
+        while i < old.len() && j < ids.len() {
+            match old[i].cmp(&ids[j]) {
+                std::cmp::Ordering::Less => {
+                    merged.push(old[i]);
+                    i += 1;
+                }
+                std::cmp::Ordering::Greater => {
+                    merged.push(ids[j]);
+                    j += 1;
+                }
+                std::cmp::Ordering::Equal => {
+                    merged.push(old[i]);
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        merged.extend_from_slice(&old[i..]);
+        merged.extend_from_slice(&ids[j..]);
+        self.ids = merged;
+    }
+
+    /// Give back the growth slack of every list (a built index is kept: a
+    /// database caches it).
+    pub(crate) fn shrink(&mut self) {
+        for list in self.trigrams.values_mut() {
+            list.shrink_to_fit();
+        }
+        self.trigrams.shrink_to_fit();
+        self.by_id.shrink_to_fit();
+        self.ids.shrink_to_fit();
+    }
+
+    /// Whether this index keeps its strings ([`new`](Self::new) /
+    /// [`build`](Self::build)) or holds candidates only
+    /// ([`candidates_only`](Self::candidates_only) /
+    /// [`build_candidates`](Self::build_candidates)).
+    pub fn keeps_strings(&self) -> bool {
+        self.keeps_strings
+    }
+
+    /// Number of indexed ids.
     pub fn len(&self) -> usize {
-        self.by_id.len()
+        self.ids.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.by_id.is_empty()
+        self.ids.is_empty()
     }
 
     /// An estimate of the heap bytes the index holds (map buckets at their
-    /// capacity, strings and posting lists at theirs).
+    /// capacity, strings and lists at theirs).
     pub fn heap_bytes(&self) -> usize {
         let bucket = |entry: usize| entry + 1; // one control byte per bucket
         self.by_id.capacity() * bucket(std::mem::size_of::<(u32, String)>())
@@ -127,10 +235,11 @@ impl StringIndex {
                 .values()
                 .map(|v| v.capacity() * 4)
                 .sum::<usize>()
-            + self.ordered.capacity() * 4
+            + self.ids.capacity() * 4
     }
 
-    /// The string for `id`, if indexed.
+    /// The string for `id`, if indexed — `None` always for a candidates-only
+    /// index.
     pub fn string_of(&self, id: u32) -> Option<&str> {
         self.by_id.get(&id).map(String::as_str)
     }
@@ -144,7 +253,7 @@ impl StringIndex {
     pub fn contains_candidates(&self, needle: &str) -> Vec<u32> {
         let nb = needle.as_bytes();
         if nb.len() < GRAM {
-            return self.all_ids();
+            return self.ids.clone();
         }
         // Distinct trigrams of the needle, rarest posting list first so the
         // running intersection shrinks fast.
@@ -176,31 +285,33 @@ impl StringIndex {
 
     /// The ids whose string actually contains `needle` (trigram-pruned, then
     /// verified). Sorted. This is the accelerated form of a `CONTAINS` filter.
+    /// A candidates-only index has no strings to verify against: it returns
+    /// the [candidates](Self::contains_candidates).
     pub fn search_contains(&self, needle: &str) -> Vec<u32> {
-        self.contains_candidates(needle)
+        let candidates = self.contains_candidates(needle);
+        if !self.keeps_strings {
+            return candidates;
+        }
+        candidates
             .into_iter()
             .filter(|id| self.by_id.get(id).is_some_and(|s| s.contains(needle)))
             .collect()
     }
 
-    /// The ids whose string starts with `prefix`, by binary search over the
-    /// string-ordered id list. Exact (not just a candidate set) and sorted by
-    /// id. This is the accelerated form of a `STRSTARTS` / prefix filter.
+    /// The ids whose string starts with `prefix`, sorted by id — exact: the
+    /// trigram candidates of the prefix (every id for a prefix shorter than a
+    /// trigram), each checked against its string. This is the accelerated form
+    /// of a `STRSTARTS` / prefix filter. A candidates-only index has no
+    /// strings to check: it returns the candidates.
     pub fn prefix(&self, prefix: &str) -> Vec<u32> {
-        let lo = self
-            .ordered
-            .partition_point(|id| self.by_id[id].as_str() < prefix);
-        let mut out = Vec::new();
-        for &id in &self.ordered[lo..] {
-            let s = &self.by_id[&id];
-            if s.starts_with(prefix) {
-                out.push(id);
-            } else {
-                break; // ordered: first non-match ends the prefix range
-            }
+        let candidates = self.contains_candidates(prefix);
+        if !self.keeps_strings {
+            return candidates;
         }
-        out.sort_unstable();
-        out
+        candidates
+            .into_iter()
+            .filter(|id| self.by_id.get(id).is_some_and(|s| s.starts_with(prefix)))
+            .collect()
     }
 
     // ---- internals --------------------------------------------------------
@@ -212,23 +323,16 @@ impl StringIndex {
         }
         for w in b.windows(GRAM) {
             let list = self.trigrams.entry(pack(w)).or_default();
-            if let Err(pos) = list.binary_search(&id) {
-                list.insert(pos, id);
+            // Ids mostly come in ascending order: the push is the fast path.
+            match list.last() {
+                Some(&last) if last >= id => {
+                    if let Err(pos) = list.binary_search(&id) {
+                        list.insert(pos, id);
+                    }
+                }
+                _ => list.push(id),
             }
         }
-    }
-
-    fn sort_ordered(&mut self) {
-        // Sort ids by their string (then id) so the order is total and stable.
-        let by_id = &self.by_id;
-        self.ordered
-            .sort_by(|a, b| by_id[a].as_str().cmp(by_id[b].as_str()).then(a.cmp(b)));
-    }
-
-    fn all_ids(&self) -> Vec<u32> {
-        let mut v: Vec<u32> = self.by_id.keys().copied().collect();
-        v.sort_unstable();
-        v
     }
 }
 
@@ -369,6 +473,55 @@ mod tests {
             idx.prefix("<http://example.org/")
         );
         assert_eq!(back.len(), idx.len());
+    }
+
+    /// review gap-accel-soundness#3: a candidates-only index answers the
+    /// same candidates as one with strings, without a copy of the strings.
+    #[test]
+    fn a_candidates_only_index_prunes_alike_without_the_strings() {
+        let pairs: Vec<(u32, String)> = (0..2000u32)
+            .map(|i| (i, format!("<http://example.org/resource/node{i:05}>")))
+            .collect();
+        let full = StringIndex::build(pairs.iter().map(|(i, s)| (*i, s.as_str())));
+        let lean = StringIndex::build_candidates(pairs.iter().map(|(i, s)| (*i, s.as_str())));
+        assert!(full.keeps_strings() && !lean.keeps_strings());
+        assert_eq!(lean.len(), full.len());
+        for needle in ["node0", "e01", "01234", "zzz", "ab", "resource/node00042"] {
+            assert_eq!(
+                lean.contains_candidates(needle),
+                full.contains_candidates(needle),
+                "{needle}"
+            );
+        }
+        assert_eq!(lean.string_of(7), None);
+        assert_eq!(
+            full.string_of(7),
+            Some("<http://example.org/resource/node00007>")
+        );
+        // The strings (and the string-ordered id list) were a large share.
+        assert!(
+            lean.heap_bytes() * 4 < full.heap_bytes() * 3,
+            "lean {} vs full {}",
+            lean.heap_bytes(),
+            full.heap_bytes()
+        );
+    }
+
+    /// An id posted under two strings is a candidate for a needle of either
+    /// (the query engine posts a typed literal under its lexical and its
+    /// canonical form); extending an index merges the new ids in order.
+    #[test]
+    fn posting_more_strings_and_ids_keeps_the_superset() {
+        let mut idx = StringIndex::build_candidates([(10u32, "12"), (20, "abc")]);
+        idx.post(10, "0012");
+        idx.post(5, "xyz5");
+        idx.add_ids(vec![30, 5, 20]);
+        idx.post(30, "0012");
+        assert_eq!(idx.contains_candidates("001"), vec![10, 30]);
+        assert_eq!(idx.contains_candidates("yz5"), vec![5]);
+        // Short needles: every id, ascending and unique.
+        assert_eq!(idx.contains_candidates("1"), vec![5, 10, 20, 30]);
+        assert_eq!(idx.len(), 4);
     }
 
     #[test]
