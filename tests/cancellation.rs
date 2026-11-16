@@ -711,8 +711,9 @@ fn a_statistics_refresh_yields_between_passes_and_stops_at_shutdown() {
 }
 
 /// After `serve_forever` returns, the server's connection workers (one of
-/// them idling on a kept-alive connection), its statistics refreshes and
-/// the cancel bridge are gone: joined, not left running.
+/// them idling on a kept-alive connection), its statistics refreshes, the
+/// cancel bridge and the idle-transaction reaper (r2-txn's, merged in
+/// round 2) are gone: joined, not left running.
 #[test]
 fn no_server_thread_outlives_serve_forever() {
     let _serial = serial();
@@ -735,10 +736,17 @@ fn no_server_thread_outlives_serve_forever() {
     }
     assert!(String::from_utf8_lossy(&head).contains("keep-alive"));
     assert!(threads_named("gstore-http-") > 0);
+    // The reaper's name, cut to the 15 bytes `comm` keeps.
+    assert!(threads_named("gstore-txn-reap") > 0);
 
     let report = srv.stop();
     assert!(report.drained, "{report:?}");
-    for prefix in ["gstore-http-", "gstore-stats-re", "gstore-cancel-b"] {
+    for prefix in [
+        "gstore-http-",
+        "gstore-stats-re",
+        "gstore-cancel-b",
+        "gstore-txn-reap",
+    ] {
         assert_eq!(
             threads_named(prefix),
             0,

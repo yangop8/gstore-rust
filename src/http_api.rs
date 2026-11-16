@@ -905,6 +905,7 @@ pub(crate) struct TxnReaper {
     inner: Arc<ApiInner>,
     stop: Arc<AtomicBool>,
     done: std::sync::mpsc::Receiver<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for TxnReaper {
@@ -913,8 +914,18 @@ impl Drop for TxnReaper {
         self.inner.txn_reap.wake();
         // Bounded: a pass never waits for a database (it skips busy ones),
         // so it ends promptly; a rollback it is in the middle of finishes
-        // on its own if this gives up (the thread holds the server).
-        let _ = self.done.recv_timeout(Duration::from_secs(10));
+        // on its own if this gives up (the thread holds the server). Once
+        // the loop has ended, the thread is joined, so no reaper outlives
+        // `serve_forever` (as its connection workers do not, review
+        // conc#14).
+        if !matches!(
+            self.done.recv_timeout(Duration::from_secs(10)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ) {
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
     }
 }
 
@@ -6212,10 +6223,11 @@ impl ApiInner {
                 drop(done_tx);
             });
         match spawned {
-            Ok(_) => Some(TxnReaper {
+            Ok(thread) => Some(TxnReaper {
                 inner: Arc::clone(self),
                 stop,
                 done,
+                thread: Some(thread),
             }),
             Err(e) => {
                 crate::gs_warn!("the idle-transaction reaper could not start: {e}");
