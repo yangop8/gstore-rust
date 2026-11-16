@@ -623,10 +623,35 @@ pub(crate) fn install_staged_dir_as(staged: &Path, target: &Path, swap: &DirSwap
     if target.exists() {
         fs::rename(target, &old)?;
     }
-    fs::rename(&new, target)?;
+    rename_into_place(&new, target)?;
     sync_dir(parent_of(target))?;
     remove_dir_if_exists(&old)?;
     Ok(())
+}
+
+/// The swap's last rename: the complete replacement `new` becomes `target`.
+fn rename_into_place(new: &Path, target: &Path) -> Result<()> {
+    #[cfg(test)]
+    if FAIL_RENAME_INTO_PLACE.with(|n| {
+        let left = n.get();
+        n.set(left.saturating_sub(1));
+        left > 0
+    }) {
+        return Err(GStoreError::Io(io::Error::other(
+            "injected failure of a swap's rename into place",
+        )));
+    }
+    fs::rename(new, target)?;
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only failpoint: the next this-many renames of a swap's complete
+    /// `<target>.new` into place fail (as `rename(2)` does on EIO), in an
+    /// install and in a recovery alike.
+    pub(crate) static FAIL_RENAME_INTO_PLACE: std::cell::Cell<u32> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// Remove directory `target` — and a staged `target.new` waiting to be swapped
@@ -687,7 +712,7 @@ pub(crate) fn recover_dir_swap(target: &Path) -> Result<()> {
 pub(crate) fn recover_dir_swap_as(target: &Path, swap: &DirSwap) -> Result<()> {
     let new = with_suffix(target, swap.new);
     if !target.exists() && new.is_dir() {
-        fs::rename(&new, target)?;
+        rename_into_place(&new, target)?;
         sync_dir(parent_of(target))?;
     }
     remove_dir_if_exists(&new)?;
@@ -1323,5 +1348,38 @@ mod tests {
         fs::write(&bad, b"definitely not bincode").unwrap();
         assert!(read_bincode::<(String, u64)>(&bad).is_err());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Round-2 review (durability): a RocksDB build whose swap failed past
+    /// its commit point with the new store still `rocksdb.new` (the rename
+    /// into place failed in the install, in its recovery and in the
+    /// build's retry) is refused — it neither opens `rocksdb/` (which would
+    /// create an empty store there, which the next open's recovery keeps
+    /// while it deletes `rocksdb.new`, the real build) nor removes the other
+    /// layouts — and the next open moves the build into place.
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn a_rocksdb_build_left_as_new_is_refused_and_the_next_open_finishes_it() {
+        let dir = tmp_dir("rocks_left_new");
+        let db_dir = dir.join("x.db");
+        FAIL_RENAME_INTO_PLACE.with(|n| n.set(3));
+        let built = crate::Database::build_rocksdb_from_str(
+            "x",
+            &db_dir,
+            "<http://ex/a> <http://ex/p> <http://ex/b> .\n\
+             <http://ex/b> <http://ex/p> <http://ex/c> .\n",
+        );
+        FAIL_RENAME_INTO_PLACE.with(|n| n.set(0));
+        let err = built
+            .err()
+            .expect("a build whose store is not in place is refused");
+        assert!(
+            err.to_string().contains("could not be moved into place"),
+            "{err}"
+        );
+        assert!(!db_dir.join("rocksdb").exists(), "no store was created");
+        assert!(db_dir.join("rocksdb.new").is_dir(), "the build is kept");
+        let db = crate::Database::open(&db_dir).unwrap();
+        assert_eq!(db.stats().triple_num, 2, "the next open serves the build");
     }
 }

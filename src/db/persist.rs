@@ -1468,12 +1468,37 @@ impl Database {
         crate::bulk::commit::refuse_open_store(dir)?;
         match staged.install() {
             Ok(()) => {}
-            Err(e) if e.committed => crate::gs_warn!(
-                "RocksDB build of '{}': the new store is in place, but its swap did not \
-                 finish: {}",
-                dir.display(),
-                e.error
-            ),
+            Err(e) if e.committed => {
+                // Past the commit point the new store is `rocksdb/`, or
+                // `rocksdb.new` with no `rocksdb/` (which every open's
+                // recovery moves into place). Finish the move now; while
+                // `rocksdb/` is missing the build must not open it (that
+                // would create an empty store there, and the next open's
+                // recovery would then delete `rocksdb.new`, the real
+                // build) nor remove the other layouts: refuse, and leave
+                // `rocksdb.new` for the next open.
+                if let Err(again) = fsutil::recover_dir_swap(&rocks_dir) {
+                    crate::gs_warn!(
+                        "RocksDB build of '{}': moving the new store into place failed \
+                         again: {again}",
+                        dir.display()
+                    );
+                }
+                if !rocks_dir.is_dir() {
+                    return Err(GStoreError::Database(format!(
+                        "RocksDB build of '{}': the new store is built, but it could not be \
+                         moved into place ({}); the next open of the database moves it",
+                        dir.display(),
+                        e.error
+                    )));
+                }
+                crate::gs_warn!(
+                    "RocksDB build of '{}': the new store is in place, but its swap did not \
+                     finish: {}",
+                    dir.display(),
+                    e.error
+                );
+            }
             Err(e) => return Err(e.error),
         }
         // `rocksdb/` takes precedence in layout detection: the new store is
@@ -1674,6 +1699,13 @@ impl Database {
         for name in &stale {
             fsutil::remove_file_if_exists(&dst.join(name))?;
         }
+        // So is a `rocksdb/` store (and its swap siblings) the source lacks:
+        // it takes precedence in layout detection, so a copy failing
+        // part-way must not leave it to be served beside the new files.
+        let (rocks_src, rocks_dst) = (src.join(ROCKS_SUBDIR), dst.join(ROCKS_SUBDIR));
+        if !rocks_src.is_dir() {
+            fsutil::discard_dir(&rocks_dst)?;
+        }
         fsutil::sync_dir(dst)?;
         for name in &names {
             let from = src.join(name);
@@ -1681,11 +1713,8 @@ impl Database {
                 fsutil::copy_file_atomic(&from, &dst.join(name))?;
             }
         }
-        let (rocks_src, rocks_dst) = (src.join(ROCKS_SUBDIR), dst.join(ROCKS_SUBDIR));
         if rocks_src.is_dir() {
             fsutil::replace_dir_with_copy(&rocks_src, &rocks_dst)?;
-        } else {
-            fsutil::discard_dir(&rocks_dst)?;
         }
         // The reasoning rules (`reason_rule_files/`), as upstream's
         // whole-directory copy carries them.
