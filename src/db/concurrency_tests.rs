@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Barrier, RwLock};
+use std::sync::{Arc, Barrier, RwLock};
 
 use super::*;
 
@@ -242,17 +242,24 @@ fn generation_oracle_under_a_rwlock() {
 }
 
 /// A user function that reports a read error fails only the query it runs
-/// in; that query's result is not cached.
+/// in; that query's result is not cached: it leaves no cache entry, and
+/// running it again evaluates it again (the function is called) and fails
+/// again (review tests-b#18: this used to be claimed, never checked).
 #[test]
 fn a_read_error_fails_only_its_own_statement() {
     let mut db = prepared();
-    db.register_function("faulty", |_| {
+    let calls = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&calls);
+    db.register_function("faulty", move |_| {
+        counted.fetch_add(1, Ordering::SeqCst);
         crate::store::read_scope::note_read_error("injected");
         Some(crate::query::Value::Bool(true))
     });
     let bad = format!("SELECT ?x WHERE {{ ?x <{UB}memberOf> <{DEPT}> FILTER(faulty(?x)) }}");
     let good = format!("SELECT ?x WHERE {{ ?x <{UB}memberOf> <{DEPT}> }}");
     let expected = db.query_read(&good, None, None).unwrap();
+    let cached = db.query_cache_len();
+    assert_eq!(cached, 1, "the good query is cached");
     let db = &db;
     std::thread::scope(|s| {
         let a = s.spawn(|| db.query_read(&bad, None, None));
@@ -261,4 +268,57 @@ fn a_read_error_fails_only_its_own_statement() {
         assert!(err.to_string().contains("injected"), "{err}");
         assert_eq!(b.join().unwrap().unwrap(), expected);
     });
+    assert_eq!(
+        db.query_cache_len(),
+        cached,
+        "the failed query left a cache entry"
+    );
+    let before = calls.load(Ordering::SeqCst);
+    let err = db.query_read(&bad, None, None).unwrap_err();
+    assert!(err.to_string().contains("injected"), "{err}");
+    assert!(
+        calls.load(Ordering::SeqCst) > before,
+        "the failed query was not evaluated again"
+    );
+}
+
+/// The rule the test above pins, on a query the cache does take (a user
+/// function makes a query uncacheable whatever happens): a Stream-mode
+/// read that fails part-way (the store file lost its pages under the open
+/// database) fails the query, caches nothing, and fails again — a result
+/// computed under a read error is never served from the cache as a success
+/// (C2, review tests-b#18).
+#[test]
+fn a_cacheable_query_that_hit_a_read_error_is_not_cached() {
+    let dir = temp_dir("read_error_cache");
+    Database::build_disk(&dir, &[lubm_dir().join("lubm.nt")]).unwrap();
+    let options = OpenOptions {
+        disk_query_mode: DiskQueryMode::Stream,
+        disk_cache_pages: 8,
+        ..OpenOptions::default()
+    };
+    let db = Database::open_with(&dir, &options).unwrap();
+    let q =
+        format!("SELECT ?x ?y WHERE {{ ?x <{UB}memberOf> <{DEPT}> . ?x <{UB}takesCourse> ?y }}");
+    // Every page but the first is gone from under the open store.
+    let kv = fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join(KV_FILE))
+        .unwrap();
+    kv.set_len(4096).unwrap();
+    drop(kv);
+    for run in 0..2 {
+        let err = db.query_read(&q, None, None).unwrap_err();
+        assert!(
+            matches!(err, GStoreError::Database(_) | GStoreError::Io(_)),
+            "run {run}: {err}"
+        );
+        assert_eq!(
+            db.query_cache_len(),
+            0,
+            "run {run}: a failed read was cached"
+        );
+    }
+    drop(db);
+    let _ = fs::remove_dir_all(&dir);
 }
