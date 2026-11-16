@@ -226,6 +226,7 @@ pub(crate) fn build_disk(
         scratch: &scratch,
         fill_percent: bulk.fill_percent,
         threads,
+        free_ids: bulk.free_ids,
     };
     let built = pipeline::build_image(&kv_new, &vs_new, input, opts, log, &ctx);
     drop(scratch);

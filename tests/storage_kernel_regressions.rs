@@ -6,6 +6,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use gstore::dict::Space;
@@ -129,6 +130,174 @@ fn free_key_keeps_terms_named_graph_quads_use() {
     assert!(ds.free_key(Space::Literal, "\"lit\"").unwrap());
     assert!(!ds.free_key(Space::Entity, "<g>").unwrap(), "still a graph");
     ds.verify_free_list().unwrap();
+}
+
+// ---- disk#8 / design#6: the free-id format of a file ----------------------------
+
+const FORMAT_CHILD: &str = "GSTORE_KERNEL_FORMAT_CHILD";
+
+/// The magic of the store file at `path` (`GSTOREKV` version 1,
+/// `GSTOREK2` version 2 with the free-id list).
+fn magic(path: &Path) -> String {
+    String::from_utf8_lossy(&fs::read(path).unwrap()[0..8]).into_owned()
+}
+
+/// Run this test binary's `child` test with `GSTORE_ID_RECLAIM=policy` and
+/// `FORMAT_CHILD=dir`.
+fn run_with_policy(child: &str, policy: &str, dir: &Path) {
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", child, "--nocapture", "--test-threads=1"])
+        .env("GSTORE_ID_RECLAIM", policy)
+        .env(FORMAT_CHILD, dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{child} with GSTORE_ID_RECLAIM={policy}: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The child of [`existing_files_keep_their_format_under_either_policy`]:
+/// open `v1/` and `v2/` both ways, write through them, close.
+#[test]
+fn format_child_writes_through_existing_files() {
+    let Ok(dir) = std::env::var(FORMAT_CHILD) else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    for name in ["v1", "v2"] {
+        let kv = dir.join(name).join("kvstore.kv");
+        {
+            let mut ds = DiskStore::open(&kv, 64).unwrap();
+            ds.insert_keys("<x>", "<p>", "<y>", false).unwrap();
+            ds.flush().unwrap();
+        }
+        for opts in [
+            gstore::db::OpenOptions::stream(),
+            gstore::db::OpenOptions::materialize(),
+        ] {
+            let mut db = gstore::Database::open_with(dir.join(name), &opts).unwrap();
+            db.query("INSERT DATA { <http://ex/n> <http://ex/p> <http://ex/m> }")
+                .unwrap();
+            db.query("DELETE DATA { <http://ex/n> <http://ex/p> <http://ex/m> }")
+                .unwrap();
+            db.sync().unwrap();
+        }
+        let mut db = gstore::Database::open(dir.join(name)).unwrap();
+        db.query("INSERT DATA { <http://ex/k> <http://ex/p> \"v\" }")
+            .unwrap();
+        db.sync().unwrap();
+    }
+}
+
+/// Review disk#8 / design#6: an existing `kvstore.kv` keeps the format its
+/// header records — version 1 without the free-id list, version 2 with it —
+/// whatever the process's id-reclamation policy (`GSTORE_ID_RECLAIM`), when
+/// it is opened, written through and saved by the store, a Stream-mode and
+/// a Materialize-mode database. Only `gcompact --enable-reclaim` upgrades.
+#[test]
+fn existing_files_keep_their_format_under_either_policy() {
+    if std::env::var(FORMAT_CHILD).is_ok() {
+        return;
+    }
+    let tmp = TmpDir::new("format");
+    for (name, free_ids) in [("v1", false), ("v2", true)] {
+        fs::create_dir_all(tmp.path().join(name)).unwrap();
+        let kv = tmp.path().join(name).join("kvstore.kv");
+        let mut ds = DiskStore::open_with(&kv, 64, free_ids).unwrap();
+        ds.insert_keys("<http://ex/a>", "<http://ex/p>", "<http://ex/b>", false)
+            .unwrap();
+        ds.flush().unwrap();
+    }
+    let v1 = tmp.path().join("v1/kvstore.kv");
+    let v2 = tmp.path().join("v2/kvstore.kv");
+    assert_eq!(magic(&v1), "GSTOREKV");
+    assert_eq!(magic(&v2), "GSTOREK2");
+    for policy in ["on", "off"] {
+        run_with_policy("format_child_writes_through_existing_files", policy, tmp.path());
+        assert_eq!(magic(&v1), "GSTOREKV", "policy {policy} upgraded a v1 file");
+        assert_eq!(magic(&v2), "GSTOREK2", "policy {policy} downgraded a v2 file");
+    }
+}
+
+const EXPLICIT_CHILD: &str = "GSTORE_KERNEL_EXPLICIT_CHILD";
+
+/// The child of [`new_files_take_the_explicitly_chosen_format`]: build and
+/// create new stores with the format chosen against the process policy.
+#[test]
+fn explicit_format_child() {
+    let Ok(dir) = std::env::var(EXPLICIT_CHILD) else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let policy_on = gstore::db::default_id_reclaim() == gstore::db::IdReclaim::Immediate;
+    // The defaults follow the process policy...
+    assert_eq!(gstore::bulk::BulkOptions::default().free_ids, policy_on);
+    assert_eq!(gstore::db::default_open_options().free_ids_if_new, policy_on);
+    // ...and an explicit choice wins over it: the opposite format.
+    let nt = dir.join("d.nt");
+    fs::write(&nt, "<http://ex/a> <http://ex/p> <http://ex/b> .\n").unwrap();
+    let sources = gstore::parser::import::sources_from_paths(&[&nt]).unwrap();
+    gstore::bulk::build(
+        &dir.join("bulk.db"),
+        "bulk",
+        gstore::bulk::BulkInput::Sources(&sources),
+        &gstore::parser::import::ImportOptions::strict(),
+        &mut (),
+        gstore::bulk::BulkTarget::Disk,
+        &gstore::bulk::BulkOptions {
+            free_ids: !policy_on,
+            ..gstore::bulk::BulkOptions::default()
+        },
+    )
+    .unwrap();
+    // An open that creates the store file (an empty kvstore.kv).
+    fs::create_dir_all(dir.join("open.db")).unwrap();
+    fs::write(dir.join("open.db/kvstore.kv"), b"").unwrap();
+    let opts = gstore::db::OpenOptions::stream().with_free_ids_if_new(!policy_on);
+    let mut db = gstore::Database::open_with(dir.join("open.db"), &opts).unwrap();
+    db.query("INSERT DATA { <http://ex/a> <http://ex/p> <http://ex/b> }")
+        .unwrap();
+    db.sync().unwrap();
+    drop(db);
+    let db = gstore::Database::open_with(dir.join("bulk.db"), &opts).unwrap();
+    assert_eq!(db.triple_num(), 1);
+}
+
+/// Review disk#8 / design#6: the format of a *new* store file is an
+/// explicit choice — `BulkOptions::free_ids` for a build,
+/// `OpenOptions::free_ids_if_new` for an open that creates the file —
+/// which the process's id-reclamation policy only defaults (the build used
+/// to read `GSTORE_ID_RECLAIM` itself, whatever its caller wanted).
+#[test]
+fn new_files_take_the_explicitly_chosen_format() {
+    if std::env::var(EXPLICIT_CHILD).is_ok() {
+        return;
+    }
+    for (policy, want) in [("on", "GSTOREKV"), ("off", "GSTOREK2")] {
+        let tmp = TmpDir::new(&format!("explicit_{policy}"));
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "explicit_format_child", "--nocapture", "--test-threads=1"])
+            .env("GSTORE_ID_RECLAIM", policy)
+            .env(EXPLICIT_CHILD, tmp.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "policy {policy}: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        for db in ["bulk.db", "open.db"] {
+            assert_eq!(
+                magic(&tmp.path().join(db).join("kvstore.kv")),
+                want,
+                "{db} under policy {policy}"
+            );
+        }
+    }
 }
 
 // ---- db#18: a RocksDB dictionary id beyond its space ---------------------------

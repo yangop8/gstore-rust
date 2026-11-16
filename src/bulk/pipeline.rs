@@ -55,6 +55,8 @@ pub(crate) struct Ctx<'a> {
     pub(crate) scratch: &'a Scratch,
     pub(crate) fill_percent: u8,
     pub(crate) threads: usize,
+    /// [`BulkOptions::free_ids`](super::BulkOptions::free_ids).
+    pub(crate) free_ids: bool,
 }
 
 /// What the pipeline wrote.
@@ -269,7 +271,7 @@ pub(crate) fn build_image(
     debug_assert_eq!(roots[format::FEATURES], 0);
     alloc.reserve(dr.pages)?;
     let page_count = alloc.next();
-    write_header(&file, &header_page(page_count, 0, &roots))?;
+    write_header(&file, &header_page(page_count, 0, &roots, ctx.free_ids))?;
     file.sync_all()?;
     phase(&mut img.phases, "finish", t);
 

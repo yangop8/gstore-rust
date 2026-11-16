@@ -1233,7 +1233,7 @@ impl Database {
             )));
         }
         let lock = super::dirlock::DirLock::acquire(dir)?;
-        let mut ds = DiskStore::open(&kv, options.disk_cache_pages)?;
+        let mut ds = DiskStore::open_with(&kv, options.disk_cache_pages, options.free_ids_if_new)?;
         reconcile_legacy_shadow(dir, &mut ds)?;
         let mut db = match options.disk_query_mode {
             DiskQueryMode::Stream => Database::load_disk_stream(dir, ds, options),

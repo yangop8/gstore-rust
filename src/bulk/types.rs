@@ -53,6 +53,15 @@ pub struct BulkOptions {
     /// B+ tree node fill in percent, 50–100 (default
     /// [`DEFAULT_FILL_PERCENT`]); the disk layout only.
     pub fill_percent: u8,
+    /// Whether the new `kvstore.kv` keeps a free-id list — feature
+    /// `FREE_IDS`, a version-2 file binaries older than Phase 6 refuse — or
+    /// not (version 1); the disk layout only. Default: the process's
+    /// id-reclamation policy when the options are made
+    /// ([`crate::db::default_id_reclaim`]: `GSTORE_ID_RECLAIM`, then
+    /// `[system] id_reclaim`, else on). The build reads only this field
+    /// (review disk#8 / design#6: it used to read the process policy
+    /// itself).
+    pub free_ids: bool,
 }
 
 impl Default for BulkOptions {
@@ -62,6 +71,7 @@ impl Default for BulkOptions {
             threads: 0,
             temp_dir: None,
             fill_percent: DEFAULT_FILL_PERCENT,
+            free_ids: crate::db::default_id_reclaim() == crate::db::IdReclaim::Immediate,
         }
     }
 }

@@ -129,6 +129,14 @@ pub struct OpenOptions {
     /// The layout new databases are built in, if configured (`[storage]
     /// default_layout`; consumed by the servers' build paths, R4-SNAP).
     pub default_layout: Option<StorageKind>,
+    /// Whether a store file the open *creates* (an empty or missing
+    /// `kvstore.kv`) keeps a free-id list — feature `FREE_IDS`, a version-2
+    /// file older binaries refuse — or not (version 1). Default `true` (id
+    /// reclamation on); [`default_open_options`] takes it from the process's
+    /// id-reclamation policy when one is set (`GSTORE_ID_RECLAIM`, `[system]
+    /// id_reclaim`). A file that exists keeps the format its header records:
+    /// neither this nor the policy changes it (review disk#8 / design#6).
+    pub free_ids_if_new: bool,
 }
 
 impl Default for OpenOptions {
@@ -139,6 +147,7 @@ impl Default for OpenOptions {
             dict_cache_bytes: DEFAULT_DICT_CACHE_BYTES,
             vstree_on_open: false,
             default_layout: None,
+            free_ids_if_new: true,
         }
     }
 }
@@ -180,6 +189,12 @@ impl OpenOptions {
     /// These options with [`vstree_on_open`](Self::vstree_on_open) set.
     pub fn with_vstree_on_open(mut self, on: bool) -> OpenOptions {
         self.vstree_on_open = on;
+        self
+    }
+
+    /// These options with [`free_ids_if_new`](Self::free_ids_if_new) set.
+    pub fn with_free_ids_if_new(mut self, free_ids: bool) -> OpenOptions {
+        self.free_ids_if_new = free_ids;
         self
     }
 
@@ -244,7 +259,9 @@ pub fn set_default_open_options(options: OpenOptions) {
 
 /// The options [`Database::open`](crate::Database::open) uses: the installed
 /// defaults ([`set_default_open_options`]) or the built-in ones, with the
-/// environment overrides applied (an unreadable value is logged and ignored).
+/// environment overrides applied (an unreadable value is logged and ignored)
+/// and [`free_ids_if_new`](OpenOptions::free_ids_if_new) from the process's
+/// id-reclamation policy when one is set ([`super::default_id_reclaim`]).
 pub fn default_open_options() -> OpenOptions {
     let mut options = INSTALLED
         .read()
@@ -252,6 +269,9 @@ pub fn default_open_options() -> OpenOptions {
         .unwrap_or_default();
     for w in options.apply_env() {
         crate::gs_warn!("open options: {w}");
+    }
+    if let Some(policy) = super::reclaim::configured_id_reclaim() {
+        options.free_ids_if_new = policy == super::IdReclaim::Immediate;
     }
     options
 }
@@ -287,6 +307,8 @@ mod tests {
             (DEFAULT_TERM_CACHE_BYTES, DEFAULT_KEY_CACHE_BYTES)
         );
         assert!(!o.vstree_on_open && o.default_layout.is_none());
+        assert!(o.free_ids_if_new, "new store files reclaim ids by default");
+        assert!(!o.with_free_ids_if_new(false).free_ids_if_new);
         assert_eq!(OpenOptions::stream().disk_query_mode, DiskQueryMode::Stream);
         assert_eq!(
             OpenOptions::materialize().disk_query_mode,

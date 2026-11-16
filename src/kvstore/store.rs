@@ -428,19 +428,24 @@ fn scan_keys(
 impl DiskStore {
     /// Open (or create) a disk store at `path` with a `cache_pages`-page cache.
     ///
-    /// A store created here keeps a free-id list (feature `FREE_IDS`, a
-    /// version-2 file that binaries older than Phase 6 refuse) when the
-    /// process's id-reclamation policy is on
-    /// ([`default_id_reclaim`](crate::db::default_id_reclaim)); with it off
-    /// (`GSTORE_ID_RECLAIM=off`) it is a version-1 file, as before. An
-    /// existing file is never upgraded here.
+    /// An existing file keeps the format its header records — version 1
+    /// without a free-id list, version 2 with one — whatever the process's
+    /// id-reclamation policy; only [`enable_reclaim`](Self::enable_reclaim)
+    /// upgrades it. A store *created* here (an empty or missing file) takes
+    /// the format of the process's default open options
+    /// ([`OpenOptions::free_ids_if_new`](crate::db::OpenOptions::free_ids_if_new)
+    /// of [`default_open_options`](crate::db::default_open_options): with id
+    /// reclamation on — the default — a free-id list, feature `FREE_IDS`, a
+    /// version-2 file that binaries older than Phase 6 refuse; with
+    /// `GSTORE_ID_RECLAIM=off` a version-1 file). [`open_with`](Self::open_with)
+    /// chooses explicitly (review disk#8 / design#6).
     pub fn open<P: AsRef<Path>>(path: P, cache_pages: usize) -> Result<DiskStore> {
-        let free_ids = crate::db::default_id_reclaim() == crate::db::IdReclaim::Immediate;
+        let free_ids = crate::db::default_open_options().free_ids_if_new;
         DiskStore::open_with(path, cache_pages, free_ids)
     }
 
     /// [`open`](Self::open), choosing whether a store *created* here keeps a
-    /// free-id list.
+    /// free-id list (an existing file keeps its header's format).
     pub fn open_with<P: AsRef<Path>>(
         path: P,
         cache_pages: usize,
