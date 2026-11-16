@@ -593,18 +593,44 @@ impl Database {
     ///
     /// A Stream-mode database whose on-disk store is broken (C5) refuses,
     /// also a CSR cached before the failure (it may hold a failed
-    /// transaction's triples).
+    /// transaction's triples). The build cannot be cancelled: a request
+    /// uses [`csr_cancellable`](Self::csr_cancellable).
     pub fn csr(&self) -> Result<std::sync::Arc<CsrGraph>> {
+        self.csr_cancellable(None)
+    }
+
+    /// [`csr`](Self::csr) for a request with a cancel flag (review conc#5):
+    /// a raised `cancel` stops the build at its next check — between two
+    /// predicates, every [`POLL_PAIRS`](crate::analytics::csr::POLL_PAIRS)
+    /// triples of an in-memory one, between the build's phases — or ends a
+    /// wait for another request's build, with [`GStoreError::Cancelled`],
+    /// and nothing is cached. The store is read one predicate at a time
+    /// (an in-memory store in place), keeping only entity→entity edges:
+    /// literal triples are never all held at once (review analytics#6). The
+    /// cache's lock is not held during the build, so a reader that only
+    /// asks whether a CSR is cached ([`cached_csr`](Self::cached_csr)) never
+    /// waits for one.
+    pub fn csr_cancellable(&self, cancel: Option<&AtomicBool>) -> Result<std::sync::Arc<CsrGraph>> {
         self.check_store_readable()?;
-        self.csr_cache.get_or_build(self.mutations, || {
-            // A read error while building fails the build (nothing is cached).
-            let scope = ReadScope::enter();
-            let graph = CsrGraph::build(&self.store);
-            match scope.take_error() {
-                Some(e) => Err(read_failure("building the CSR", e)),
-                None => graph,
-            }
-        })
+        self.csr_cache
+            .get_or_build_cancellable(self.mutations, cancel, || {
+                // A read error while building fails the build (nothing is
+                // cached).
+                let scope = ReadScope::enter();
+                let graph = match self.store.as_memory() {
+                    Some(mem) => CsrGraph::build_from_memory(mem, cancel),
+                    None => {
+                        let never = AtomicBool::new(false);
+                        let preds = crate::dict::Space::Predicate.first_id()
+                            ..self.dict.id_limit(crate::dict::Space::Predicate);
+                        CsrGraph::build_cancellable(&self.store, preds, cancel.unwrap_or(&never))
+                    }
+                };
+                match scope.take_error() {
+                    Some(e) => Err(read_failure("building the CSR", e)),
+                    None => graph,
+                }
+            })
     }
 
     /// Build the CSR now instead of on the first graph-function query —
@@ -2092,7 +2118,8 @@ impl Database {
         // The advanced graph functions run on this database's cached
         // CSR (see `csr`), built only when a query needs it; substring
         // filters on its cached dictionary index (see `string_index`).
-        let csr = || self.csr();
+        let flag = cancel.clone();
+        let csr = || self.csr_cancellable(flag.as_deref());
         let string_index = || self.string_index();
         // Use the VS-tree as a candidate filter only while it is
         // consistent with the store; otherwise evaluate without it.
@@ -2795,7 +2822,7 @@ impl Database {
                 .with_named(&self.named);
             return eval.eval_update_modify(delete, insert, pattern);
         }
-        let csr = || self.csr();
+        let csr = || self.csr_cancellable(cancel.map(|c| &**c));
         let string_index = || self.string_index();
         let eval = prepare(self, Evaluator::new(&self.dict, &self.store), cancel, pfn)
             .with_named(&self.named)

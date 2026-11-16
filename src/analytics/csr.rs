@@ -58,7 +58,7 @@
 use std::fmt;
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use crate::dict::{Dictionary, Space};
 use crate::error::{GStoreError, Result};
@@ -342,6 +342,56 @@ impl fmt::Debug for CsrGraph {
     }
 }
 
+/// How many `(subject, object)` pairs of one predicate
+/// [`CsrGraph::build_from_memory`] scans between two cancellation checks.
+pub const POLL_PAIRS: usize = 1 << 16;
+
+/// One cancellation check of a CSR build: the [`build_hook`] (tests), then
+/// `cancel`.
+fn poll(cancel: Option<&AtomicBool>) -> Result<()> {
+    build_hook::poll(cancel);
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        Err(GStoreError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+/// A process-wide hook that runs at every cancellation check of a
+/// cancellable CSR build ([`CsrGraph::build_cancellable`],
+/// [`CsrGraph::build_from_memory`]) with the build's cancel flag — so a test
+/// can park a build at a check and prove that a `/cancel` or a shutdown
+/// raised meanwhile is observed at the next one. Not for production use.
+#[doc(hidden)]
+pub mod build_hook {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    /// What runs at a check: it gets the build's flag (`None`: the build
+    /// cannot be cancelled).
+    pub type Hook = Arc<dyn Fn(Option<&AtomicBool>) + Send + Sync>;
+
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+
+    /// Install (`Some`) or remove (`None`) the hook.
+    pub fn set(hook: Option<Hook>) {
+        let mut slot = HOOK.lock().unwrap_or_else(PoisonError::into_inner);
+        INSTALLED.store(hook.is_some(), Ordering::SeqCst);
+        *slot = hook;
+    }
+
+    pub(crate) fn poll(cancel: Option<&AtomicBool>) {
+        if !INSTALLED.load(Ordering::Acquire) {
+            return;
+        }
+        let hook = HOOK.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        if let Some(hook) = hook {
+            hook(cancel);
+        }
+    }
+}
+
 impl CsrGraph {
     /// An empty graph (no vertices, no edges).
     pub fn empty() -> CsrGraph {
@@ -359,7 +409,11 @@ impl CsrGraph {
     }
 
     /// Build the CSR of every triple `src` holds (one `iter_all` scan, then two
-    /// sorts: `O(E log E)`). Triples with a literal object are skipped.
+    /// sorts: `O(E log E)`). Triples with a literal object are skipped — but
+    /// `iter_all` reads them all first; a caller that knows the predicates
+    /// reads them one at a time with [`build_cancellable`](Self::build_cancellable)
+    /// (and an in-memory store is read in place by
+    /// [`build_from_memory`](Self::build_from_memory)).
     ///
     /// Errors only if the graph exceeds the compact `u32` index space
     /// (more than `u32::MAX` vertices or edges).
@@ -370,22 +424,19 @@ impl CsrGraph {
     /// [`build`](Self::build) that a raised `cancel` stops with
     /// [`GStoreError::Cancelled`] — for a reader a writer must be able to
     /// stop (a snapshot read inside an on-disk store's gate, which a commit
-    /// drains). The store is read one predicate at a time (`so_by_p` of each
+    /// drains), and for a request `/cancel` or a shutdown must be able to
+    /// stop. The store is read one predicate at a time (`so_by_p` of each
     /// id of `preds`, which must cover every predicate `src` holds: the same
-    /// triples as one `iter_all`), the flag checked between predicates and
-    /// between the build's phases. The graph is the one `build` returns.
+    /// triples as one `iter_all`), keeping only the entity→entity pairs of
+    /// each (the literal triples of one predicate are held at a time, never
+    /// all of them); the flag is checked between predicates and between the
+    /// build's phases. The graph is the one `build` returns.
     pub fn build_cancellable<S: TripleSource + ?Sized>(
         src: &S,
         preds: impl IntoIterator<Item = PredId>,
         cancel: &AtomicBool,
     ) -> Result<CsrGraph> {
-        let check = || {
-            if cancel.load(Ordering::Relaxed) {
-                Err(GStoreError::Cancelled)
-            } else {
-                Ok(())
-            }
-        };
+        let check = || poll(Some(cancel));
         let mut triples = Vec::new();
         for p in preds {
             check()?;
@@ -395,6 +446,34 @@ impl CsrGraph {
                     .filter(|&(s, o)| is_entity_id(s) && is_entity_id(o))
                     .map(|(s, o)| IdTriple::new(s, p, o)),
             );
+        }
+        CsrGraph::from_id_triples_checked(triples, &check)
+    }
+
+    /// The CSR of in-memory `store`, read in place: each predicate's sorted
+    /// `(subject, object)` list is scanned where it lies and only its
+    /// entity→entity pairs are copied, so a literal triple is never
+    /// materialized (review analytics#6). A raised `cancel` stops it with
+    /// [`GStoreError::Cancelled`], checked between predicates, every
+    /// [`POLL_PAIRS`] pairs within one and between the build's phases. The
+    /// graph is the one [`build`](Self::build) returns.
+    pub fn build_from_memory(
+        store: &crate::store::TripleStore,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<CsrGraph> {
+        let check = || poll(cancel);
+        let mut triples = Vec::new();
+        for p in store.predicates() {
+            check()?;
+            for chunk in store.so_by_p(p).chunks(POLL_PAIRS) {
+                triples.extend(
+                    chunk
+                        .iter()
+                        .filter(|&&(s, o)| is_entity_id(s) && is_entity_id(o))
+                        .map(|&(s, o)| IdTriple::new(s, p, o)),
+                );
+                check()?;
+            }
         }
         CsrGraph::from_id_triples_checked(triples, &check)
     }
@@ -798,14 +877,35 @@ impl CsrGraph {
 /// `prepPathQuery` (GE:262-271: rebuild when `kvstore->isCSRUpdate()`), but
 /// with the dirty flag replaced by the generation so no write path has to
 /// remember to set it. Concurrent callers wait for an in-flight build instead
-/// of building twice.
+/// of building twice; the build runs with the cache's lock released, so
+/// [`peek`](Self::peek) and the other accessors never wait for it, and a
+/// waiter that can be cancelled ([`get_or_build_cancellable`](Self::get_or_build_cancellable))
+/// stops waiting when its flag is raised.
 #[derive(Default)]
 pub struct CsrCache {
-    slot: Mutex<Option<(u64, Arc<CsrGraph>)>>,
-    /// Whether `slot` holds a graph, readable without its lock (which a
-    /// build holds) — see [`status`](Self::status).
+    slot: Mutex<CsrSlot>,
+    /// Notified when a build ends (its waiters re-check the slot).
+    ended: Condvar,
+    /// Whether `slot` holds a graph, readable without its lock — see
+    /// [`status`](Self::status).
     built: CsrStatus,
 }
+
+/// The state of a [`CsrCache`].
+#[derive(Default)]
+struct CsrSlot {
+    /// The cached graph and the generation it was built for.
+    graph: Option<(u64, Arc<CsrGraph>)>,
+    /// A build is running (with the lock released).
+    building: bool,
+    /// Advanced by [`CsrCache::clear`] and [`CsrCache::restore`]: a build
+    /// that started before does not install its graph.
+    epoch: u64,
+}
+
+/// How often a cancellable waiter for another caller's build re-checks its
+/// flag.
+const WAIT_POLL: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// Whether a [`CsrCache`] holds a graph, readable without waiting — not
 /// for a build in progress, nor for whoever holds the owner (e.g. a server's
@@ -829,8 +929,9 @@ impl CsrStatus {
 impl fmt::Debug for CsrCache {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let slot = self.lock();
-        match slot.as_ref() {
+        match slot.graph.as_ref() {
             Some((gen, g)) => write!(f, "CsrCache {{ generation: {gen}, graph: {g:?} }}"),
+            None if slot.building => write!(f, "CsrCache {{ building }}"),
             None => write!(f, "CsrCache {{ empty }}"),
         }
     }
@@ -849,7 +950,11 @@ impl CsrCache {
         let built = CsrStatus::default();
         built.set(true);
         CsrCache {
-            slot: Mutex::new(Some((generation, graph))),
+            slot: Mutex::new(CsrSlot {
+                graph: Some((generation, graph)),
+                ..CsrSlot::default()
+            }),
+            ended: Condvar::new(),
             built,
         }
     }
@@ -862,9 +967,9 @@ impl CsrCache {
         self.built.clone()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Option<(u64, Arc<CsrGraph>)>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, CsrSlot> {
         // The slot is a plain value; a panic during a build leaves it valid.
-        self.slot.lock().unwrap_or_else(|e| e.into_inner())
+        self.slot.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The graph for `generation`: the cached one if it was built for that
@@ -872,28 +977,92 @@ impl CsrCache {
     /// entry for another generation is dropped *before* the build, so the
     /// old and the new graph are never both held by the cache (upstream
     /// also resets its CSR before rebuilding, GeneralEvaluation.cpp:141-143);
-    /// a failed build leaves the cache empty.
+    /// a failed build leaves the cache empty. A caller that finds a build
+    /// running waits for it (see
+    /// [`get_or_build_cancellable`](Self::get_or_build_cancellable) for one
+    /// that can stop waiting).
     pub fn get_or_build<F>(&self, generation: u64, build: F) -> Result<Arc<CsrGraph>>
     where
         F: FnOnce() -> Result<CsrGraph>,
     {
+        self.get_or_build_cancellable(generation, None, build)
+    }
+
+    /// [`get_or_build`](Self::get_or_build) for a caller with a cancel flag:
+    /// while it waits for another caller's build, a raised `cancel` ends the
+    /// wait with [`GStoreError::Cancelled`] (`build` itself should watch the
+    /// same flag — e.g. [`CsrGraph::build_cancellable`]). The build runs with
+    /// the cache's lock released; a build that fails or is cancelled caches
+    /// nothing (and a waiter whose flag is not raised then builds itself).
+    pub fn get_or_build_cancellable<F>(
+        &self,
+        generation: u64,
+        cancel: Option<&AtomicBool>,
+        build: F,
+    ) -> Result<Arc<CsrGraph>>
+    where
+        F: FnOnce() -> Result<CsrGraph>,
+    {
+        let cancelled = || cancel.is_some_and(|c| c.load(Ordering::Relaxed));
         let mut slot = self.lock();
-        if let Some((gen, g)) = slot.as_ref() {
-            if *gen == generation {
-                return Ok(Arc::clone(g));
+        loop {
+            if let Some((gen, g)) = slot.graph.as_ref() {
+                if *gen == generation {
+                    return Ok(Arc::clone(g));
+                }
+            }
+            if !slot.building {
+                break;
+            }
+            if cancelled() {
+                return Err(GStoreError::Cancelled);
+            }
+            slot = match cancel {
+                Some(_) => {
+                    self.ended
+                        .wait_timeout(slot, WAIT_POLL)
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0
+                }
+                None => self
+                    .ended
+                    .wait(slot)
+                    .unwrap_or_else(PoisonError::into_inner),
+            };
+        }
+        if cancelled() {
+            return Err(GStoreError::Cancelled);
+        }
+        if slot.graph.take().is_some() {
+            self.built.set(false);
+        }
+        slot.building = true;
+        let epoch = slot.epoch;
+        drop(slot);
+
+        /// Ends the build — also when it panics — and wakes its waiters.
+        struct Ending<'a>(&'a CsrCache);
+        impl Drop for Ending<'_> {
+            fn drop(&mut self) {
+                self.0.lock().building = false;
+                self.0.ended.notify_all();
             }
         }
-        *slot = None;
-        self.built.set(false);
+        let _ending = Ending(self);
         let g = Arc::new(build()?);
-        *slot = Some((generation, Arc::clone(&g)));
-        self.built.set(true);
+        let mut slot = self.lock();
+        // A clear or restore meanwhile wins: this graph may be of old data.
+        if slot.epoch == epoch {
+            slot.graph = Some((generation, Arc::clone(&g)));
+            self.built.set(true);
+        }
         Ok(g)
     }
 
-    /// The cached graph if it is current for `generation` (never builds).
+    /// The cached graph if it is current for `generation` (never builds,
+    /// never waits for a build).
     pub fn peek(&self, generation: u64) -> Option<Arc<CsrGraph>> {
-        match self.lock().as_ref() {
+        match self.lock().graph.as_ref() {
             Some((gen, g)) if *gen == generation => Some(Arc::clone(g)),
             _ => None,
         }
@@ -901,7 +1070,7 @@ impl CsrCache {
 
     /// The generation the cached graph was built for, if any.
     pub fn cached_generation(&self) -> Option<u64> {
-        self.lock().as_ref().map(|(gen, _)| *gen)
+        self.lock().graph.as_ref().map(|(gen, _)| *gen)
     }
 
     /// Cache `graph` for `generation` again — a graph built for data an
@@ -909,14 +1078,16 @@ impl CsrCache {
     /// its inserts), whose generation was restored with it.
     pub fn restore(&self, generation: u64, graph: Arc<CsrGraph>) {
         let mut slot = self.lock();
-        *slot = Some((generation, graph));
+        slot.graph = Some((generation, graph));
+        slot.epoch += 1;
         self.built.set(true);
     }
 
-    /// Drop the cached graph.
+    /// Drop the cached graph (a build running now caches nothing).
     pub fn clear(&self) {
         let mut slot = self.lock();
-        *slot = None;
+        slot.graph = None;
+        slot.epoch += 1;
         self.built.set(false);
     }
 }
@@ -1047,6 +1218,99 @@ mod tests {
         let r = CsrGraph::build_cancellable(&src, 0..8, &flag);
         assert!(matches!(r, Err(GStoreError::Cancelled)));
         assert_eq!(src.reads.get(), 1);
+    }
+
+    fn same_graph(a: &CsrGraph, b: &CsrGraph) {
+        assert_eq!(a.entities, b.entities);
+        for (x, y) in [(&a.out, &b.out), (&a.inc, &b.inc)] {
+            assert_eq!((&x.off, &x.pred, &x.nbr), (&y.off, &y.pred, &y.nbr));
+        }
+        assert_eq!(a.preds, b.preds);
+        assert_eq!(a.pred_edges, b.pred_edges);
+        assert_eq!(a.num_edges, b.num_edges);
+    }
+
+    /// review analytics#6: an in-memory store is read in place, predicate
+    /// by predicate (no copy of its literal triples), into the graph `build`
+    /// gives; a raised flag stops it before anything is read.
+    #[test]
+    fn the_in_memory_build_equals_build_and_is_cancellable() {
+        let lit = crate::model::id::LITERAL_FIRST_ID;
+        let mut store = crate::store::TripleStore::new();
+        let mut triples = Vec::new();
+        for i in 0..300u32 {
+            triples.push(t(i, i % 3, (i * 7 + 1) % 300));
+            triples.push(t(i, 9, lit + i));
+        }
+        store.bulk_load(triples);
+        let whole = CsrGraph::build(&store).unwrap();
+        same_graph(&CsrGraph::build_from_memory(&store, None).unwrap(), &whole);
+        let flag = AtomicBool::new(false);
+        same_graph(
+            &CsrGraph::build_from_memory(&store, Some(&flag)).unwrap(),
+            &whole,
+        );
+        flag.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            CsrGraph::build_from_memory(&store, Some(&flag)),
+            Err(GStoreError::Cancelled)
+        ));
+    }
+
+    /// conc#5: a build runs with the cache's lock released — `peek` does
+    /// not wait for it — and one that fails (a cancel) caches nothing; a
+    /// waiter whose flag is raised stops waiting; once the build ends a
+    /// waiter builds or gets the graph.
+    #[test]
+    fn a_build_holds_no_lock_and_a_cancelled_one_caches_nothing() {
+        use std::sync::mpsc;
+        let cache = CsrCache::new();
+        let (started_tx, started) = mpsc::channel();
+        let (go_tx, go) = mpsc::channel::<bool>();
+        std::thread::scope(|s| {
+            let cache = &cache;
+            let builder = s.spawn(move || {
+                cache.get_or_build(1, || {
+                    started_tx.send(()).unwrap();
+                    // `true`: finish; `false`: fail as a cancelled build.
+                    if go.recv().unwrap() {
+                        Ok(CsrGraph::empty())
+                    } else {
+                        Err(GStoreError::Cancelled)
+                    }
+                })
+            });
+            started.recv().unwrap();
+            // The building thread holds no lock a reader needs.
+            assert!(cache.peek(1).is_none());
+            assert_eq!(cache.cached_generation(), None);
+            assert!(!cache.status().is_built());
+            // A waiter whose flag is raised stops waiting.
+            let raised = AtomicBool::new(true);
+            assert!(matches!(
+                cache.get_or_build_cancellable(1, Some(&raised), || Ok(CsrGraph::empty())),
+                Err(GStoreError::Cancelled)
+            ));
+            go_tx.send(false).unwrap();
+            assert!(matches!(
+                builder.join().unwrap(),
+                Err(GStoreError::Cancelled)
+            ));
+        });
+        assert!(cache.peek(1).is_none(), "a cancelled build caches nothing");
+        assert!(!cache.status().is_built());
+        // The next caller builds, and the graph is cached.
+        let g = cache.get_or_build(1, || Ok(CsrGraph::empty())).unwrap();
+        assert!(Arc::ptr_eq(&g, &cache.peek(1).unwrap()));
+        // A clear during a build: that build's graph is not cached.
+        let g2 = cache
+            .get_or_build(2, || {
+                cache.clear();
+                Ok(CsrGraph::empty())
+            })
+            .unwrap();
+        assert_eq!(g2.num_nodes(), 0);
+        assert!(cache.peek(2).is_none());
     }
 
     #[test]

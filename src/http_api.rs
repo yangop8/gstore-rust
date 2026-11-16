@@ -779,7 +779,12 @@ impl ReadSnapshot {
             SnapStore::Mem(store) => {
                 // The snapshot never changes, so its CSR is cached under one
                 // generation for the transaction's lifetime.
-                let csr = || self.csr.get_or_build(0, || CsrGraph::build(store));
+                let flag = cancel.clone();
+                let csr = || {
+                    self.csr.get_or_build_cancellable(0, flag.as_deref(), || {
+                        CsrGraph::build_from_memory(store, flag.as_deref())
+                    })
+                };
                 let mut eval = self.configure(Evaluator::new(&self.dict, store), &csr, pfn);
                 if let Some(c) = cancel {
                     eval = eval.with_cancel(c);
@@ -2807,7 +2812,10 @@ impl ApiServer {
     /// every database with unsaved changes, and retire every slot so a request
     /// that is still queued on one can no longer apply a write nobody would
     /// save. From the start, every write still in flight saves itself before it
-    /// is acknowledged (see [`ApiInner::closing`]).
+    /// is acknowledged (see [`ApiInner::closing`]). The databases nobody holds
+    /// are done first; one a cancelled statement still holds is waited for
+    /// afterwards (it stops at its next cancellation check), so it never holds
+    /// up the others' saves.
     fn finish_shutdown(&self, mut drained: bool) -> ShutdownReport {
         let inner = &self.inner;
         inner.closing.store(true, Ordering::SeqCst);
@@ -2836,16 +2844,10 @@ impl ApiServer {
             .map(|(n, h)| (n.clone(), Arc::clone(h)))
             .collect();
         handles.sort_by(|a, b| a.0.cmp(&b.0));
-        for (name, h) in handles {
-            let mut slot = match h.write() {
-                Ok(slot) => slot,
-                Err(e) => {
-                    crate::gs_error!("shutdown: {}", e.msg);
-                    continue;
-                }
-            };
+        // Roll back, save and retire one database, its guard held.
+        let mut finish = |name: String, mut slot: SlotWrite<'_>| {
             if slot.retired {
-                continue;
+                return;
             }
             if let Some(open) = slot.txn.take() {
                 let _ = slot.db.rollback();
@@ -2880,6 +2882,23 @@ impl ApiServer {
                 }
             }
             slot.retire();
+        };
+        // Every database nobody holds first; then wait for the ones a
+        // statement still reads (it was cancelled above and stops at its
+        // next check — an index build included), so a database kept busy
+        // delays only its own save, never the others' (review conc#5).
+        let mut busy = Vec::new();
+        for (name, h) in &handles {
+            match h.try_write() {
+                Some(slot) => finish(name.clone(), slot),
+                None => busy.push((name, h)),
+            }
+        }
+        for (name, h) in busy {
+            match h.write() {
+                Ok(slot) => finish(name.clone(), slot),
+                Err(e) => crate::gs_error!("shutdown: {}", e.msg),
+            }
         }
         report
     }

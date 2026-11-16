@@ -761,7 +761,14 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         }
         let csr = match self.csr_provider {
             Some(provider) => provider()?,
-            None => Arc::new(CsrGraph::build(self.store)?),
+            // This query's own CSR, read one predicate at a time; the
+            // query's cancel flag stops the build (review conc#5).
+            None => {
+                let never = std::sync::atomic::AtomicBool::new(false);
+                let cancel = self.cancel.as_deref().unwrap_or(&never);
+                let preds = Space::Predicate.first_id()..self.dict.id_limit(Space::Predicate);
+                Arc::new(CsrGraph::build_cancellable(self.store, preds, cancel)?)
+            }
         };
         *self.gfun_csr.borrow_mut() = Some(Arc::clone(&csr));
         Ok(csr)
