@@ -21,8 +21,12 @@
 //! which the REST endpoints use too).
 //!
 //! The IP checks ([`check_ip`]) and the failed-login lockout
-//! ([`note_auth_failure`], [`note_login_success`]) are those of
-//! [`super::ipfilter`].
+//! ([`locked_account`], [`note_auth_failure`], [`note_login_success`]) are
+//! those of [`super::ipfilter`]: by default a password check of an account
+//! locked at the caller's address is refused (`1101`) before the password
+//! hash runs, on every path that checks one — [`verify`] (every
+//! authenticated operation, `login` and `testConnect` included, and the
+//! lifecycle routes) and the pre-body check ([`check_before_body`]).
 
 use super::envelope::{GResp, Status};
 use super::ipfilter;
@@ -43,7 +47,9 @@ pub enum IpStage {
 
 /// The IP access check (upstream `APIUtil::check_access_ip`), answering
 /// `1101 IPBlocked`: at [`IpStage::Connect`] the allow / deny lists, at
-/// [`IpStage::Operation`] the failed-login lockout (see [`super::ipfilter`]).
+/// [`IpStage::Operation`] upstream's per-address lockout (see
+/// [`super::ipfilter`]; only under `upstream_login_lockout` — the default
+/// lockout refuses a locked account's password check in [`verify`]).
 pub fn check_ip(ctx: &Ctx<'_>, stage: IpStage) -> Result<(), GResp> {
     let filter = &ctx.inner.ipfilter;
     let (blocked, msg) = match stage {
@@ -57,16 +63,32 @@ pub fn check_ip(ctx: &Ctx<'_>, stage: IpStage) -> Result<(), GResp> {
     }
 }
 
-/// Record a failed authentication from the caller's address (upstream
-/// `update_access_ip_error_num`); enough of them lock the address out.
-pub fn note_auth_failure(ctx: &Ctx<'_>) {
-    ctx.inner.ipfilter.note_failure(&ctx.remote_ip);
+/// The `1101` answer to a password check of `account` from the caller's
+/// address that the default lockout refuses (none under
+/// `upstream_login_lockout`). Ask it before the password hash runs.
+pub fn locked_account(ctx: &Ctx<'_>, account: &str) -> Option<GResp> {
+    let wait = ctx.inner.ipfilter.auth_refusal(account, &ctx.remote_ip)?;
+    Some(GResp::error(Status::IpBlocked, ipfilter::lockout_msg(wait)))
 }
 
-/// Clear the caller's failed-authentication count after a successful
-/// `login` (upstream `reset_access_ip_error_num`).
+/// Record a failed authentication of `account` from the caller's address:
+/// against that account at that address, or — under
+/// `upstream_login_lockout` — against the address (upstream
+/// `update_access_ip_error_num`). Enough of them lock it out.
+pub fn note_auth_failure(ctx: &Ctx<'_>, account: &str) {
+    ctx.inner
+        .ipfilter
+        .note_auth_failure(account, &ctx.remote_ip);
+}
+
+/// Record a successful `login` of the caller: clears its account's
+/// failed-authentication count at the caller's address — or, under
+/// `upstream_login_lockout`, the address's count (upstream
+/// `reset_access_ip_error_num`).
 pub fn note_login_success(ctx: &Ctx<'_>) {
-    ctx.inner.ipfilter.reset(&ctx.remote_ip);
+    ctx.inner
+        .ipfilter
+        .note_login_success(ctx.user(), &ctx.remote_ip);
 }
 
 /// The credentials a request presents.
@@ -141,11 +163,13 @@ pub(crate) enum PreAuth {
 /// Check `creds` (`md5`: the password is its MD5 hex digest) against the
 /// user store before the request's body is read — the pre-body hook's check
 /// of credentials in a request head (see `crate::preauth`) — under the same
-/// IP rules as [`authenticate`]: a blocked or locked-out address is not
-/// checked at all, and a wrong password counts towards the lockout
-/// ([`note_auth_failure`]). A success does not reset the failure count (only
-/// a `login` does) and records no user: the request's handler authenticates
-/// it again. An upstream *inner* request (`creds.inner`) is not checked
+/// IP rules as [`authenticate`]: a blocked or locked-out address, and an
+/// account the lockout refuses at this address, are not checked at all (no
+/// password hash runs), and a wrong password counts towards the lockout
+/// ([`note_auth_failure`]). A success clears only its own account's count
+/// at this address (under `upstream_login_lockout` nothing: only a `login`
+/// resets an address) and records no user: the request's handler
+/// authenticates it again. An upstream *inner* request (`creds.inner`) is not checked
 /// either: whether its password is checked at all is [`verify`]'s decision
 /// (`trust_inner_localhost`), and a failure counted here could lock out the
 /// local tools that send it. Root's default password from a client that is
@@ -168,6 +192,15 @@ pub(crate) fn check_before_body(
     {
         return PreAuth::Unchecked;
     }
+    // A locked account is not checked (no hash runs): its handler refuses
+    // the request after the body, which is held to the pre-auth cap.
+    if inner
+        .ipfilter
+        .auth_refusal(&creds.username, remote_ip)
+        .is_some()
+    {
+        return PreAuth::Unchecked;
+    }
     let form = if creds.md5 {
         PasswordForm::Md5Hex
     } else {
@@ -184,9 +217,12 @@ pub(crate) fn check_before_body(
         .users
         .finish_check(checked);
     match outcome {
-        CredentialCheck::Valid => PreAuth::Valid,
+        CredentialCheck::Valid => {
+            inner.ipfilter.note_auth_success(&creds.username, remote_ip);
+            PreAuth::Valid
+        }
         CredentialCheck::Invalid => {
-            inner.ipfilter.note_failure(remote_ip);
+            inner.ipfilter.note_auth_failure(&creds.username, remote_ip);
             PreAuth::Invalid
         }
         CredentialCheck::NeedsPlaintextLogin => PreAuth::Unchecked,
@@ -227,10 +263,13 @@ pub fn authenticate(ctx: &mut Ctx<'_>, params: &Params) -> Result<String, GResp>
 /// * an upstream *inner* request (`inner=true` from `127.0.0.1`) skips the
 ///   password check when [`GapiConfig::trust_inner_localhost`](super::GapiConfig)
 ///   is on; the user must still exist;
-/// * otherwise the user store: unknown user or wrong password → `1001`
-///   (recorded with [`note_auth_failure`]); `encryption=1` against an entry
-///   not yet migrated to the MD5-compatible format → `1001`, with a message
-///   asking for one plaintext login.
+/// * otherwise the user store: an account the lockout refuses at the
+///   caller's address → `1101` before any password hash runs
+///   ([`locked_account`]); unknown user or wrong password → `1001`
+///   (recorded with [`note_auth_failure`]; a success clears the account's
+///   count at that address); `encryption=1` against an entry not yet
+///   migrated to the MD5-compatible format → `1001`, with a message asking
+///   for one plaintext login.
 pub fn verify(
     ctx: &mut Ctx<'_>,
     creds: &Credentials,
@@ -244,6 +283,9 @@ pub fn verify(
         )
     };
     if accept_system && username == ctx.inner.config().system_username {
+        if let Some(refused) = locked_account(ctx, &username) {
+            return Err(refused);
+        }
         let expected = ctx.inner.system_password();
         let ok = !expected.is_empty()
             && if creds.md5 {
@@ -255,13 +297,16 @@ pub fn verify(
                 ct_eq(creds.password.as_bytes(), expected.as_bytes())
             };
         if ok {
+            ctx.inner
+                .ipfilter
+                .note_auth_success(&username, &ctx.remote_ip);
             ctx.user = Some(username.clone());
             return Ok(username);
         }
         // Only this run's system password admits the system user here: a
         // stored user of that name (which can no longer be created, but may
         // predate the rule) must not stop or restart the server.
-        note_auth_failure(ctx);
+        note_auth_failure(ctx, &username);
         return Err(wrong());
     }
     // Only a local client: a reverse proxy on this machine (a loopback peer
@@ -292,6 +337,11 @@ pub fn verify(
              one, nor through a proxy): change root's password",
         ));
     }
+    // A locked account is refused before the slow hash: guessing gets no
+    // further, and costs the server nothing (review gapi#5 / sec#7).
+    if let Some(refused) = locked_account(ctx, &username) {
+        return Err(refused);
+    }
     let form = if creds.md5 {
         PasswordForm::Md5Hex
     } else {
@@ -308,11 +358,14 @@ pub fn verify(
     let outcome = ctx.state().users.finish_check(checked);
     match outcome {
         CredentialCheck::Valid => {
+            ctx.inner
+                .ipfilter
+                .note_auth_success(&username, &ctx.remote_ip);
             ctx.user = Some(username.clone());
             Ok(username)
         }
         CredentialCheck::Invalid => {
-            note_auth_failure(ctx);
+            note_auth_failure(ctx, &username);
             Err(wrong())
         }
         CredentialCheck::NeedsPlaintextLogin => Err(GResp::error(

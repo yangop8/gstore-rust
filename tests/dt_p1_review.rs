@@ -744,7 +744,13 @@ fn the_ip_lists_and_the_lockout_hold_on_the_rest_endpoints() {
     assert!(!body.contains("session"), "{body}");
 
     // The lockout: failed Basic logins count, and lock REST out too.
-    let srv = start("lockout");
+    // review gapi#5 / http#6: this is upstream's per-address lockout, the
+    // upstream_login_lockout switch now (the default lockout, per account
+    // and address, is tests/login_lockout.rs's).
+    let srv = start_cfg("lockout", |mut c| {
+        c.upstream_login_lockout = true;
+        c
+    });
     for i in 0..5 {
         let (s, _) = rest(&srv.addr, "root", &format!("bad{i}"), "GET", "/show", "");
         assert_eq!(s, 401);

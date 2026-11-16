@@ -30,9 +30,31 @@ max_user_num=1000
 deamon=off
 # the maximum output result, default 100000
 # max_output_size=100000
+# (gstore-rust) how long one SPARQL statement may run, in seconds (fractions
+# allowed); a statement still running then is stopped and answered as timed
+# out (REST 503, /api 1005), releasing its database. 0 = no limit
+# (default 3600)
+# query_timeout=3600
+# (gstore-rust) the most bytes one serialized query answer may take; a larger
+# one is answered "result too large" (page with LIMIT/OFFSET instead).
+# 0 = no limit (default 1073741824, 1 GiB)
+# max_result_bytes=1073741824
 # ip_allow_path first if both path are configured
 ip_allow_path=
 ip_deny_path="./conf/ipDeny.config"
+# (gstore-rust) failed logins are counted per account and address: after
+# login_lockout_failures failures that account is locked for that address,
+# first for 1 s, each further failure doubling the lock up to
+# login_lockout_max_seconds; a lock refuses only that account's password
+# checks (no password hash runs), and a success clears only its own count.
+# Turning upstream_login_lockout on restores upstream's rule instead (an
+# address with more than 4 failures is refused everything but login and
+# testConnect until a successful login or a restart): unlimited guessing
+# through login, and behind a proxy one client locks out all. Upstream-compat
+# switch, default off.
+;upstream_login_lockout=off
+# login_lockout_failures=4
+# login_lockout_max_seconds=900
 
 # ---- gstore-rust extensions (not in upstream conf.ini) ----
 # address the HTTP listener binds; upstream listens on every interface,

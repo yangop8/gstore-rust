@@ -406,8 +406,9 @@ struct ServerInner {
     /// Set (under the `db` lock) when the in-memory database has changes that
     /// are not yet saved to [`dir`](Self::dir); cleared by a successful save.
     dirty: AtomicBool,
-    /// Optional HTTP Basic credentials. `None` ⇒ the server is open.
-    auth: Option<(String, String)>,
+    /// Optional HTTP Basic credentials (with their failed-login lockout).
+    /// `None` ⇒ the server is open.
+    auth: Option<SingleAuth>,
     /// The directory the database was loaded from / is persisted to. `None` ⇒
     /// in-memory only (nothing is ever saved).
     dir: Option<PathBuf>,
@@ -424,6 +425,87 @@ struct ServerInner {
     /// graph function may run for as long as its `maxIter` says — stops at
     /// its next check and releases the database for the final save.
     cancel: Arc<AtomicBool>,
+}
+
+/// The single-database server's HTTP Basic credentials and their
+/// failed-login lockout ([`LoginLockout`](crate::gapi::ipfilter::LoginLockout),
+/// review http#6 / sec#7): failures are counted per presented user name and
+/// client address, and while one is locked its requests are answered `429`
+/// (with `Retry-After`) without being compared. Clones share the lockout
+/// (the pre-body hook of [`crate::preauth`] holds one).
+#[derive(Clone)]
+pub(crate) struct SingleAuth {
+    user: String,
+    pass: String,
+    lockout: Arc<crate::gapi::ipfilter::LoginLockout>,
+}
+
+/// How [`SingleAuth::check`] judged a request's credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SingleAuthCheck {
+    /// The credentials match.
+    Valid,
+    /// Missing or wrong (a wrong one was counted).
+    Invalid,
+    /// The presented user is locked out at this address for this long more
+    /// (nothing compared).
+    Locked(Duration),
+}
+
+impl SingleAuth {
+    pub(crate) fn new(user: &str, pass: &str) -> SingleAuth {
+        SingleAuth {
+            user: user.to_string(),
+            pass: pass.to_string(),
+            lockout: Arc::default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lockout_for_tests(&self) -> &crate::gapi::ipfilter::LoginLockout {
+        &self.lockout
+    }
+
+    /// The user name a decoded Basic token (`user:pass` bytes) presents.
+    fn presented_user(decoded: &[u8]) -> String {
+        let user = decoded
+            .iter()
+            .position(|&b| b == b':')
+            .map_or(decoded, |i| &decoded[..i]);
+        String::from_utf8_lossy(user).into_owned()
+    }
+
+    /// Whether the decoded Basic token `decoded` matches — unless its user is
+    /// locked out at `ip` (then `false`, without comparing). Records nothing:
+    /// the pre-body hook's check, which the handler repeats after the body.
+    pub(crate) fn accepts(&self, decoded: &[u8], ip: &str) -> bool {
+        self.lockout
+            .refusal(&Self::presented_user(decoded), ip)
+            .is_none()
+            && ct_eq(decoded, format!("{}:{}", self.user, self.pass).as_bytes())
+    }
+
+    /// Check `req`'s `Authorization: Basic` header from client `ip`, and
+    /// record the outcome: a wrong one counts against its user name at
+    /// `ip`, a valid one clears that count. A request without credentials is
+    /// [`Invalid`](SingleAuthCheck::Invalid) without counting (a browser's
+    /// first request before it prompts).
+    pub(crate) fn check(&self, req: &Request, ip: &str) -> SingleAuthCheck {
+        let Some(decoded) = req.basic_token() else {
+            return SingleAuthCheck::Invalid;
+        };
+        let user = Self::presented_user(&decoded);
+        if let Some(wait) = self.lockout.refusal(&user, ip) {
+            return SingleAuthCheck::Locked(wait);
+        }
+        if ct_eq(&decoded, format!("{}:{}", self.user, self.pass).as_bytes()) {
+            self.lockout.note_success(&user, ip);
+            SingleAuthCheck::Valid
+        } else {
+            self.lockout.note_failure(&user, ip);
+            SingleAuthCheck::Invalid
+        }
+    }
 }
 
 impl Server {
@@ -526,6 +608,10 @@ impl Server {
     }
 
     /// Require HTTP Basic auth with these credentials on every request.
+    /// Failed attempts are throttled per presented user name and client
+    /// address: after four, that name is locked for the address — 1 s at
+    /// first, doubling with each further failure up to 15 min — and its
+    /// requests are answered `429` without being checked (review http#6).
     ///
     /// ```no_run
     /// # use gstore::{Database, server::Server};
@@ -538,7 +624,7 @@ impl Server {
         // succeeds. (If it were somehow already shared we'd silently keep the
         // open config, but the builder contract prevents that.)
         if let Some(inner) = Arc::get_mut(&mut self.inner) {
-            inner.auth = Some((user.to_string(), pass.to_string()));
+            inner.auth = Some(SingleAuth::new(user, pass));
         }
         self
     }
@@ -2822,17 +2908,33 @@ impl ServerInner {
             return Ok(true);
         }
         // Auth gate: when credentials are configured every request must present
-        // a matching `Authorization: Basic` header.
-        if let Some((user, pass)) = &self.auth {
-            if !req.authorized(user, pass) {
-                write_response_ext(
-                    stream,
-                    401,
-                    "text/plain",
-                    &meta.headers(&[("WWW-Authenticate", "Basic realm=\"gStore\"")]),
-                    b"unauthorized",
-                )?;
-                return Ok(true);
+        // a matching `Authorization: Basic` header; a user name locked out at
+        // the client's address (failed-login lockout) is refused `429`.
+        if let Some(auth) = &self.auth {
+            let ip = crate::http_api::peer_ip(current_peer());
+            match auth.check(&req, &ip) {
+                SingleAuthCheck::Valid => {}
+                SingleAuthCheck::Invalid => {
+                    write_response_ext(
+                        stream,
+                        401,
+                        "text/plain",
+                        &meta.headers(&[("WWW-Authenticate", "Basic realm=\"gStore\"")]),
+                        b"unauthorized",
+                    )?;
+                    return Ok(true);
+                }
+                SingleAuthCheck::Locked(wait) => {
+                    let retry = crate::gapi::ipfilter::retry_after_secs(wait).to_string();
+                    write_response_ext(
+                        stream,
+                        429,
+                        "text/plain",
+                        &meta.headers(&[("Retry-After", retry.as_str())]),
+                        crate::gapi::ipfilter::lockout_msg(wait).as_bytes(),
+                    )?;
+                    return Ok(true);
+                }
             }
         } else if meta.forwarded() {
             // Without credentials the server relies on serving local clients
@@ -3204,20 +3306,17 @@ impl Request {
 
     /// True iff the request carries valid `Authorization: Basic` credentials
     /// equal to `user:pass`.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn authorized(&self, user: &str, pass: &str) -> bool {
-        let token = match self
-            .header("authorization")
-            .and_then(|h| strip_basic_prefix(h))
-        {
-            Some(t) => t.trim(),
-            None => return false,
-        };
-        let decoded = match base64_decode(token) {
-            Some(d) => d,
-            None => return false,
-        };
-        let expected = format!("{user}:{pass}");
-        ct_eq(&decoded, expected.as_bytes())
+        self.basic_token()
+            .is_some_and(|decoded| ct_eq(&decoded, format!("{user}:{pass}").as_bytes()))
+    }
+
+    /// The decoded `Authorization: Basic` token (`user:pass` bytes), if the
+    /// request carries a well-formed one.
+    fn basic_token(&self) -> Option<Vec<u8>> {
+        let token = strip_basic_prefix(self.header("authorization")?)?.trim();
+        base64_decode(token)
     }
 
     /// The negotiated result format token from `?format=` (URL or form body).

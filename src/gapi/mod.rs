@@ -511,7 +511,11 @@ fn route(ctx: &mut Ctx<'_>, params: &Params) -> GResp {
         return (spec.handler)(ctx, params);
     }
     // Upstream exempts login / testConnect from the second (operation-level)
-    // IP check.
+    // IP check — upstream's per-address lockout, in force only under
+    // `upstream_login_lockout`. The default lockout refuses a locked
+    // account's password check in `auth::verify` instead, for every
+    // operation, login / testConnect included, before any hash runs
+    // (review gapi#5 / sec#7).
     if !matches!(op.as_str(), "login" | "testConnect") {
         if let Err(r) = auth::check_ip(ctx, auth::IpStage::Operation) {
             return r;

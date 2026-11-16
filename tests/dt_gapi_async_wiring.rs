@@ -467,7 +467,13 @@ fn blocked_addresses_cannot_submit_asynchronous_operations() {
 
 #[test]
 fn a_locked_out_address_cannot_submit_asynchronous_operations() {
-    let (srv, addr, _root) = start("lockout");
+    // review gapi#5: upstream's per-address lockout is the
+    // upstream_login_lockout switch now (the default lockout, per account
+    // and address, is tests/login_lockout.rs's).
+    let root = tmp_root("lockout");
+    let mut config = GStoreConfig::default();
+    config.upstream_login_lockout = true;
+    let (srv, addr) = start_with(&root, config);
     build(&addr, "alpha");
     for _ in 0..5 {
         let j = as_user(&addr, "root", "login", &[("password", "wrong")]);

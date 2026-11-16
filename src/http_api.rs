@@ -228,7 +228,7 @@ use crate::gapi::ipfilter::IpFilter;
 use crate::gapi::tasks::{TaskConfig, TaskManager};
 use crate::gapi::GapiConfig;
 use crate::http_users::{
-    CheckedCredentials, CredentialCheck, PasswordForm, Privilege, UserStore, ROOT_USER,
+    CheckedCredentials, CredentialCheck, NewPassword, PasswordForm, Privilege, UserStore, ROOT_USER,
 };
 use crate::kvstore::{DiskReadView, DiskSource, ViewError};
 use crate::model::{Term, Triple};
@@ -3021,8 +3021,11 @@ impl ApiInner {
             return (Resp::from(resp), user_disp);
         }
         // The IP checks of the `/api` layer hold for every endpoint on this
-        // listener: the allow / deny lists, and the failed-login lockout for
-        // everything but `/login` (as `/api` exempts its `login`).
+        // listener: the allow / deny lists, and — under
+        // `upstream_login_lockout` — upstream's per-address lockout for
+        // everything but `/login` (as `/api` exempts its `login`). The
+        // default lockout refuses a locked account's password check instead
+        // (`/login`'s and Basic credentials' below), before the hash runs.
         let ip = peer_ip(peer);
         if !self.ipfilter.permits(&ip) {
             return (
@@ -3089,13 +3092,21 @@ impl ApiInner {
         // Basic credentials are checked with the state lock held only to look
         // the user up: the deliberately slow password hash runs with no lock
         // held, so a client sending bad credentials (no account needed) cannot
-        // stall every other request — `/cancel` included — behind it.
-        let basic = parse_basic_auth(req).map(|(u, p)| {
-            let attempt = locked(&self.state)
-                .users
-                .begin_check(&u, &p, PasswordForm::Plain);
-            (u, attempt.verify())
-        });
+        // stall every other request — `/cancel` included — behind it. An
+        // account the lockout refuses at this address is answered `429`
+        // before any hash runs (review http#6 / sec#7).
+        let basic = match parse_basic_auth(req) {
+            None => None,
+            Some((u, p)) => {
+                if let Some(wait) = self.ipfilter.auth_refusal(&u, &ip) {
+                    return (lockout_refused(wait), "-".to_string());
+                }
+                let attempt = locked(&self.state)
+                    .users
+                    .begin_check(&u, &p, PasswordForm::Plain);
+                Some((u, attempt.verify()))
+            }
+        };
         // Short critical section: count the request, resolve the caller, route.
         // An endpoint with slow work (parsing, a query, I/O) returns
         // `Dispatch::Deferred` so it runs below with the `ApiState` lock
@@ -3334,14 +3345,15 @@ impl ApiInner {
         basic: Option<(String, CheckedCredentials)>,
     ) -> Option<String> {
         if let Some((u, checked)) = basic {
+            let ip = peer_ip(crate::server::current_peer());
             // Also migrates a legacy password hash on first successful use,
             // so Basic-auth-only clients get upgraded like `/login` users.
             if st.users.finish_check(checked) == CredentialCheck::Valid {
+                self.ipfilter.note_auth_success(&u, &ip);
                 return Some(u);
             }
-            // Counts towards the address's lockout, as a failed `/api` login.
-            self.ipfilter
-                .note_failure(&peer_ip(crate::server::current_peer()));
+            // Counts towards the lockout, as a failed `/api` login.
+            self.ipfilter.note_auth_failure(&u, &ip);
         }
         if let Some(tok) = req.bearer_or_session_token() {
             if let Some(u) = st.users.session_user(&tok) {
@@ -3498,13 +3510,19 @@ impl ApiInner {
         }
 
         let resp = match (method, path) {
-            ("POST", "/user/create") => self.guarded(st, &user, "usermanage", |s, st| {
-                s.handle_user_create(st, req)
-            }),
+            // The privilege check stays here, under the state lock; the
+            // password hash and the users.db write run deferred, with no
+            // lock held (review http#7).
+            ("POST", "/user/create") => {
+                if !crate::sysdb::allowed(&st.users, &user, "usermanage", None) {
+                    return Dispatch::Done(self.forbidden());
+                }
+                return self.handle_user_create(st, req);
+            }
             ("POST", "/user/drop") => {
                 self.guarded(st, &user, "usermanage", |s, st| s.handle_user_drop(st, req))
             }
-            ("POST", "/user/password") => self.handle_user_password(st, req, &user),
+            ("POST", "/user/password") => return self.handle_user_password(st, req, &user),
             ("POST", "/user/grant") => self.guarded(st, &user, "userprivilegemanage", |s, st| {
                 s.handle_user_grant(st, req, true)
             }),
@@ -3560,20 +3578,25 @@ impl ApiInner {
             return Dispatch::Done(Resp::fail(400, "missing username or password"));
         };
         Dispatch::Deferred(Box::new(move |inner| {
+            let ip = peer_ip(crate::server::current_peer());
+            // A locked account is refused before the slow hash (review
+            // http#6): guessing through `/login` gets no further.
+            if let Some(wait) = inner.ipfilter.auth_refusal(&username, &ip) {
+                return lockout_refused(wait);
+            }
             let attempt =
                 locked(&inner.state)
                     .users
                     .begin_check(&username, &password, PasswordForm::Plain);
             let checked = attempt.verify();
-            let ip = peer_ip(crate::server::current_peer());
             let mut st = locked(&inner.state);
             if st.users.finish_check(checked) != CredentialCheck::Valid {
-                inner.ipfilter.note_failure(&ip);
+                inner.ipfilter.note_auth_failure(&username, &ip);
                 return Resp::fail(401, "invalid username or password");
             }
-            // As `/api`'s `login`: a successful login clears the address's
-            // failed-login count.
-            inner.ipfilter.reset(&ip);
+            // As `/api`'s `login`: a successful login clears the account's
+            // failed-login count at this address (upstream: the address's).
+            inner.ipfilter.note_login_success(&username, &ip);
             let token = st.users.start_session(&username);
             let priv_str = st
                 .users
@@ -5525,22 +5548,30 @@ impl ApiInner {
 
     // ---- user management --------------------------------------------------
 
-    fn handle_user_create(&self, st: &mut ApiState, req: &Request) -> Resp {
+    /// `/user/create` (the caller's `usermanage` privilege is checked by
+    /// [`dispatch`](Self::dispatch)). The request is checked here, under the
+    /// state lock; the password hash and the users.db write run deferred
+    /// with no lock held (review http#7), and the user is created only if
+    /// the name is still free then.
+    fn handle_user_create(&self, st: &mut ApiState, req: &Request) -> Dispatch {
         let (Some(name), Some(password)) = (
             req.param("op_username").or_else(|| req.param("username")),
             req.param("op_password").or_else(|| req.param("password")),
         ) else {
-            return Resp::fail(400, "missing op_username or op_password");
+            return Dispatch::Done(Resp::fail(400, "missing op_username or op_password"));
         };
         let privileges = req.param("privileges").unwrap_or_default();
         let Some(privs) = Privilege::parse_list(&privileges) else {
-            return Resp::fail(400, "invalid privileges (use names or codes 1..8)");
+            return Dispatch::Done(Resp::fail(
+                400,
+                "invalid privileges (use names or codes 1..8)",
+            ));
         };
         // With a `db_name` the privileges are granted on that database only;
         // without, on every database.
         let db = match grant_db_param(req) {
             Ok(db) => db,
-            Err(r) => return r,
+            Err(r) => return Dispatch::Done(r),
         };
         let (global, on_db) = match db {
             Some(db) => (BTreeSet::new(), Some((db, privs))),
@@ -5548,21 +5579,30 @@ impl ApiInner {
         };
         // The system user (`/shutdown`, `/restart`) is not a stored user.
         if name == self.config().system_username {
-            return Resp::fail(
+            return Dispatch::Done(Resp::fail(
                 400,
                 &format!("'{name}' is the system user's name (system_username)"),
+            ));
+        }
+        if st.users.exists(&name) {
+            return Dispatch::Done(Resp::fail(400, &format!("user '{name}' already exists")));
+        }
+        Dispatch::Deferred(Box::new(move |inner| {
+            let hashed = match NewPassword::hash(&password) {
+                Ok(h) => h,
+                Err(e) => return Resp::fail(400, &e),
+            };
+            let on_db = on_db.as_ref().map(|(db, p)| (db.as_str(), p));
+            let created = crate::http_users::write_off_lock(
+                &inner.state,
+                |st| &mut st.users,
+                |users| users.prepare_add(&name, &hashed, global.clone(), on_db),
             );
-        }
-        if let Err(e) = st.users.add(&name, &password, global) {
-            return Resp::fail(400, &e);
-        }
-        if let Some((db, privs)) = on_db.filter(|(_, p)| !p.is_empty()) {
-            if let Err(e) = st.users.grant_on(&name, &db, &privs) {
-                let _ = st.users.drop_user(&name);
-                return Resp::fail(400, &e);
+            match created {
+                Ok(()) => Resp::ok(&format!("user '{name}' created")),
+                Err(e) => Resp::fail(400, &e),
             }
-        }
-        Resp::ok(&format!("user '{name}' created"))
+        }))
     }
 
     fn handle_user_drop(&self, st: &mut ApiState, req: &Request) -> Resp {
@@ -5589,26 +5629,44 @@ impl ApiInner {
         }
     }
 
-    fn handle_user_password(&self, st: &mut ApiState, req: &Request, user: &str) -> Resp {
+    /// `/user/password`: whether the caller may change the target's
+    /// password is decided here, under the state lock; the password hash
+    /// and the users.db write run deferred with no lock held (review
+    /// http#7), and the password is set only if the user still exists then.
+    fn handle_user_password(&self, st: &mut ApiState, req: &Request, user: &str) -> Dispatch {
         let Some(target) = req
             .param("username")
             .or_else(|| req.param("op_username"))
             .or_else(|| Some(user.to_string()))
         else {
-            return Resp::fail(400, "missing username");
+            return Dispatch::Done(Resp::fail(400, "missing username"));
         };
         let Some(password) = req.param("op_password").or_else(|| req.param("password")) else {
-            return Resp::fail(400, "missing op_password");
+            return Dispatch::Done(Resp::fail(400, "missing op_password"));
         };
         // A user may change their own password; only admins may change others'.
         let is_admin = st.users.is_superuser(user);
         if target != user && !is_admin {
-            return self.forbidden();
+            return Dispatch::Done(self.forbidden());
         }
-        match st.users.set_password(&target, &password) {
-            Ok(()) => Resp::ok(&format!("password for '{target}' changed")),
-            Err(e) => Resp::fail(400, &e),
+        if !st.users.exists(&target) {
+            return Dispatch::Done(Resp::fail(400, &format!("user '{target}' does not exist")));
         }
+        Dispatch::Deferred(Box::new(move |inner| {
+            let hashed = match NewPassword::hash(&password) {
+                Ok(h) => h,
+                Err(e) => return Resp::fail(400, &e),
+            };
+            let changed = crate::http_users::write_off_lock(
+                &inner.state,
+                |st| &mut st.users,
+                |users| users.prepare_set_password(&target, &hashed),
+            );
+            match changed {
+                Ok(()) => Resp::ok(&format!("password for '{target}' changed")),
+                Err(e) => Resp::fail(400, &e),
+            }
+        }))
     }
 
     fn handle_user_grant(&self, st: &mut ApiState, req: &Request, grant: bool) -> Resp {
@@ -6188,6 +6246,17 @@ fn presents_default_root_password(req: &Request) -> bool {
     req.path == "/login"
         && req.param("username").as_deref() == Some(ROOT_USER)
         && req.param("password").as_deref() == Some(default)
+}
+
+/// The answer to a password check the failed-login lockout refuses
+/// (`crate::gapi::ipfilter`): `429 Too Many Requests` with `Retry-After`.
+fn lockout_refused(wait: Duration) -> Resp {
+    let mut r = Resp::fail(429, &crate::gapi::ipfilter::lockout_msg(wait));
+    r.extra.push((
+        "Retry-After".to_string(),
+        crate::gapi::ipfilter::retry_after_secs(wait).to_string(),
+    ));
+    r
 }
 
 /// Render a [`QueryResult`] into an HTTP response using the negotiated format.
