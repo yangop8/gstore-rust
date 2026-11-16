@@ -135,6 +135,10 @@ none
   grace period now also bound the CSR build of the advanced graph
   functions and the substring-index build of `CONTAINS`-style filters; a
   cancelled build caches nothing.
+- docs/GAP_PLAN.md (§9.1 row 6c, text only; status unchanged): the cached
+  trigram substring index of an in-memory dictionary keeps candidates only
+  (no copy of the term strings) and is extended after a write that adds or
+  frees terms instead of being rebuilt (gap-accel-soundness#3, db#5).
 - docs/REFACTOR_BACKLOG.md — analytics#6 (remainder): `CsrGraph::build`
   (generic, `iter_all`) still materializes every triple; it is left for
   callers without a predicate list (`src/concurrent.rs`'s ConcurrentDb CSR
