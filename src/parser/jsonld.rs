@@ -100,15 +100,42 @@ struct TermDef {
 }
 
 /// The active JSON-LD context threaded through processing. It is shared
-/// (`Rc`) by every node object that does not carry its own `@context`, and
-/// copied only for one that does (review parser#7: each node object used to
-/// copy the whole context, O(nodes x terms)).
-#[derive(Debug, Clone, Default)]
+/// (`Rc`) by every node object that does not carry its own `@context`; one
+/// that does gets a new context whose term definitions are a layer of its
+/// own over the shared ones ([`Terms`]), so nothing is copied in
+/// proportion to the terms in scope (review parser#7: each node object
+/// used to copy the whole context, O(nodes x terms)).
+#[derive(Debug, Default)]
 struct Context {
     base: Option<String>,
     vocab: Option<String>,
     language: Option<String>,
-    terms: HashMap<String, TermDef>,
+    terms: Rc<Terms>,
+}
+
+/// Term definitions in layers: the definitions of one `@context` (an
+/// object, or every member of an array of them), over the layers of the
+/// contexts it extends, which are shared, not copied. A lookup walks the
+/// layers from the top, so a later definition hides an earlier one and
+/// `"term": null` (stored as `None`) removes it. A `@context` that defines
+/// no term adds no layer, so there are at most as many layers as nested
+/// objects carrying term definitions (bounded by the JSON nesting depth).
+#[derive(Debug, Default)]
+struct Terms {
+    own: HashMap<String, Option<TermDef>>,
+    below: Option<Rc<Terms>>,
+}
+
+impl Terms {
+    fn get(&self, key: &str) -> Option<&TermDef> {
+        let mut layer = self;
+        loop {
+            if let Some(def) = layer.own.get(key) {
+                return def.as_ref();
+            }
+            layer = layer.below.as_deref()?;
+        }
+    }
 }
 
 // ---- triple extraction ----------------------------------------------------
@@ -172,22 +199,41 @@ impl Processor {
         parent: &Rc<Context>,
         pairs: &[(String, Json)],
     ) -> Result<Rc<Context>> {
-        match get(pairs, "@context") {
-            Some(c) => self.build_context(parent, c).map(Rc::new),
-            None => Ok(Rc::clone(parent)),
+        let Some(c) = get(pairs, "@context") else {
+            return Ok(Rc::clone(parent));
+        };
+        // A new layer of term definitions over the parent's (shared).
+        let mut ctx = Context {
+            base: parent.base.clone(),
+            vocab: parent.vocab.clone(),
+            language: parent.language.clone(),
+            terms: Rc::new(Terms {
+                own: HashMap::new(),
+                below: Some(Rc::clone(&parent.terms)),
+            }),
+        };
+        self.build_context(&mut ctx, c)?;
+        // A `@context` without term definitions adds no layer.
+        if ctx.terms.own.is_empty() {
+            if let Some(below) = ctx.terms.below.clone() {
+                ctx.terms = below;
+            }
         }
+        Ok(Rc::new(ctx))
     }
 
-    fn build_context(&self, parent: &Context, ctx_json: &Json) -> Result<Context> {
-        let mut ctx = parent.clone();
+    /// Apply the local context `ctx_json` to `ctx`, whose top term layer
+    /// is its own (not shared): an array's members in order, each on the
+    /// result of the ones before (the same layer, not a copy per member).
+    fn build_context(&self, ctx: &mut Context, ctx_json: &Json) -> Result<()> {
         match ctx_json {
             // Remote contexts are not fetched (documented limitation).
             Json::Str(_) => {}
             // A null context resets everything.
-            Json::Null => ctx = Context::default(),
+            Json::Null => *ctx = Context::default(),
             Json::Arr(items) => {
                 for it in items {
-                    ctx = self.build_context(&ctx, it)?;
+                    self.build_context(ctx, it)?;
                 }
             }
             Json::Obj(defs) => {
@@ -212,17 +258,18 @@ impl Processor {
                         // `"term": null` explicitly removes the mapping (JSON-LD
                         // context term deletion) rather than defining a dead term.
                         _ if matches!(v, Json::Null) => {
-                            ctx.terms.remove(k);
+                            own_terms(ctx).insert(k.clone(), None);
                         }
                         _ => {
-                            ctx.terms.insert(k.clone(), self.build_term_def(&ctx, v)?);
+                            let def = self.build_term_def(ctx, v)?;
+                            own_terms(ctx).insert(k.clone(), Some(def));
                         }
                     }
                 }
             }
             _ => {}
         }
-        Ok(ctx)
+        Ok(())
     }
 
     fn build_term_def(&self, ctx: &Context, v: &Json) -> Result<TermDef> {
@@ -464,6 +511,23 @@ impl Processor {
         let lang = def.language.clone().or_else(|| ctx.language.clone());
         Ok(make_plain(&value, lang))
     }
+}
+
+/// The top term layer of a context being built, to add definitions to.
+/// It is the context's own ([`Processor::active_context`] or a `null`
+/// context made it); were it shared, a new layer over it is started rather
+/// than a copy made.
+fn own_terms(ctx: &mut Context) -> &mut HashMap<String, Option<TermDef>> {
+    if Rc::get_mut(&mut ctx.terms).is_none() {
+        let below = Rc::clone(&ctx.terms);
+        ctx.terms = Rc::new(Terms {
+            own: HashMap::new(),
+            below: Some(below),
+        });
+    }
+    &mut Rc::get_mut(&mut ctx.terms)
+        .expect("a new term layer is not shared")
+        .own
 }
 
 fn rdf_type() -> Term {

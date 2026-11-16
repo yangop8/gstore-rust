@@ -561,9 +561,10 @@ struct EvalContext {
     parent_subject: Term,
     parent_object: Option<Term>,
     vocab: Option<String>,
-    /// Shared by every element that declares no prefix of its own, copied
-    /// by one that does (review parser#7: each element used to copy it).
-    prefixes: Rc<HashMap<String, String>>,
+    /// Shared by every element that declares no prefix of its own; one
+    /// that does adds a layer of its own over it ([`Prefixes`]; review
+    /// parser#7: each element used to copy the whole map).
+    prefixes: Rc<Prefixes>,
     lang: Option<String>,
     /// Incomplete triples awaiting a child subject: `(predicate, direction)`.
     incomplete: Vec<(Term, Dir)>,
@@ -576,7 +577,10 @@ impl EvalContext {
             base,
             parent_object: None,
             vocab: None,
-            prefixes: Rc::new(initial_prefixes()),
+            prefixes: Rc::new(Prefixes {
+                own: initial_prefixes(),
+                below: None,
+            }),
             lang: None,
             incomplete: Vec::new(),
         }
@@ -618,7 +622,6 @@ impl Extractor {
         let mut typed_resource: Option<Term> = None;
 
         // Local mutable context copies.
-        let mut prefixes = Rc::clone(&ctx.prefixes);
         let mut vocab = ctx.vocab.clone();
         let mut lang = ctx.lang.clone();
         // `xml:base` (rare in RDFa) overrides the inherited base for this subtree.
@@ -637,15 +640,25 @@ impl Extractor {
             };
         }
 
-        // Step 3: prefix mappings from @prefix and xmlns:*.
+        // Step 3: prefix mappings from @prefix and xmlns:*, in a layer of
+        // this element's own over the inherited ones (shared, not copied).
+        let mut own_prefixes = HashMap::new();
         if let Some(p) = el.attr("prefix") {
-            parse_prefix_attr(p, Rc::make_mut(&mut prefixes));
+            parse_prefix_attr(p, &mut own_prefixes);
         }
         for (k, v) in &el.attrs {
             if let Some(pfx) = k.strip_prefix("xmlns:") {
-                Rc::make_mut(&mut prefixes).insert(pfx.to_string(), v.clone());
+                own_prefixes.insert(pfx.to_string(), v.clone());
             }
         }
+        let prefixes = if own_prefixes.is_empty() {
+            Rc::clone(&ctx.prefixes)
+        } else {
+            Rc::new(Prefixes {
+                own: own_prefixes,
+                below: Some(Rc::clone(&ctx.prefixes)),
+            })
+        };
 
         // Step 4: language, through the shared language-tag rule
         // (`zh_CN` is `zh-CN`, `""` no language; anything else that is no
@@ -931,7 +944,31 @@ impl Extractor {
 struct LocalCtx<'a> {
     base: &'a str,
     vocab: &'a Option<String>,
-    prefixes: &'a HashMap<String, String>,
+    prefixes: &'a Prefixes,
+}
+
+/// The prefix mappings in scope, in layers: those an element declares
+/// (`prefix`, `xmlns:*`) over the layers of its ancestors, which are shared,
+/// not copied. A lookup walks the layers from the element's own, so an
+/// inner mapping hides an outer one. Only elements that declare a prefix
+/// add a layer, so there are at most as many as the tree is deep
+/// ([`MAX_TREE_DEPTH`]).
+#[derive(Default)]
+struct Prefixes {
+    own: HashMap<String, String>,
+    below: Option<Rc<Prefixes>>,
+}
+
+impl Prefixes {
+    fn get(&self, prefix: &str) -> Option<&String> {
+        let mut layer = self;
+        loop {
+            if let Some(ns) = layer.own.get(prefix) {
+                return Some(ns);
+            }
+            layer = layer.below.as_deref()?;
+        }
+    }
 }
 
 fn make_literal(value: &str, datatype: Option<String>, lang: &Option<String>) -> Term {

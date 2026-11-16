@@ -644,6 +644,187 @@ fn an_rdfa_prefix_is_scoped_to_its_element() {
     )));
 }
 
+/// Review parser#7, by another route (found in review): a node object
+/// with its own `@context`, even an empty one, still copied the whole
+/// context in scope (5000 `{"@context": {}}` under 4000 terms: 1.8 s), and
+/// each member of a `@context` array copied the context built so far
+/// (8000 one-term members: 10.5 s for a 238 KB document, quadratic). A
+/// node's definitions are now a layer over the shared ones, and an array's
+/// members fill one layer: 16 times the terms in scope cost about the same
+/// (bound: 4), and 4 times the array members about 4 times as much (bound:
+/// 8, which a quadratic cost, at 16, misses).
+#[test]
+fn jsonld_node_contexts_and_context_arrays_add_layers_not_copies() {
+    let nodes = 5000;
+    let doc = |terms: usize, node: &str| {
+        let defs: Vec<String> = (0..terms)
+            .map(|i| format!("\"t{i}\": \"http://ex/t{i}\""))
+            .collect();
+        format!(
+            "{{\"@context\": {{{}}}, \"@graph\": [{}]}}",
+            defs.join(", "),
+            vec![node; nodes].join(", ")
+        )
+    };
+    for (node, triples) in [
+        (r#"{"@context": {}}"#, 0),
+        (
+            r#"{"@context": {"x": "http://ex/x"}, "@id": "http://ex/s", "x": "v", "t0": "w"}"#,
+            2 * nodes,
+        ),
+    ] {
+        let small = doc(250, node);
+        let large = doc(4000, node);
+        assert_eq!(jsonld::parse_str(&large).unwrap().len(), triples, "{node}");
+        let t_small = fastest(|| {
+            jsonld::parse_str(&small).unwrap();
+        });
+        let t_large = fastest(|| {
+            jsonld::parse_str(&large).unwrap();
+        });
+        let ratio = t_large.as_secs_f64() / t_small.as_secs_f64().max(1e-6);
+        assert!(
+            ratio < 4.0 || t_large < Duration::from_millis(30),
+            "{node}: 16x the context terms took {ratio:.1}x as long ({t_small:?} -> {t_large:?})"
+        );
+    }
+    let array = |members: usize| {
+        let items: Vec<String> = (0..members)
+            .map(|i| format!("{{\"t{i}\": \"http://ex/t{i}\"}}"))
+            .collect();
+        format!(
+            "{{\"@context\": [{}], \"@id\": \"http://ex/s\", \"t0\": \"a\", \"t{}\": \"b\"}}",
+            items.join(", "),
+            members - 1
+        )
+    };
+    let small = array(2000);
+    let large = array(8000);
+    assert_eq!(
+        jsonld::parse_str(&large).unwrap(),
+        [
+            Triple::new(iri("http://ex/s"), iri("http://ex/t0"), lit("a")),
+            Triple::new(iri("http://ex/s"), iri("http://ex/t7999"), lit("b")),
+        ]
+    );
+    let t_small = fastest(|| {
+        jsonld::parse_str(&small).unwrap();
+    });
+    let t_large = fastest(|| {
+        jsonld::parse_str(&large).unwrap();
+    });
+    let ratio = t_large.as_secs_f64() / t_small.as_secs_f64().max(1e-6);
+    assert!(
+        ratio < 8.0 || t_large < Duration::from_millis(30),
+        "4x the context array members took {ratio:.1}x as long ({t_small:?} -> {t_large:?})"
+    );
+}
+
+/// The layers keep JSON-LD's scoping (JSON-LD 1.1 §4.1, context
+/// processing): a node's `"term": null` removes the outer definition for
+/// that node and what it contains (the term falls back to `@vocab`), not
+/// for its siblings; a later member of a context array overrides an
+/// earlier one; a `null` member resets the context.
+#[test]
+fn jsonld_context_layers_keep_definitions_scoped() {
+    let doc = r#"{"@context": {"@vocab": "http://v/", "ex": "http://ex/", "name": "http://ex/name"},
+        "@graph": [
+          {"@id": "ex:a", "@context": {"name": null}, "name": "A",
+           "ex:child": {"@id": "ex:c", "name": "C"}},
+          {"@id": "ex:b", "name": "B"},
+          {"@id": "ex:d", "@context": [{"name": "http://one/name"}, {"name": "http://two/name"}],
+           "name": "D"},
+          {"@id": "http://ex/e", "@context": [null, {"name": "http://three/name"}],
+           "name": "E", "other": "dropped: no @vocab after the reset"}
+        ]}"#;
+    let mut got = jsonld::parse_str(doc).unwrap();
+    got.sort_by_key(|t| format!("{t:?}"));
+    let mut want = vec![
+        Triple::new(iri("http://ex/a"), iri("http://v/name"), lit("A")),
+        Triple::new(
+            iri("http://ex/a"),
+            iri("http://ex/child"),
+            iri("http://ex/c"),
+        ),
+        Triple::new(iri("http://ex/c"), iri("http://v/name"), lit("C")),
+        Triple::new(iri("http://ex/b"), iri("http://ex/name"), lit("B")),
+        Triple::new(iri("http://ex/d"), iri("http://two/name"), lit("D")),
+        Triple::new(iri("http://ex/e"), iri("http://three/name"), lit("E")),
+    ];
+    want.sort_by_key(|t| format!("{t:?}"));
+    assert_eq!(got, want);
+}
+
+/// Review parser#7 (RDFa), by the same route: an element declaring a
+/// prefix still copied the whole map in scope (2000 such elements: 6 ms
+/// under 10 prefixes, 140 ms under 1000). Its mappings are now a layer over
+/// the shared ones: 100 times the prefixes cost about the same (bound: 4).
+#[test]
+fn rdfa_elements_declaring_a_prefix_add_a_layer_not_a_copy() {
+    let elements = 4000;
+    let doc = |prefixes: usize| {
+        let decl: Vec<String> = (0..prefixes)
+            .map(|i| format!("p{i}: http://ex/p{i}/"))
+            .collect();
+        let body: String = (0..elements)
+            .map(|i| {
+                format!(
+                    "<div prefix=\"q: http://ex/q/\" about=\"http://ex/s{i}\" property=\"q:v\">x</div>"
+                )
+            })
+            .collect();
+        format!(
+            "<html prefix=\"{}\"><body>{body}</body></html>",
+            decl.join(" ")
+        )
+    };
+    let small = doc(10);
+    let large = doc(1000);
+    let ts = rdfa::parse_str(&large).unwrap();
+    assert_eq!(
+        ts.iter()
+            .filter(|t| t.predicate == iri("http://ex/q/v"))
+            .count(),
+        elements
+    );
+    let t_small = fastest(|| {
+        rdfa::parse_str(&small).unwrap();
+    });
+    let t_large = fastest(|| {
+        rdfa::parse_str(&large).unwrap();
+    });
+    let ratio = t_large.as_secs_f64() / t_small.as_secs_f64().max(1e-6);
+    assert!(
+        ratio < 4.0 || t_large < Duration::from_millis(30),
+        "100x the prefixes took {ratio:.1}x as long ({t_small:?} -> {t_large:?})"
+    );
+}
+
+/// RDFa Core §7.5 step 3, nested: an inner mapping (`prefix` or `xmlns:`)
+/// hides an outer one for the element and its descendants only.
+#[test]
+fn an_inner_rdfa_prefix_hides_an_outer_one_in_its_subtree() {
+    let doc = "<html prefix=\"a: http://ex/a/\"><body>\
+               <div prefix=\"a: http://ex/inner/\">\
+                 <span about=\"http://ex/s1\" property=\"a:p\">x</span>\
+                 <div xmlns:a=\"http://ex/x/\"><span about=\"http://ex/s3\" property=\"a:p\">z</span></div>\
+                 <span about=\"http://ex/s4\" property=\"a:p\">w</span>\
+               </div>\
+               <div about=\"http://ex/s2\" property=\"a:p\">y</div></body></html>";
+    let ts = rdfa::parse_str(doc).unwrap();
+    for (s, p, o) in [
+        ("http://ex/s1", "http://ex/inner/p", "x"),
+        ("http://ex/s3", "http://ex/x/p", "z"),
+        ("http://ex/s4", "http://ex/inner/p", "w"),
+        ("http://ex/s2", "http://ex/a/p", "y"),
+    ] {
+        assert!(
+            ts.contains(&Triple::new(iri(s), iri(p), lit(o))),
+            "{s} {p} {o:?} missing from {ts:?}"
+        );
+    }
+}
+
 // ---- one token is bounded in the streaming readers (parser#5) -----------------
 
 /// A reader of `head`, then `n` bytes of `fill`, then `tail`, holding none

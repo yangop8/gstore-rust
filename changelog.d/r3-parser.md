@@ -73,10 +73,17 @@
   request byte: a 64 MiB body took about 770 MB more before parsing started.
 - **JSON-LD contexts and RDFa prefix maps are shared (parser#7).** A
   JSON-LD node object without its own `@context` shares its parent's
-  context instead of copying it, and one with an `@context` copies it once.
-  An RDFa element copies the prefix map only when it declares a prefix.
-  Every node used to copy the whole map: O(nodes × terms), 10.9 s for 20000
-  empty node objects under a 4000-term context.
+  context instead of copying it. One with an `@context` gets a layer of its
+  own term definitions over the shared ones, and the members of a
+  `@context` array fill one layer, so nothing is copied in proportion to
+  the terms in scope. An RDFa element that declares a prefix (`prefix`,
+  `xmlns:`) likewise adds a layer over the shared prefix map. Every node
+  used to copy the whole map: O(nodes × terms), 10.9 s for 20000 empty node
+  objects under a 4000-term context. Copying only for a node with its own
+  `@context` (this package's first version) left the same cost one
+  `"@context": {}` per node away (1.8 s for 5000 such nodes under 4000
+  terms, now 4 ms), and a `@context` array of 8000 one-term members took
+  10.5 s (quadratic, now 8 ms).
 - **Blank graph labels in large documents (parser#14).** In N-Quads / TriG,
   the check of whether a blank graph label was used before as a subject or
   object is now a growing (scalable) Bloom filter.
@@ -161,7 +168,12 @@ two other agents' builds):
   quadratic resolver gives 64. The previous code needed 11 s for 1.4 MB.
 - **parser#7.** 16 times the JSON-LD context terms, or 100 times the RDFa
   prefixes, cost under 4 times as much. The previous code measured 14.8x and
-  30.1x.
+  30.1x. Review follow-up (layers instead of copy-on-write), measured with
+  the same test profile: 5000 node objects each with `"@context": {}` under
+  250 / 4000 terms, 106 ms / 1.65 s before (15.5x), 2 ms / 4 ms after; a
+  `@context` array of 2000 / 8000 one-term members, 655 ms / 10.5 s before,
+  1.2 ms / 8 ms after; 4000 RDFa elements each declaring a prefix under 10 /
+  1000 prefixes, 13 ms / 325 ms before (24.7x), about 4 ms either way after.
 - **Bench smoke gate** (D9), branch head `db97fcc`. Release build of
   `gbuild` + `gstore-bench`; `gstore-bench report --check README.md
   CHANGELOG.md` clean. Command: `flock /tmp/gstore-bench.lock env
