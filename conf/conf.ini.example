@@ -287,6 +287,17 @@ upload_allow_compress_packages = "zip"
 # entries, and the bytes its files unpack to in all (zip-bomb guard).
 unzip_max_entries = 10000
 unzip_max_size = 10737418240
+# (gstore-rust extension) the longest single token (a literal, IRI, name,
+# number or language tag) the streaming RDF readers (N-Triples, N-Quads,
+# Turtle, TriG) hold, and the longest N-Triples / N-Quads line, in bytes: a
+# longer one fails its statement (a tolerant build skips and logs it). Bounds
+# the memory an unterminated string or a gzip-compressed input can take.
+# 64 MB; 0 = no limit (upstream has none)
+rdf_max_token_size = 67108864
+# (gstore-rust extension) the longest SPARQL query or update, in bytes: a
+# longer one is refused before it is parsed. 16 MB; 0 = no limit (upstream has
+# none). Large loads belong in build / batchInsert, not in INSERT DATA.
+sparql_max_size = 16777216
 # (gstore-rust extension) /file/download. By default a download needs a valid
 # username / password, and a user reads a file only with the matching
 # privilege on the database it came from (export / query) or when he uploaded

@@ -204,6 +204,15 @@ pub struct ImportOptions {
     pub batch_bytes: usize,
     /// The read window: the buffer size of the reader over a file.
     pub window: usize,
+    /// The most bytes one token (a literal, IRI, name, number or language
+    /// tag) of a streaming format (N-Triples, N-Quads, Turtle, TriG) may
+    /// take, and one N-Triples / N-Quads line: a longer one fails its
+    /// statement, and only this much of it is held. `0` (or `usize::MAX`)
+    /// = no limit. Defaults to
+    /// [`default_max_token_bytes`](crate::parser::stream::default_max_token_bytes)
+    /// (`[upload] rdf_max_token_size` in `gserver` and `gbuild`; review
+    /// parser#5).
+    pub max_token_bytes: usize,
 }
 
 impl Default for ImportOptions {
@@ -223,6 +232,7 @@ impl ImportOptions {
             batch_size: DEFAULT_BATCH_SIZE,
             batch_bytes: DEFAULT_BATCH_BYTES,
             window: DEFAULT_WINDOW,
+            max_token_bytes: crate::parser::stream::default_max_token_bytes(),
         }
     }
 
@@ -642,6 +652,13 @@ impl Pipeline<'_> {
 impl StatementSink for Pipeline<'_> {
     fn at_line(&mut self, line: usize) {
         self.line = line;
+    }
+
+    fn max_token_bytes(&self) -> usize {
+        match self.opts.max_token_bytes {
+            0 => usize::MAX,
+            n => n,
+        }
     }
 
     fn statement(&mut self, quads: &mut Vec<Quad>) -> Result<()> {

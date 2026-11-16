@@ -22,7 +22,10 @@
 //! reader's buffer, a few characters of lookahead and the statement being
 //! parsed — never the document. Each completed statement's triples go to a
 //! [`StatementSink`] (inside a TriG block too, so one huge graph block is not
-//! buffered either).
+//! buffered either). One token — a string, IRI, name, number or language
+//! tag — may take at most [`StatementSink::max_token_bytes`] (64 MiB by
+//! default): a longer one fails its statement once the reader has read that
+//! much of it, and the reader moves past it without holding the rest.
 //!
 //! # Errors and recovery
 //!
@@ -66,8 +69,8 @@ use crate::model::{Term, Triple};
 use crate::parser::nquads::Quad;
 use crate::parser::sparql::ast::{xsd, RDF_TYPE};
 use crate::parser::stream::{
-    expansion_budget, expansion_error, BlankLabeler, CharSource, CollectQuads, StatementSink,
-    SyntaxError, DEFAULT_WINDOW, MAX_LOOKAHEAD,
+    expansion_budget, expansion_error, token_too_long, BlankLabeler, CharSource, CollectQuads,
+    StatementSink, SyntaxError, DEFAULT_WINDOW, MAX_LOOKAHEAD,
 };
 
 /// Parse a Turtle document into triples.
@@ -147,6 +150,7 @@ fn run<R: BufRead>(
         ctx: [None, None, None],
         stmt_start: 0,
         held: 0,
+        max_token: sink.max_token_bytes(),
     };
     p.run(sink)
 }
@@ -178,6 +182,9 @@ struct Parser<R> {
     /// Bytes of RDF terms the current statement holds (its quads, the items
     /// of its collections), bounded by [`expansion_budget`].
     held: usize,
+    /// The most bytes one token (a literal, IRI, name, number, language
+    /// tag) may take ([`StatementSink::max_token_bytes`]).
+    max_token: usize,
 }
 
 /// The `rdf:` namespace base (for collection `rdf:first`/`rest`/`nil`).
@@ -442,6 +449,17 @@ impl<R: BufRead> Parser<R> {
         Ok(())
     }
 
+    /// `Err` when a token being read has grown to `len` bytes, past the
+    /// limit of one token ([`StatementSink::max_token_bytes`]; review
+    /// parser#5: an unterminated `"""` string or a newline-free IRI was
+    /// held whole, however long).
+    fn check_token(&self, len: usize, what: &str) -> Result<()> {
+        if len > self.max_token {
+            return Err(token_too_long(self.src.line(), what, self.max_token));
+        }
+        Ok(())
+    }
+
     /// Count `bytes` more of RDF terms held for the current statement: an
     /// error past its [`expansion_budget`] (so a long prefix repeated by a
     /// long object list cannot take memory without bound).
@@ -539,7 +557,7 @@ impl<R: BufRead> Parser<R> {
 
     fn parse_directive(&mut self) -> Result<()> {
         self.bump(); // '@'
-        let kw = self.read_bareword();
+        let kw = self.read_bareword()?;
         match kw.as_str() {
             "prefix" => {
                 self.skip_ws();
@@ -588,6 +606,7 @@ impl<R: BufRead> Parser<R> {
             } else if c.is_whitespace() {
                 break;
             } else {
+                self.check_token(ns.len(), "a prefix name")?;
                 ns.push(c);
                 self.bump();
             }
@@ -797,6 +816,11 @@ impl<R: BufRead> Parser<R> {
             if matches!(self.peek(), Some(c) if c <= ' ') {
                 return Err(self.err("invalid IRI (space or control character before '>')"));
             }
+            if let Err(e) = self.check_token(s.len(), "an IRI") {
+                // Stop after the IRI, not inside it (see `resync`).
+                self.skip_rest_of_iri();
+                return Err(e);
+            }
             match self.bump() {
                 Some('>') => return Ok(self.resolve_iri(&s)),
                 Some('\\') => {
@@ -814,20 +838,26 @@ impl<R: BufRead> Parser<R> {
                     };
                     if let Err(e) = escaped {
                         // Stop after the IRI, not inside it (see `resync`).
-                        while let Some(c) = self.peek() {
-                            if c <= ' ' {
-                                break;
-                            }
-                            self.bump();
-                            if c == '>' {
-                                break;
-                            }
-                        }
+                        self.skip_rest_of_iri();
                         return Err(e);
                     }
                 }
                 Some(c) => s.push(c),
                 None => return Err(self.err("unterminated IRI")),
+            }
+        }
+    }
+
+    /// After an error inside an IRI: move past its `>` (or to the space or
+    /// control character that ends it), without holding it.
+    fn skip_rest_of_iri(&mut self) {
+        while let Some(c) = self.peek() {
+            if c <= ' ' {
+                break;
+            }
+            self.bump();
+            if c == '>' {
+                break;
             }
         }
     }
@@ -852,6 +882,7 @@ impl<R: BufRead> Parser<R> {
                     self.bump();
                 }
             } else if is_blank_label_char(c) {
+                self.check_token(label.len(), "a blank node label")?;
                 label.push(c);
                 self.bump();
             } else {
@@ -878,6 +909,7 @@ impl<R: BufRead> Parser<R> {
             {
                 break;
             }
+            self.check_token(prefix.len(), "a prefixed name")?;
             prefix.push(c);
             self.bump();
         }
@@ -902,6 +934,7 @@ impl<R: BufRead> Parser<R> {
     fn read_pn_local(&mut self) -> Result<String> {
         let mut local = String::new();
         while let Some(c) = self.peek() {
+            self.check_token(local.len(), "a prefixed name")?;
             if c == '\\' {
                 match self.peek2() {
                     Some(e) if LOCAL_ESCAPES.contains(e) => {
@@ -938,6 +971,10 @@ impl<R: BufRead> Parser<R> {
         }
         let mut value = String::new();
         loop {
+            if let Err(e) = self.check_token(value.len(), "a string literal") {
+                self.skip_rest_of_literal(quote, triple);
+                return Err(e);
+            }
             match self.peek() {
                 None => return Err(self.err("unterminated literal")),
                 // A raw line break in a short string: W3C Turtle forbids it
@@ -989,6 +1026,7 @@ impl<R: BufRead> Parser<R> {
                 let mut lang = String::new();
                 while let Some(c) = self.peek() {
                     if c.is_ascii_alphanumeric() || c == '-' {
+                        self.check_token(lang.len(), "a language tag")?;
                         lang.push(c);
                         self.bump();
                     } else {
@@ -1074,6 +1112,7 @@ impl<R: BufRead> Parser<R> {
             s.push(self.bump().unwrap());
         }
         while let Some(c) = self.peek() {
+            self.check_token(s.len(), "a number")?;
             if c.is_ascii_digit() {
                 s.push(c);
                 self.bump();
@@ -1143,17 +1182,18 @@ impl<R: BufRead> Parser<R> {
         Ok(())
     }
 
-    fn read_bareword(&mut self) -> String {
+    fn read_bareword(&mut self) -> Result<String> {
         let mut w = String::new();
         while let Some(c) = self.peek() {
             if c.is_ascii_alphabetic() {
+                self.check_token(w.len(), "a directive name")?;
                 w.push(c);
                 self.bump();
             } else {
                 break;
             }
         }
-        w
+        Ok(w)
     }
 
     fn expect(&mut self, c: char) -> Result<()> {

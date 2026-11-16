@@ -160,8 +160,10 @@ pub const MAX_NESTING_DEPTH: usize = 128;
 /// generously, as generated queries do use long `||` or `UNION` chains.
 pub const MAX_TREE_HEIGHT: usize = 1024;
 
-/// Parse a SPARQL query or update string.
+/// Parse a SPARQL query or update string. A request longer than
+/// [`lexer::max_request_bytes`] is refused before it is tokenized.
 pub fn parse(input: &str) -> Result<Query> {
+    lexer::check_request_size(input)?;
     let (tokens, spans) = tokenize_with_spans(input)?;
     Parser::new(input, tokens, spans).parse_request()
 }

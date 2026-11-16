@@ -132,19 +132,22 @@ pub fn parse_line(line: &str, line_no: usize) -> Result<Option<Triple>> {
     Ok(Some(Triple::new(subject, predicate, object)))
 }
 
-/// A cursor over a single line's characters: the term scanner of both line
-/// readers, this one and [`crate::parser::nquads`] (one scanner, so the two
-/// cannot drift apart; review parser#6).
-pub(crate) struct Scanner {
-    chars: Vec<char>,
+/// A cursor over a single line: the term scanner of both line readers, this
+/// one and [`crate::parser::nquads`] (one scanner, so the two cannot drift
+/// apart; review parser#6). It reads the line in place, at byte offsets
+/// (review parser#5: it used to copy the line into a `Vec<char>`, four
+/// bytes per input byte on top of the line itself).
+pub(crate) struct Scanner<'a> {
+    src: &'a str,
+    /// Byte offset of the next character (on a character boundary).
     pos: usize,
     line_no: usize,
 }
 
-impl Scanner {
-    pub(crate) fn new(s: &str, line_no: usize) -> Scanner {
+impl<'a> Scanner<'a> {
+    pub(crate) fn new(s: &'a str, line_no: usize) -> Scanner<'a> {
         Scanner {
-            chars: s.chars().collect(),
+            src: s,
             pos: 0,
             line_no,
         }
@@ -158,13 +161,13 @@ impl Scanner {
     }
 
     pub(crate) fn peek(&self) -> Option<char> {
-        self.chars.get(self.pos).copied()
+        self.src[self.pos..].chars().next()
     }
 
     pub(crate) fn bump(&mut self) -> Option<char> {
         let c = self.peek();
-        if c.is_some() {
-            self.pos += 1;
+        if let Some(c) = c {
+            self.pos += c.len_utf8();
         }
         c
     }
@@ -193,6 +196,11 @@ impl Scanner {
         self.bump(); // consume '<'
         let mut s = String::new();
         loop {
+            // The run up to the next `>` or backslash, at once.
+            let rest = &self.src[self.pos..];
+            let plain = rest.find(['>', '\\']).unwrap_or(rest.len());
+            s.push_str(&rest[..plain]);
+            self.pos += plain;
             match self.bump() {
                 Some('>') => return Ok(Term::Iri(s)),
                 Some('\\') => self.read_unicode_escape(&mut s)?,
@@ -215,7 +223,7 @@ impl Scanner {
         while let Some(c) = self.peek() {
             if crate::model::term::is_blank_label_char(c) || c == '.' {
                 s.push(c);
-                self.pos += 1;
+                self.pos += c.len_utf8();
             } else {
                 break;
             }
@@ -236,6 +244,11 @@ impl Scanner {
         self.bump(); // consume opening '"'
         let mut value = String::new();
         loop {
+            // The run up to the next `"` or backslash, at once.
+            let rest = &self.src[self.pos..];
+            let plain = rest.find(['"', '\\']).unwrap_or(rest.len());
+            value.push_str(&rest[..plain]);
+            self.pos += plain;
             match self.bump() {
                 Some('"') => break,
                 Some('\\') => self.read_string_escape(&mut value)?,

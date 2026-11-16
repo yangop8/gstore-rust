@@ -610,3 +610,165 @@ fn an_rdfa_prefix_is_scoped_to_its_element() {
     assert!(ts.contains(&Triple::new(iri("http://ex/s1"), iri("http://ex/inner/p"), lit("x"))));
     assert!(ts.contains(&Triple::new(iri("http://ex/s2"), iri("http://ex/a/p"), lit("y"))));
 }
+
+// ---- one token is bounded in the streaming readers (parser#5) -----------------
+
+/// A reader of `head`, then `n` bytes of `fill`, then `tail`, holding none
+/// of the `n` bytes in memory.
+fn generated(head: &str, fill: u8, n: usize, tail: &str) -> impl std::io::BufRead {
+    let r = Cursor::new(head.as_bytes().to_vec())
+        .chain(std::io::repeat(fill).take(n as u64))
+        .chain(Cursor::new(tail.as_bytes().to_vec()));
+    std::io::BufReader::with_capacity(64 * 1024, r)
+}
+
+/// Import `reader` tolerantly with a token cap of `cap` bytes: the stored
+/// statements' objects and the logged errors.
+fn import_capped(
+    reader: impl std::io::BufRead,
+    format: gstore::parser::import::RdfFormat,
+    cap: usize,
+) -> (Vec<Term>, Vec<String>) {
+    use gstore::parser::import::{import_reader, ImportOptions};
+    use gstore::parser::nquads::Quad;
+    use gstore::parser::stream::SyntaxError;
+    // Small batches: the batch vector is allocated for `batch_size` quads
+    // up front (about 19 MB at the default), which is not what is measured.
+    let opts = ImportOptions {
+        max_token_bytes: cap,
+        batch_size: 16,
+        ..ImportOptions::tolerant()
+    };
+    let mut errors: Vec<(String, SyntaxError)> = Vec::new();
+    let mut objects = Vec::new();
+    import_reader(reader, format, "doc", &opts, &mut errors, &mut |b: &mut Vec<Quad>| {
+        objects.extend(b.drain(..).map(|q| q.object));
+        Ok(())
+    })
+    .unwrap();
+    let errors = errors
+        .into_iter()
+        .map(|(_, e)| format!("line {}: {}", e.line, e.message))
+        .collect();
+    (objects, errors)
+}
+
+/// Review parser#5: a token of a streaming reader was held whole however
+/// long — an unterminated `"""` string, a newline-free short string or
+/// IRI. Now the statement fails once the token passes the cap
+/// (`ImportOptions::max_token_bytes`, `[upload] rdf_max_token_size`), having
+/// held about that much of it, and a tolerant import goes on with the next
+/// statement.
+#[test]
+fn a_turtle_token_longer_than_the_cap_fails_its_statement_only() {
+    use gstore::parser::import::RdfFormat;
+    let cap = 256 * 1024;
+    let n = 16 * MIB;
+    let next = "\n<http://ex/s> <http://ex/p> <http://ex/next> .\n";
+    for (what, head, fill, tail) in [
+        ("short string", "<http://ex/s> <http://ex/p> \"", b'a', next),
+        ("IRI", "<http://ex/s> <http://ex/p> <http://ex/", b'a', ">\n<http://ex/s> <http://ex/p> <http://ex/next> .\n"),
+        ("prefixed name", "@prefix e: <http://ex/> .\n<http://ex/s> <http://ex/p> e:", b'a', next),
+        ("number", "<http://ex/s> <http://ex/p> ", b'7', next),
+    ] {
+        let ((objects, errors), peak) =
+            peak_during(|| import_capped(generated(head, fill, n, tail), RdfFormat::Turtle, cap));
+        assert_eq!(objects, [iri("http://ex/next")], "{what}: {errors:?}");
+        assert_eq!(errors.len(), 1, "{what}: {errors:?}");
+        assert!(errors[0].contains("rdf_max_token_size"), "{what}: {errors:?}");
+        eprintln!("measured: turtle {what} of {n} bytes, cap {cap}: peak {peak} bytes");
+        assert!(peak < 4 * MIB, "{what}: held {peak} bytes for a {n}-byte token");
+    }
+    // An unterminated long string runs to the end of the input: one error,
+    // and only the cap's worth of it held.
+    let ((objects, errors), peak) = peak_during(|| {
+        import_capped(
+            generated("<http://ex/s> <http://ex/p> \"\"\"", b'a', n, ""),
+            RdfFormat::Turtle,
+            cap,
+        )
+    });
+    assert!(objects.is_empty());
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].contains("rdf_max_token_size"), "{errors:?}");
+    eprintln!("measured: turtle unterminated long string of {n} bytes, cap {cap}: peak {peak}");
+    assert!(peak < 4 * MIB, "held {peak} bytes for an unterminated long string");
+    // TriG: the same in a graph block.
+    let ((objects, errors), _) = peak_during(|| {
+        import_capped(
+            generated("<http://ex/g> { <http://ex/s> <http://ex/p> \"", b'a', n, "\"\n<http://ex/s> <http://ex/p> <http://ex/next> }\n"),
+            RdfFormat::TriG,
+            cap,
+        )
+    });
+    assert_eq!(objects, [iri("http://ex/next")], "{errors:?}");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+}
+
+/// Review parser#5: an N-Triples / N-Quads line was read whole, and the
+/// scanner copied it into a `Vec<char>` (six times the line in memory). A
+/// line within the cap now takes about twice its size (the line and its
+/// term); a longer one is an error of its statement.
+#[test]
+fn an_nquads_line_is_held_once_and_bounded_by_the_cap() {
+    use gstore::parser::import::RdfFormat;
+    let n = 16 * MIB;
+    let tail = "\" <http://ex/g> .\n<http://ex/s> <http://ex/p> <http://ex/next> .\n";
+    let ((objects, errors), peak) = peak_during(|| {
+        import_capped(
+            generated("<http://ex/s> <http://ex/p> \"", b'a', n, tail),
+            RdfFormat::NQuads,
+            usize::MAX,
+        )
+    });
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(objects.len(), 2);
+    assert_eq!(objects[0], lit(&"a".repeat(n)));
+    drop(objects);
+    eprintln!("measured: N-Quads line of {n} bytes, no cap: peak {peak} bytes");
+    assert!(peak < 4 * n, "held {peak} bytes for a {n}-byte line");
+    for format in [RdfFormat::NQuads, RdfFormat::NTriples] {
+        let ((objects, errors), peak) = peak_during(|| {
+            import_capped(
+                generated("<http://ex/s> <http://ex/p> \"", b'a', n, "\" .\n<http://ex/s> <http://ex/p> <http://ex/next> .\n"),
+                format,
+                MIB,
+            )
+        });
+        assert_eq!(objects, [iri("http://ex/next")], "{format:?}");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors[0].starts_with("line 1:") && errors[0].contains("rdf_max_token_size"),
+            "{errors:?}"
+        );
+        eprintln!("measured: {format:?} line of {n} bytes, cap 1 MiB: peak {peak} bytes");
+        assert!(peak < 4 * MIB, "{format:?}: held {peak} bytes");
+    }
+}
+
+// ---- the SPARQL tokenizer reads the request in place (parser#8) ---------------
+
+/// Review parser#8: the tokenizer copied the request into a `Vec<char>`
+/// plus a byte-offset table, 12 bytes per request byte, before parsing.
+/// Now whitespace and comments cost nothing, and a long string literal
+/// about its own size.
+#[test]
+fn the_sparql_tokenizer_allocates_per_token_not_per_byte() {
+    use gstore::parser::sparql::lexer::tokenize;
+    let n = 16 * MIB;
+    let blank = format!("{}SELECT * WHERE {{ ?s ?p ?o }}", " \n".repeat(n / 2));
+    let (tokens, peak) = peak_during(|| tokenize(&blank).unwrap());
+    assert_eq!(tokens.len(), 9);
+    eprintln!("measured: tokenize {n} bytes of whitespace: peak {peak} bytes");
+    assert!(peak < MIB, "{peak} bytes for {n} bytes of whitespace");
+    let comments = format!("{}ASK {{}}", "# a comment line\n".repeat(n / 17));
+    let (tokens, peak) = peak_during(|| tokenize(&comments).unwrap());
+    assert_eq!(tokens.len(), 4);
+    eprintln!("measured: tokenize {n} bytes of comments: peak {peak} bytes");
+    assert!(peak < MIB, "{peak} bytes for {n} bytes of comments");
+    let literal = format!("ASK {{ FILTER(?x = \"{}\") }}", "é".repeat(n / 2));
+    let (tokens, peak) = peak_during(|| tokenize(&literal).unwrap());
+    assert_eq!(tokens.len(), 10);
+    eprintln!("measured: tokenize a {n}-byte string literal: peak {peak} bytes");
+    assert!(peak < 3 * n, "{peak} bytes for a {n}-byte literal");
+}
