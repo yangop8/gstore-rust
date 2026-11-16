@@ -932,3 +932,164 @@ fn a_backup_inside_a_transaction_is_refused() {
     let mut r = Database::restore_incremental(tmp.path("full"), &[tmp.path("inc")]).unwrap();
     assert!(has(&mut r, "later") && !has(&mut r, "uncommitted"));
 }
+
+/// conc#13 moved the rules' copy before the save: it must still not write
+/// into a directory another process has open. The backup is refused before
+/// it touches anything there (the rules of the database in that directory
+/// used to be replaced, and only the save after them was refused).
+#[test]
+fn a_backup_into_a_directory_another_process_holds_writes_nothing() {
+    let tmp = TmpDir::new("foreign");
+    let target = tmp.path("other.db");
+    let rules = target.join(gstore::reason::rules::RULE_DIR);
+    fs::create_dir_all(&rules).unwrap();
+    fs::write(rules.join("keep.json"), "{}").unwrap();
+    // `<dir>/LOCK` held through another open file description, as another
+    // process holds it.
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(target.join("LOCK"))
+        .unwrap();
+    lock.try_lock().unwrap();
+    let before = files(&target);
+    let db = base();
+    let err = db
+        .backup(&target)
+        .expect_err("a backup into a locked directory");
+    assert!(
+        err.to_string().contains("locked by another process"),
+        "{err}"
+    );
+    assert!(
+        files(&target) == before,
+        "the backup wrote into a directory another process holds"
+    );
+}
+
+/// db#8: a direct-API call that applies many mutations is one commit of the
+/// redo log — one append, every record but the last marked `c=`, the last
+/// `e=` — not one append per triple (as an UPDATE request's records are).
+#[test]
+fn a_direct_api_batch_is_appended_as_one_commit() {
+    use gstore::parser::import::{ImportOptions, Source};
+    use gstore::parser::sparql::ast::GroundTriple;
+    let ground = |tag: &str| GroundTriple {
+        subject: Term::iri(format!("http://ex/{tag}")),
+        predicate: Term::iri("http://ex/p"),
+        object: Term::iri("http://ex/o"),
+        graph: None,
+    };
+    let tmp = TmpDir::new("batch");
+    let log = tmp.path("redo.log");
+    let nt = tmp.path("batch.nt");
+    let mut db = base();
+    db.enable_redo_log(&log);
+    assert_eq!(
+        db.insert_data(&[ground("b1"), ground("b2"), ground("b3")]),
+        3
+    );
+    assert_eq!(
+        db.try_insert_data(&[ground("b4"), ground("b5")]).unwrap(),
+        2
+    );
+    assert_eq!(db.delete_data(&[ground("b1"), ground("b2")]), 2);
+    fs::write(
+        &nt,
+        "<http://ex/b6> <http://ex/p> <http://ex/o> .\n<http://ex/b7> <http://ex/p> <http://ex/o> .\n",
+    )
+    .unwrap();
+    let mut n = 0;
+    db.insert_sources(
+        &[Source::File(nt.clone())],
+        &ImportOptions::tolerant(),
+        &mut (),
+        &mut n,
+    )
+    .unwrap();
+    assert_eq!(n, 2);
+    n = 0;
+    db.remove_sources(
+        &[Source::File(nt)],
+        &ImportOptions::tolerant(),
+        &mut (),
+        &mut n,
+    )
+    .unwrap();
+    assert_eq!(n, 2);
+    let text = fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        text.matches(" e=").count(),
+        5,
+        "one commit per call:\n{text}"
+    );
+    assert_eq!(text.matches(" c=").count(), 6, "{text}");
+    let (applied, mut r) = replayed(&log);
+    assert_eq!(applied, 11);
+    assert!(has(&mut r, "b3") && has(&mut r, "b5"));
+    assert!(!has(&mut r, "b1") && !has(&mut r, "b6"));
+}
+
+/// A request that panics part-way keeps what it applied, like one that
+/// fails: its records reach the log, and the redo hold ends with it — a
+/// direct-API write after it is appended at once, not held back for a
+/// rollback to drop (the hold used to stay set: both were lost).
+#[test]
+fn a_request_that_panics_part_way_logs_what_it_applied() {
+    let tmp = TmpDir::new("panic");
+    let log = tmp.path("redo.log");
+    let mut db = base();
+    db.register_function("boom", |_| panic!("injected panic"));
+    db.enable_redo_log(&log);
+    let request = format!(
+        "{} ; DELETE {{ ?s ?p ?o }} WHERE {{ ?s ?p ?o FILTER(boom(?s)) }}",
+        ins(&["applied"])
+    );
+    let r = catch_unwind(AssertUnwindSafe(|| db.query(&request)));
+    assert!(r.is_err(), "the request panics: {r:?}");
+    assert!(has(&mut db, "applied"), "its first operation stays applied");
+    assert!(db.insert_triple(&t("direct")));
+    db.begin().unwrap();
+    db.rollback().unwrap();
+    let (_, mut r) = replayed(&log);
+    assert!(
+        has(&mut r, "applied"),
+        "the applied part of the request is not in the log"
+    );
+    assert!(
+        has(&mut r, "direct"),
+        "a direct-API write after the panic was dropped"
+    );
+}
+
+/// db#13 on a RocksDB base, with the redo log of a RocksDB database (its
+/// UPDATEs are journaled statements): the base is copied, never opened in
+/// place, and the increment replays onto it.
+#[cfg(feature = "rocksdb")]
+#[test]
+fn restore_incremental_never_writes_a_rocksdb_base() {
+    let tmp = TmpDir::new("db13_rocks");
+    let mut db = Database::build_rocksdb_from_str("rk", tmp.path("rk.db"), BASE).unwrap();
+    db.enable_redo_log_in(tmp.path("live")).unwrap();
+    db.backup(tmp.path("base")).unwrap();
+    db.query(&ins(&["z"])).unwrap();
+    db.query("DELETE DATA { <http://ex/a> <http://ex/p> <http://ex/b> }")
+        .unwrap();
+    db.backup_incremental(tmp.path("inc")).unwrap();
+    drop(db);
+    age(&tmp.path("base"));
+    let before = files(&tmp.path("base"));
+    let mut r = Database::restore_incremental(tmp.path("base"), &[tmp.path("inc")]).unwrap();
+    assert!(has(&mut r, "z"));
+    assert!(!ask(&mut r, "ASK { <http://ex/a> ?p ?o }"));
+    assert_eq!(r.triple_num(), 2);
+    drop(r);
+    let after = files(&tmp.path("base"));
+    assert_eq!(
+        after.keys().collect::<Vec<_>>(),
+        before.keys().collect::<Vec<_>>()
+    );
+    assert!(after == before, "the RocksDB base was written");
+}

@@ -375,9 +375,11 @@ pub struct Database {
     /// The redo log's appender (see [`logs`]); behind a mutex because the
     /// backups and [`sync`](Self::sync) take `&self`.
     redo_writer: Mutex<logs::LogWriter>,
-    /// An auto-commit statement (an UPDATE request, a reasoning run) is
-    /// running: its redo records are appended together at its end — after
-    /// its commit point — instead of one by one as a direct-API mutation's.
+    /// An auto-commit statement (an UPDATE request, a reasoning run) or a
+    /// direct-API batch call ([`redo_batch`](Self::redo_batch)) is running:
+    /// its redo records are appended together at its end — a statement's
+    /// after its commit point — instead of one by one as a single
+    /// direct-API mutation's.
     redo_hold: bool,
     /// Incremental-backup checkpoint: the redo-log byte offset the most recent
     /// full ([`backup`](Self::backup)) or incremental
@@ -1336,28 +1338,31 @@ impl Database {
         log: &mut dyn import::ErrorLog,
         applied: &mut u64,
     ) -> Result<import::ImportReport> {
-        // RocksDB: one journaled statement — a crash undoes all of it, never
-        // a prefix; an error keeps what was applied (see `applied`).
-        let journaled = self.rocks_begin_statement()?;
-        let report = self.rocks_statement_body(journaled, |db| {
-            import::import_sources(
-                sources,
-                "batch insert",
-                opts,
-                log,
-                &mut |batch: &mut Vec<Quad>| {
-                    let mut added = Vec::new();
-                    let quads = batch.drain(..).map(|q| {
-                        let graph = graph_iri(&q.graph);
-                        (q.into_triple(), graph)
-                    });
-                    let result = db.insert_statements(quads, &mut added);
-                    *applied += added.len() as u64;
-                    result
-                },
-            )
-        });
-        self.end_sources_statement(journaled, report)
+        // One redo-log commit for the whole call (review db#8).
+        self.redo_batch(|this| {
+            // RocksDB: one journaled statement — a crash undoes all of it,
+            // never a prefix; an error keeps what was applied (see `applied`).
+            let journaled = this.rocks_begin_statement()?;
+            let report = this.rocks_statement_body(journaled, |db| {
+                import::import_sources(
+                    sources,
+                    "batch insert",
+                    opts,
+                    log,
+                    &mut |batch: &mut Vec<Quad>| {
+                        let mut added = Vec::new();
+                        let quads = batch.drain(..).map(|q| {
+                            let graph = graph_iri(&q.graph);
+                            (q.into_triple(), graph)
+                        });
+                        let result = db.insert_statements(quads, &mut added);
+                        *applied += added.len() as u64;
+                        result
+                    },
+                )
+            });
+            this.end_sources_statement(journaled, report)
+        })
     }
 
     /// The end of an `insert_sources` / `remove_sources` statement on
@@ -1389,38 +1394,42 @@ impl Database {
         log: &mut dyn import::ErrorLog,
         applied: &mut u64,
     ) -> Result<import::ImportReport> {
-        // RocksDB: one journaled statement (see `insert_sources`); the
-        // batches' frees wait for its end.
-        let journaled = self.rocks_begin_statement()?;
-        let report = self.rocks_statement_body(journaled, |db| {
-            import::import_sources(
-                sources,
-                "batch remove",
-                opts,
-                log,
-                &mut |batch: &mut Vec<Quad>| {
-                    // In a read scope (C2): a term that cannot be looked up
-                    // must fail the removal, not read as absent.
-                    let scope = ReadScope::enter();
-                    let quads = batch.drain(..).map(|q| {
-                        let graph = graph_iri(&q.graph);
-                        (q.into_triple(), graph)
-                    });
-                    let (removed, err) = db.remove_statements(quads, Some(&scope));
-                    *applied += removed as u64;
-                    if let Some(e) = err {
+        // One redo-log commit for the whole call (review db#8).
+        self.redo_batch(|this| {
+            // RocksDB: one journaled statement (see `insert_sources`); the
+            // batches' frees wait for its end.
+            let journaled = this.rocks_begin_statement()?;
+            let report = this.rocks_statement_body(journaled, |db| {
+                import::import_sources(
+                    sources,
+                    "batch remove",
+                    opts,
+                    log,
+                    &mut |batch: &mut Vec<Quad>| {
+                        // In a read scope (C2): a term that cannot be looked
+                        // up must fail the removal, not read as absent.
+                        let scope = ReadScope::enter();
+                        let quads = batch.drain(..).map(|q| {
+                            let graph = graph_iri(&q.graph);
+                            (q.into_triple(), graph)
+                        });
+                        let (removed, err) = db.remove_statements(quads, Some(&scope));
+                        *applied += removed as u64;
+                        if let Some(e) = err {
+                            db.flush_reclaim();
+                            return Err(read_failure("removing statements", e));
+                        }
+                        // Each batch frees the ids it left unreferenced
+                        // (RocksDB: they wait for the statement's end; only
+                        // those are kept).
                         db.flush_reclaim();
-                        return Err(read_failure("removing statements", e));
-                    }
-                    // Each batch frees the ids it left unreferenced (RocksDB:
-                    // they wait for the statement's end; only those are kept).
-                    db.flush_reclaim();
-                    db.keep_dead_candidates();
-                    db.check_store_readable()
-                },
-            )
-        });
-        self.end_sources_statement(journaled, report)
+                        db.keep_dead_candidates();
+                        db.check_store_readable()
+                    },
+                )
+            });
+            this.end_sources_statement(journaled, report)
+        })
     }
 
     // (RocksDB / on-disk / snapshot persistence lives in `persist.rs`.)
@@ -2399,13 +2408,16 @@ impl Database {
     /// that cannot be encoded (dictionary id space exhausted) is skipped; see
     /// [`try_insert_data`](Self::try_insert_data) to surface that as an error.
     pub fn insert_data(&mut self, triples: &[GroundTriple]) -> usize {
-        triples
-            .iter()
-            .filter(|g| {
-                self.insert_quad(&Self::ground_to_triple(g), g.graph.as_deref())
-                    .unwrap_or(false)
-            })
-            .count()
+        // One redo-log commit for the whole call (review db#8).
+        self.redo_batch(|this| {
+            triples
+                .iter()
+                .filter(|g| {
+                    this.insert_quad(&Self::ground_to_triple(g), g.graph.as_deref())
+                        .unwrap_or(false)
+                })
+                .count()
+        })
     }
 
     /// Apply `INSERT DATA`, stopping with an error if a dictionary id space is
@@ -2416,7 +2428,8 @@ impl Database {
         let quads = triples
             .iter()
             .map(|g| (Self::ground_to_triple(g), g.graph.as_deref()));
-        self.insert_statements(quads, &mut added)?;
+        // One redo-log commit for the whole call (review db#8).
+        self.redo_batch(|this| this.insert_statements(quads, &mut added))?;
         Ok(added.len())
     }
 
@@ -2425,7 +2438,8 @@ impl Database {
         let quads = triples
             .iter()
             .map(|g| (Self::ground_to_triple(g), g.graph.as_deref()));
-        let (n, _) = self.remove_statements(quads, None);
+        // One redo-log commit for the whole call (review db#8).
+        let (n, _) = self.redo_batch(|this| this.remove_statements(quads, None));
         self.flush_reclaim();
         n
     }
@@ -2694,8 +2708,22 @@ impl Database {
         // the page cache, D12); the journal is deleted at its commit point
         // (`apply_update_ops`), or when it fails or panics.
         let journaled = self.rocks_begin_statement()?;
-        self.rocks_statement_body(journaled, |db| {
-            db.apply_update_ops(sparql, ops, cancel, pfn, journaled)
+        // A request that panics part-way keeps what it applied, as one that
+        // fails does (RocksDB: its journal is deleted on the way out): its
+        // redo records are logged then, and the redo hold that
+        // `apply_update_ops` set ends with it — a hold left behind would
+        // keep later direct-API writes' records back, for a rollback to
+        // drop (review durability#6, db#2).
+        let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.rocks_statement_body(journaled, |db| {
+                db.apply_update_ops(sparql, ops, cancel, pfn, journaled)
+            })
+        }));
+        done.unwrap_or_else(|panic| {
+            if self.redo_hold {
+                let _ = self.end_statement_logs(None);
+            }
+            std::panic::resume_unwind(panic)
         })
     }
 
@@ -3511,8 +3539,12 @@ impl Database {
         }
         // The reasoning rules first: contract C8 orders a database's
         // rule-directory lock before its persist_lock (review conc#13).
-        // They cannot change meanwhile (that takes `&mut self`).
+        // They cannot change meanwhile (that takes `&mut self`). A
+        // directory another process has open is refused before anything is
+        // written into it, as the save below refuses it (review db#11): its
+        // lock is taken first (the save shares it).
         fsutil::create_dir_durable(backup_dir)?;
+        let _target = dirlock::DirLock::acquire(backup_dir)?;
         self.backup_reason_rules(backup_dir)?;
         let _persist = self.persist_guard();
         self.save_locked(backup_dir)?;
@@ -3975,6 +4007,27 @@ impl Database {
         }
         self.redo_writer_mut()
             .append(&path, LogKind::Redo, &commit, sync)
+    }
+
+    /// Run `body`, one direct-API call that may apply many mutations
+    /// ([`insert_sources`](Self::insert_sources),
+    /// [`try_insert_data`](Self::try_insert_data), …), as one redo-log
+    /// commit: its records are appended together when it returns — also
+    /// when it fails or panics part-way, since what it applied stays —
+    /// instead of one append per triple (review db#8). Like any direct-API
+    /// write it is `fdatasync`ed by the next commit point. Inside a
+    /// transaction or a statement (whose commit appends the records), or
+    /// with no redo log, `body` just runs.
+    fn redo_batch<T>(&mut self, body: impl FnOnce(&mut Self) -> T) -> T {
+        if self.redo_log.is_none() || self.redo_hold || self.txn.is_some() {
+            return body(self);
+        }
+        self.redo_hold = true;
+        let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(self)));
+        self.redo_hold = false;
+        // A failed append is owed (see `enable_redo_log`).
+        let _ = self.flush_redo(false);
+        done.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
     }
 
     /// The commit that just succeeded: append its redo records and its

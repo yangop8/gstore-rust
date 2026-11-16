@@ -290,7 +290,15 @@ fn a_read_error_fails_only_its_own_statement() {
 /// (C2, review tests-b#18).
 #[test]
 fn a_cacheable_query_that_hit_a_read_error_is_not_cached() {
+    /// Removes the database directory, also when the test fails.
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
     let dir = temp_dir("read_error_cache");
+    let _cleanup = Cleanup(dir.clone());
     Database::build_disk(&dir, &[lubm_dir().join("lubm.nt")]).unwrap();
     let options = OpenOptions {
         disk_query_mode: DiskQueryMode::Stream,
@@ -319,6 +327,4 @@ fn a_cacheable_query_that_hit_a_read_error_is_not_cached() {
             "run {run}: a failed read was cached"
         );
     }
-    drop(db);
-    let _ = fs::remove_dir_all(&dir);
 }

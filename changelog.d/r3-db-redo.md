@@ -17,6 +17,18 @@
   opened `redo.log` 50 times), nothing was ever synced, and an UPDATE was
   logged before its commit point (in the update log: even when its commit
   point then failed).
+- **db#8: a direct-API call is one commit of the redo log.** `insert_data`,
+  `try_insert_data`, `delete_data`, `insert_sources` and `remove_sources`
+  append their records with one `write` when they return (also when they
+  fail or panic part-way: what they applied stays), instead of one
+  open/`write` per triple; inside a transaction or an UPDATE request they
+  go with its commit as before.
+- **A request that panics part-way logs what it applied.** Like a request
+  that fails, an UPDATE (or reasoning run) that panics keeps the
+  operations it applied before the panic; their redo records are now
+  appended on the way out, and the statement's redo hold ends with it. A
+  hold left set kept the records of later direct-API writes back, and a
+  later `rollback()` dropped them all.
 - **Record framing (durability#6).** Every record now carries a CRC-32
   header token, `c=<8 hex>`; the last record of a commit carries `e=<8 hex>`
   instead (`REDO I 0 44 e=1a2b3c4d`, `REC <millis> <changed> <len>
@@ -35,6 +47,11 @@
   unterminated IRI"). A damaged record in the middle of a log (checksum,
   terminator, or a header with a record header after it) is reported as
   corruption (`redo.log is corrupt at byte N: …`), never skipped silently.
+  A record that runs past the end of the file is the torn tail unless a
+  whole record (complete, its checksum right) follows it — then its length
+  field was damaged and it is corruption; text inside its body that merely
+  looks like a record header (an update-log statement may hold a line that
+  starts with `REC `) does not count.
   An increment's `incr.log` must replay whole: an incomplete one, or one
   whose length disagrees with its `INCREMENTAL` marker, fails
   `restore_incremental`.
@@ -91,8 +108,11 @@
   increment undid when it rolled back. The servers already refused it.
 - **conc#13: backups follow contract C8's lock order.** `backup` and
   `backup_incremental` copy the reasoning rules (rule-directory lock) before
-  they take `persist_lock`; they took them the other way round. A backup's
-  checkpoint now moves only once its `BACKUP_OFFSET` marker is written.
+  they take `persist_lock`; they took them the other way round. `backup`
+  takes the target directory's lock before it copies the rules there, so a
+  directory another process has open is still refused before anything is
+  written into it (review db#11). A backup's checkpoint now moves only once
+  its `BACKUP_OFFSET` marker is written.
 - **tests-b#18.** `a_read_error_fails_only_its_own_statement` now checks what
   it claimed (no cache entry, re-evaluated, fails again), and
   `a_cacheable_query_that_hit_a_read_error_is_not_cached` pins the rule on a
@@ -103,8 +123,12 @@
   owed records across rollback / disable, committed-only update log,
   inferred triples, crafted lengths, unknown ops, a line-for-line emulation
   of the pre-clear-record reader, old-format logs, a base backup that stays
-  byte- and mtime-identical, backup inside a transaction); framing unit
-  tests in `src/db/logs.rs`; the lock-order test
+  byte- and mtime-identical — snapshot, disk and, with `--features
+  rocksdb`, RocksDB bases —, backup inside a transaction, a backup into a
+  directory another process holds, one commit per direct-API batch call, a
+  request that panics part-way); framing unit tests in `src/db/logs.rs`
+  (including statement text that looks like a record header inside a torn
+  record, and a damaged length field); the lock-order test
   `src/db/redo_backup_tests.rs`.
 
 ## GAP_PLAN status line
@@ -134,8 +158,9 @@ none
   Phase 6): correct as above.
 - README.md (Library API, redo log / incremental backup): the logs' commit
   rule (records of a commit appended after its commit point, `fdatasync`ed;
-  direct-API mutations appended when applied, synced by the next commit
-  point; `sync()` syncs the logs), the update log's committed-only rule, the
+  direct-API mutations appended when applied — a batch call such as
+  `insert_sources` or `insert_data` as one commit — synced by the next
+  commit point; `sync()` syncs the logs), the update log's committed-only rule, the
   torn-tail and corruption behaviour of replay, the reported append failure
   and the `backup_incremental` refusal, `backup()` refused inside a
   transaction, and `restore_incremental` reading the base read-only (a
@@ -153,20 +178,32 @@ none
     before an append succeeds (no flush on drop: `Database` has no `Drop`;
     a later increment chain then has a gap that nothing reports). A cap with
     a sticky "gap" mark cleared by the next full `backup()` would bound it.
+  - (durability#6) The logs are appended after the commit point, so a crash
+    in the window between the two (one `write` and one `fdatasync`) leaves
+    an on-disk or RocksDB store holding a committed statement its logs do
+    not have; the next `backup_incremental` misses it without a word (the
+    opposite order would log statements a crash then undoes). A two-phase
+    record (prepared before the commit point, confirmed after) or a
+    commit sequence number in the store would close the window.
   - (db#8) `replay_*`, `backup_incremental` and the appender's first scan
     read the log into memory (replay and backup did before); a streaming
     reader would bound memory for very large logs. The scan runs once per
     session (afterwards the appender knows the boundary) and
     `backup_incremental` reads only `[checkpoint, end)`.
-  - (durability#6) Torn-versus-corrupt is decided by whether a record header
-    follows the defect; a torn update-log record whose SPARQL text itself
-    holds a newline followed by `REC ` is reported as corruption rather than
-    skipped (the safe direction).
+  - (durability#6) Torn-versus-corrupt is decided by what follows the
+    defect: a record that runs past the end of the file is torn unless a
+    whole record follows it, any other defect is corruption when a record
+    header follows it. Two contrived cases remain: a torn update-log
+    statement whose own text holds a complete, well-framed record (a line
+    `REC <n> <n> <len>` with exactly `<len>` bytes and a newline after it,
+    or a valid checksum) is reported as corruption instead of skipped; and
+    a record whose length field was damaged to run past the end, followed
+    only by a torn record, is skipped with the torn tail instead of
+    reported. A per-append marker (or a log-level sequence number) would
+    remove both.
   - (durability#6) An auto-commit UPDATE that fails part-way has its applied
     (committed) part in the redo log but not in the statement-level update
     log, which cannot express a partial statement (as before).
-  - (durability#6) A statement that panics leaves the redo hold set until the
-    next statement or commit ends: the records are delayed, not lost.
   - (db#13, not in this package's regions) `Database::restore` says a
     snapshot backup "is never written", but `open` takes the directory's
     lock (writing `LOCK`); `restore_incremental` no longer does.
@@ -213,6 +250,14 @@ none
     `logs::frame_*` and `logs::LogWriter`).
   - `src/db/persist.rs`: `Database::sync` calls `sync_logs()` after its
     commit point (doc updated).
+  - Review follow-up (same package, `src/db/mod.rs`): `run_update` (a
+    `catch_unwind` around its statement body that logs the applied part
+    of a request that panics and ends the redo hold, then resumes the
+    panic); `insert_sources`, `remove_sources`, `insert_data`,
+    `try_insert_data` and `delete_data` (their bodies wrapped in the new
+    private `redo_batch`, placed after `flush_redo`); `backup` takes the
+    target's `DirLock` before copying the rules. No other R3 package edits
+    these functions.
 - New files: `src/db/logs.rs`, `src/db/redo_backup_tests.rs`,
   `tests/redo_log_durability.rs`.
 - Not done, with reasons: see the REFACTOR_BACKLOG notes above (bounded
