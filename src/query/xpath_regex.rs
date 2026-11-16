@@ -79,7 +79,22 @@ pub(crate) struct Compiled {
 /// Compile `pattern` under the XPath `flags` string; `None` if either is
 /// invalid.
 pub(crate) fn compile(pattern: &str, flags: &str) -> Option<Compiled> {
-    let f = Flags::parse(flags)?;
+    build(pattern, flags, None).ok()
+}
+
+/// Why [`build`] failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuildError {
+    /// The pattern or the flags are invalid.
+    Invalid,
+    /// The compiled program would exceed the size limit given to `build`.
+    TooBig,
+}
+
+/// [`compile`], with the `regex` crate's limit on the compiled program's
+/// size (`None`: the crate's default, 10 MiB).
+fn build(pattern: &str, flags: &str, size_limit: Option<usize>) -> Result<Compiled, BuildError> {
+    let f = Flags::parse(flags).ok_or(BuildError::Invalid)?;
     let source = if f.literal {
         regex::escape(pattern)
     } else if f.strip_whitespace {
@@ -87,15 +102,21 @@ pub(crate) fn compile(pattern: &str, flags: &str) -> Option<Compiled> {
     } else {
         pattern.to_string()
     };
-    let re = RegexBuilder::new(&source)
+    let mut builder = RegexBuilder::new(&source);
+    builder
         .case_insensitive(f.case_insensitive)
         // `q` turns `m`, `s` and `x` off (§5.6.1.1).
         .dot_matches_new_line(f.dot_all && !f.literal)
-        .multi_line(f.multi_line && !f.literal)
-        .build()
-        .ok()?;
+        .multi_line(f.multi_line && !f.literal);
+    if let Some(limit) = size_limit {
+        builder.size_limit(limit);
+    }
+    let re = builder.build().map_err(|e| match e {
+        regex::Error::CompiledTooBig(_) if size_limit.is_some() => BuildError::TooBig,
+        _ => BuildError::Invalid,
+    })?;
     let matches_empty = re.is_match("");
-    Some(Compiled {
+    Ok(Compiled {
         re,
         literal: f.literal,
         matches_empty,
@@ -231,21 +252,38 @@ impl Replacement {
 
 /// Compiled patterns of one query, keyed by (flags, pattern); a pattern or
 /// flags string that does not compile is remembered as `None`. Patterns
-/// are nearly always constants, so a query compiles each once; one built
-/// from the data per solution (`REGEX(?a, ?b)`) is bounded by
-/// [`RegexCache::MAX_ENTRIES`]: past it, new patterns are compiled without
-/// being kept.
+/// are nearly always constants, so a query compiles each once.
+///
+/// What the cache holds is bounded by a weight, not only a count: a
+/// compiled pattern keeps its program (up to the crate's 10 MiB limit:
+/// `\w{200}` is about 12 MiB with its search caches) and the search caches
+/// it grows (a few MiB) for as long as it is kept, and patterns built from
+/// the data per solution (`REGEX(?a, ?b)`) can be many. A pattern whose
+/// program fits [`SMALL_PROGRAM`](Self::SMALL_PROGRAM) weighs 1, a larger
+/// one [`LARGE_WEIGHT`](Self::LARGE_WEIGHT); when a new entry would take
+/// the total past [`MAX_WEIGHT`](Self::MAX_WEIGHT) the cache is emptied
+/// first, so a constant pattern is compiled again at most once per that
+/// many distinct patterns of the data. At most 64 small patterns or 8
+/// large ones are kept at once, where a count of 1024 entries let one
+/// query pin gigabytes.
 #[derive(Debug, Default)]
 pub(crate) struct RegexCache {
     by_flags: HashMap<String, HashMap<String, Option<Rc<Compiled>>>>,
-    entries: usize,
+    /// The weight of the entries held.
+    weight: usize,
     /// Patterns compiled so far (cache misses), for tests and statistics.
     compiled: u64,
 }
 
 impl RegexCache {
-    /// The most patterns one query keeps compiled.
-    pub(crate) const MAX_ENTRIES: usize = 1024;
+    /// The most weight the cache holds (see the type's docs).
+    pub(crate) const MAX_WEIGHT: usize = 64;
+    /// The weight of a pattern whose program exceeds
+    /// [`SMALL_PROGRAM`](Self::SMALL_PROGRAM).
+    pub(crate) const LARGE_WEIGHT: usize = 8;
+    /// The largest compiled program (bytes, the `regex` crate's size
+    /// limit) a pattern of weight 1 may have.
+    pub(crate) const SMALL_PROGRAM: usize = 256 * 1024;
 
     /// `pattern` compiled under `flags`, from the cache or compiled now;
     /// `None` if the pattern or the flags are invalid.
@@ -254,14 +292,23 @@ impl RegexCache {
             return hit.clone();
         }
         self.compiled += 1;
-        let compiled = compile(pattern, flags).map(Rc::new);
-        if self.entries < Self::MAX_ENTRIES {
-            self.entries += 1;
-            self.by_flags
-                .entry(flags.to_string())
-                .or_default()
-                .insert(pattern.to_string(), compiled.clone());
+        // Compile under the small limit first: most patterns fit, and one
+        // that does not stops compiling at that limit, then compiles again
+        // under the crate's default.
+        let (compiled, weight) = match build(pattern, flags, Some(Self::SMALL_PROGRAM)) {
+            Ok(c) => (Some(Rc::new(c)), 1),
+            Err(BuildError::Invalid) => (None, 1),
+            Err(BuildError::TooBig) => (compile(pattern, flags).map(Rc::new), Self::LARGE_WEIGHT),
+        };
+        if self.weight + weight > Self::MAX_WEIGHT {
+            self.by_flags.clear();
+            self.weight = 0;
         }
+        self.weight += weight;
+        self.by_flags
+            .entry(flags.to_string())
+            .or_default()
+            .insert(pattern.to_string(), compiled.clone());
         compiled
     }
 
@@ -361,9 +408,55 @@ mod tests {
             assert!(cache.get("(", "").is_none());
         }
         assert_eq!(cache.compiled(), 3);
-        for i in 0..RegexCache::MAX_ENTRIES + 10 {
+        for i in 0..RegexCache::MAX_WEIGHT + 10 {
             assert!(cache.get(&format!("p{i}"), "").is_some());
         }
-        assert_eq!(cache.entries, RegexCache::MAX_ENTRIES);
+        assert!(cache.weight <= RegexCache::MAX_WEIGHT);
+    }
+
+    /// What the cache keeps is bounded by weight: a pattern with a large
+    /// program (`\w{20}`: a few MiB, under the crate's 10 MiB limit) counts
+    /// as [`RegexCache::LARGE_WEIGHT`] small ones, so patterns built from
+    /// the data cannot pin gigabytes (1024 entries of `\w{200}` were about
+    /// 12 GiB). A constant pattern is compiled again only after the cache
+    /// was emptied for others.
+    #[test]
+    fn the_cache_is_bounded_by_weight() {
+        let mut cache = RegexCache::default();
+        let large = |i: usize| format!("\\w{{20}}x{i}");
+        assert_eq!(
+            build(&large(0), "", Some(RegexCache::SMALL_PROGRAM)).err(),
+            Some(BuildError::TooBig)
+        );
+        // A large pattern still compiles and matches.
+        let c = cache
+            .get(&large(0), "")
+            .expect("compiles under the default limit");
+        assert!(c.re.is_match(&format!("{}x0", "a".repeat(20))));
+        assert_eq!(cache.weight, RegexCache::LARGE_WEIGHT);
+        // Many large patterns: never more than MAX_WEIGHT held.
+        for i in 1..40 {
+            assert!(cache.get(&large(i), "").is_some());
+            assert!(cache.weight <= RegexCache::MAX_WEIGHT, "{}", cache.weight);
+            let held: usize = cache.by_flags.values().map(HashMap::len).sum();
+            assert!(held * RegexCache::LARGE_WEIGHT <= RegexCache::MAX_WEIGHT);
+        }
+        // A constant pattern among 1,000 distinct data patterns compiles
+        // once per emptying of the cache, not once per call.
+        let mut cache = RegexCache::default();
+        for i in 0..1000 {
+            assert!(cache.get("^const", "").is_some());
+            assert!(cache.get(&format!("data{i}"), "").is_some());
+        }
+        let constant_compiles = cache.compiled() - 1000;
+        assert!(
+            constant_compiles <= (1000 / (RegexCache::MAX_WEIGHT - 1) + 1) as u64,
+            "{constant_compiles}"
+        );
+        // Invalid patterns are remembered too (weight 1).
+        let before = cache.compiled();
+        assert!(cache.get("(", "").is_none());
+        assert!(cache.get("(", "").is_none());
+        assert_eq!(cache.compiled(), before + 1);
     }
 }
