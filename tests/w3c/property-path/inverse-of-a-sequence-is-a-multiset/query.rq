@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §9.3 Property Paths and Equivalent Patterns, §18.4 (Sequence):
+# and Inverse: :y ^(:p/:q) ?x is ?x :p/:q :y (review query#9)
+PREFIX : <http://example.org/>
+SELECT ?x { :y ^(:p/:q) ?x }

@@ -1,0 +1,6 @@
+# spec: SPARQL 1.1 Query §9.1 Property Path Syntax and §18.2.2.3 / §18.4 (Negated Property Set):
+# and §18.4 Sequence: ?x :likes/!:knows :b goes through a node ?v with ?v P :b, P not
+# :knows; evaluated from the constant object the negated step still excludes :knows
+# (review query#2)
+PREFIX : <http://example.org/>
+SELECT ?x { ?x :likes/!:knows :b }

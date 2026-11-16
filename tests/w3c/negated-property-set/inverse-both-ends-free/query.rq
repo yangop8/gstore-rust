@@ -1,0 +1,5 @@
+# spec: SPARQL 1.1 Query §9.1 Property Path Syntax and §18.2.2.3 / §18.4 (Negated Property Set):
+# !(^:knows|^:name|^:age) is inv(NPS({:knows :name :age})): ?y P ?x for the
+# triples whose predicate is not in the set (review sparqlconf#3)
+PREFIX : <http://example.org/>
+SELECT ?x ?y { ?x !(^:knows|^:name|^:age) ?y }

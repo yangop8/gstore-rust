@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §9.3 Property Paths and Equivalent Patterns, §18.4 (Sequence):
+# and §18.5 Count: COUNT(*) counts both routes (review query#9 / sparqlconf#4)
+PREFIX : <http://example.org/>
+SELECT (COUNT(*) AS ?c) { :x :p/:q ?y }

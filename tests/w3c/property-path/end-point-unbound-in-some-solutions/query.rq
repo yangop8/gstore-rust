@@ -1,0 +1,5 @@
+# spec: SPARQL 1.1 Query §18.5 Join and LeftJoin, §18.4 ZeroOrMorePath: a solution that
+# leaves ?t unbound is compatible with every solution of ?t :next* ?x, whose zero-length
+# matches are all nodes of the graph (:a :b :n1 :n2 1 2)
+PREFIX : <http://example.org/>
+SELECT ?s ?t ?x { ?s :id ?i OPTIONAL { ?s :alias ?t } ?t :next* ?x }

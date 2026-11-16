@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §18.4 (ZeroOrMorePath with two variables: t in nodes(G)) and §18.5
+# Join: :zzz is no node of the graph, so the join is empty
+PREFIX : <http://example.org/>
+SELECT ?x { BIND(:zzz AS ?s) ?s :knows* ?x }

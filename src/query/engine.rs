@@ -164,6 +164,7 @@
 //! solution; the [`Database`](crate::Database) chooses the WHERE dataset
 //! (`WITH`, `USING`, `USING NAMED`) and applies the quads.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::rc::Rc;
@@ -2178,27 +2179,24 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     }
 
     // ---- property paths --------------------------------------------------
+    //
+    // SPARQL 1.1 §18.4 defines a path pattern's solutions as a multiset:
+    // a predicate step is a triple pattern, `inv(P)` swaps the end points,
+    // `seq(P, Q)` is a join through a fresh variable and `alt(P, Q)` a union
+    // (so both keep every route: review query#9 / sparqlconf#4), while the
+    // closures (`*`, `+`, ALP) and `?` and a negated property set produce
+    // each solution once. A walk keeps the multiset as counts ([`Reached`]:
+    // each node once, with the number of routes to it), so `/` and `|` cost
+    // the distinct nodes of each step, not the routes — which grow as
+    // degree^length, inside a closure too — and only the solutions handed
+    // out are expanded. Reached nodes come out in a fixed order — the
+    // stores' sorted lists, followed breadth first — never in a hash set's
+    // iteration order, so `LIMIT` / `OFFSET` pages and `ORDER BY` ties are
+    // the same on every run (review gap-accel-soundness#1).
 
     /// Evaluate a single property-path pattern into bindings over the layout.
     fn eval_path_pattern(&self, p: &PathPattern, layout: &VarLayout) -> Vec<Binding> {
-        let subj_const = match &p.subject {
-            PatternTerm::Term(t) => Some(self.dict.term_id(t)),
-            PatternTerm::Var(_) => None,
-        };
-        let obj_const = match &p.object {
-            PatternTerm::Term(t) => Some(self.dict.term_id(t)),
-            PatternTerm::Var(_) => None,
-        };
-        // A constant endpoint absent from the dictionary ⇒ no matches.
-        if matches!(subj_const, Some(None)) || matches!(obj_const, Some(None)) {
-            return Vec::new();
-        }
-        let subj_id = subj_const.flatten();
-        let obj_id = obj_const.flatten();
-
-        let pairs = self.path_pairs(&p.path, subj_id, obj_id);
-
-        pairs
+        self.path_pattern_pairs(p)
             .into_iter()
             .filter_map(|(s, o)| {
                 let mut b = vec![None; layout.len()];
@@ -2212,105 +2210,52 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             .collect()
     }
 
-    /// All `(start, end)` pairs matching `path`, constrained by known endpoints.
+    /// The `(start, end)` pairs of a path pattern, with its constant end
+    /// points fixed. A constant that is not in the dictionary still matches
+    /// itself at length zero (`<unknown> :p* ?x` binds `?x` to `<unknown>`,
+    /// §18.4 ZeroLengthPath / ALP): it gets a synthetic id, which has no
+    /// edges, so only the zero-length matches reach it (review sparqlconf#13).
+    fn path_pattern_pairs(&self, p: &PathPattern) -> Vec<(u32, u32)> {
+        let end = |t: &PatternTerm| match t {
+            PatternTerm::Term(t) => Some(self.term_to_id(t)),
+            PatternTerm::Var(_) => None,
+        };
+        self.path_pairs(&p.path, end(&p.subject), end(&p.object))
+    }
+
+    /// All `(start, end)` pairs matching `path`, constrained by known
+    /// endpoints — a multiset, in a deterministic order.
     fn path_pairs(&self, path: &PathExpr, subj: Option<u32>, obj: Option<u32>) -> Vec<(u32, u32)> {
+        let mut out = Vec::new();
         match (subj, obj) {
             (Some(s), _) => {
-                let ends = self.path_reach(path, s, false);
-                ends.into_iter()
-                    .filter(|e| obj.is_none_or(|o| o == *e))
-                    .map(|e| (s, e))
-                    .collect()
+                let ends = self.path_reach_counted(path, s, false);
+                for (e, k) in ends.nodes {
+                    if obj.is_none_or(|o| o == e) && !self.push_pairs(&mut out, (s, e), k) {
+                        break;
+                    }
+                }
             }
             (None, Some(o)) => {
                 // Walk the path backwards from the object.
-                let starts = self.path_reach(path, o, true);
-                starts.into_iter().map(|s| (s, o)).collect()
+                let starts = self.path_reach_counted(path, o, true);
+                for (s, k) in starts.nodes {
+                    if !self.push_pairs(&mut out, (s, o), k) {
+                        break;
+                    }
+                }
             }
             (None, None) => {
-                // Both ends free: enumerate from every entity node.
+                // Both ends free: enumerate from every node of the graph
+                // (§18.4: the zero-length matches are `nodes(G)`).
                 let mut nodes: Vec<u32> = self.store.subject_keys();
                 nodes.extend(self.store.object_keys());
                 nodes.sort_unstable();
                 nodes.dedup();
-                let mut out = Vec::new();
-                for s in nodes {
-                    for e in self.path_reach(path, s, false) {
-                        out.push((s, e));
-                    }
-                }
-                out
-            }
-        }
-    }
-
-    /// Nodes reachable from `start` by following `path` (or, if `reverse`, the
-    /// nodes from which `start` is reachable via `path`).
-    fn path_reach(
-        &self,
-        path: &PathExpr,
-        start: u32,
-        reverse: bool,
-    ) -> std::collections::HashSet<u32> {
-        let mut out = std::collections::HashSet::new();
-        // Cooperative cancellation (a deadline or `/cancel`): a path over
-        // every node, or a closure, can run long (review robust#5); the
-        // Result-returning caller turns the cut-short set into Cancelled.
-        if self.cancelled() {
-            return out;
-        }
-        match path {
-            PathExpr::Pred(iri) => {
-                if let Some(pid) = self.path_pred_id(iri) {
-                    if reverse {
-                        out.extend(self.store.s_by_po(pid, start));
-                    } else {
-                        out.extend(self.store.o_by_sp(start, pid));
-                    }
-                }
-            }
-            PathExpr::Inverse(inner) => return self.path_reach(inner, start, !reverse),
-            PathExpr::Seq(a, b) => {
-                // forward: a then b; reverse: b then a (with reverse traversal).
-                let (first, second) = if reverse { (b, a) } else { (a, b) };
-                for mid in self.path_reach(first, start, reverse) {
-                    if self.cancelled() {
-                        break;
-                    }
-                    out.extend(self.path_reach(second, mid, reverse));
-                }
-            }
-            PathExpr::Alt(a, b) => {
-                out.extend(self.path_reach(a, start, reverse));
-                out.extend(self.path_reach(b, start, reverse));
-            }
-            PathExpr::ZeroOrOne(inner) => {
-                out.insert(start);
-                out.extend(self.path_reach(inner, start, reverse));
-            }
-            PathExpr::ZeroOrMore(inner) => {
-                self.path_closure(inner, start, reverse, true, &mut out);
-            }
-            PathExpr::OneOrMore(inner) => {
-                self.path_closure(inner, start, reverse, false, &mut out);
-            }
-            PathExpr::NegatedSet(preds) => {
-                // One step via any predicate not in the negated set.
-                let banned: std::collections::HashSet<u32> = preds
-                    .iter()
-                    .filter(|(_, inv)| *inv == reverse) // direction match
-                    .filter_map(|(iri, _)| self.path_pred_id(iri))
-                    .collect();
-                if reverse {
-                    for (p, s) in self.store.ps_by_o(start) {
-                        if !banned.contains(&p) {
-                            out.insert(s);
-                        }
-                    }
-                } else {
-                    for (p, o) in self.store.po_by_s(start) {
-                        if !banned.contains(&p) {
-                            out.insert(o);
+                'starts: for s in nodes {
+                    for (e, k) in self.path_reach_counted(path, s, false).nodes {
+                        if !self.push_pairs(&mut out, (s, e), k) {
+                            break 'starts;
                         }
                     }
                 }
@@ -2319,38 +2264,190 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         out
     }
 
-    /// Transitive closure for `*`/`+` via BFS over the inner path.
+    /// Append `pair` `k` times (a pair reached by `k` routes is `k`
+    /// solutions); `false` once the evaluation is cancelled, which the
+    /// multiplicity of a long `/` or `|` chain makes worth polling for.
+    fn push_pairs(&self, out: &mut Vec<(u32, u32)>, pair: (u32, u32), k: u64) -> bool {
+        for i in 0..k {
+            if i % 4096 == 4095 && self.cancelled() {
+                return false;
+            }
+            out.push(pair);
+        }
+        true
+    }
+
+    /// The nodes reached from `start` by following `path` (or, if `reverse`,
+    /// the nodes from which `start` is reached via `path`), each once, with
+    /// the number of routes to it for `/` and `|` (see the section comment),
+    /// in a deterministic order.
+    fn path_reach_counted(&self, path: &PathExpr, start: u32, reverse: bool) -> Reached {
+        let mut out = Reached::default();
+        self.path_reach_into(path, start, reverse, 1, &mut out);
+        out
+    }
+
+    /// [`path_reach_counted`](Self::path_reach_counted), adding every node
+    /// reached to `out` `k` times (the routes that led to `start`).
+    fn path_reach_into(
+        &self,
+        path: &PathExpr,
+        start: u32,
+        reverse: bool,
+        k: u64,
+        out: &mut Reached,
+    ) {
+        // Cooperative cancellation (a deadline or `/cancel`): a path over
+        // every node, or a closure, can run long (review robust#5); the
+        // Result-returning caller turns the cut-short result into Cancelled.
+        if self.cancelled() {
+            return;
+        }
+        match path {
+            PathExpr::Pred(iri) => {
+                self.note_path_step();
+                if let Some(pid) = self.path_pred_id(iri) {
+                    // A triple pattern: each node once (the triples are a set).
+                    if reverse {
+                        out.add_distinct(self.store.s_by_po(pid, start), k);
+                    } else {
+                        out.add_distinct(self.store.o_by_sp(start, pid), k);
+                    }
+                }
+            }
+            PathExpr::Inverse(inner) => self.path_reach_into(inner, start, !reverse, k, out),
+            PathExpr::Seq(a, b) => {
+                // forward: a then b; reverse: b then a (with reverse
+                // traversal). A join through a fresh variable: every route
+                // to an intermediate node continues along every route from
+                // it, so their numbers multiply — counted once per distinct
+                // intermediate node, not walked once per route.
+                let (first, second) = if reverse { (b, a) } else { (a, b) };
+                for (mid, m) in self.path_reach_counted(first, start, reverse).nodes {
+                    if self.cancelled() {
+                        break;
+                    }
+                    self.path_reach_into(second, mid, reverse, k.saturating_mul(m), out);
+                }
+            }
+            PathExpr::Alt(a, b) => {
+                // A union: a node reached by both branches comes twice.
+                self.path_reach_into(a, start, reverse, k, out);
+                self.path_reach_into(b, start, reverse, k, out);
+            }
+            PathExpr::ZeroOrOne(inner) => {
+                // A set (§18.4 ZeroOrOnePath): `start` itself, then every
+                // other node one step away, each once.
+                let mut seen = PathSeen::default();
+                seen.insert(start);
+                let mut nodes = vec![start];
+                for (n, _) in self.path_reach_counted(inner, start, reverse).nodes {
+                    if seen.insert(n) {
+                        nodes.push(n);
+                    }
+                }
+                out.add_distinct(nodes, k);
+            }
+            PathExpr::ZeroOrMore(inner) => {
+                out.add_distinct(self.path_closure(inner, start, reverse, true), k);
+            }
+            PathExpr::OneOrMore(inner) => {
+                out.add_distinct(self.path_closure(inner, start, reverse, false), k);
+            }
+            PathExpr::NegatedSet(members) => {
+                // §18.2.2.3: `!(p₁|…|pᵢ|^pᵢ₊₁|…|^pₘ)` is
+                // `alt(NPS({p₁…pᵢ}), inv(NPS({pᵢ₊₁…pₘ})))`: the forward
+                // members are excluded from one step in the walk's own
+                // direction, the inverse members from one step against it.
+                // `!^p` alone has no forward branch, `!p` and `!()` no
+                // inverse one (review query#2 / sparqlconf#3).
+                let forward: Vec<&str> = members
+                    .iter()
+                    .filter(|(_, inv)| !*inv)
+                    .map(|(iri, _)| iri.as_str())
+                    .collect();
+                let inverse: Vec<&str> = members
+                    .iter()
+                    .filter(|(_, inv)| *inv)
+                    .map(|(iri, _)| iri.as_str())
+                    .collect();
+                if !forward.is_empty() || inverse.is_empty() {
+                    out.add_distinct(self.negated_step(&forward, start, reverse), k);
+                }
+                if !inverse.is_empty() {
+                    out.add_distinct(self.negated_step(&inverse, start, !reverse), k);
+                }
+            }
+        }
+    }
+
+    /// One step of `NPS(banned)` from `start` — forward along a triple, or
+    /// backward when `reverse` — over every predicate not in `banned`. The
+    /// step is a set (§18.4: `{ μ | ∃ triple(x, p, y), p ∉ S }`), so a node
+    /// linked through several such predicates comes once.
+    fn negated_step(&self, banned: &[&str], start: u32, reverse: bool) -> Vec<u32> {
+        self.note_path_step();
+        let banned: Vec<PredId> = banned
+            .iter()
+            .filter_map(|iri| self.path_pred_id(iri))
+            .collect();
+        let edges = if reverse {
+            self.store.ps_by_o(start)
+        } else {
+            self.store.po_by_s(start)
+        };
+        let mut seen = PathSeen::default();
+        edges
+            .into_iter()
+            .filter(|&(p, n)| !banned.contains(&p) && seen.insert(n))
+            .map(|(_, n)| n)
+            .collect()
+    }
+
+    /// Transitive closure for `*`/`+` (§18.4 ALP): every node reached from
+    /// `start` in one or more steps of `inner` (plus `start` itself when
+    /// `reflexive`), each once, breadth first in discovery order.
     fn path_closure(
         &self,
         inner: &PathExpr,
         start: u32,
         reverse: bool,
         reflexive: bool,
-        out: &mut std::collections::HashSet<u32>,
-    ) {
-        let mut frontier = vec![start];
-        let mut visited = std::collections::HashSet::new();
+    ) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut frontier = std::collections::VecDeque::from([start]);
+        let mut visited = PathSeen::default();
         if reflexive {
-            out.insert(start);
+            out.push(start);
             visited.insert(start);
         }
-        while let Some(n) = frontier.pop() {
+        while let Some(n) = frontier.pop_front() {
             // One cancellation check per frontier step (review robust#5).
             if self.cancelled() {
-                return;
+                break;
             }
-            for next in self.path_reach(inner, n, reverse) {
+            // The inner path's multiplicities do not matter here: only
+            // which nodes it reaches.
+            for (next, _) in self.path_reach_counted(inner, n, reverse).nodes {
                 if visited.insert(next) {
-                    out.insert(next);
-                    frontier.push(next);
+                    out.push(next);
+                    frontier.push_back(next);
                 }
             }
         }
+        out
     }
 
     fn path_pred_id(&self, iri: &str) -> Option<PredId> {
         self.dict
             .predicate_id(&Term::iri(iri.to_string()).dict_key())
+    }
+
+    /// Count one property-path step ([`EvalStats::path_steps`]).
+    fn note_path_step(&self) {
+        let mut s = self.stats.get();
+        s.path_steps += 1;
+        self.stats.set(s);
     }
 
     // ---- graph-pattern algebra -------------------------------------------
@@ -2708,6 +2805,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
 
     /// Evaluate a conjunction of patterns, joining smallest/connected first.
     fn eval_join(&self, conjuncts: &[&GraphPattern], layout: &VarLayout) -> Vec<Binding> {
+        // A property path whose end point another conjunct binds runs from
+        // the bound values instead of from every node (review sparqlconf#9).
+        if let Some(group) = PathJoin::new(conjuncts, layout) {
+            return self.eval_path_join(&group, layout);
+        }
         // Evaluate each conjunct independently, recording its variable set.
         let mut parts: Vec<Option<(Vec<Binding>, Vec<usize>)>> = conjuncts
             .iter()
@@ -2747,6 +2849,134 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             }
         }
         acc
+    }
+
+    /// [`eval_join`](Self::eval_join) for a group with a property path
+    /// whose end point another conjunct binds (see [`PathJoin`]): the parts
+    /// are joined in [`PathJoin::order`]; a [`PathJoinStep::Bound`] path
+    /// extends each solution so far from the value it gives the end point.
+    fn eval_path_join(&self, group: &PathJoin<'_>, layout: &VarLayout) -> Vec<Binding> {
+        let (mut rows, steps) = self.path_join_plan(group, layout);
+        let mut acc: Vec<Binding> = Vec::new();
+        let mut acc_vars: Vec<usize> = Vec::new();
+        for (k, step) in steps.into_iter().enumerate() {
+            // Cooperative cancellation between the joins (review robust#5).
+            if self.cancelled() {
+                return Vec::new();
+            }
+            match step {
+                PathJoinStep::Rows(i) => {
+                    let rb = rows[i]
+                        .take()
+                        .unwrap_or_else(|| self.eval_pattern(&group.parts[i], layout));
+                    acc = if k == 0 {
+                        rb
+                    } else {
+                        join_sets(&acc, &acc_vars, &rb, &group.vars[i])
+                    };
+                }
+                PathJoinStep::Bound(i) => {
+                    let GraphPattern::Path(p) = group.parts[i].as_ref() else {
+                        unreachable!("only a path is joined from its bound end point");
+                    };
+                    let mut cache = BoundPathCache::default();
+                    let mut next = Vec::new();
+                    for (n, l) in acc.iter().enumerate() {
+                        if n % 64 == 63 && self.cancelled() {
+                            return Vec::new();
+                        }
+                        for &pair in self.bound_path_pairs(p, l, layout, &mut cache).iter() {
+                            if let Some(m) = extend_by_path(l, p, pair, layout) {
+                                next.push(m);
+                            }
+                        }
+                    }
+                    acc = next;
+                }
+            }
+            for &v in &group.vars[step.part()] {
+                if !acc_vars.contains(&v) {
+                    acc_vars.push(v);
+                }
+            }
+            if acc.is_empty() {
+                break;
+            }
+        }
+        acc
+    }
+
+    /// The solutions of every part of `group` that is evaluated on its own
+    /// (`None` for the paths joined from a bound end point, see
+    /// [`PathJoin`]) and the order the parts are joined in — shared by both
+    /// executors, so they produce the same solutions in the same order.
+    fn path_join_plan(
+        &self,
+        group: &PathJoin<'_>,
+        layout: &VarLayout,
+    ) -> (Vec<Option<Vec<Binding>>>, Vec<PathJoinStep>) {
+        let rows: Vec<Option<Vec<Binding>>> = group
+            .parts
+            .iter()
+            .zip(&group.ends)
+            .map(|(part, ends)| ends.is_empty().then(|| self.eval_pattern(part, layout)))
+            .collect();
+        let sizes: Vec<Option<usize>> = rows.iter().map(|r| r.as_ref().map(Vec::len)).collect();
+        let steps = group.order(&sizes);
+        (rows, steps)
+    }
+
+    /// The `(start, end)` pairs of path pattern `p` that may extend the
+    /// solution `l` of a bind join: walked from the subject when `l` binds
+    /// it, else backwards from the object when `l` binds that, else (an
+    /// end point left unbound, e.g. by OPTIONAL) with both ends free —
+    /// each computed once per value in `cache`. Together with
+    /// [`extend_by_path`] this is exactly the join of `l` with the path's
+    /// own solutions.
+    fn bound_path_pairs(
+        &self,
+        p: &PathPattern,
+        l: &Binding,
+        layout: &VarLayout,
+        cache: &mut BoundPathCache,
+    ) -> PathPairs {
+        let bound = |t: &PatternTerm| match t {
+            PatternTerm::Var(v) => l[layout.index[v]],
+            PatternTerm::Term(_) => None,
+        };
+        let from = match (bound(&p.subject), bound(&p.object)) {
+            (Some(s), _) => (false, s),
+            (None, Some(o)) => (true, o),
+            (None, None) => {
+                return Rc::clone(
+                    cache
+                        .free
+                        .get_or_insert_with(|| Rc::new(self.path_pattern_pairs(p))),
+                )
+            }
+        };
+        Rc::clone(cache.from.entry(from).or_insert_with(|| {
+            let (backwards, v) = from;
+            // The path's own solutions over a variable end point start at
+            // the graph's nodes (§18.4: the zero-length matches are
+            // `nodes(G)`), so a value bound elsewhere that is no node of
+            // the graph — a VALUES or BIND term, a node of another graph —
+            // matches nothing, not even itself.
+            if !self.is_graph_node(v) {
+                return Rc::new(Vec::new());
+            }
+            Rc::new(if backwards {
+                self.path_pairs(&p.path, None, Some(v))
+            } else {
+                self.path_pairs(&p.path, Some(v), None)
+            })
+        }))
+    }
+
+    /// Whether `id` is a node of the active graph: the subject or object of
+    /// one of its triples.
+    fn is_graph_node(&self, id: u32) -> bool {
+        !is_synth(id) && (self.store.has_subject(id) || self.store.has_object(id))
     }
 
     /// Evaluate a basic graph pattern from scratch (index-pushed, ordered).
@@ -6125,6 +6355,53 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     }
 }
 
+/// The nodes a property-path walk has met: membership only, never iterated
+/// (results keep their discovery order, review gap-accel-soundness#1).
+type PathSeen = HashSet<u32, FxBuildHasher>;
+
+/// The nodes a property-path walk reaches from one node, as a multiset:
+/// each distinct node once, in the order it was first reached, with its
+/// multiplicity — the number of routes to it, saturating (see the property
+/// path section of [`Evaluator`]).
+#[derive(Default)]
+struct Reached {
+    nodes: Vec<(u32, u64)>,
+    /// The position of each node in `nodes`, built when a second batch
+    /// arrives (a single batch of distinct nodes needs none).
+    index: Option<HashMap<u32, usize, FxBuildHasher>>,
+}
+
+impl Reached {
+    /// Add every node of `batch` — distinct nodes — `k` times.
+    fn add_distinct(&mut self, batch: impl IntoIterator<Item = u32>, k: u64) {
+        let Reached { nodes, index } = self;
+        if nodes.is_empty() {
+            nodes.extend(batch.into_iter().map(|n| (n, k)));
+            *index = None;
+            return;
+        }
+        let index = index.get_or_insert_with(|| {
+            nodes
+                .iter()
+                .enumerate()
+                .map(|(i, &(n, _))| (n, i))
+                .collect()
+        });
+        for n in batch {
+            match index.entry(n) {
+                std::collections::hash_map::Entry::Occupied(e) => {
+                    let count = &mut nodes[*e.get()].1;
+                    *count = count.saturating_add(k);
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(nodes.len());
+                    nodes.push((n, k));
+                }
+            }
+        }
+    }
+}
+
 /// Bind a path endpoint (variable or constant) into a binding; false on conflict.
 fn bind_node(b: &mut Binding, pt: &PatternTerm, id: u32, layout: &VarLayout) -> bool {
     match pt {
@@ -6242,6 +6519,232 @@ fn flatten_join<'a>(gp: &'a GraphPattern, out: &mut Vec<&'a GraphPattern>) {
         }
         other => out.push(other),
     }
+}
+
+/// A group of conjuncts in which a property path with two variable end
+/// points shares an end point with another conjunct (review sparqlconf#9).
+///
+/// Evaluated on its own, such a path runs from every node of the graph
+/// (both ends free) and is joined afterwards: `O(nodes × reach)` work for a
+/// group like `?s :id 2990 . ?s :next* ?x`. Here the path is a *bind join*:
+/// the conjuncts that bind its end point come first, and each of their
+/// solutions is extended by the path walked from the value it binds
+/// ([`Evaluator::bound_path_pairs`], once per distinct value) — the same
+/// solutions as the join of the path's own ones (§18.5), at the cost of the
+/// bound side. Both executors run the parts in [`order`](Self::order): the
+/// materializing one level by level ([`Evaluator::eval_path_join`]), the
+/// streaming one depth first (`topk`), so they agree on the solution order.
+struct PathJoin<'g> {
+    /// The conjuncts, each BGP split into its connected components: the
+    /// path, not a cross product inside the BGP, is what links them.
+    parts: Vec<Cow<'g, GraphPattern>>,
+    /// The variables each part binds.
+    vars: Vec<Vec<usize>>,
+    /// The end-point variables of each path joined from a bound end point;
+    /// empty for every other part (those are evaluated on their own).
+    ends: Vec<Vec<usize>>,
+}
+
+/// One step of a [`PathJoin`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PathJoinStep {
+    /// Join part `i`'s own solutions (a path among them evaluated with both
+    /// ends free, when nothing before it binds an end point).
+    Rows(usize),
+    /// Extend every solution so far by path part `i`, walked from the end
+    /// point the solution binds.
+    Bound(usize),
+}
+
+impl PathJoinStep {
+    /// The part this step joins.
+    fn part(self) -> usize {
+        match self {
+            PathJoinStep::Rows(i) | PathJoinStep::Bound(i) => i,
+        }
+    }
+}
+
+impl<'g> PathJoin<'g> {
+    /// The group's parts, or `None` when no path qualifies (then the group
+    /// joins as before, by [`greedy_join_order`]).
+    fn new(conjuncts: &[&'g GraphPattern], layout: &VarLayout) -> Option<PathJoin<'g>> {
+        let vars: Vec<Vec<usize>> = conjuncts.iter().map(|c| pattern_vars(c, layout)).collect();
+        let bound_elsewhere = |i: usize, v: usize| {
+            vars.iter()
+                .enumerate()
+                .any(|(j, vs)| j != i && vs.contains(&v))
+        };
+        let ends: Vec<Vec<usize>> = conjuncts
+            .iter()
+            .enumerate()
+            .map(|(i, c)| match c {
+                GraphPattern::Path(p) => match (&p.subject, &p.object) {
+                    (PatternTerm::Var(s), PatternTerm::Var(o)) => {
+                        let (s, o) = (layout.index[s], layout.index[o]);
+                        if bound_elsewhere(i, s) || bound_elsewhere(i, o) {
+                            if s == o {
+                                vec![s]
+                            } else {
+                                vec![s, o]
+                            }
+                        } else {
+                            Vec::new()
+                        }
+                    }
+                    // A constant end point already fixes where the walk
+                    // starts.
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            })
+            .collect();
+        if ends.iter().all(Vec::is_empty) {
+            return None;
+        }
+        let mut group = PathJoin {
+            parts: Vec::new(),
+            vars: Vec::new(),
+            ends: Vec::new(),
+        };
+        for (i, &c) in conjuncts.iter().enumerate() {
+            match c {
+                GraphPattern::Bgp(tps) => {
+                    let components = bgp_components(tps);
+                    if components.len() == 1 {
+                        group.push(Cow::Borrowed(c), vars[i].clone(), Vec::new());
+                    } else {
+                        for tps in components {
+                            let part = GraphPattern::Bgp(tps);
+                            let part_vars = pattern_vars(&part, layout);
+                            group.push(Cow::Owned(part), part_vars, Vec::new());
+                        }
+                    }
+                }
+                _ => group.push(Cow::Borrowed(c), vars[i].clone(), ends[i].clone()),
+            }
+        }
+        Some(group)
+    }
+
+    fn push(&mut self, part: Cow<'g, GraphPattern>, vars: Vec<usize>, ends: Vec<usize>) {
+        self.parts.push(part);
+        self.vars.push(vars);
+        self.ends.push(ends);
+    }
+
+    /// The join order, given the solution count of every part evaluated on
+    /// its own (`None` for the bind-joined paths): the smallest part first;
+    /// then repeatedly the smallest part connected to what is joined so far,
+    /// else a bind-joined path one of whose end points is bound by now (the
+    /// first in the group), else the smallest unconnected part, else the
+    /// first remaining path, evaluated with both ends free. Ties go to the
+    /// earlier part.
+    fn order(&self, sizes: &[Option<usize>]) -> Vec<PathJoinStep> {
+        let mut left: Vec<usize> = (0..self.parts.len()).collect();
+        let mut acc_vars: Vec<usize> = Vec::new();
+        let mut steps = Vec::with_capacity(left.len());
+        while !left.is_empty() {
+            let connected = |i: usize| self.vars[i].iter().any(|v| acc_vars.contains(v));
+            let smallest = |want_connected: bool| {
+                left.iter()
+                    .copied()
+                    .filter(|&i| sizes[i].is_some() && (!want_connected || connected(i)))
+                    .min_by_key(|&i| sizes[i])
+            };
+            let step = if steps.is_empty() {
+                smallest(false).map(PathJoinStep::Rows)
+            } else {
+                smallest(true).map(PathJoinStep::Rows).or_else(|| {
+                    left.iter()
+                        .copied()
+                        .find(|&i| {
+                            sizes[i].is_none() && self.ends[i].iter().any(|v| acc_vars.contains(v))
+                        })
+                        .map(PathJoinStep::Bound)
+                })
+            };
+            let step = step
+                .or_else(|| smallest(false).map(PathJoinStep::Rows))
+                .unwrap_or(PathJoinStep::Rows(left[0]));
+            let i = step.part();
+            left.retain(|&j| j != i);
+            for &v in &self.vars[i] {
+                if !acc_vars.contains(&v) {
+                    acc_vars.push(v);
+                }
+            }
+            steps.push(step);
+        }
+        steps
+    }
+}
+
+/// The `(start, end)` pairs of a path pattern, shared by a memo's users.
+type PathPairs = Rc<Vec<(u32, u32)>>;
+
+/// The memo of one bind-joined path ([`Evaluator::bound_path_pairs`]): its
+/// `(start, end)` pairs per bound value and side (walked backwards from the
+/// object?, value), and with both ends free.
+#[derive(Default)]
+struct BoundPathCache {
+    from: HashMap<(bool, u32), PathPairs, FxBuildHasher>,
+    free: Option<PathPairs>,
+}
+
+/// The solution `l` extended by the path solution `(s, o)`; `None` when
+/// they disagree on an end point.
+fn extend_by_path(
+    l: &Binding,
+    p: &PathPattern,
+    (s, o): (u32, u32),
+    layout: &VarLayout,
+) -> Option<Binding> {
+    let mut b = l.clone();
+    (bind_node(&mut b, &p.subject, s, layout) && bind_node(&mut b, &p.object, o, layout))
+        .then_some(b)
+}
+
+/// The connected components of a BGP — triple patterns linked through a
+/// shared variable, in any position — each in the BGP's order, ordered by
+/// their first pattern.
+fn bgp_components(tps: &[TriplePattern]) -> Vec<Vec<TriplePattern>> {
+    fn vars_of(tp: &TriplePattern) -> Vec<&str> {
+        [&tp.subject, &tp.predicate, &tp.object]
+            .into_iter()
+            .filter_map(|t| match t {
+                PatternTerm::Var(v) => Some(v.as_str()),
+                PatternTerm::Term(_) => None,
+            })
+            .collect()
+    }
+    let vars: Vec<Vec<&str>> = tps.iter().map(vars_of).collect();
+    // Union-find over the patterns (the root is the smallest index).
+    let mut parent: Vec<usize> = (0..tps.len()).collect();
+    fn root(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    for i in 0..tps.len() {
+        for j in 0..i {
+            if vars[i].iter().any(|v| vars[j].contains(v)) {
+                let (a, b) = (root(&mut parent, i), root(&mut parent, j));
+                parent[a.max(b)] = a.min(b);
+            }
+        }
+    }
+    let mut components: Vec<(usize, Vec<TriplePattern>)> = Vec::new();
+    for (i, tp) in tps.iter().enumerate() {
+        let r = root(&mut parent, i);
+        match components.iter_mut().find(|(cr, _)| *cr == r) {
+            Some((_, c)) => c.push(tp.clone()),
+            None => components.push((r, vec![tp.clone()])),
+        }
+    }
+    components.into_iter().map(|(_, c)| c).collect()
 }
 
 /// Per-BGP translation caches of a mixed pipeline (both directions):

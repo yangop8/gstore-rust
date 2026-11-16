@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §18.4 (OneOrMorePath): a node with no edges reaches nothing in one
+# or more steps
+PREFIX : <http://example.org/>
+SELECT ?x { :zzz :knows+ ?x }

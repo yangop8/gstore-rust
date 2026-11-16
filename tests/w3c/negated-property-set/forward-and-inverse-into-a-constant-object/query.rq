@@ -1,0 +1,5 @@
+# spec: SPARQL 1.1 Query §9.1 Property Path Syntax and §18.2.2.3 / §18.4 (Negated Property Set):
+# ?x !(:likes|^:age) :a is the union of ?x P :a (P not :likes) and :a P ?x
+# (P not :age) (review query#2 / sparqlconf#3)
+PREFIX : <http://example.org/>
+SELECT ?x { ?x !(:likes|^:age) :a }
