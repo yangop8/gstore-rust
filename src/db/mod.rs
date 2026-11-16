@@ -71,6 +71,8 @@ pub mod named;
 mod r4_review_tests;
 pub mod reclaim;
 #[cfg(test)]
+mod redo_backup_tests;
+#[cfg(test)]
 mod review_tests;
 #[cfg(all(test, feature = "rocksdb"))]
 mod rocks_recovery_tests;
@@ -3494,11 +3496,26 @@ impl Database {
     /// transactions, and rolled-back transactions are excluded — so enable redo
     /// logging, not the SPARQL-statement update log, if you intend to take
     /// increments. See [`enable_redo_log_in`](Self::enable_redo_log_in).)
+    ///
+    /// Refused while a transaction is open: the snapshot would hold its
+    /// uncommitted writes, and no later increment would undo them when it
+    /// rolls back (review db#14).
     pub fn backup<P: AsRef<Path>>(&self, backup_dir: P) -> Result<()> {
         let backup_dir = backup_dir.as_ref();
+        if self.txn.is_some() {
+            return Err(GStoreError::Database(
+                "backup: commit or roll back the open transaction first (a backup taken now \
+                 would hold its uncommitted writes, and no later increment would undo them)"
+                    .into(),
+            ));
+        }
+        // The reasoning rules first: contract C8 orders a database's
+        // rule-directory lock before its persist_lock (review conc#13).
+        // They cannot change meanwhile (that takes `&mut self`).
+        fsutil::create_dir_durable(backup_dir)?;
+        self.backup_reason_rules(backup_dir)?;
         let _persist = self.persist_guard();
         self.save_locked(backup_dir)?;
-        self.backup_reason_rules(backup_dir)?;
         let off = self.redo_log_len()?;
         write_backup_offset(&backup_dir.join(BACKUP_OFFSET_FILE), off)?;
         self.backup_offset.store(off, Ordering::SeqCst);
@@ -3578,6 +3595,13 @@ impl Database {
                     .into(),
             ));
         };
+        // The reasoning rules and ledgers as they are now, which the replayed
+        // triples go with (an empty rule directory: none) — taken first, as
+        // contract C8 orders a database's rule-directory lock before its
+        // persist_lock (review conc#13).
+        fsutil::create_dir_durable(out_dir)?;
+        self.backup_reason_rules(out_dir)?;
+        fs::create_dir_all(out_dir.join(crate::reason::rules::RULE_DIR))?;
         let _persist = self.persist_guard();
         let base = self.backup_offset.load(Ordering::SeqCst);
         let (end, slice) = {
@@ -3602,12 +3626,7 @@ impl Database {
             }
             (end, logs::read_range(&log_path, base, end)?)
         };
-        fsutil::create_dir_durable(out_dir)?;
         fsutil::atomic_write(&out_dir.join(INCREMENTAL_LOG_FILE), &slice)?;
-        // The reasoning rules and ledgers as they are now, which the replayed
-        // triples go with (an empty rule directory: none).
-        self.backup_reason_rules(out_dir)?;
-        fs::create_dir_all(out_dir.join(crate::reason::rules::RULE_DIR))?;
         write_incremental_marker(&out_dir.join(INCREMENTAL_MARKER_FILE), base, end)?;
         self.backup_offset.store(end, Ordering::SeqCst);
         Ok(())
@@ -3620,8 +3639,10 @@ impl Database {
     /// `base_dir` is a directory produced by [`backup`](Self::backup); each entry
     /// of `incr_dirs` is a directory produced by
     /// [`backup_incremental`](Self::backup_incremental), in chronological order.
-    /// The base (any layout) is loaded and detached into memory — the backup
-    /// directories are never modified — then each delta's `incr.log` is replayed
+    /// The base (any layout) is read into memory without being written — a
+    /// snapshot in place (no lock taken), any other layout through a copy in
+    /// the system's temporary directory, removed again (review db#13); the
+    /// backup directories are never modified — then each delta's `incr.log` is replayed
     /// onto it. Deltas are checked for contiguity: each must begin exactly where
     /// the previous one ended (starting from the base's recorded checkpoint), so
     /// an out-of-order or gapped chain is rejected rather than silently
@@ -3635,7 +3656,7 @@ impl Database {
         incr_dirs: &[Q],
     ) -> Result<Database> {
         let base_dir = base_dir.as_ref();
-        let mut db = Database::open(base_dir)?.into_memory()?;
+        let mut db = Database::read_backup_detached(base_dir)?;
         // The base's checkpoint is where the first increment must begin. A missing
         // marker (a backup taken without logging) legitimately means offset 0, but
         // a marker that exists yet cannot be read is a corrupt base — surface that
@@ -3690,6 +3711,52 @@ impl Database {
         db.redo_log = saved;
         db.backup_offset.store(expected, Ordering::SeqCst);
         outcome.map(|()| db)
+    }
+
+    /// The database in backup directory `dir`, in memory, read without
+    /// writing `dir` (review db#13): a snapshot is read in place without
+    /// taking its lock (as [`read_copy`](Self::read_copy)); any other layout
+    /// is copied into a scratch directory under the system's temporary
+    /// directory, opened and detached from there, and the copy removed.
+    /// The reasoning rules (and ledgers) come along, held in memory.
+    fn read_backup_detached(dir: &Path) -> Result<Database> {
+        match Database::storage_kind(dir) {
+            Some(StorageKind::Snapshot) => {
+                let mut db = Database::read_copy(dir)?;
+                db.reason_home.mem = crate::reason::store::read_rule_dir(dir)?;
+                return Ok(db);
+            }
+            Some(_) => {}
+            None => {
+                return Err(GStoreError::Database(format!(
+                    "'{}' does not contain a gStore database",
+                    dir.display()
+                )))
+            }
+        }
+        /// The scratch copy, removed when dropped (also on failure).
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let scratch = Scratch(std::env::temp_dir().join(format!(
+            "gstore-restore-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )));
+        let _ = fs::remove_dir_all(&scratch.0);
+        Database::backup_dir(dir, &scratch.0)
+            .and_then(|()| Database::open(&scratch.0)?.into_memory())
+            .map_err(|e| {
+                GStoreError::Database(format!(
+                    "reading backup '{}' through a copy in '{}': {e}",
+                    dir.display(),
+                    scratch.0.display()
+                ))
+            })
     }
 
     // ---- update log -------------------------------------------------------

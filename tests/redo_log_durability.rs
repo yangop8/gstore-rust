@@ -12,12 +12,14 @@
 
 #![cfg(all(target_os = "linux", target_pointer_width = "64"))]
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::process::ExitStatusExt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gstore::{Database, DiskQueryMode, OpenOptions, QueryResult, Term, Triple};
 
@@ -819,4 +821,112 @@ fn old_format_logs_still_replay() {
     let mut r = base();
     assert_eq!(r.replay_update_log(&update).unwrap(), 1);
     assert!(has(&mut r, "u"));
+}
+
+// ---- backups ----------------------------------------------------------------------
+
+/// Every file under `dir` with its content and modification time.
+fn files(dir: &Path) -> BTreeMap<PathBuf, (Vec<u8>, SystemTime)> {
+    fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, (Vec<u8>, SystemTime)>) {
+        for e in fs::read_dir(dir).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(root, &p, out);
+            } else {
+                let mtime = fs::metadata(&p).unwrap().modified().unwrap();
+                out.insert(
+                    p.strip_prefix(root).unwrap().to_path_buf(),
+                    (fs::read(&p).unwrap(), mtime),
+                );
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+/// Set the modification time of every file under `dir` to long ago, so
+/// any later write shows (whatever the clock's granularity).
+fn age(dir: &Path) {
+    for (rel, _) in files(dir) {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join(rel))
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(1_000_000))
+            .unwrap();
+    }
+}
+
+/// db#13: restoring from a base and its increments never writes the base
+/// (it used to open it in place: a `LOCK` file, and on a disk base a
+/// rewritten `kvstore.kv` and a new `vstree.kv`).
+#[test]
+fn restore_incremental_never_writes_the_base() {
+    let tmp = TmpDir::new("db13");
+    // A snapshot base.
+    let mut db = base();
+    db.enable_redo_log_in(tmp.path("live")).unwrap();
+    db.backup(tmp.path("snap")).unwrap();
+    db.query(&ins(&["x"])).unwrap();
+    db.backup_incremental(tmp.path("snap_inc")).unwrap();
+    age(&tmp.path("snap"));
+    let before = files(&tmp.path("snap"));
+    let mut r = Database::restore_incremental(tmp.path("snap"), &[tmp.path("snap_inc")]).unwrap();
+    assert!(has(&mut r, "x"));
+    drop(r);
+    let after = files(&tmp.path("snap"));
+    assert_eq!(
+        after.keys().collect::<Vec<_>>(),
+        before.keys().collect::<Vec<_>>()
+    );
+    assert!(after == before, "the snapshot base was written");
+
+    // A disk base whose VS-tree is stale (not copied by the backup).
+    let nt = tmp.path("base.nt");
+    fs::write(&nt, BASE).unwrap();
+    Database::build_disk(tmp.path("disk"), &[&nt]).unwrap();
+    let mut db = Database::open(tmp.path("disk")).unwrap();
+    db.insert_triple(&t("stale"));
+    db.sync().unwrap();
+    db.enable_redo_log_in(tmp.path("disk_live")).unwrap();
+    db.backup(tmp.path("disk_base")).unwrap();
+    db.query(&ins(&["y"])).unwrap();
+    db.backup_incremental(tmp.path("disk_inc")).unwrap();
+    drop(db);
+    age(&tmp.path("disk_base"));
+    let before = files(&tmp.path("disk_base"));
+    let mut r =
+        Database::restore_incremental(tmp.path("disk_base"), &[tmp.path("disk_inc")]).unwrap();
+    assert!(has(&mut r, "y") && has(&mut r, "stale"));
+    drop(r);
+    let after = files(&tmp.path("disk_base"));
+    assert_eq!(
+        after.keys().collect::<Vec<_>>(),
+        before.keys().collect::<Vec<_>>()
+    );
+    assert!(after == before, "the disk base was written");
+}
+
+/// db#14: a backup inside an open transaction is refused — it would capture
+/// the transaction's uncommitted writes, which no later increment undoes
+/// when it rolls back.
+#[test]
+fn a_backup_inside_a_transaction_is_refused() {
+    let tmp = TmpDir::new("db14");
+    let mut db = base();
+    db.enable_redo_log_in(tmp.path("live")).unwrap();
+    db.begin().unwrap();
+    assert!(db.insert_triple(&t("uncommitted")));
+    let err = db
+        .backup(tmp.path("full"))
+        .expect_err("a backup inside a transaction");
+    assert!(err.to_string().contains("transaction"), "{err}");
+    db.rollback().unwrap();
+    db.backup(tmp.path("full")).unwrap();
+    db.insert_triple(&t("later"));
+    db.backup_incremental(tmp.path("inc")).unwrap();
+    let mut r = Database::restore_incremental(tmp.path("full"), &[tmp.path("inc")]).unwrap();
+    assert!(has(&mut r, "later") && !has(&mut r, "uncommitted"));
 }
