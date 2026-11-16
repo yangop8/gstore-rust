@@ -278,6 +278,14 @@ none
   still stored verbatim as `_:b` (`token_to_term`), so two requests share
   one node; SPARQL 1.1 Update §3.1.1 says blank nodes in `INSERT DATA` are
   fresh. Recorded in CHANGELOG's known gaps; same failure mode as query#5.
+- **For r4-db-graph (sparqlconf#16: reject blank nodes in DELETE templates
+  and `DELETE DATA` at parse time):** until then a labelled blank node in a
+  DELETE template / `DELETE WHERE` names the stored node of that label (as
+  before this package; its first version made it fresh, so such a DELETE
+  matched and deleted nothing). `tests/sparql_builtins.rs`
+  `delete_templates_keep_labelled_blank_nodes` pins that; when the parser
+  rejects these requests, its DELETE assertions become "is a parse error"
+  (convention 13(b)), and its INSERT assertion (fresh node) stays.
 - **query#7** is fixed as the plan specifies (divisor = values summed,
   extension documented); the spec's error semantics stay a backlog item
   (Docs notes), so `tricky/avg-over-an-error-is-unbound` keeps `xfail
