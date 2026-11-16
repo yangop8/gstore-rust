@@ -203,12 +203,18 @@ struct Api {
     server: Arc<ApiServer>,
     addr: SocketAddr,
     root: PathBuf,
+    serving: Option<thread::JoinHandle<gstore::server::ShutdownReport>>,
     _tmp: TmpDir,
 }
 
 impl Drop for Api {
     fn drop(&mut self) {
         self.server.shutdown();
+        // The shutdown saves and logs into the root: wait for it before the
+        // temporary directory goes (`_tmp` drops after this).
+        if let Some(serving) = self.serving.take() {
+            let _ = serving.join();
+        }
     }
 }
 
@@ -226,11 +232,12 @@ impl Api {
         let server = Arc::new(server);
         let addr = server.local_addr().unwrap();
         let s2 = Arc::clone(&server);
-        thread::spawn(move || s2.serve_forever());
+        let serving = Some(thread::spawn(move || s2.serve_forever()));
         let api = Api {
             server,
             addr,
             root,
+            serving,
             _tmp: tmp,
         };
         // An answer proves the server serves (its transaction housekeeping
