@@ -42,7 +42,7 @@
 //! later be handed out twice).
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::ops::ControlFlow;
 use std::path::Path;
@@ -183,6 +183,52 @@ pub struct DiskStore {
     /// The statistics were rebuilt when the store was opened (a file
     /// written before they were maintained) and are not flushed yet.
     stats_rebuilt: bool,
+    /// The terms the named-graph quads use (see [`QuadRefs`]): built from
+    /// `GSPO` by the first [`free_key`](Self::free_key) that needs it, kept
+    /// current by every quad write after, dropped when a write operation
+    /// fails or the store is refreshed (and built again on demand).
+    quad_refs: Option<QuadRefs>,
+}
+
+/// Reference counts of the terms named-graph quads use (review disk#3):
+/// `GSPO` is keyed graph-first, so whether a term is some quad's subject,
+/// predicate or object cannot be answered by a prefix probe.
+#[derive(Default)]
+struct QuadRefs {
+    /// Graph IRIs, subjects and objects (entity and literal ids: their
+    /// ranges are disjoint), with the number of quad positions each fills.
+    nodes: HashMap<u32, u32>,
+    /// Predicates, likewise.
+    preds: HashMap<u32, u32>,
+}
+
+impl QuadRefs {
+    fn change(map: &mut HashMap<u32, u32>, id: u32, add: bool) {
+        if add {
+            *map.entry(id).or_insert(0) += 1;
+        } else if let Some(n) = map.get_mut(&id) {
+            *n -= 1;
+            if *n == 0 {
+                map.remove(&id);
+            }
+        }
+    }
+
+    /// Count (`add`) or uncount the terms of the quad `(g, t)`.
+    fn quad(&mut self, g: EntityLiteralId, t: IdTriple, add: bool) {
+        for node in [g, t.sub, t.obj] {
+            QuadRefs::change(&mut self.nodes, node, add);
+        }
+        QuadRefs::change(&mut self.preds, t.pred, add);
+    }
+
+    /// Whether a quad uses the term `id` of `space`.
+    fn references(&self, space: Space, id: u32) -> bool {
+        match space {
+            Space::Predicate => self.preds.contains_key(&id),
+            Space::Entity | Space::Literal => self.nodes.contains_key(&id),
+        }
+    }
 }
 
 /// Source of [`DiskStore::instance`] ids.
@@ -485,6 +531,7 @@ impl DiskStore {
             instance: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
             version: AtomicU64::new(0),
             stats_rebuilt: false,
+            quad_refs: None,
         };
         store.refresh()?;
         Ok(store)
@@ -533,6 +580,7 @@ impl DiskStore {
         self.nonempty_preds = stats.iter().filter(|s| s.0 > 0).count();
         self.stats = stats;
         self.stats_undo.clear();
+        self.quad_refs = None;
         *self.disk_dict.lock().unwrap() = None;
         self.version.fetch_add(1, Ordering::AcqRel);
         Ok(())
@@ -741,7 +789,12 @@ impl DiskStore {
     /// `Ok(false)`, writing nothing, without the `FREE_IDS` feature, for an
     /// unknown key, or when this store still references the term (the working
     /// set decided it is unused; the store keeps it rather than corrupt
-    /// itself).
+    /// itself): a triple of the default graph, or a named-graph quad in any
+    /// position — graph, subject, predicate or object (review disk#3: only a
+    /// graph IRI was checked, so a term only a quad used was freed and the
+    /// next new term took its id, changing the quad). The quad check reads
+    /// the terms the quads use, gathered from `GSPO` once (`O(quads)`) and
+    /// kept current by the quad writes after (`O(1)` each).
     pub fn free_key(&mut self, space: Space, key: &str) -> Result<bool> {
         if !self.frees_ids() {
             return Ok(false);
@@ -760,9 +813,8 @@ impl DiskStore {
                 _ => {
                     st.spo.prefix_exists(pg, &be32(id))?
                         || st.osp.prefix_exists(pg, &be32(id))?
-                        || st.gspo.prefix_exists(pg, &be32(id))?
                 }
-            };
+            } || st.quads_reference(pg, space, id)?;
             if referenced {
                 return Ok(false);
             }
@@ -780,6 +832,23 @@ impl DiskStore {
             st.sync_term_counts(pg);
             Ok(freed)
         })
+    }
+
+    /// Whether a named-graph quad uses the term `id` of `space` (see
+    /// [`QuadRefs`]), gathering the quads' terms first if they are not.
+    fn quads_reference(&mut self, pager: &Pager, space: Space, id: u32) -> Result<bool> {
+        if self.quad_refs.is_none() {
+            let mut refs = QuadRefs::default();
+            scan_keys(&self.gspo, pager, &[], 16, |k| {
+                let t = IdTriple::new(id_at(k, 4), id_at(k, 8), id_at(k, 12));
+                refs.quad(id_at(k, 0), t, true);
+            })?;
+            self.quad_refs = Some(refs);
+        }
+        Ok(self
+            .quad_refs
+            .as_ref()
+            .is_some_and(|r| r.references(space, id)))
     }
 
     /// Catch this struct's term counters up with the header (see
@@ -873,12 +942,21 @@ impl DiskStore {
         match outcome {
             Ok(r) => {
                 self.stats_undo.clear();
-                op.commit()?;
+                if let Err(e) = op.commit() {
+                    // Ending the operation failed (a nested abort rolled it
+                    // back, or its commit failed): the quads' terms are
+                    // gathered again from the pages on demand.
+                    self.quad_refs = None;
+                    return Err(e);
+                }
                 Ok(r)
             }
             Err(e) => {
                 drop(op); // rolls the pages and the header back
                 self.restore_counters(before);
+                // The quad writes of the failed operation may have counted
+                // terms: gathered again on demand.
+                self.quad_refs = None;
                 Err(e)
             }
         }
@@ -1082,6 +1160,9 @@ impl DiskStore {
         self.gspo.insert(pager, &key, b"")?;
         self.quad_count += 1;
         pager.set_root(ROOT_QUAD_COUNT, self.quad_count);
+        if let Some(refs) = &mut self.quad_refs {
+            refs.quad(g, t, true);
+        }
         Ok(true)
     }
 
@@ -1096,6 +1177,9 @@ impl DiskStore {
         }
         self.quad_count = self.quad_count.saturating_sub(1);
         pager.set_root(ROOT_QUAD_COUNT, self.quad_count);
+        if let Some(refs) = &mut self.quad_refs {
+            refs.quad(g, t, false);
+        }
         Ok(true)
     }
 
