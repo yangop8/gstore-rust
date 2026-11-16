@@ -44,10 +44,13 @@
 //!   everything else;
 //! * `login`, `testConnect`, `getCoreVersion`, `check`, `show`,
 //!   `userpassword`, `upload`, `download`, `funquery`/`funcudb`/`funreview`
-//!   are open to every user;
+//!   are open to every user, and so is `rollback` (the transaction handlers
+//!   let only the transaction's owner or a superuser end it, so an owner
+//!   whose update privilege was revoked can still roll back; upstream
+//!   requires the update privilege — review gap-txn-lifecycle#5);
 //! * `query`/`monitor` need the query privilege **on the target database**;
-//!   `update`, `batchInsert`, `batchRemove`, `begin`, `tquery`, `commit`,
-//!   `rollback` and `checkpoint` the update privilege; `load`, `unload`,
+//!   `update`, `batchInsert`, `batchRemove`, `begin`, `tquery`, `commit`
+//!   and `checkpoint` the update privilege; `load`, `unload`,
 //!   `backup`, `restore` and `export` the privilege of the same name;
 //! * every other operation (`build`, `drop`, `stat`, `usermanage`,
 //!   `showuser`, `userprivilegemanage`, `ipmanage`, the log operations,
@@ -100,13 +103,22 @@ pub enum Requirement {
 /// The requirement of operation `op` (an upstream operation name, or a
 /// privilege name such as `"update"`), after upstream's
 /// `APIUtil::check_privilege`.
+///
+/// `rollback` is the one divergence: any authenticated user may ask for it,
+/// because the transaction handlers let only the transaction's owner (or a
+/// superuser) end it — so an owner whose update privilege was revoked can
+/// still roll back the transaction that blocks the database (review
+/// gap-txn-lifecycle#5; upstream requires the update privilege).
 pub fn requirement(op: &str) -> Requirement {
     match op {
         "login" | "testConnect" | "getCoreVersion" | "funquery" | "funcudb" | "funreview"
-        | "check" | "show" | "userpassword" | "upload" | "download" => Requirement::Anyone,
+        | "check" | "show" | "userpassword" | "upload" | "download" | "rollback" => {
+            Requirement::Anyone
+        }
         "query" | "monitor" => Requirement::Privilege(Privilege::Query),
-        "update" | "batchInsert" | "batchRemove" | "begin" | "tquery" | "commit" | "rollback"
-        | "checkpoint" => Requirement::Privilege(Privilege::Update),
+        "update" | "batchInsert" | "batchRemove" | "begin" | "tquery" | "commit" | "checkpoint" => {
+            Requirement::Privilege(Privilege::Update)
+        }
         "load" => Requirement::Privilege(Privilege::Load),
         "unload" => Requirement::Privilege(Privilege::Unload),
         "restore" => Requirement::Privilege(Privilege::Restore),

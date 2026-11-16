@@ -1007,9 +1007,23 @@ fn api_unknown_and_finished_transactions_are_clean_errors_in(layout: Layout) {
     let (s, _) = api.root("POST", &format!("/tquery?tid={tid}"), "ASK { ?s ?p ?o }");
     assert_eq!(s, 409, "tquery after commit");
 
-    // The Workbench's `beginTime_tid` form addresses the same transaction.
+    // The Workbench's `beginTime_tid` form addresses the same transaction —
+    // review gap-txn-lifecycle#2: with its real begin time (what the
+    // transaction log, and `/show`, give for it); a made-up or stale one
+    // names no open transaction (it used to be ignored).
     let tid = api.begin("root", "t");
     let (s, body) = api.root("POST", &format!("/rollback?tid=1700000000_{tid}"), "");
+    assert_eq!(s, 404, "{body}");
+    let (s, body) = api.root("GET", "/show", "");
+    assert_eq!(s, 200, "{body}");
+    let long = body
+        .split("\"txnlog_TID\":\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .unwrap_or_else(|| panic!("the open transaction in /show: {body}"))
+        .to_string();
+    assert!(long.ends_with(&format!("_{tid}")), "{long}");
+    let (s, body) = api.root("POST", &format!("/rollback?tid={long}"), "");
     assert_eq!(s, 200, "{body}");
     let (s, body) = api.root("POST", &format!("/rollback?tid={tid}"), "");
     assert_eq!(s, 409, "{body}");

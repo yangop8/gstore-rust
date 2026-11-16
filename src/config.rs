@@ -245,6 +245,7 @@ pub const KNOWN_KEYS: &[(&str, &str)] = &[
     ("system", "pfn_base_path"),
     ("system", "licensetype"),
     ("system", "check_point"),
+    ("system", "txn_idle_timeout"),
     ("system", "build_multi_thread"),
     ("log", "log_mode"),
     ("log", "querylog_mode"),
@@ -442,6 +443,15 @@ pub struct GStoreConfig {
     pub licensetype: String,
     /// Save every write before it is acknowledged (default on).
     pub check_point: bool,
+    /// *(Rust extension)* Seconds after which an open HTTP transaction
+    /// (`/begin`, `/api` `begin`) with no statement running is rolled back
+    /// and logged as aborted — by the next `begin` on its database, the
+    /// next request, or a background pass every `min(timeout / 4, 30 s)` —
+    /// so a vanished client cannot block its database's writes and
+    /// maintenance indefinitely (default `600`; `0` = never, upstream's
+    /// behaviour). A transaction whose owner was deleted is rolled back
+    /// too.
+    pub txn_idle_timeout: u64,
     /// Build with multiple threads (default on). `off` makes `gbuild`'s
     /// bulk build use one thread.
     pub build_multi_thread: bool,
@@ -684,6 +694,7 @@ impl Default for GStoreConfig {
             pfn_base_path: PathBuf::from("./pfn/"),
             licensetype: "opensource".to_string(),
             check_point: true,
+            txn_idle_timeout: 600,
             build_multi_thread: true,
             build_memory_mb: crate::bulk::DEFAULT_MEMORY_BUDGET as u64 >> 20,
             build_threads: 0,
@@ -955,6 +966,11 @@ impl GStoreConfig {
             }
             "licensetype" => self.licensetype = v.to_string(),
             "check_point" => self.check_point = parse_switch(v).ok_or_else(|| bad("on or off"))?,
+            "txn_idle_timeout" => {
+                self.txn_idle_timeout = v
+                    .parse()
+                    .map_err(|_| bad("a number of seconds (0 = never)"))?
+            }
             "build_multi_thread" => {
                 self.build_multi_thread = parse_switch(v).ok_or_else(|| bad("on or off"))?
             }
@@ -1182,6 +1198,7 @@ impl GStoreConfig {
             "pfn_base_path" => path(&self.pfn_base_path),
             "licensetype" => self.licensetype.clone(),
             "check_point" => switch(self.check_point),
+            "txn_idle_timeout" => self.txn_idle_timeout.to_string(),
             "build_multi_thread" => switch(self.build_multi_thread),
             "build_memory_mb" => self.build_memory_mb.to_string(),
             "build_threads" => self.build_threads.to_string(),
@@ -1347,6 +1364,14 @@ impl GStoreConfig {
                  password '{DEFAULT_ROOT_PASSWORD}' on a loopback server: change it and remove \
                  the switch)"
             ));
+        }
+        if self.txn_idle_timeout == 0 {
+            out.push(
+                "upstream-compat: txn_idle_timeout=0 (an open transaction never expires: a \
+                 client that vanishes after begin blocks its database's writes until root \
+                 rolls it back)"
+                    .to_string(),
+            );
         }
         if self.anonymous_download {
             out.push(

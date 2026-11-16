@@ -1101,12 +1101,28 @@ fn transactions_through_api_with_snapshot_isolation_and_owners() {
         ],
     );
     assert_eq!(n(&j, "AnsNum"), 1);
-    // The Workbench's "beginTime_tid" form addresses the same transaction.
+    // The Workbench's "beginTime_tid" form addresses the same transaction —
+    // review gap-txn-lifecycle#2: with the begin time the transaction log
+    // shows for it. A made-up (or stale) begin time names no open
+    // transaction and ends nothing (it used to be ignored, so a stale id
+    // ended whichever transaction had the number now).
     let j = as_user(
         "alice",
         "rollback",
         &[("tid", &format!("1700000000_{tid}"))],
     );
+    assert_eq!(code(&j), 1005, "{j}");
+    assert!(msg(&j).contains("Wrong transaction id"), "{j}");
+    let log = root_api(&addr, "txnlog", &[("pageNo", "1"), ("pageSize", "50")]);
+    let long = log
+        .get("list")
+        .and_then(Json::as_array)
+        .unwrap()
+        .iter()
+        .map(|r| s(r, "TID").to_string())
+        .find(|t| t.ends_with(&format!("_{tid}")))
+        .unwrap_or_else(|| panic!("transaction {tid} in the log: {log}"));
+    let j = as_user("alice", "rollback", &[("tid", &long)]);
     assert_eq!(
         (code(&j), msg(&j)),
         (0, "Transaction rollback success."),

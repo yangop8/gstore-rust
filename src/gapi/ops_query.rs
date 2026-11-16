@@ -450,7 +450,9 @@ fn begin(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     };
     let target = {
         let st = ctx.state();
-        ApiInner::begin_target(&st, &db).map_err(|e| (e, st.db_dir(&db).is_dir()))
+        ctx.inner
+            .begin_target(&st, &db)
+            .map_err(|e| (e, st.db_dir(&db).is_dir()))
     };
     let dbh = match target {
         Ok(h) => h,
@@ -479,21 +481,14 @@ fn begin_error(db: &str, e: OpError, on_disk: bool) -> GResp {
     }
 }
 
-/// Parse a `tid` like upstream's `check_txn_id`: a positive integer, or the
-/// Workbench's `beginTime_tid` form.
-fn parse_tid(raw: &str) -> Option<u64> {
-    let raw = raw.trim();
-    let digits = raw.rsplit_once('_').map_or(raw, |(_, t)| t);
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    digits.parse::<u64>().ok().filter(|&t| t != 0)
-}
-
-/// The transaction id parameter, or the `1003` answer.
-fn tid_param(p: &Params) -> Result<u64, GResp> {
+/// The transaction id parameter, or the `1003` answer: parsed like
+/// upstream's `check_txn_id` — a positive integer, or the Workbench's
+/// `beginTime_tid` form, whose begin time must then be the transaction's
+/// (review gap-txn-lifecycle#2) — by the parser the REST endpoints share
+/// ([`crate::http_api::parse_tid`]).
+fn tid_param(p: &Params) -> Result<crate::http_api::TidRef, GResp> {
     let raw = required(p, "tid")?;
-    parse_tid(&raw).ok_or_else(|| {
+    crate::http_api::parse_tid(&raw).ok_or_else(|| {
         GResp::error(
             Status::ParamIsIllegal,
             format!("TID {raw} is not a pure number."),
@@ -518,7 +513,11 @@ fn txn_db_loaded(ctx: &Ctx<'_>, db: &str) -> Result<(), GResp> {
 /// Resolve transaction `tid` of the caller on `db`: its database's handle.
 /// Ids are numbered per database (upstream keeps one transaction manager per
 /// loaded database), so `tid` is only looked up on `db`.
-fn txn_target(ctx: &Ctx<'_>, db: &str, tid: u64) -> Result<Option<DbHandle>, OpError> {
+fn txn_target(
+    ctx: &Ctx<'_>,
+    db: &str,
+    tid: crate::http_api::TidRef,
+) -> Result<Option<DbHandle>, OpError> {
     let st = ctx.state();
     let name = ctx.inner.txn_for(&st, Some(db), tid, ctx.user())?;
     Ok(st.dbs.get(&name).map(Arc::clone))
@@ -557,7 +556,7 @@ fn tquery(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     let stmt = Statement::parse(&sparql);
     match ctx
         .inner
-        .run_in_txn_task(&dbh, &db, tid, &sparql, stmt, ctx.user())
+        .run_in_txn_task(&dbh, &db, tid.tid, &sparql, stmt, ctx.user())
     {
         Ok(QueryResult::Update { changed }) => {
             GResp::success("Transaction query success").with("AnsNum", changed)
@@ -613,6 +612,13 @@ fn end(ctx: &mut Ctx<'_>, p: &Params, commit: bool) -> GResp {
         // durability#2) — the code `batchInsert` answers for a failed save.
         Ok(Some(w)) => {
             GResp::error(Status::OperationFailed, format!("{fail_prefix}: {w}")).with("warning", w)
+        }
+        // A commit whose commit point failed and that could not be undone
+        // (review gap-txn-lifecycle#3): applied but not durable, the same
+        // answer with the cause as its warning.
+        Err(e) if e.kind == OpErrorKind::Persist => {
+            GResp::error(Status::OperationFailed, format!("{fail_prefix}: {}", e.msg))
+                .with("warning", e.msg)
         }
         Err(e) => txn_error(&fail_prefix, e),
     }
@@ -788,10 +794,24 @@ mod tests {
 
     #[test]
     fn tids_parse_like_upstream() {
-        assert_eq!(parse_tid("1"), Some(1));
-        assert_eq!(parse_tid(" 42 "), Some(42));
-        assert_eq!(parse_tid("1700000000_7"), Some(7));
-        for bad in ["", "0", "abc", "1.5", "-1", "1_x", "_"] {
+        use crate::http_api::{parse_tid, TidRef};
+        assert_eq!(parse_tid("1"), Some(TidRef::plain(1)));
+        assert_eq!(parse_tid(" 42 "), Some(TidRef::plain(42)));
+        // review gap-txn-lifecycle#2: the begin time of the Workbench's
+        // `beginTime_tid` form is kept (and checked by the handlers), not
+        // dropped.
+        assert_eq!(
+            parse_tid("1700000000_7"),
+            Some(TidRef {
+                tid: 7,
+                begun: Some(1_700_000_000)
+            })
+        );
+        // review gap-txn-lifecycle#2: one parser for REST and /api — the
+        // REST endpoints used to accept a sign ("+2").
+        for bad in [
+            "", "0", "abc", "1.5", "-1", "1_x", "_", "+2", "1_+2", "x_1", "1_2_3", "_7",
+        ] {
             assert_eq!(parse_tid(bad), None, "{bad:?}");
         }
     }

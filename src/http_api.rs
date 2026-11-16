@@ -144,8 +144,16 @@
 //! (bounded, [`TaskConfig::shutdown_wait`]).
 //!
 //! **Transactions.** At most one transaction is open per database, owned by
-//! the user who began it: only that user (or `root`) may `/tquery`, `/commit`
-//! or `/rollback` it. While it is open, every non-transactional write to that
+//! the user who began it: only that user (or a superuser — `root`, or a user
+//! with the `admin` privilege) may `/tquery`, `/commit` or `/rollback` it,
+//! and the owner may roll it back whatever their current privileges. One
+//! idle (no statement running) for `txn_idle_timeout` seconds (default 600,
+//! `0` never), or whose owner was deleted, is rolled back and logged as
+//! aborted — by the next `/begin` on its database, the next request, or a
+//! background pass (see `ApiInner::reap_idle_txns`). A commit is answered
+//! as what happened: committed, rolled back when its commit point failed,
+//! or applied but not durable when it could no longer be undone
+//! ([`Database::commit_checked`]). While it is open, every non-transactional write to that
 //! database (`/update`, `/batch*`, `/upload`, …) is rejected with `409` rather
 //! than silently joining the transaction, and every non-transactional read is
 //! answered from a snapshot of the committed state taken at `/begin`, so no
@@ -155,7 +163,8 @@
 //! (an open transaction that wrote holds the begin-time copy until it ends);
 //! a Stream-mode on-disk database's snapshot is a read view of its store,
 //! which the commit expires (reads in flight are cancelled and re-run on the
-//! committed state); a RocksDB database is still copied whole. `/begin`
+//! committed state); a RocksDB database is still copied whole, under the
+//! shared guard (its readers go on meanwhile). `/begin`
 //! accepts gStore's `isolevel`
 //! (`1` SERIALIZABLE — the default, `2` SNAPSHOT, `3` READ_COMMITTED, see
 //! [`TxnIsolation`]); with a single writer every level is honoured. Like
@@ -165,7 +174,9 @@
 //! on several databases (without it the id must be open on exactly one and
 //! not recently ended on another — a retried `/commit` — else `409`).
 //! Unknown transaction ids are `404`; committing or rolling back a finished
-//! one is `409`.
+//! one is `409` (also when it ended in an earlier load of the database). The
+//! transaction log's `<begin>_<tid>` form is accepted too and names only the
+//! transaction that began then.
 //!
 //! **Upstream protocol.** The same server also speaks upstream gStore 1.4's
 //! own protocol — `GET|POST /api` (and `POST /`, `GET /?operation=…`) with an
@@ -535,15 +546,470 @@ impl TxnIsolation {
 pub(crate) struct Txn {
     /// The database it operates on.
     pub(crate) db: String,
-    /// The user who began it: only they (or `root`) may `/tquery`, `/commit` or
-    /// `/rollback` it.
+    /// The user who began it: only they (or a superuser — `root`, or a user
+    /// with the `admin` privilege) may `/tquery`, `/commit` or `/rollback`
+    /// it; they may roll it back whatever their current privileges.
     pub(crate) owner: String,
     pub(crate) isolation: TxnIsolation,
+    /// When it began (Unix milliseconds): the `<begin>` of the
+    /// `<begin>_<tid>` form the transaction log shows (and the Workbench
+    /// sends back), checked against it (see [`TidRef`]).
+    pub(crate) begun: u128,
+    /// The load generation of its database ([`DbSlot::load_gen`]): ids
+    /// restart at 1 with every load, so it tells the transactions of two
+    /// loads apart.
+    pub(crate) generation: u64,
+    /// The transaction clock ([`TxnReapState::now_ms`]) when its last
+    /// statement ended (or it began): idle from then on.
+    pub(crate) last_active: u64,
+    /// Its statements in flight (counted from before they take the
+    /// database's guard until they release it): a running statement is
+    /// activity, so the transaction is never idle meanwhile.
+    pub(crate) running: u32,
 }
 
 /// How many finished transaction ids are remembered so that a repeated
 /// `/commit` or `/rollback` gets a precise "already committed" error.
 const ENDED_TXN_MEMORY: usize = 1024;
+
+/// A finished transaction ([`ApiState::ended_txns`]). Kept across reloads of
+/// its database: the load generation and the begin time tell a retried
+/// request for it apart from the transaction of the same number a later
+/// load opened.
+pub(crate) struct EndedTxn {
+    pub(crate) db: String,
+    pub(crate) tid: u64,
+    /// Its database's load generation, when known.
+    pub(crate) generation: Option<u64>,
+    /// Its begin time (Unix milliseconds), when known.
+    pub(crate) begun: Option<u128>,
+    /// How it ended ("committed", "rolled back", …).
+    pub(crate) outcome: &'static str,
+}
+
+/// How a transaction that a failed commit rolled back ended.
+const ENDED_COMMIT_ROLLED_BACK: &str = "rolled back after its commit failed";
+/// How a transaction ended whose commit failed after it could no longer be
+/// undone.
+const ENDED_NOT_DURABLE: &str = "left applied but not durable by a failed commit";
+/// How an idle transaction ended.
+const ENDED_IDLE: &str = "rolled back after txn_idle_timeout";
+/// How the transaction of a deleted user ended.
+const ENDED_ORPHAN: &str = "rolled back because its owner was deleted";
+
+/// A transaction id as clients send it: a positive integer, or the
+/// `<begin>_<tid>` form of the transaction log (upstream's Workbench sends
+/// it back), whose begin time must then match the transaction's. One parser
+/// for the REST endpoints and `/api` ([`parse_tid`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TidRef {
+    pub(crate) tid: u64,
+    /// The `<begin>` part (Unix milliseconds), when given.
+    pub(crate) begun: Option<u128>,
+}
+
+impl TidRef {
+    /// A bare id.
+    pub(crate) fn plain(tid: u64) -> TidRef {
+        TidRef { tid, begun: None }
+    }
+}
+
+/// Parse a transaction id ([`TidRef`]): digits only (surrounding
+/// whitespace aside) — no sign, no other separator — and not 0.
+pub(crate) fn parse_tid(raw: &str) -> Option<TidRef> {
+    let raw = raw.trim();
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let (begun, tid) = match raw.split_once('_') {
+        Some((b, t)) if digits(b) => (Some(b.parse::<u128>().ok()?), t),
+        Some(_) => return None,
+        None => (None, raw),
+    };
+    if !digits(tid) {
+        return None;
+    }
+    let tid = tid.parse::<u64>().ok().filter(|&t| t != 0)?;
+    Some(TidRef { tid, begun })
+}
+
+/// Whether an open transaction may go on, or why it no longer counts as
+/// running (see [`ApiInner::txn_liveness`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TxnLiveness {
+    /// Running (or idle for less than `txn_idle_timeout`).
+    Live,
+    /// Idle for `txn_idle_timeout` or longer, no statement in flight.
+    Idle,
+    /// Its owner no longer exists.
+    Orphaned,
+}
+
+impl TxnLiveness {
+    /// How it ends when it is reaped (`None` while live).
+    fn ended_as(self) -> Option<&'static str> {
+        match self {
+            TxnLiveness::Live => None,
+            TxnLiveness::Idle => Some(ENDED_IDLE),
+            TxnLiveness::Orphaned => Some(ENDED_ORPHAN),
+        }
+    }
+}
+
+/// The idle-transaction reaper's state, one per server
+/// ([`ApiInner::txn_reap`]): the earliest idle deadline (read with no lock
+/// on every request), the server's transaction clock, and the periodic
+/// reaper's wake-ups and passes.
+pub(crate) struct TxnReapState {
+    /// The earliest time ([`now_ms`](Self::now_ms)) at which an open
+    /// transaction may have become reapable — idle past `txn_idle_timeout`,
+    /// or found without an owner — `u64::MAX` when none is known. Lowered
+    /// (never raised, see [`arm`](Self::arm)) under the state lock by
+    /// whoever stamps activity, re-computed by each reap pass; a value in
+    /// the past makes the next request run a pass.
+    pub(crate) at: AtomicU64,
+    /// A test-only shift of the transaction clock
+    /// ([`debug_advance_txn_clock`]).
+    skew_ms: AtomicU64,
+    /// The periodic reaper's (wake-ups asked for, the wake-up count seen
+    /// at the start of its last finished pass).
+    beat: Mutex<(u64, u64)>,
+    beat_changed: std::sync::Condvar,
+    /// Whether this server already marked the transactions a previous
+    /// process left `RUNNING` in the transaction log as `ABORTED`.
+    swept: AtomicBool,
+}
+
+impl Default for TxnReapState {
+    fn default() -> TxnReapState {
+        TxnReapState {
+            at: AtomicU64::new(u64::MAX),
+            skew_ms: AtomicU64::new(0),
+            beat: Mutex::new((0, 0)),
+            beat_changed: std::sync::Condvar::new(),
+            swept: AtomicBool::new(false),
+        }
+    }
+}
+
+impl TxnReapState {
+    /// The transaction clock: monotonic milliseconds since the process
+    /// first read it (plus the test skew).
+    pub(crate) fn now_ms(&self) -> u64 {
+        static BASE: OnceLock<Instant> = OnceLock::new();
+        let base = BASE.get_or_init(Instant::now);
+        (base.elapsed().as_millis() as u64).saturating_add(self.skew_ms.load(Ordering::SeqCst))
+    }
+
+    /// Make a pass due no later than `at` (called under the state lock, so
+    /// a pass that re-computes the deadline never loses it).
+    pub(crate) fn arm(&self, at: u64) {
+        self.at.fetch_min(at, Ordering::SeqCst);
+    }
+
+    fn beat(&self) -> std::sync::MutexGuard<'_, (u64, u64)> {
+        self.beat.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Wake the periodic reaper now; returns the wake-up's number.
+    fn wake(&self) -> u64 {
+        let mut beat = self.beat();
+        beat.0 += 1;
+        self.beat_changed.notify_all();
+        beat.0
+    }
+
+    /// A periodic pass that started after wake-up `seen` finished: tell
+    /// whoever waits for one.
+    fn finished_pass(&self, seen: u64) {
+        let mut beat = self.beat();
+        beat.1 = beat.1.max(seen);
+        self.beat_changed.notify_all();
+    }
+}
+
+/// The servers whose transaction lifecycle the hidden test hooks reach, by
+/// root directory (registered when they start serving).
+static TXN_SERVERS: Mutex<Vec<(PathBuf, Weak<ApiInner>)>> = Mutex::new(Vec::new());
+
+/// The serving [`ApiServer`] whose root is `root` (the path it was bound
+/// with), if any.
+fn txn_server(root: &Path) -> Option<Arc<ApiInner>> {
+    let servers = TXN_SERVERS.lock().unwrap_or_else(PoisonError::into_inner);
+    servers
+        .iter()
+        .rev()
+        .filter(|(r, _)| r == root)
+        .find_map(|(_, w)| w.upgrade())
+}
+
+/// Test hook: move the transaction clock of the server serving `root`
+/// forward by `by` — what `txn_idle_timeout` is measured on. Returns whether
+/// such a server is serving.
+#[doc(hidden)]
+pub fn debug_advance_txn_clock(root: &Path, by: Duration) -> bool {
+    match txn_server(root) {
+        Some(inner) => {
+            let ms = u64::try_from(by.as_millis()).unwrap_or(u64::MAX);
+            inner.txn_reap.skew_ms.fetch_add(ms, Ordering::SeqCst);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Test hook: wake the periodic idle-transaction reaper of the server
+/// serving `root` now (its explicit trigger; it also runs every
+/// `min(txn_idle_timeout / 4, 30 s)`). Returns the wake-up's number for
+/// [`debug_wait_txn_reaper_pass`], `None` when no such server serves.
+#[doc(hidden)]
+pub fn debug_wake_txn_reaper(root: &Path) -> Option<u64> {
+    txn_server(root).map(|inner| inner.txn_reap.wake())
+}
+
+/// Test hook: wait until the periodic reaper of the server serving `root`
+/// finished a pass that started after wake-up `wake` (from
+/// [`debug_wake_txn_reaper`]) — so it read the transaction clock after
+/// everything the test did before waking it. `hang_guard` bounds the wait;
+/// `false` when it ran out (or no such server serves).
+#[doc(hidden)]
+pub fn debug_wait_txn_reaper_pass(root: &Path, wake: u64, hang_guard: Duration) -> bool {
+    let Some(inner) = txn_server(root) else {
+        return false;
+    };
+    let state = &inner.txn_reap;
+    let (beat, _) = state
+        .beat_changed
+        .wait_timeout_while(state.beat(), hang_guard, |b| b.1 < wake)
+        .unwrap_or_else(PoisonError::into_inner);
+    beat.1 >= wake
+}
+
+/// Where a test can park a transaction step ([`debug_park_txn`]).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxnParkPoint {
+    /// A `/tquery` statement has ended (its activity is stamped) but still
+    /// holds its database's guard.
+    StatementEnded,
+    /// A RocksDB `/begin` is copying the database for its read snapshot,
+    /// holding the shared guard.
+    BeginCapture,
+    /// A RocksDB `/begin` has its copy and holds no guard yet (a write may
+    /// slip in before it registers the transaction).
+    BeginCaptured,
+}
+
+/// A parked step: [`wait_parked`](Self::wait_parked) until a thread reaches
+/// it, [`release`](Self::release) to let it (and later ones) go on.
+/// Released and unregistered when dropped.
+#[doc(hidden)]
+pub struct TxnPark {
+    db: String,
+    point: TxnParkPoint,
+    gate: Arc<ParkGate>,
+}
+
+#[derive(Default)]
+struct ParkGate {
+    /// (threads that reached the point, released)
+    state: Mutex<(u64, bool)>,
+    changed: std::sync::Condvar,
+}
+
+/// The parks armed by tests (normally none: one atomic read per point).
+static TXN_PARKS: Mutex<Vec<(String, TxnParkPoint, Arc<ParkGate>)>> = Mutex::new(Vec::new());
+static TXN_PARKS_ARMED: AtomicBool = AtomicBool::new(false);
+
+/// Test hook: park every thread that reaches `point` for database `db`
+/// until the returned handle is released or dropped.
+#[doc(hidden)]
+pub fn debug_park_txn(db: &str, point: TxnParkPoint) -> TxnPark {
+    let gate = Arc::new(ParkGate::default());
+    let mut parks = TXN_PARKS.lock().unwrap_or_else(PoisonError::into_inner);
+    parks.push((db.to_string(), point, Arc::clone(&gate)));
+    TXN_PARKS_ARMED.store(true, Ordering::SeqCst);
+    TxnPark {
+        db: db.to_string(),
+        point,
+        gate,
+    }
+}
+
+impl TxnPark {
+    /// Wait (at most `hang_guard`) until a thread is parked here.
+    pub fn wait_parked(&self, hang_guard: Duration) -> bool {
+        let g = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let (g, _) = self
+            .gate
+            .changed
+            .wait_timeout_while(g, hang_guard, |(n, _)| *n == 0)
+            .unwrap_or_else(PoisonError::into_inner);
+        g.0 > 0
+    }
+
+    /// Let the parked thread (and every later one) go on.
+    pub fn release(&self) {
+        let mut g = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        g.1 = true;
+        self.gate.changed.notify_all();
+    }
+}
+
+impl Drop for TxnPark {
+    fn drop(&mut self) {
+        self.release();
+        let mut parks = TXN_PARKS.lock().unwrap_or_else(PoisonError::into_inner);
+        parks
+            .retain(|(d, p, g)| !(d == &self.db && *p == self.point && Arc::ptr_eq(g, &self.gate)));
+        if parks.is_empty() {
+            TXN_PARKS_ARMED.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Park here if a test armed `point` for `db` ([`debug_park_txn`]).
+fn txn_park(db: &str, point: TxnParkPoint) {
+    if !TXN_PARKS_ARMED.load(Ordering::SeqCst) {
+        return;
+    }
+    let gate = {
+        let parks = TXN_PARKS.lock().unwrap_or_else(PoisonError::into_inner);
+        parks
+            .iter()
+            .find(|(d, p, _)| d == db && *p == point)
+            .map(|(_, _, g)| Arc::clone(g))
+    };
+    let Some(gate) = gate else {
+        return;
+    };
+    let mut g = gate.state.lock().unwrap_or_else(PoisonError::into_inner);
+    g.0 += 1;
+    gate.changed.notify_all();
+    while !g.1 {
+        g = gate.changed.wait(g).unwrap_or_else(PoisonError::into_inner);
+    }
+}
+
+/// The periodic idle-transaction reaper of a serving [`ApiServer`] (see
+/// [`ApiInner::start_txn_reaper`]): stopped and joined (bounded) when
+/// dropped.
+pub(crate) struct TxnReaper {
+    inner: Arc<ApiInner>,
+    stop: Arc<AtomicBool>,
+    done: std::sync::mpsc::Receiver<()>,
+}
+
+impl Drop for TxnReaper {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        self.inner.txn_reap.wake();
+        // Bounded: a pass never waits for a database (it skips busy ones),
+        // so it ends promptly; a rollback it is in the middle of finishes
+        // on its own if this gives up (the thread holds the server).
+        let _ = self.done.recv_timeout(Duration::from_secs(10));
+    }
+}
+
+/// A statement of an open transaction in flight (see
+/// [`ApiInner::txn_statement`]): it counts as activity until it is
+/// [`end`](Self::end)ed (or dropped), which restarts the transaction's idle
+/// clock.
+pub(crate) struct TxnStatement<'a> {
+    inner: &'a ApiInner,
+    db: String,
+    tid: u64,
+    /// The registry entry's load generation when the statement started
+    /// (`None`: no such transaction, or already ended).
+    generation: Option<u64>,
+}
+
+impl TxnStatement<'_> {
+    /// The statement ended: stamp its transaction's activity.
+    fn end(mut self) {
+        self.stamp_end();
+    }
+
+    fn stamp_end(&mut self) {
+        if let Some(generation) = self.generation.take() {
+            let mut st = locked(&self.inner.state);
+            self.inner
+                .txn_activity(&mut st, &self.db, self.tid, generation, false);
+        }
+    }
+}
+
+impl Drop for TxnStatement<'_> {
+    fn drop(&mut self) {
+        self.stamp_end();
+    }
+}
+
+/// The transaction open on a database, as monitoring shows it (see
+/// [`ApiInner::txn_summary`]).
+pub(crate) struct TxnSummary {
+    pub(crate) tid: u64,
+    /// Its begin time (Unix milliseconds).
+    pub(crate) begun: u128,
+    pub(crate) owner: String,
+    pub(crate) isolation: TxnIsolation,
+    /// Seconds since its last statement ended (or it began); `0` while a
+    /// statement runs.
+    pub(crate) idle_secs: u64,
+    /// Its statements in flight.
+    pub(crate) running: u32,
+}
+
+impl TxnSummary {
+    /// As a JSON object.
+    pub(crate) fn to_json(&self) -> crate::json::Json {
+        crate::json::Json::obj()
+            .with("TID", self.tid.to_string())
+            .with("txnlog_TID", format!("{}_{}", self.begun, self.tid))
+            .with("user", self.owner.as_str())
+            .with("isolation", self.isolation.name())
+            .with("begin_time", self.begun.to_string())
+            .with("idle_seconds", self.idle_secs)
+            .with("running_statements", u64::from(self.running))
+    }
+
+    /// `,"transaction":{…}`, spliced into a REST JSON object.
+    fn json_field(&self) -> String {
+        format!(",\"transaction\":{}", self.to_json())
+    }
+}
+
+/// How [`ApiInner::end_txn`] ended a transaction.
+struct TxnEnd {
+    /// For [`ApiState::ended_txns`] ("committed", "rolled back", …).
+    outcome: &'static str,
+    /// For the transaction log.
+    state: TxnState,
+    /// For `txn.log`.
+    logged: &'static str,
+    /// The answer (see [`ApiInner::end_txn`]).
+    result: Result<Option<String>, OpError>,
+}
+
+/// A RocksDB `/begin`'s copy of the database, taken under the shared guard,
+/// with the state it was taken at (see [`ApiInner::begin_txn`]).
+struct CapturedSnapshot {
+    snapshot: ReadSnapshot,
+    mutations: u64,
+    settings_gen: u64,
+}
+
+/// How many times a RocksDB `/begin` copies the database under the shared
+/// guard before it copies it under the exclusive one (see
+/// [`ApiInner::begin_txn`]).
+const BEGIN_CAPTURE_ATTEMPTS: usize = 3;
 
 /// A database's committed state, taken at `/begin`. While a transaction is
 /// open every *non-transactional* read of that database is answered from
@@ -1017,6 +1483,11 @@ pub(crate) struct DbSlot {
     /// upstream test scripts address it so. Ownership checks, not
     /// unguessable ids, keep transactions apart.
     pub(crate) next_tid: u64,
+    /// This load's generation: unique per process for every database
+    /// served (a reload gets a new one). Finished transactions are
+    /// remembered with it ([`EndedTxn`]), so ids reused by a later load are
+    /// told apart from theirs.
+    pub(crate) load_gen: u64,
     /// Set once the database was unloaded, dropped or replaced while a request
     /// still held this handle: the slot then holds an empty placeholder that
     /// must never be queried, written or saved (it would overwrite `dir`).
@@ -1400,6 +1871,10 @@ impl DbSlot {
             dirty,
             txn: None,
             next_tid: 1,
+            load_gen: {
+                static LOAD_GEN: AtomicU64 = AtomicU64::new(1);
+                LOAD_GEN.fetch_add(1, Ordering::Relaxed)
+            },
             retired: false,
             settings_gen: 0,
             last_save: 0,
@@ -1695,9 +2170,10 @@ pub(crate) struct ApiState {
     pub(crate) txns: HashMap<(String, u64), Txn>,
     /// The single open transaction per database (single-writer), if any.
     pub(crate) db_txn: HashMap<String, u64>,
-    /// Recently finished transactions (database, `tid`, outcome), newest last,
-    /// bounded by [`ENDED_TXN_MEMORY`].
-    pub(crate) ended_txns: VecDeque<(String, u64, &'static str)>,
+    /// Recently finished transactions, newest last, bounded by
+    /// [`ENDED_TXN_MEMORY`] — across reloads of their databases (see
+    /// [`EndedTxn`]).
+    pub(crate) ended_txns: VecDeque<EndedTxn>,
     pub(crate) started: Instant,
     pub(crate) requests: u64,
     /// The `LOAD` policy installed on every database this server serves
@@ -1736,21 +2212,59 @@ impl ApiState {
         }
     }
 
+    /// Remember that transaction `tid` of database `db` ended with
+    /// `outcome` (its load generation and begin time unknown: a retry gives
+    /// the outcome to a bare id only).
     pub(crate) fn remember_ended(&mut self, db: &str, tid: u64, outcome: &'static str) {
+        self.push_ended(EndedTxn {
+            db: db.to_string(),
+            tid,
+            generation: None,
+            begun: None,
+            outcome,
+        });
+    }
+
+    /// Remember how the registry entry `txn` (transaction `tid`) ended.
+    pub(crate) fn remember_ended_txn(&mut self, txn: &Txn, tid: u64, outcome: &'static str) {
+        self.push_ended(EndedTxn {
+            db: txn.db.clone(),
+            tid,
+            generation: Some(txn.generation),
+            begun: Some(txn.begun),
+            outcome,
+        });
+    }
+
+    fn push_ended(&mut self, ended: EndedTxn) {
         if self.ended_txns.len() >= ENDED_TXN_MEMORY {
             self.ended_txns.pop_front();
         }
-        self.ended_txns.push_back((db.to_string(), tid, outcome));
+        self.ended_txns.push_back(ended);
     }
 
     /// How transaction `tid` of database `db` (any database when `None`)
-    /// ended, if it is remembered.
+    /// ended, if it is remembered (the newest, for an id several loads
+    /// used).
     pub(crate) fn ended_outcome(&self, db: Option<&str>, tid: u64) -> Option<&'static str> {
-        self.ended_txns
-            .iter()
-            .rev()
-            .find(|(d, t, _)| *t == tid && db.is_none_or(|db| d == db))
-            .map(|(_, _, o)| *o)
+        self.ended_record(db, TidRef::plain(tid)).map(|e| e.outcome)
+    }
+
+    /// The newest remembered end of transaction `tid` of database `db` (any
+    /// database when `None`); with a begin time, only the transaction that
+    /// began then.
+    fn ended_record(&self, db: Option<&str>, tid: TidRef) -> Option<&EndedTxn> {
+        self.ended_txns.iter().rev().find(|e| {
+            e.tid == tid.tid
+                && db.is_none_or(|db| e.db == db)
+                && tid.begun.is_none_or(|b| e.begun == Some(b))
+        })
+    }
+
+    /// The database of open transaction `tid` (see
+    /// [`open_txn_db_at`](Self::open_txn_db_at)).
+    pub(crate) fn open_txn_db(&self, db: Option<&str>, tid: u64) -> Result<String, OpError> {
+        self.open_txn_db_at(db, TidRef::plain(tid))
     }
 
     /// The database of open transaction `tid`: on `db` when named, else the
@@ -1758,32 +2272,46 @@ impl ApiState {
     /// without a name an id is ambiguous when it is open on several databases
     /// — or open on one and recently ended on another: a client retrying the
     /// `/commit` of a transaction that already ended must not end another
-    /// database's transaction of the same number.
-    pub(crate) fn open_txn_db(&self, db: Option<&str>, tid: u64) -> Result<String, OpError> {
+    /// database's transaction of the same number. A `<begin>_<tid>` id names
+    /// only the transaction that began then (review gap-txn-lifecycle#2): a
+    /// stale one — of an earlier load or an earlier server process — is
+    /// "not running" when its end is remembered, else unknown, and never
+    /// ends the transaction that has the number now.
+    pub(crate) fn open_txn_db_at(&self, db: Option<&str>, tid: TidRef) -> Result<String, OpError> {
+        let begun_ok = |name: &String| {
+            tid.begun.is_none_or(|b| {
+                self.txns
+                    .get(&(name.clone(), tid.tid))
+                    .is_some_and(|t| t.begun == b)
+            })
+        };
+        let id = tid.tid;
         if let Some(db) = db {
-            if self.txns.contains_key(&(db.to_string(), tid)) {
-                return Ok(db.to_string());
+            let name = db.to_string();
+            if self.txns.contains_key(&(name.clone(), id)) && begun_ok(&name) {
+                return Ok(name);
             }
         } else {
             let mut on: Vec<&String> = self
                 .txns
                 .keys()
-                .filter(|(_, t)| *t == tid)
+                .filter(|(_, t)| *t == id)
                 .map(|(d, _)| d)
+                .filter(|d| begun_ok(d))
                 .collect();
             on.sort();
             if let [one] = on.as_slice() {
                 let ended_elsewhere = self
                     .ended_txns
                     .iter()
-                    .find(|(d, t, _)| *t == tid && d != *one);
-                if let Some((other, _, outcome)) = ended_elsewhere {
+                    .find(|e| e.tid == id && e.db != **one && tid.begun.is_none());
+                if let Some(other) = ended_elsewhere {
                     return Err(OpError::new(
                         OpErrorKind::Conflict,
                         format!(
-                            "transaction {tid} is open on database '{one}' but transaction {tid} \
-                             of database '{other}' was {outcome} recently: name the database \
-                             (db_name)"
+                            "transaction {id} is open on database '{one}' but transaction {id} \
+                             of database '{}' was {} recently: name the database (db_name)",
+                            other.db, other.outcome
                         ),
                     ));
                 }
@@ -1796,7 +2324,7 @@ impl ApiState {
                     return Err(OpError::new(
                         OpErrorKind::Conflict,
                         format!(
-                            "transaction {tid} is open on several databases ({}): name the \
+                            "transaction {id} is open on several databases ({}): name the \
                              database (db_name)",
                             names.join(", ")
                         ),
@@ -1804,15 +2332,36 @@ impl ApiState {
                 }
             }
         }
-        Err(match self.ended_outcome(db, tid) {
-            Some(outcome) => OpError::new(
-                OpErrorKind::TxnEnded,
-                format!("transaction {tid} is not running (already {outcome})"),
-            ),
-            None => OpError::new(
+        let outcome = match tid.begun {
+            None => self.ended_outcome(db, id),
+            Some(_) => self.ended_record(db, tid).map(|e| e.outcome),
+        };
+        Err(match outcome {
+            Some(outcome) => {
+                // The same number may be open again in a later load.
+                let earlier = self.ended_record(db, tid).is_some_and(|e| {
+                    self.txns.iter().any(|((d, t), open)| {
+                        *d == e.db && *t == id && Some(open.generation) != e.generation
+                    })
+                });
+                let when = if earlier {
+                    " in an earlier load of the database"
+                } else {
+                    ""
+                };
+                OpError::new(
+                    OpErrorKind::TxnEnded,
+                    format!("transaction {id} is not running (already {outcome}{when})"),
+                )
+            }
+            None if tid.begun.is_some() => OpError::new(
                 OpErrorKind::TxnUnknown,
-                format!("no open transaction {tid}"),
+                format!(
+                    "no open transaction {id} began at that time (a transaction of an earlier \
+                     load or server process)"
+                ),
             ),
+            None => OpError::new(OpErrorKind::TxnUnknown, format!("no open transaction {id}")),
         })
     }
 
@@ -1865,6 +2414,10 @@ pub(crate) struct ApiInner {
     /// transaction may begin — so a write still in flight when the shutdown's
     /// final save runs cannot be acknowledged and then lost.
     pub(crate) closing: AtomicBool,
+    /// The idle-transaction reaper's state: the earliest idle deadline the
+    /// request path checks with no lock, the transaction clock (see
+    /// [`reap_idle_txns`](Self::reap_idle_txns), `txn_idle_timeout`).
+    pub(crate) txn_reap: TxnReapState,
     /// The server's lifecycle (shared with [`ApiServer`]), so the `/shutdown`
     /// and `/restart` routes can stop it.
     life: Arc<Lifecycle>,
@@ -2424,6 +2977,7 @@ impl ApiServer {
                 check_point: true,
                 grace: DEFAULT_SHUTDOWN_GRACE,
                 closing: AtomicBool::new(false),
+                txn_reap: TxnReapState::default(),
                 life: Arc::clone(&life),
                 ipfilter: IpFilter::from_config(&GStoreConfig::default()),
                 apilogs: ApiLogs::new(),
@@ -2734,6 +3288,7 @@ impl ApiServer {
     /// proceed on other workers. Returns what the shutdown did.
     pub fn serve_forever(&self) -> ShutdownReport {
         let _ = self.inner.self_ref.set(Arc::downgrade(&self.inner));
+        let _txn_reaper = self.inner.start_txn_reaper();
         // The body caps, budget and pre-body hook of this run (see
         // `crate::preauth`).
         let ingest = crate::preauth::api_ingest(&self.http, &self.inner, self.addr);
@@ -2768,6 +3323,7 @@ impl ApiServer {
     #[cfg(feature = "tls")]
     pub fn serve_forever_tls(&self, config: Arc<rustls::ServerConfig>) -> ShutdownReport {
         let _ = self.inner.self_ref.set(Arc::downgrade(&self.inner));
+        let _txn_reaper = self.inner.start_txn_reaper();
         // The body caps, budget and pre-body hook of this run (see
         // `crate::preauth`).
         let ingest = crate::preauth::api_ingest(&self.http, &self.inner, self.addr);
@@ -2913,6 +3469,7 @@ impl ApiInner {
         // The TCP peer of this connection, recorded by `serve_connection` for
         // the worker thread (the upstream `/api` layer's remote IP).
         let peer = crate::server::current_peer();
+        self.reap_idle_txns_if_due();
 
         let started = Instant::now();
         let (resp, user_disp) = catch_unwind(AssertUnwindSafe(|| self.respond(&req, peer, meta)))
@@ -4498,10 +5055,14 @@ impl ApiInner {
             }
             names.sort();
             names.dedup();
-            {
+            let txns: HashMap<String, TxnSummary> = {
                 let st = locked(&inner.state);
                 names.retain(|n| crate::sysdb::allowed(&st.users, &user, "query", Some(n)));
-            }
+                names
+                    .iter()
+                    .filter_map(|n| Some((n.clone(), inner.txn_summary(&st, n)?)))
+                    .collect()
+            };
             let mut items = Vec::new();
             for n in &names {
                 // The figures each database published at the end of its last
@@ -4515,8 +5076,9 @@ impl ApiInner {
                     None => (false, "null".to_string(), false, false),
                 };
                 items.push(format!(
-                    "{{\"name\":{},\"loaded\":{is_loaded},\"in_transaction\":{in_transaction},\"dirty\":{dirty},\"triples\":{triples}}}",
-                    json_str(n)
+                    "{{\"name\":{},\"loaded\":{is_loaded},\"in_transaction\":{in_transaction},\"dirty\":{dirty},\"triples\":{triples}{}}}",
+                    json_str(n),
+                    txns.get(n).map_or_else(String::new, TxnSummary::json_field)
                 ));
             }
             let body = format!(
@@ -4552,7 +5114,7 @@ impl ApiInner {
                 }
             },
         };
-        let dbh = match Self::begin_target(st, &name) {
+        let dbh = match self.begin_target(st, &name) {
             Ok(dbh) => dbh,
             Err(e) => return Dispatch::Done(e.rest()),
         };
@@ -4578,8 +5140,11 @@ impl ApiInner {
     }
 
     /// The pre-checks of a `begin` on `name`, under the state lock: the loaded
-    /// database's handle, or why no transaction can begin on it now.
-    pub(crate) fn begin_target(st: &ApiState, name: &str) -> Result<DbHandle, OpError> {
+    /// database's handle, or why no transaction can begin on it now. A
+    /// transaction open on it that is idle past `txn_idle_timeout` or whose
+    /// owner was deleted does not refuse the begin: [`begin_txn`](Self::begin_txn)
+    /// reaps it.
+    pub(crate) fn begin_target(&self, st: &ApiState, name: &str) -> Result<DbHandle, OpError> {
         let Some(dbh) = st.dbs.get(name).map(Arc::clone) else {
             return Err(OpError::new(
                 OpErrorKind::NotLoaded,
@@ -4587,7 +5152,9 @@ impl ApiInner {
             ));
         };
         if let Some(&open) = st.db_txn.get(name) {
-            return Err(txn_already_open_err(name, open));
+            if self.txn_liveness(st, name, open) == TxnLiveness::Live {
+                return Err(txn_already_open_err(name, open));
+            }
         }
         if st.busy.contains(name) {
             return Err(OpError::new(
@@ -4598,11 +5165,83 @@ impl ApiInner {
         Ok(dbh)
     }
 
+    /// Whether open transaction `tid` of `db` may go on (see
+    /// [`TxnLiveness`]); `Live` when it is not open. Under the state lock.
+    pub(crate) fn txn_liveness(&self, st: &ApiState, db: &str, tid: u64) -> TxnLiveness {
+        match st.txns.get(&(db.to_string(), tid)) {
+            Some(txn) => Self::liveness_of(
+                st,
+                txn,
+                self.config().txn_idle_timeout,
+                self.txn_reap.now_ms(),
+            ),
+            None => TxnLiveness::Live,
+        }
+    }
+
+    /// [`txn_liveness`](Self::txn_liveness) of registry entry `txn` at
+    /// transaction-clock time `now`, with `txn_idle_timeout` = `timeout`
+    /// seconds (`0`: never idle). A statement in flight keeps it live.
+    fn liveness_of(st: &ApiState, txn: &Txn, timeout: u64, now: u64) -> TxnLiveness {
+        if txn.running > 0 {
+            return TxnLiveness::Live;
+        }
+        if txn.owner != ROOT_USER && st.users.get(&txn.owner).is_none() {
+            return TxnLiveness::Orphaned;
+        }
+        if timeout > 0 && now >= Self::idle_deadline(txn, timeout) {
+            return TxnLiveness::Idle;
+        }
+        TxnLiveness::Live
+    }
+
+    /// When registry entry `txn` becomes idle past `timeout` seconds.
+    fn idle_deadline(txn: &Txn, timeout: u64) -> u64 {
+        txn.last_active.saturating_add(timeout.saturating_mul(1000))
+    }
+
+    /// What monitoring shows of the transaction open on `db`, if any (REST
+    /// `/show` and `/monitor`, `/api` `show` and `monitor`): its id (also in
+    /// the transaction log's `<begin>_<tid>` form), owner, and how long it
+    /// has been idle. Under the state lock.
+    pub(crate) fn txn_summary(&self, st: &ApiState, db: &str) -> Option<TxnSummary> {
+        let tid = *st.db_txn.get(db)?;
+        let txn = st.txns.get(&(db.to_string(), tid))?;
+        let idle_ms = if txn.running > 0 {
+            0
+        } else {
+            self.txn_reap.now_ms().saturating_sub(txn.last_active)
+        };
+        Some(TxnSummary {
+            tid,
+            begun: txn.begun,
+            owner: txn.owner.clone(),
+            isolation: txn.isolation,
+            idle_secs: idle_ms / 1000,
+            running: txn.running,
+        })
+    }
+
     /// Begin a transaction owned by `user` on loaded database `name` (handle
     /// `dbh`, from [`begin_target`](Self::begin_target)). Must be called with
     /// no lock held: it locks the database, snapshots its committed state,
-    /// and registers the transaction while still holding the db lock (so the
-    /// registry and the slot always agree). Returns the new transaction id.
+    /// and registers the transaction while still holding the exclusive guard
+    /// (so the registry and the slot always agree). Returns the new
+    /// transaction id.
+    ///
+    /// A transaction still open on the database that is idle past
+    /// `txn_idle_timeout`, or whose owner was deleted, is rolled back first,
+    /// under the exclusive guard (the one reaping home that waits for a
+    /// database, see [`reap_idle_txns`](Self::reap_idle_txns)).
+    ///
+    /// A RocksDB database has no copy-on-write store to snapshot, so it is
+    /// copied whole (REFACTOR_BACKLOG D4): under the *shared* guard, so its
+    /// readers go on meanwhile (review gap-rocksdb-exec#3). The exclusive
+    /// guard is taken only to register the transaction, after checking that
+    /// the committed state did not change since the copy (a write that
+    /// slipped in makes it copy again; after [`BEGIN_CAPTURE_ATTEMPTS`] it
+    /// copies under the exclusive guard). The other layouts' snapshots cost
+    /// O(1) and are taken under the exclusive guard.
     pub(crate) fn begin_txn(
         &self,
         dbh: &DbHandle,
@@ -4610,33 +5249,67 @@ impl ApiInner {
         isolation: TxnIsolation,
         user: &str,
     ) -> Result<u64, OpError> {
-        let mut slot = dbh.write()?;
-        if slot.retired {
-            return Err(OpError::new(
-                OpErrorKind::NotLoaded,
-                format!("database '{name}' is not loaded"),
-            ));
-        }
-        if let Some(open) = &slot.txn {
-            return Err(txn_already_open_err(name, open.tid));
-        }
-        // Checked under the db lock, which the shutdown takes after setting
-        // the flag: no transaction can begin after its rollback pass.
-        if self.closing.load(Ordering::SeqCst) {
-            return Err(OpError::new(
-                OpErrorKind::ShuttingDown,
-                "the server is shutting down",
-            ));
-        }
-        self.sync_query_settings(&mut slot);
-        let snapshot = match ReadSnapshot::capture(&slot.db) {
-            Ok(snapshot) => Arc::new(snapshot),
-            Err(e) => {
-                return Err(OpError::new(
-                    OpErrorKind::Failed,
-                    format!("begin failed: {e}"),
-                ))
+        let mut copied: Option<CapturedSnapshot> = None;
+        let mut copies = 0;
+        let rocks = dbh.layout == StorageKind::RocksDb;
+        let (mut slot, snapshot) = loop {
+            if rocks && copied.is_none() && copies < BEGIN_CAPTURE_ATTEMPTS {
+                copied = self.capture_shared(dbh, name)?;
+                copies += usize::from(copied.is_some());
             }
+            let mut slot = dbh.write()?;
+            if slot.retired {
+                return Err(OpError::new(
+                    OpErrorKind::NotLoaded,
+                    format!("database '{name}' is not loaded"),
+                ));
+            }
+            if let Some(open) = slot.txn.as_ref().map(|o| o.tid) {
+                if !self.reap_locked(&mut slot, dbh, name, open) {
+                    return Err(txn_already_open_err(name, open));
+                }
+                if copied.is_none() && Self::copies_for_snapshot(&slot.db) {
+                    // Copy it with the shared guard (the reaped
+                    // transaction's rollback is in the committed state).
+                    drop(slot);
+                    continue;
+                }
+            }
+            // Checked under the db lock, which the shutdown takes after setting
+            // the flag: no transaction can begin after its rollback pass.
+            if self.closing.load(Ordering::SeqCst) {
+                return Err(OpError::new(
+                    OpErrorKind::ShuttingDown,
+                    "the server is shutting down",
+                ));
+            }
+            self.sync_query_settings(&mut slot);
+            let snapshot = match copied.take() {
+                Some(c)
+                    if c.mutations == slot.db.mutation_count()
+                        && c.settings_gen == slot.settings_gen =>
+                {
+                    c.snapshot
+                }
+                Some(_) if copies < BEGIN_CAPTURE_ATTEMPTS => {
+                    // A write (or new settings) slipped in after the copy.
+                    drop(slot);
+                    continue;
+                }
+                stale => {
+                    if stale.is_some() {
+                        crate::gs_info!(
+                            "begin on '{name}': the database changed during each of \
+                             {BEGIN_CAPTURE_ATTEMPTS} copies for the transaction's read \
+                             snapshot; copying it under the exclusive guard"
+                        );
+                    }
+                    ReadSnapshot::capture(&slot.db).map_err(|e| {
+                        OpError::new(OpErrorKind::Failed, format!("begin failed: {e}"))
+                    })?
+                }
+            };
+            break (slot, Arc::new(snapshot));
         };
         let begin_stats = slot.db.stats();
         let begin_generation = slot.db.mutation_count();
@@ -4646,6 +5319,7 @@ impl ApiInner {
                 format!("begin failed: {e}"),
             ));
         }
+        let begun = unix_millis() as u128;
         // Register it while the db lock is held, so the registry and the
         // slot always agree (a /commit locks the db before the registry).
         let tid = {
@@ -4666,19 +5340,26 @@ impl ApiInner {
                 return Err(e);
             }
             // Sequential per loaded database, like upstream (see
-            // `DbSlot::next_tid`). An id this database used before it was last
-            // (re)loaded starts a new life: forget how it ended then.
+            // `DbSlot::next_tid`). How the ids of earlier loads ended stays
+            // remembered, with their load generation (review
+            // gap-txn-lifecycle#2).
             let tid = slot.next_tid.max(1);
             slot.next_tid = tid.checked_add(1).unwrap_or(1);
-            st.ended_txns.retain(|(d, t, _)| !(*t == tid && d == name));
-            st.txns.insert(
-                (name.to_string(), tid),
-                Txn {
-                    db: name.to_string(),
-                    owner: user.to_string(),
-                    isolation,
-                },
-            );
+            let now = self.txn_reap.now_ms();
+            let txn = Txn {
+                db: name.to_string(),
+                owner: user.to_string(),
+                isolation,
+                begun,
+                generation: slot.load_gen,
+                last_active: now,
+                running: 0,
+            };
+            let timeout = self.config().txn_idle_timeout;
+            if timeout > 0 {
+                self.txn_reap.arm(Self::idle_deadline(&txn, timeout));
+            }
+            st.txns.insert((name.to_string(), tid), txn);
             st.db_txn.insert(name.to_string(), tid);
             tid
         };
@@ -4702,41 +5383,90 @@ impl ApiInner {
                 isolation.name()
             ),
         );
-        self.apilogs.txn_begin(&self.root, name, tid, user);
+        self.apilogs
+            .txn_begin_at(&self.root, name, tid, user, begun);
         Ok(tid)
     }
 
+    /// Whether `db`'s read snapshot is a copy of the whole store (RocksDB:
+    /// no in-RAM store, no on-disk read view; see [`ReadSnapshot::capture`]).
+    fn copies_for_snapshot(db: &Database) -> bool {
+        db.backend().as_memory().is_none() && db.backend().as_disk().is_none()
+    }
+
+    /// For a `/begin` on a database whose snapshot is a copy (RocksDB): the
+    /// copy, taken under the shared guard, with the state it was taken at.
+    /// `None` for the other layouts, and while a transaction is open or the
+    /// database is retired (the exclusive step deals with those).
+    fn capture_shared(
+        &self,
+        dbh: &DbHandle,
+        name: &str,
+    ) -> Result<Option<CapturedSnapshot>, OpError> {
+        let slot = self.read_synced(dbh)?;
+        if slot.retired || slot.txn.is_some() || !Self::copies_for_snapshot(&slot.db) {
+            return Ok(None);
+        }
+        txn_park(name, TxnParkPoint::BeginCapture);
+        let mutations = slot.db.mutation_count();
+        let settings_gen = slot.settings_gen;
+        let snapshot = ReadSnapshot::capture(&slot.db)
+            .map_err(|e| OpError::new(OpErrorKind::Failed, format!("begin failed: {e}")))?;
+        drop(slot);
+        txn_park(name, TxnParkPoint::BeginCaptured);
+        Ok(Some(CapturedSnapshot {
+            snapshot,
+            mutations,
+            settings_gen,
+        }))
+    }
+
     /// Look up open transaction `tid` of database `db` (when not named: the one
-    /// database where `tid` is open, see [`ApiState::open_txn_db`]) for `user`:
-    /// unknown ids are `404`, already finished ones `409`, an id open on
-    /// several databases `409`, and someone else's transaction `403` (only the
-    /// owner or `root` may touch it). Returns the transaction's database.
+    /// database where `tid` is open, see [`ApiState::open_txn_db_at`]) for
+    /// `user`: unknown ids are `404`, already finished ones `409`, an id open
+    /// on several databases `409`, and someone else's transaction `403` (only
+    /// the owner or a superuser — `root`, or a user with the `admin`
+    /// privilege — may touch it). Returns the transaction's database.
+    ///
+    /// A transaction idle past `txn_idle_timeout` (no statement in flight),
+    /// or whose owner was deleted, is answered as ended ("rolled back after
+    /// txn_idle_timeout"): this runs under the state lock and so cannot roll
+    /// it back, but it makes the next request's reaping pass due.
     pub(crate) fn txn_for(
         &self,
         st: &ApiState,
         db: Option<&str>,
-        tid: u64,
+        tid: TidRef,
         user: &str,
     ) -> Result<String, OpError> {
-        let name = st.open_txn_db(db, tid)?;
-        let txn = &st.txns[&(name, tid)];
-        if txn.owner != user && user != ROOT_USER {
+        let name = st.open_txn_db_at(db, tid)?;
+        let id = tid.tid;
+        let txn = &st.txns[&(name.clone(), id)];
+        if txn.owner != user && user != ROOT_USER && !st.users.is_superuser(user) {
             return Err(OpError::new(
                 OpErrorKind::NotOwner,
-                format!("transaction {tid} belongs to another user"),
+                format!("transaction {id} belongs to another user"),
+            ));
+        }
+        if let Some(outcome) = self.txn_liveness(st, &name, id).ended_as() {
+            self.txn_reap.arm(0);
+            return Err(OpError::new(
+                OpErrorKind::TxnEnded,
+                format!("transaction {id} is not running ({outcome})"),
             ));
         }
         Ok(txn.db.clone())
     }
 
     fn handle_tquery(&self, st: &mut ApiState, req: &Request, user: &str) -> Dispatch {
-        let Some(tid) = self.txn_id(req) else {
+        let Some(tid) = self.txn_ref(req) else {
             return Dispatch::Done(Resp::fail(400, "missing or malformed tid/txn parameter"));
         };
         let name = match self.txn_for(st, self.req_db_name(req).as_deref(), tid, user) {
             Ok(name) => name,
             Err(e) => return Dispatch::Done(e.rest()),
         };
+        let tid = tid.tid;
         // The handle the transaction lives on, taken with the ownership check:
         // ids restart at 1 when a database is loaded again, so the statement
         // must run on this handle (refused once it is retired), never on
@@ -4779,7 +5509,9 @@ impl ApiInner {
     /// [`run_in_txn`](Self::run_in_txn) as a registered task of `user`: listed
     /// by `/tasklist`, and cancellable — by `/cancel`, and by a shutdown past
     /// its grace period — like any other query. `stmt` is `sparql` parsed
-    /// (with no lock held). Must be called with no lock held.
+    /// (with no lock held). Must be called with no lock held. The statement
+    /// counts as the transaction's activity from here until it releases the
+    /// database (see [`TxnStatement`]).
     pub(crate) fn run_in_txn_task(
         &self,
         dbh: &DbHandle,
@@ -4789,14 +5521,60 @@ impl ApiInner {
         stmt: crate::Result<Statement>,
         user: &str,
     ) -> Result<QueryResult, OpError> {
-        let (task_id, cancel) = {
+        let (task_id, cancel, activity) = {
             let mut st = locked(&self.state);
-            self.register_task(&mut st, name, sparql, user)
+            let (task_id, cancel) = self.register_task(&mut st, name, sparql, user);
+            let activity = self.txn_statement(&mut st, name, tid);
+            (task_id, cancel, activity)
         };
         let mut task = TaskGuard::new(self, task_id);
-        let out = self.run_in_txn(dbh, name, tid, stmt, Some(cancel), user);
+        let out = self.run_in_txn(dbh, name, tid, stmt, Some(cancel), user, activity);
         task.set_ok(out.is_ok());
         out
+    }
+
+    /// A statement of open transaction `tid` of `db` starts: it counts as
+    /// activity until the returned value ends (see [`TxnStatement`]). Under
+    /// the state lock (`st`).
+    pub(crate) fn txn_statement(&self, st: &mut ApiState, db: &str, tid: u64) -> TxnStatement<'_> {
+        let generation = st
+            .txns
+            .get(&(db.to_string(), tid))
+            .map(|txn| txn.generation);
+        if let Some(generation) = generation {
+            self.txn_activity(st, db, tid, generation, true);
+        }
+        TxnStatement {
+            inner: self,
+            db: db.to_string(),
+            tid,
+            generation,
+        }
+    }
+
+    /// Stamp a statement of open transaction `tid` of `db` (load
+    /// `generation`) starting (`start`) or ending: a statement in flight is
+    /// activity, and the idle clock restarts when the last one ends. Under
+    /// the state lock (`st`).
+    fn txn_activity(&self, st: &mut ApiState, db: &str, tid: u64, generation: u64, start: bool) {
+        let now = self.txn_reap.now_ms();
+        let Some(txn) = st
+            .txns
+            .get_mut(&(db.to_string(), tid))
+            .filter(|t| t.generation == generation)
+        else {
+            return;
+        };
+        if start {
+            txn.running += 1;
+        } else {
+            txn.running = txn.running.saturating_sub(1);
+        }
+        txn.last_active = now;
+        let timeout = self.config().txn_idle_timeout;
+        if txn.running == 0 && timeout > 0 {
+            self.txn_reap.arm(Self::idle_deadline(txn, timeout));
+        }
     }
 
     /// Run `stmt` (a parsed statement, or the error parsing it gave) inside
@@ -4806,7 +5584,10 @@ impl ApiInner {
     /// `/rollback` take the exclusive guard before they end it — so the
     /// statement either runs inside transaction `tid` or is refused, never
     /// applied outside it. A read takes a shared guard (it sees the
-    /// transaction's own writes), an UPDATE the exclusive one.
+    /// transaction's own writes), an UPDATE the exclusive one. `activity`
+    /// ends (stamping the transaction's activity) before the guard is
+    /// released.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn run_in_txn(
         &self,
         dbh: &DbHandle,
@@ -4815,6 +5596,7 @@ impl ApiInner {
         stmt: crate::Result<Statement>,
         cancel: Option<Arc<AtomicBool>>,
         user: &str,
+        activity: TxnStatement<'_>,
     ) -> Result<QueryResult, OpError> {
         let not_open = || {
             OpError::new(
@@ -4842,10 +5624,14 @@ impl ApiInner {
             if !open_here(&slot) {
                 return Err(not_open());
             }
-            return slot
+            let out = slot
                 .db
                 .read_as(&stmt, cancel, Some(&caller))
                 .map_err(query_err);
+            activity.end();
+            txn_park(name, TxnParkPoint::StatementEnded);
+            drop(slot);
+            return out;
         }
         let mut slot = dbh.write()?;
         if !open_here(&slot) {
@@ -4860,6 +5646,8 @@ impl ApiInner {
                 open.changed = true;
             }
         }
+        activity.end();
+        txn_park(name, TxnParkPoint::StatementEnded);
         drop(slot);
         result.map_err(query_err)
     }
@@ -4879,7 +5667,7 @@ impl ApiInner {
         user: &str,
         commit: bool,
     ) -> Dispatch {
-        let Some(tid) = self.txn_id(req) else {
+        let Some(tid) = self.txn_ref(req) else {
             return Dispatch::Done(Resp::fail(400, "missing or malformed tid/txn parameter"));
         };
         let db_name = match self.txn_for(st, self.req_db_name(req).as_deref(), tid, user) {
@@ -4891,7 +5679,9 @@ impl ApiInner {
         Dispatch::Deferred(Box::new(move |inner| {
             let verb = if commit { "commit" } else { "rollback" };
             match inner.end_txn(dbh.as_ref(), &db_name, tid, &user, commit) {
-                Ok(warning) => Resp::ok_warn(&format!("transaction {tid} {verb} done"), &warning),
+                Ok(warning) => {
+                    Resp::ok_warn(&format!("transaction {} {verb} done", tid.tid), &warning)
+                }
                 Err(e) => e.rest(),
             }
         }))
@@ -4903,23 +5693,35 @@ impl ApiInner {
     /// the warning of a failed check_point save after a commit that changed
     /// data (the commit stands in memory but is not durable: callers answer
     /// it as a failure — REST 500, `/api` 1005; review durability#2).
+    ///
+    /// The outcome is recorded — in the registry of ended transactions, the
+    /// transaction logs — only once the commit or rollback returned, and as
+    /// what happened (review http#18). A commit whose commit point failed
+    /// is answered as such (review gap-txn-lifecycle#3, see
+    /// [`Database::commit_checked`]): rolled back (REST 500, `/api` 1005,
+    /// "commit failed and the transaction was rolled back"), or, when it
+    /// could no longer be undone, applied but not durable ([`NOT_DURABLE`],
+    /// [`OpErrorKind::Persist`]; the database needs a reload). Either way
+    /// the transaction log records it as aborted.
     pub(crate) fn end_txn(
         &self,
         dbh: Option<&DbHandle>,
         db: &str,
-        tid: u64,
+        tid: TidRef,
         user: &str,
         commit: bool,
     ) -> Result<Option<String>, OpError> {
-        let verb = if commit { "commit" } else { "rollback" };
         let mut slot = match dbh {
             Some(h) => Some(h.write()?),
             None => None,
         };
-        // End it in the registry while the db lock is held (race-free with
-        // /begin, /tquery and a concurrent /commit of the same tid).
-        let txn = {
-            let mut st = locked(&self.state);
+        let id = tid.tid;
+        // Checked while the db lock is held (race-free with /begin, /tquery,
+        // a concurrent /commit of the same tid and the reapers, which all
+        // take the guard before they touch it). The registry entry is
+        // removed once the outcome is known, still under the guard.
+        {
+            let st = locked(&self.state);
             self.txn_for(&st, Some(db), tid, user)?;
             // `dbh` was looked up before this lock was taken: if the database
             // has been unloaded and loaded again since (which restarts its
@@ -4929,73 +5731,305 @@ impl ApiInner {
                 if !st.dbs.get(db).is_some_and(|cur| Arc::ptr_eq(cur, h)) {
                     return Err(OpError::new(
                         OpErrorKind::TxnEnded,
-                        format!("transaction {tid} is not open on database '{db}'"),
+                        format!("transaction {id} is not open on database '{db}'"),
                     ));
                 }
             }
-            let txn = st
-                .txns
-                .remove(&(db.to_string(), tid))
-                .expect("checked by txn_for");
-            st.db_txn.remove(&txn.db);
-            st.remember_ended(db, tid, if commit { "committed" } else { "rolled back" });
+        }
+        let ended = match slot.as_mut().filter(|s| !s.retired) {
+            Some(slot) => self.finish_txn(slot, id, commit),
+            None => TxnEnd {
+                outcome: "rolled back",
+                state: TxnState::RolledBack,
+                logged: if commit { "commit" } else { "rollback" },
+                result: Err(OpError::new(
+                    OpErrorKind::NotLoaded,
+                    format!("database '{db}' is not loaded"),
+                )),
+            },
+        };
+        let txn = {
+            let mut st = locked(&self.state);
+            let txn = st.txns.remove(&(db.to_string(), id));
+            if let Some(txn) = &txn {
+                st.db_txn.remove(db);
+                st.remember_ended_txn(txn, id, ended.outcome);
+            }
             txn
         };
-        let result = match slot.as_mut().filter(|s| !s.retired) {
-            Some(slot) => {
-                // Let the begin-time snapshot go first: an in-memory one
-                // shares the dictionary's interners, and a commit that frees
-                // a term would copy a shared interner whole just to drop the
-                // copy right after (readers holding the snapshot keep their
-                // own reference).
-                let changed = slot.txn.take().is_some_and(|o| o.changed);
-                Some(if commit {
-                    // `Database::commit` keeps the writes even when flushing
-                    // its redo log fails, so the data changed either way.
-                    let committed = slot.db.commit();
-                    let warning = if changed {
-                        slot.wrote(self.save_writes())
-                    } else {
-                        None
-                    };
-                    committed.map(|()| warning)
-                } else {
-                    slot.db.rollback().map(|()| None)
-                })
-            }
-            None => None,
-        };
         drop(slot);
+        if let Some(txn) = txn {
+            self.log_txn_end(&txn, id, user, ended.logged, ended.state);
+        }
+        ended.result
+    }
+
+    /// End the open transaction `id` of `slot` (exclusive guard held):
+    /// commit or roll it back and say how it ended (see
+    /// [`end_txn`](Self::end_txn)).
+    fn finish_txn(&self, slot: &mut DbSlot, id: u64, commit: bool) -> TxnEnd {
+        // Let the begin-time snapshot go first: an in-memory one shares the
+        // dictionary's interners, and a commit that frees a term would copy
+        // a shared interner whole just to drop the copy right after (readers
+        // holding the snapshot keep their own reference).
+        let changed = slot.txn.take().is_some_and(|o| o.changed);
+        if !commit {
+            return TxnEnd {
+                outcome: "rolled back",
+                state: TxnState::RolledBack,
+                logged: "rollback",
+                result: slot.db.rollback().map(|()| None).map_err(|e| {
+                    OpError::new(OpErrorKind::Failed, format!("rollback failed: {e}"))
+                }),
+            };
+        }
+        let committed = |slot: &mut DbSlot| TxnEnd {
+            outcome: "committed",
+            state: TxnState::Committed,
+            logged: "commit",
+            result: Ok(if changed {
+                slot.wrote(self.save_writes())
+            } else {
+                None
+            }),
+        };
+        let rolled_back = |e: String| TxnEnd {
+            outcome: ENDED_COMMIT_ROLLED_BACK,
+            state: TxnState::Aborted,
+            logged: "commit-failed-rolled-back",
+            result: Err(OpError::new(
+                OpErrorKind::Failed,
+                format!("commit failed and transaction {id} was rolled back: {e}"),
+            )),
+        };
+        match slot.db.commit_checked() {
+            Ok(()) => committed(slot),
+            Err(crate::db::CommitFailure::CommittedWithError(e)) => {
+                crate::gs_warn!("transaction {id} committed, but: {e}");
+                committed(slot)
+            }
+            Err(crate::db::CommitFailure::NotCommitted(e)) => {
+                // Refused before anything was taken: it is still open in the
+                // database, which must agree with the registry it leaves.
+                let _ = slot.db.rollback();
+                rolled_back(e.to_string())
+            }
+            Err(crate::db::CommitFailure::RolledBack(e)) => {
+                let broken = slot.db.storage_failure().map_or_else(String::new, |f| {
+                    format!(
+                        "; the on-disk store failed ({f}): unload and load the database \
+                         before writing to it again"
+                    )
+                });
+                rolled_back(format!("{e}{broken}"))
+            }
+            Err(crate::db::CommitFailure::NotDurable(e)) => {
+                slot.dirty = true;
+                let msg = format!(
+                    "{NOT_DURABLE}: the commit point of transaction {id} failed: {e}; the \
+                     database needs a reload (unload, then load) — it then holds what was made \
+                     durable"
+                );
+                crate::gs_error!("{msg}");
+                TxnEnd {
+                    outcome: ENDED_NOT_DURABLE,
+                    state: TxnState::Aborted,
+                    logged: "commit-failed-not-durable",
+                    result: Err(OpError::new(OpErrorKind::Persist, msg)),
+                }
+            }
+        }
+    }
+
+    /// Append the end of transaction `id` (registry entry `txn`, ended by
+    /// `user`) to `txn.log` (as `logged`) and the transaction log (`state`).
+    fn log_txn_end(&self, txn: &Txn, id: u64, user: &str, logged: &str, state: TxnState) {
         append_log(
             &self.root,
             "txn.log",
             &format!(
                 "{}\t{}\t{}\t{}\t{}\t{}",
                 now_millis(),
-                verb,
+                logged,
                 txn.db,
-                tid,
+                id,
                 user,
                 txn.isolation.name()
             ),
         );
-        let state = if commit {
-            TxnState::Committed
-        } else {
-            TxnState::RolledBack
-        };
         self.apilogs
-            .txn_end(&self.root, &txn.db, tid, &txn.owner, state);
-        match result {
-            Some(Ok(warning)) => Ok(warning),
-            Some(Err(e)) => Err(OpError::new(
-                OpErrorKind::Failed,
-                format!("{verb} failed: {e}"),
-            )),
-            None => Err(OpError::new(
-                OpErrorKind::NotLoaded,
-                format!("database '{}' is not loaded", txn.db),
-            )),
+            .txn_end(&self.root, &txn.db, id, &txn.owner, state);
+    }
+
+    /// One pass of the idle-transaction reaper (review gap-txn-lifecycle#1,
+    /// gap-txn-lifecycle#5): roll back every open transaction idle past
+    /// `txn_idle_timeout` with no statement in flight, or whose owner was
+    /// deleted, recorded as aborted ("rolled back after txn_idle_timeout").
+    ///
+    /// It never waits for a database: under the state lock it only collects
+    /// the candidates (removing nothing); then it takes each candidate's
+    /// exclusive guard with [`DbCell::try_write`] and skips a database that
+    /// is busy (a long read, a save, an export…) — the deadline stays due, so
+    /// the next request or pass tries again. Holding the guard it re-checks
+    /// everything ([`reap_locked`](Self::reap_locked)), so the registry and
+    /// the slot agree at every step. Runs from three homes: lazily inside
+    /// [`begin_txn`](Self::begin_txn) (the one that may wait for the guard
+    /// it takes anyway), on the request path when the earliest deadline has
+    /// passed ([`reap_idle_txns_if_due`](Self::reap_idle_txns_if_due)), and
+    /// periodically ([`start_txn_reaper`](Self::start_txn_reaper)).
+    pub(crate) fn reap_idle_txns(&self) {
+        let now = self.txn_reap.now_ms();
+        let timeout = self.config().txn_idle_timeout;
+        let candidates: Vec<(String, u64, DbHandle)> = {
+            let st = locked(&self.state);
+            // Re-computed from the registry (under the lock that every arm
+            // is made under, so none is lost).
+            self.txn_reap.at.store(u64::MAX, Ordering::SeqCst);
+            let mut out = Vec::new();
+            for ((db, tid), txn) in &st.txns {
+                match Self::liveness_of(&st, txn, timeout, now) {
+                    TxnLiveness::Live => {
+                        if timeout > 0 && txn.running == 0 {
+                            self.txn_reap.arm(Self::idle_deadline(txn, timeout));
+                        }
+                    }
+                    _ => {
+                        if let Some(h) = st.dbs.get(db) {
+                            out.push((db.clone(), *tid, Arc::clone(h)));
+                        }
+                    }
+                }
+            }
+            out
+        };
+        for (db, tid, dbh) in candidates {
+            if self.closing.load(Ordering::SeqCst) {
+                break;
+            }
+            match dbh.try_write() {
+                Some(mut slot) => {
+                    self.reap_locked(&mut slot, &dbh, &db, tid);
+                }
+                // Busy: tried again by the next request or pass.
+                None => {
+                    let _st = locked(&self.state);
+                    self.txn_reap.arm(now);
+                }
+            }
+        }
+    }
+
+    /// The request path's reaping (one line at the top of
+    /// [`handle`](Self::handle)): a [`reap_idle_txns`](Self::reap_idle_txns)
+    /// pass once the earliest idle deadline has passed — one atomic read
+    /// otherwise. Never waits for a database guard (so `/cancel` stays
+    /// immediate); a panic in it is contained.
+    pub(crate) fn reap_idle_txns_if_due(&self) {
+        let due = self.txn_reap.at.load(Ordering::SeqCst);
+        if due != u64::MAX && due <= self.txn_reap.now_ms() {
+            let _ = catch_unwind(AssertUnwindSafe(|| self.reap_idle_txns()));
+        }
+    }
+
+    /// The reaping step, under `slot`'s exclusive guard (`slot` is `dbh`'s,
+    /// database `name`): when its open transaction `tid` is still idle past
+    /// `txn_idle_timeout` or orphaned — re-checked under the state lock,
+    /// with the registry entry still on this handle — remove it from the
+    /// registry and remember how it ended, then roll it back as
+    /// [`end_txn`](Self::end_txn) would and log it as aborted. Returns
+    /// whether the slot has no open transaction now.
+    fn reap_locked(&self, slot: &mut DbSlot, dbh: &DbHandle, name: &str, tid: u64) -> bool {
+        if slot.retired || slot.txn.as_ref().map(|o| o.tid) != Some(tid) {
+            return slot.txn.is_none();
+        }
+        let (txn, outcome) = {
+            let mut st = locked(&self.state);
+            if !st.dbs.get(name).is_some_and(|cur| Arc::ptr_eq(cur, dbh)) {
+                return false;
+            }
+            let Some(outcome) = self.txn_liveness(&st, name, tid).ended_as() else {
+                return false;
+            };
+            let Some(txn) = st.txns.remove(&(name.to_string(), tid)) else {
+                return false;
+            };
+            st.db_txn.remove(name);
+            st.remember_ended_txn(&txn, tid, outcome);
+            (txn, outcome)
+        };
+        // As `end_txn`: the begin-time snapshot goes first.
+        slot.txn = None;
+        if let Err(e) = slot.db.rollback() {
+            crate::gs_error!("rolling back transaction {tid} of '{name}' ({outcome}) failed: {e}");
+        }
+        crate::gs_warn!(
+            "transaction {tid} of '{}' on database '{name}' {outcome}",
+            txn.owner
+        );
+        self.log_txn_end(&txn, tid, "-", "aborted", TxnState::Aborted);
+        true
+    }
+
+    /// Start serving's transaction housekeeping — one line at the top of
+    /// [`ApiServer::serve_forever`] / `serve_forever_tls`, whose end drops
+    /// the returned guard: mark the transactions a previous server process
+    /// left `RUNNING` in the transaction log as `ABORTED` (once per server;
+    /// review gap-txn-lifecycle#2), and start the periodic idle-transaction
+    /// reaper — a thread that runs a [`reap_idle_txns`](Self::reap_idle_txns)
+    /// pass every `min(txn_idle_timeout / 4, 30 s)` (none when
+    /// `txn_idle_timeout` is 0), so an idle server too frees abandoned
+    /// transactions (and a RocksDB database's copy for one). It stops once
+    /// the server is closing, and when the guard drops (joined, bounded).
+    pub(crate) fn start_txn_reaper(self: &Arc<Self>) -> Option<TxnReaper> {
+        {
+            let mut servers = TXN_SERVERS.lock().unwrap_or_else(PoisonError::into_inner);
+            servers.retain(|(_, w)| w.strong_count() > 0);
+            servers.push((self.root.clone(), Arc::downgrade(self)));
+        }
+        if !self.txn_reap.swept.swap(true, Ordering::SeqCst) {
+            self.apilogs.abort_stale_running(&self.root);
+        }
+        let timeout = self.config().txn_idle_timeout;
+        if timeout == 0 {
+            return None;
+        }
+        let every = Duration::from_millis(timeout.saturating_mul(250).clamp(1, 30_000));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (done_tx, done) = std::sync::mpsc::channel::<()>();
+        let inner = Arc::clone(self);
+        let halt = Arc::clone(&stop);
+        let spawned = std::thread::Builder::new()
+            .name("gstore-txn-reaper".into())
+            .spawn(move || {
+                let state = &inner.txn_reap;
+                let mut seen = state.beat().0;
+                loop {
+                    let (beat, _) = state
+                        .beat_changed
+                        .wait_timeout_while(state.beat(), every, |b| {
+                            b.0 == seen && !halt.load(Ordering::SeqCst)
+                        })
+                        .unwrap_or_else(PoisonError::into_inner);
+                    seen = beat.0;
+                    drop(beat);
+                    if halt.load(Ordering::SeqCst) || inner.closing.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let _ = catch_unwind(AssertUnwindSafe(|| inner.reap_idle_txns()));
+                    state.finished_pass(seen);
+                }
+                drop(done_tx);
+            });
+        match spawned {
+            Ok(_) => Some(TxnReaper {
+                inner: Arc::clone(self),
+                stop,
+                done,
+            }),
+            Err(e) => {
+                crate::gs_warn!("the idle-transaction reaper could not start: {e}");
+                None
+            }
         }
     }
 
@@ -5490,15 +6524,19 @@ impl ApiInner {
         let nreq = st.requests;
         let nusers = st.users.count();
         let ntxns = st.txns.len();
+        let txns: HashMap<String, TxnSummary> = entries
+            .iter()
+            .filter_map(|(n, _)| Some((n.clone(), self.txn_summary(st, n)?)))
+            .collect();
         Dispatch::Deferred(Box::new(move |_| {
             // The figures each database published at the end of its last
             // write (no database lock: monitoring never waits for a
             // statement).
             let mut dbs = Vec::new();
-            for (_n, d) in &entries {
+            for (n, d) in &entries {
                 let f = d.figures();
                 dbs.push(format!(
-                    "{{\"name\":{},\"triples\":{},\"entities\":{},\"literals\":{},\"predicates\":{},\"index_valid\":{},\"in_transaction\":{},\"dirty\":{}}}",
+                    "{{\"name\":{},\"triples\":{},\"entities\":{},\"literals\":{},\"predicates\":{},\"index_valid\":{},\"in_transaction\":{},\"dirty\":{}{}}}",
                     json_str(&d.name),
                     f.triples,
                     f.entities,
@@ -5507,6 +6545,7 @@ impl ApiInner {
                     f.index_valid,
                     f.in_transaction,
                     f.dirty,
+                    txns.get(n).map_or_else(String::new, TxnSummary::json_field),
                 ));
             }
             let body = format!(
@@ -5691,13 +6730,17 @@ impl ApiInner {
         valid_db_name(&n).then_some(n)
     }
 
-    /// The transaction id from `tid`/`txn`. Like gStore, the Workbench's
-    /// `beginTime_tid` form is accepted too (the part after the last `_`).
+    /// The transaction id from `tid`/`txn` (its number: the Workbench's
+    /// `beginTime_tid` form is accepted, see [`txn_ref`](Self::txn_ref), whose
+    /// begin time the transaction handlers check).
     fn txn_id(&self, req: &Request) -> Option<u64> {
-        let raw = req.param("tid").or_else(|| req.param("txn"))?;
-        let raw = raw.trim();
-        let digits = raw.rsplit_once('_').map_or(raw, |(_, t)| t);
-        digits.parse::<u64>().ok().filter(|&t| t != 0)
+        self.txn_ref(req).map(|t| t.tid)
+    }
+
+    /// The `tid` (or `txn`) parameter, parsed as `/api` parses it
+    /// ([`parse_tid`]): a positive integer or `<begin>_<tid>`.
+    fn txn_ref(&self, req: &Request) -> Option<TidRef> {
+        parse_tid(&req.param("tid").or_else(|| req.param("txn"))?)
     }
 }
 

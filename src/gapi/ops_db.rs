@@ -731,7 +731,10 @@ fn show(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
                 .map(|(k, h)| (k.clone(), Arc::clone(h)))
                 .collect::<BTreeMap<String, DbHandle>>(),
             st.busy.clone(),
-            st.db_txn.keys().cloned().collect::<HashSet<String>>(),
+            st.db_txn
+                .keys()
+                .filter_map(|n| Some((n.clone(), ctx.inner.txn_summary(&st, n)?)))
+                .collect::<HashMap<String, crate::http_api::TxnSummary>>(),
             st.root.clone(),
         )
     };
@@ -780,7 +783,7 @@ fn show(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
             DbStatus::AlreadyBuilt
         };
         let lock_count =
-            i64::from(busy_names.contains(&r.database) || txn_dbs.contains(&r.database));
+            i64::from(busy_names.contains(&r.database) || txn_dbs.contains_key(&r.database));
         let mut item = r.to_json(status).with("lockCount", lock_count).with(
             "costTime",
             read_cost(&root.join(crate::db_dir_for(&r.database))),
@@ -794,6 +797,12 @@ fn show(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
             // are always available.
             item.set("csr", h.csr.is_built());
             item.set("txn", true);
+            // Rust extension (review gap-txn-lifecycle#1): the open
+            // transaction — id, owner, idle seconds — so an operator can
+            // find the one that blocks the database.
+            if let Some(t) = txn_dbs.get(&r.database) {
+                item.set("transaction", t.to_json());
+            }
             // Rust extensions: the layout, and an on-disk database's query
             // mode (both fixed while it is loaded).
             item.set("layout", layout_name(h.layout));
@@ -1372,9 +1381,14 @@ fn monitor(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         Ok(i) => i,
         Err(r) => return r,
     };
-    let (record, connections, dir) = {
+    let (record, connections, dir, txn) = {
         let st = ctx.state();
-        (st.sysdb.get(&db).cloned(), st.requests, st.db_dir(&db))
+        (
+            st.sysdb.get(&db).cloned(),
+            st.requests,
+            st.db_dir(&db),
+            ctx.inner.txn_summary(&st, &db),
+        )
     };
     let disk_used = if p.str("disk").as_deref() == Some("0") {
         0
@@ -1413,6 +1427,10 @@ fn monitor(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     let mut resp = resp.with("layout", layout_name(ins.layout));
     if let Some(mode) = ins.query_mode {
         resp = resp.with("queryMode", mode.name());
+    }
+    // ... and its open transaction (review gap-txn-lifecycle#1).
+    if let Some(t) = txn {
+        resp = resp.with("transaction", t.to_json());
     }
     resp
 }
