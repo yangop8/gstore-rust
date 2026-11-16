@@ -42,7 +42,17 @@
 //! [`pr`]). `PPR`, `maximumKplex` and `coreTruss` keep upstream's costs
 //! (random-walk counts, the exponential branch and bound per ego network,
 //! bounded to ego networks of 8192 vertices; see [`maximum_kplex`]).
-//! Every long loop polls the cancellation flag ([`GFunCtx::check_cancel`]).
+//! Every long loop polls the cancellation flag ([`GFunCtx::poll`]), inside
+//! a component's BFS or a hub's neighbourhood too: a weighted ticker charges
+//! each vertex expansion with its degree and polls every 4096 units (review
+//! analytics#8). `PR`, `louvain` and `labelProp` charge every sweep against
+//! [`GFunCtx::max_iteration_work`] (default
+//! [`MAX_ITERATION_WORK`](super::MAX_ITERATION_WORK)) and fail with a query
+//! error when it is spent before they converge — upstream runs up to 2^31
+//! sweeps for `tol < 0` / `increase < 0` (review gap-gfun-fuzz#2). The
+//! per-source functions keep one `n`-sized working set per call, reset
+//! sparsely (review analytics#7; `PPR`'s per-source `O(n)` scan is
+//! upstream's algorithm).
 
 mod grisu;
 mod kplex;

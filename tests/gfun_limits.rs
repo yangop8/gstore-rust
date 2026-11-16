@@ -1033,7 +1033,8 @@ fn per_source_working_sets_are_allocated_once_per_call() {
     let srcs: Vec<GNode> = (0..SOURCES)
         .map(|i| GNode::from_node(&g, g.node_of(2 * i).unwrap()))
         .collect();
-    let cases: [(GFnKind, Box<dyn Fn(&mut GArgs)>); 4] = [
+    type SetArgs = Box<dyn Fn(&mut GArgs)>;
+    let cases: [(GFnKind, SetArgs); 4] = [
         (GFnKind::DegreeCorrelation, Box::new(|a| a.k = Some(1))),
         (
             GFnKind::ClosenessCentrality,

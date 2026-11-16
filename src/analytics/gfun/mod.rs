@@ -924,9 +924,16 @@ pub(crate) fn query_output_budget_exceeded(label: &str, max_bytes: usize) -> GSt
 /// Every function's JSON is bounded by [`GFunCtx::max_output_bytes`] while
 /// it is built: the path family checks it as it streams its entries, the
 /// metric family's lists as they grow (`PPR` and `JaccardSimilarity` write
-/// up to `retNum` entries per source), so a call fails at the bound instead
-/// of building an output of any size first. A scalar or fixed-shape output
-/// is checked here once computed.
+/// up to `retNum` entries per source; `maximumKplex`'s fake solution names
+/// vertex 0 up to 2^20 times), so a call fails at the bound instead of
+/// building an output of any size first. A scalar output is checked here
+/// once computed. (The query engine passes what is left of the query's
+/// budget, so the bound holds per query; review gap-gfun-fuzz#4, #5.)
+///
+/// Every long loop polls the cancellation flag ([`GFunCtx::poll`]) — inside
+/// a component's BFS, a hub's neighbourhood, a sweep — and the iterative
+/// functions whose sweep count the query chooses stop at
+/// [`GFunCtx::max_iteration_work`] (review analytics#8, gap-gfun-fuzz#2).
 pub fn eval(kind: GFnKind, ctx: &GFunCtx<'_>, args: &GArgs) -> Result<GFunValue> {
     ctx.check_cancel()?;
     let value = match kind {
