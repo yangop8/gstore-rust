@@ -126,6 +126,8 @@ pub struct CharSource<R> {
     line: usize,
     eof: bool,
     io_error: Option<io::Error>,
+    /// A character decoded from invalid UTF-8 was consumed (see
+    /// [`take_bad_utf8`](Self::take_bad_utf8)).
     bad_utf8: bool,
     /// Bytes of the characters consumed so far.
     consumed: u64,
@@ -168,10 +170,20 @@ impl<R: BufRead> CharSource<R> {
         self.io_error.take()
     }
 
-    /// Whether an invalid UTF-8 sequence was decoded (as U+FFFD) since the
-    /// last call; resets the flag.
+    /// Whether a character decoded from an invalid UTF-8 sequence (as
+    /// U+FFFD) was consumed ([`bump`](Self::bump)) since the last call;
+    /// resets the flag. Only consumed characters count, so a bad byte the
+    /// reader has merely looked ahead at is charged to the statement that
+    /// reads it, not to the one being finished (review parser#12).
     pub fn take_bad_utf8(&mut self) -> bool {
         std::mem::take(&mut self.bad_utf8)
+    }
+
+    /// Set the flag [`take_bad_utf8`](Self::take_bad_utf8) reports (to put
+    /// back one taken while a part of the input, a comment, was checked on
+    /// its own).
+    pub fn flag_bad_utf8(&mut self) {
+        self.bad_utf8 = true;
     }
 
     /// Decode one more character into the lookahead. `false` at the end of
@@ -203,7 +215,6 @@ impl<R: BufRead> CharSource<R> {
         let n = utf8_len(b0);
         if n == 0 {
             self.inner.consume(1);
-            self.bad_utf8 = true;
             self.look.push_back(('\u{FFFD}', 1 | BAD));
             return true;
         }
@@ -218,7 +229,6 @@ impl<R: BufRead> CharSource<R> {
                 }
                 None => {
                     self.inner.consume(1);
-                    self.bad_utf8 = true;
                     self.look.push_back(('\u{FFFD}', 1 | BAD));
                 }
             }
@@ -261,7 +271,6 @@ impl<R: BufRead> CharSource<R> {
         {
             Some(c) => self.look.push_back((c, n as u8)),
             None => {
-                self.bad_utf8 = true;
                 self.look.push_back(('\u{FFFD}', have.max(1) as u8 | BAD));
             }
         }

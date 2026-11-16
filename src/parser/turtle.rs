@@ -11,6 +11,9 @@
 //! * prefixed names `p:local`, the `a` keyword (= rdf:type)
 //! * predicate-object lists (`;`) and object lists (`,`)
 //! * IRIs, blank nodes, plain/typed/lang literals, numeric & boolean literals
+//!   (numbers are the grammar's `INTEGER` / `DECIMAL` / `DOUBLE` terminals,
+//!   longest match: `1.e5` is a double, `1e` or `1.5.5` a syntax error)
+//! * prefixes with inner dots (`ex.v2:`, `PN_PREFIX`)
 //! * `[ … ]` blank-node property lists and `( … )` collections (lowered to an
 //!   `rdf:first`/`rdf:rest`/`rdf:nil` chain), including nesting
 //! * with [`parse_reader_trig`], TriG graph blocks (see [`crate::parser::trig`])
@@ -35,6 +38,10 @@
 //! `TurtleParser::discardLine`): the statement's triples are dropped, the rest
 //! of the line the error was detected on is skipped, and parsing resumes at
 //! the next line (still inside the current TriG block, if any).
+//!
+//! Invalid UTF-8 fails the statement it is read in. Inside a comment, which
+//! is whitespace, it is an error of the comment's line of its own: the
+//! statements around the comment still load (a strict sink stops there).
 //!
 //! # Extension: line breaks in short strings
 //!
@@ -151,6 +158,7 @@ fn run<R: BufRead>(
         stmt_start: 0,
         held: 0,
         max_token: sink.max_token_bytes(),
+        bad_comment: None,
     };
     p.run(sink)
 }
@@ -185,6 +193,10 @@ struct Parser<R> {
     /// The most bytes one token (a literal, IRI, name, number, language
     /// tag) may take ([`StatementSink::max_token_bytes`]).
     max_token: usize,
+    /// The line of a comment holding invalid UTF-8, found while skipping
+    /// whitespace: reported on its own, not charged to the statement around
+    /// or after it (review parser#12).
+    bad_comment: Option<usize>,
 }
 
 /// The `rdf:` namespace base (for collection `rdf:first`/`rest`/`nil`).
@@ -217,6 +229,26 @@ fn is_blank_label_char(c: char) -> bool {
     crate::model::term::is_blank_label_char(c)
 }
 
+/// A character that ends a prefixed name or keyword (besides whitespace).
+fn is_term_separator(c: char) -> bool {
+    c == '.' || is_term_separator_not_dot(c)
+}
+
+fn is_term_separator_not_dot(c: char) -> bool {
+    matches!(
+        c,
+        ';' | ',' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '"' | '\''
+    )
+}
+
+/// A character a prefix may continue with after a `.` (PN_CHARS, leniently:
+/// any non-ASCII character that is not whitespace or a control).
+fn is_prefix_char(c: char) -> bool {
+    c.is_alphanumeric()
+        || matches!(c, '_' | '-' | '\u{00B7}')
+        || (!c.is_ascii() && !c.is_whitespace() && !c.is_control())
+}
+
 /// Characters a `\`-escape may produce in a local name (`PN_LOCAL_ESC`).
 const LOCAL_ESCAPES: &str = "_~.-!$&'()*+,;=/?#@%";
 
@@ -233,6 +265,12 @@ impl<R: BufRead> Parser<R> {
             let item = self.next_item();
             if let Some(e) = self.src.take_io_error() {
                 return Err(e.into());
+            }
+            // A comment with invalid UTF-8 is an error of its own line; the
+            // statement around or after it still counts (review parser#12:
+            // the next statement used to fail in its place).
+            if let Some(line) = self.bad_comment.take() {
+                sink.error(SyntaxError::new(line, "invalid UTF-8 in a comment"))?;
             }
             let item = match item {
                 // Decoded as U+FFFD: the statement is not what the file says.
@@ -425,11 +463,22 @@ impl<R: BufRead> Parser<R> {
                     self.bump();
                 }
                 Some('#') => {
+                    // Checked on its own for invalid UTF-8 (see
+                    // `bad_comment`): what the statement read before keeps
+                    // its own flag.
+                    let before = self.src.take_bad_utf8();
+                    let line = self.src.line();
                     while let Some(c) = self.peek() {
                         if c == '\n' {
                             break;
                         }
                         self.bump();
+                    }
+                    if self.src.take_bad_utf8() {
+                        self.bad_comment.get_or_insert(line);
+                    }
+                    if before {
+                        self.src.flag_bad_utf8();
                     }
                 }
                 _ => break,
@@ -596,11 +645,23 @@ impl<R: BufRead> Parser<R> {
         Ok(())
     }
 
-    /// Read a prefix namespace token `p:` or `:`, returning the prefix (no colon).
+    /// Read a prefix namespace token `p:` or `:`, returning the prefix (no
+    /// colon). A prefix the names of the document could not use afterwards
+    /// is refused: one ending in `.` (PN_PREFIX) or holding a term
+    /// separator. Inner dots are fine (`ex.v2:`; review parser#11).
     fn read_prefix_ns(&mut self) -> Result<String> {
         let mut ns = String::new();
         while let Some(c) = self.peek() {
             if c == ':' {
+                if ns.ends_with('.')
+                    || ns.starts_with('.')
+                    || ns.chars().any(is_term_separator_not_dot)
+                {
+                    return Err(self.err(format!(
+                        "invalid prefix name '{ns}:' (a prefix cannot start or end with '.' or \
+                         hold any of ;,()[]{{}}<\"')"
+                    )));
+                }
                 self.bump();
                 return Ok(ns);
             } else if c.is_whitespace() {
@@ -657,6 +718,7 @@ impl<R: BufRead> Parser<R> {
         }
         match self.peek() {
             Some('.') => {
+                self.no_number_after_dot()?;
                 self.bump();
                 Ok(())
             }
@@ -899,14 +961,25 @@ impl<R: BufRead> Parser<R> {
         // Could be `prefix:local`, `:local`, or a boolean literal.
         let mut prefix = String::new();
         while let Some(c) = self.peek() {
+            if c == '.' {
+                // PN_PREFIX may hold '.', not at its end: the dots belong
+                // to the prefix when a prefix character follows them
+                // (`ex.v2:a`; review parser#11), else they end the
+                // statement (`true.`).
+                let dots = (0..MAX_LOOKAHEAD - 1)
+                    .take_while(|&k| self.src.peek_at(k) == Some('.'))
+                    .count();
+                if prefix.is_empty() || !self.src.peek_at(dots).is_some_and(is_prefix_char) {
+                    break;
+                }
+                for _ in 0..dots {
+                    prefix.push('.');
+                    self.bump();
+                }
+                continue;
+            }
             // Stop at the ':' that ends the prefix, or any term separator.
-            if c == ':'
-                || c.is_whitespace()
-                || matches!(
-                    c,
-                    '.' | ';' | ',' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '"' | '\''
-                )
-            {
+            if c == ':' || c.is_whitespace() || is_term_separator(c) {
                 break;
             }
             self.check_token(prefix.len(), "a prefixed name")?;
@@ -1104,44 +1177,86 @@ impl<R: BufRead> Parser<R> {
         }
     }
 
+    /// A numeric literal, lexed as the Turtle grammar's longest match of
+    /// (§6.5):
+    ///
+    /// ```text
+    /// INTEGER  ::= [+-]? [0-9]+
+    /// DECIMAL  ::= [+-]? [0-9]* '.' [0-9]+
+    /// DOUBLE   ::= [+-]? ([0-9]+ '.' [0-9]* EXPONENT | '.' [0-9]+ EXPONENT | [0-9]+ EXPONENT)
+    /// EXPONENT ::= [eE] [+-]? [0-9]+
+    /// ```
+    ///
+    /// What follows the number is left to the statement: `1e` is the
+    /// integer `1` followed by `e` (an error there), `1.5.5` the decimal
+    /// `1.5` followed by the decimal `.5` (see [`Parser::expect_dot`]), and
+    /// `1.e5` a double (review parser#10: `1e`, `1E+`, `1.5.5` and `1e5e5`
+    /// were stored as numbers, and `1.e5` was refused).
     fn parse_numeric(&mut self) -> Result<Term> {
         let mut s = String::new();
-        let mut is_decimal = false;
-        let mut is_double = false;
         if matches!(self.peek(), Some('+') | Some('-')) {
             s.push(self.bump().unwrap());
         }
-        while let Some(c) = self.peek() {
-            self.check_token(s.len(), "a number")?;
-            if c.is_ascii_digit() {
-                s.push(c);
+        let int_digits = self.read_digits(&mut s)?;
+        let mut fraction = false;
+        if self.peek() == Some('.') {
+            if self.peek2().is_some_and(|c| c.is_ascii_digit()) {
+                // '.' [0-9]+ (DECIMAL, or a DOUBLE's mantissa).
+                s.push('.');
                 self.bump();
-            } else if c == '.' && self.peek2().is_some_and(|n| n.is_ascii_digit()) {
-                is_decimal = true;
-                s.push(c);
+                self.read_digits(&mut s)?;
+                fraction = true;
+            } else if int_digits > 0 && self.exponent_at(1) {
+                // [0-9]+ '.' EXPONENT: `1.e5`.
+                s.push('.');
                 self.bump();
-            } else if c == 'e' || c == 'E' {
-                is_double = true;
-                s.push(c);
-                self.bump();
-                if matches!(self.peek(), Some('+') | Some('-')) {
-                    s.push(self.bump().unwrap());
-                }
-            } else {
-                break;
             }
         }
-        if s.is_empty() || s.chars().all(|c| c == '+' || c == '-') {
+        if int_digits == 0 && !fraction {
             return Err(self.err("invalid numeric literal"));
         }
-        let dt = if is_double {
+        let mut double = false;
+        if self.exponent_at(0) {
+            s.push(self.bump().unwrap()); // e / E
+            if matches!(self.peek(), Some('+') | Some('-')) {
+                s.push(self.bump().unwrap());
+            }
+            self.read_digits(&mut s)?;
+            double = true;
+        }
+        let dt = if double {
             xsd::DOUBLE
-        } else if is_decimal {
+        } else if fraction {
             xsd::DECIMAL
         } else {
             xsd::INTEGER
         };
         Ok(Term::typed_literal(s, dt))
+    }
+
+    /// Append the run of ASCII digits that follows to `s`; how many.
+    fn read_digits(&mut self, s: &mut String) -> Result<usize> {
+        let mut n = 0;
+        while let Some(c) = self.peek().filter(char::is_ascii_digit) {
+            self.check_token(s.len(), "a number")?;
+            s.push(c);
+            self.bump();
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    /// Whether an EXPONENT (`[eE] [+-]? [0-9]+`) starts `k` characters ahead.
+    fn exponent_at(&mut self, k: usize) -> bool {
+        if !matches!(self.src.peek_at(k), Some('e' | 'E')) {
+            return false;
+        }
+        let digit = if matches!(self.src.peek_at(k + 1), Some('+' | '-')) {
+            k + 2
+        } else {
+            k + 1
+        };
+        self.src.peek_at(digit).is_some_and(|c| c.is_ascii_digit())
     }
 
     fn read_string_escape(&mut self, out: &mut String) -> Result<()> {
@@ -1206,9 +1321,25 @@ impl<R: BufRead> Parser<R> {
         }
     }
 
+    /// The `.` that ends a statement or directive. A `.` followed by a
+    /// digit is never one: it starts a DECIMAL / DOUBLE (`<s> <p> 1.5.5 .`
+    /// is the number `1.5` followed by the number `.5`, a syntax error; it
+    /// was read as `1.5`, then a stray statement `5 .`).
     fn expect_dot(&mut self) -> Result<()> {
         self.skip_ws();
+        self.no_number_after_dot()?;
         self.expect('.')
+    }
+
+    /// `Err` when the next characters are `.` and a digit (a number, not a
+    /// statement terminator).
+    fn no_number_after_dot(&mut self) -> Result<()> {
+        if self.peek() == Some('.') && self.peek2().is_some_and(|c| c.is_ascii_digit()) {
+            return Err(
+                self.err("expected '.', found a number starting with '.' (malformed number?)")
+            );
+        }
+        Ok(())
     }
 
     /// Resolve a relative IRI against the `@base` / `BASE` in force (the

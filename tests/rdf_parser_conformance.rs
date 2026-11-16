@@ -839,3 +839,295 @@ fn the_sparql_tokenizer_allocates_per_token_not_per_byte() {
     eprintln!("measured: tokenize a {n}-byte string literal: peak {peak} bytes");
     assert!(peak < 3 * n, "{peak} bytes for a {n}-byte literal");
 }
+
+// ---- Turtle numbers follow the grammar (parser#10) ----------------------------
+
+const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
+
+fn typed(v: &str, local: &str) -> Term {
+    Term::typed_literal(v, format!("{XSD}{local}"))
+}
+
+/// Import `doc` tolerantly (no token cap): the stored objects and the
+/// logged errors (`line N: message`).
+fn import_tolerant(
+    doc: &[u8],
+    format: gstore::parser::import::RdfFormat,
+) -> (Vec<Term>, Vec<String>) {
+    import_capped(Cursor::new(doc.to_vec()), format, usize::MAX)
+}
+
+/// Import `doc` strictly: `Err` with the message of the first failure.
+fn import_strict(doc: &[u8], format: gstore::parser::import::RdfFormat) -> Result<(), String> {
+    use gstore::parser::import::{import_reader, ImportOptions};
+    use gstore::parser::nquads::Quad;
+    use gstore::parser::stream::SyntaxError;
+    let mut errors: Vec<(String, SyntaxError)> = Vec::new();
+    import_reader(
+        Cursor::new(doc.to_vec()),
+        format,
+        "doc",
+        &ImportOptions::strict(),
+        &mut errors,
+        &mut |b: &mut Vec<Quad>| {
+            b.clear();
+            Ok(())
+        },
+    )
+    .map(drop)
+    .map_err(|e| e.to_string())
+}
+
+/// Turtle 1.1 §6.5, productions [19]-[21] and [154]:
+///
+/// ```text
+/// INTEGER  ::= [+-]? [0-9]+
+/// DECIMAL  ::= [+-]? [0-9]* '.' [0-9]+
+/// DOUBLE   ::= [+-]? ([0-9]+ '.' [0-9]* EXPONENT | '.' [0-9]+ EXPONENT | [0-9]+ EXPONENT)
+/// EXPONENT ::= [eE] [+-]? [0-9]+
+/// ```
+///
+/// and §7.2: the literal's lexical form is the token as written. Review
+/// parser#10: `1.e5` (a DOUBLE: digits, '.', no fraction, exponent) was
+/// refused (in a tolerant import it became `"1"^^xsd:integer`).
+#[test]
+fn turtle_numbers_follow_the_integer_decimal_double_productions() {
+    let cases = [
+        ("123", "integer"),
+        ("-123", "integer"),
+        ("+123", "integer"),
+        ("007", "integer"),
+        ("123.0", "decimal"),
+        (".1", "decimal"),
+        ("-.1", "decimal"),
+        ("+123.0", "decimal"),
+        ("123.0e1", "double"),
+        ("-123e-1", "double"),
+        ("123.E+1", "double"),
+        ("1.e5", "double"),
+        (".5e-3", "double"),
+        ("1E5", "double"),
+        ("+1.5E+3", "double"),
+    ];
+    for (number, dt) in cases {
+        let want = vec![Triple::new(
+            iri("http://ex/s"),
+            iri("http://ex/p"),
+            typed(number, dt),
+        )];
+        for doc in [
+            format!("<http://ex/s> <http://ex/p> {number} ."),
+            format!("<http://ex/s> <http://ex/p> {number} , {number}."),
+            format!("<http://ex/s> <http://ex/p> {number};."),
+        ] {
+            let mut got = turtle::parse_str(&doc).unwrap_or_else(|e| panic!("{doc}: {e}"));
+            got.dedup();
+            assert_eq!(got, want, "{doc}");
+        }
+    }
+    // `123.` is the INTEGER 123 and the statement's '.' (neither a DECIMAL,
+    // which needs a digit after '.', nor a DOUBLE, which needs an exponent).
+    assert_eq!(
+        turtle::parse_str("<http://ex/s> <http://ex/p> 123.").unwrap(),
+        [Triple::new(
+            iri("http://ex/s"),
+            iri("http://ex/p"),
+            typed("123", "integer")
+        )]
+    );
+    // TriG uses the same terminals.
+    let quads =
+        gstore::parser::trig::parse_str("<http://ex/g> { <http://ex/s> <http://ex/p> 1.e5 }")
+            .unwrap();
+    assert_eq!(quads.len(), 1);
+    assert_eq!(quads[0].object, typed("1.e5", "double"));
+    assert_eq!(quads[0].graph, Some(iri("http://ex/g")));
+}
+
+/// Review parser#10: the reader took any run of digits, dots and `e`s as a
+/// number, so `1e`, `1E+`, `1.5.5` and `1e5e5` were stored as numbers (the
+/// statement counted as loaded, nothing logged). The terminals above match
+/// a prefix of each, and what is left is a syntax error: the statement
+/// fails, in strict and tolerant imports alike, and the next one loads.
+#[test]
+fn malformed_turtle_numbers_fail_their_statement() {
+    use gstore::parser::import::RdfFormat;
+    for bad in [
+        "1e", "1E+", "1e-", "1.5e", "1.5.5", "1e5e5", "1e5.5", "123abc", "0x12", "+-1", "+", "-",
+        ".", "..5",
+    ] {
+        let doc = format!("<http://ex/s> <http://ex/p> {bad} .\n");
+        assert!(turtle::parse_str(&doc).is_err(), "{bad} was accepted");
+        let doc = format!("{doc}<http://ex/s> <http://ex/p> <http://ex/next> .\n");
+        let (objects, errors) = import_tolerant(doc.as_bytes(), RdfFormat::Turtle);
+        assert_eq!(objects, [iri("http://ex/next")], "{bad}: {errors:?}");
+        assert_eq!(errors.len(), 1, "{bad}: {errors:?}");
+        assert!(errors[0].starts_with("line 1:"), "{bad}: {errors:?}");
+    }
+    // TriG: a statement inside a block, whose final '.' is optional.
+    assert!(
+        gstore::parser::trig::parse_str("<http://ex/g> { <http://ex/s> <http://ex/p> 1.5.5 }")
+            .is_err()
+    );
+    assert!(
+        gstore::parser::trig::parse_str("<http://ex/g> { <http://ex/s> <http://ex/p> 1e }")
+            .is_err()
+    );
+}
+
+/// The longest-match rule splits `1.5.5` into the DECIMALs `1.5` and `.5`:
+/// in a collection, where a term may follow a term, that is two items
+/// (Turtle 1.1 §6.5 and §7.3, collections).
+#[test]
+fn turtle_numbers_are_split_by_longest_match() {
+    let ts = turtle::parse_str("<http://ex/s> <http://ex/p> ( 1.5.5 1e5.5 ) .").unwrap();
+    let first = iri(&format!("{RDF}first"));
+    let items: Vec<&Term> = ts
+        .iter()
+        .filter(|t| t.predicate == first)
+        .map(|t| &t.object)
+        .collect();
+    assert_eq!(
+        items,
+        [
+            &typed("1.5", "decimal"),
+            &typed(".5", "decimal"),
+            &typed("1e5", "double"),
+            &typed(".5", "decimal")
+        ]
+    );
+}
+
+// ---- a prefix may hold inner dots (parser#11) ---------------------------------
+
+/// Turtle 1.1 §6.5 [167]: `PN_PREFIX ::= PN_CHARS_BASE ((PN_CHARS | '.')*
+/// PN_CHARS)?` — a prefix may hold dots, but not start or end with one.
+/// Review parser#11: `@prefix ex.v2: <…>` was accepted, but `ex.v2:s` then
+/// stopped at the dot ("expected a prefixed name or IRI"), so every
+/// statement using the prefix failed.
+#[test]
+fn a_turtle_prefix_may_hold_inner_dots() {
+    let doc = "@prefix ex.v2: <http://ex/> .\n\
+               PREFIX a..b: <http://ab/>\n\
+               ex.v2:s ex.v2:p ex.v2:o.\n\
+               a..b:s a..b:p a..b:o , ex.v2:o ;\n    ex.v2:q true.\n";
+    let ts = turtle::parse_str(doc).unwrap();
+    assert_eq!(
+        ts,
+        [
+            Triple::new(iri("http://ex/s"), iri("http://ex/p"), iri("http://ex/o")),
+            Triple::new(iri("http://ab/s"), iri("http://ab/p"), iri("http://ab/o")),
+            Triple::new(iri("http://ab/s"), iri("http://ab/p"), iri("http://ex/o")),
+            Triple::new(
+                iri("http://ab/s"),
+                iri("http://ex/q"),
+                typed("true", "boolean")
+            ),
+        ]
+    );
+    // TriG: as a graph label, after GRAPH and inside the block.
+    let quads = gstore::parser::trig::parse_str(
+        "@prefix g.x: <http://g/> .\ng.x:G { g.x:s g.x:p g.x:o }\nGRAPH g.x:H { g.x:s g.x:p g.x:o . }\n",
+    )
+    .unwrap();
+    let graphs: Vec<_> = quads.iter().map(|q| q.graph.clone()).collect();
+    assert_eq!(graphs, [Some(iri("http://g/G")), Some(iri("http://g/H"))]);
+    assert!(quads
+        .iter()
+        .all(|q| q.subject == iri("http://g/s") && q.object == iri("http://g/o")));
+    // Through the importer (the review: a tolerant import stored nothing and
+    // logged one failure per statement using the prefix).
+    let (objects, errors) = import_tolerant(
+        b"@prefix ex.v2: <http://ex/> .\nex.v2:s ex.v2:p ex.v2:o .\n<http://ex/s> <http://ex/p> ex.v2:o2 .\n",
+        gstore::parser::import::RdfFormat::Turtle,
+    );
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(objects, [iri("http://ex/o"), iri("http://ex/o2")]);
+}
+
+/// A prefix that starts or ends with '.' is not a PN_PREFIX, and no name of
+/// the document could use it: the directive is refused, not stored.
+#[test]
+fn a_turtle_prefix_may_not_start_or_end_with_a_dot() {
+    for decl in [
+        "@prefix ex.: <http://ex/> .",
+        "@prefix .ex: <http://ex/> .",
+        "PREFIX ex.: <http://ex/>",
+    ] {
+        let err = turtle::parse_str(decl).unwrap_err().to_string();
+        assert!(err.contains("invalid prefix name"), "{decl}: {err}");
+    }
+}
+
+// ---- invalid UTF-8 in a comment (parser#12) -----------------------------------
+
+/// Review parser#12: the bad-UTF-8 flag of a comment was charged to the
+/// statement after it — `<o1>` below was dropped with "line 3: invalid
+/// UTF-8" (strict: the import failed at line 3). A comment is whitespace
+/// (Turtle 1.1 §6.4): the error is reported at the comment's line, and the
+/// statements around it load.
+#[test]
+fn invalid_utf8_in_a_turtle_comment_is_reported_at_its_line() {
+    use gstore::parser::import::RdfFormat;
+    let all = [
+        iri("http://ex/o0"),
+        iri("http://ex/o1"),
+        iri("http://ex/o2"),
+    ];
+    for (what, doc, line) in [
+        (
+            "comment line",
+            &b"<http://ex/s> <http://ex/p> <http://ex/o0> .\n# caf\xe9\n<http://ex/s> <http://ex/p> <http://ex/o1> .\n<http://ex/s> <http://ex/p> <http://ex/o2> .\n"[..],
+            2,
+        ),
+        (
+            "trailing comment",
+            &b"<http://ex/s> <http://ex/p> <http://ex/o0> . # caf\xe9\n<http://ex/s> <http://ex/p> <http://ex/o1> .\n<http://ex/s> <http://ex/p> <http://ex/o2> .\n"[..],
+            1,
+        ),
+        (
+            "comment inside a statement",
+            &b"<http://ex/s> <http://ex/p> <http://ex/o0> .\n<http://ex/s> # caf\xe9\n  <http://ex/p> <http://ex/o1> .\n<http://ex/s> <http://ex/p> <http://ex/o2> .\n"[..],
+            2,
+        ),
+    ] {
+        for format in [RdfFormat::Turtle, RdfFormat::TriG] {
+            let (objects, errors) = import_tolerant(doc, format);
+            assert_eq!(objects, all, "{what} ({format:?}): {errors:?}");
+            assert_eq!(
+                errors,
+                [format!("line {line}: invalid UTF-8 in a comment")],
+                "{what} ({format:?})"
+            );
+        }
+        // Strict: a Turtle document must be UTF-8, so the import still
+        // fails — at the comment's line.
+        let err = import_strict(doc, RdfFormat::Turtle).unwrap_err();
+        assert!(err.contains(&format!("line {line}")), "{what}: {err}");
+    }
+}
+
+/// Invalid UTF-8 in a term still fails the statement holding it — and only
+/// that one, also when the byte comes right after the previous statement's
+/// '.' (the reader looks ahead there, to tell a '.' from a number).
+#[test]
+fn invalid_utf8_in_a_turtle_term_fails_its_own_statement() {
+    use gstore::parser::import::RdfFormat;
+    let (objects, errors) = import_tolerant(
+        b"<http://ex/s> <http://ex/p> \"caf\xe9\" .\n<http://ex/s> <http://ex/p> <http://ex/o1> .\n",
+        RdfFormat::Turtle,
+    );
+    assert_eq!(objects, [iri("http://ex/o1")]);
+    assert_eq!(errors, ["line 1: invalid UTF-8"]);
+    let (objects, errors) = import_tolerant(
+        b"<http://ex/s> <http://ex/p> <http://ex/o0> .\xe9 <http://ex/s> <http://ex/p> <http://ex/o1> .\n<http://ex/s> <http://ex/p> <http://ex/o2> .\n",
+        RdfFormat::Turtle,
+    );
+    assert_eq!(
+        objects,
+        [iri("http://ex/o0"), iri("http://ex/o2")],
+        "{errors:?}"
+    );
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].starts_with("line 1:"), "{errors:?}");
+}
