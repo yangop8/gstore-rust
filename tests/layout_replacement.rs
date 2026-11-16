@@ -536,3 +536,143 @@ fn a_server_killed_during_a_drop_leaves_no_half_deleted_database() {
     }
 }
 
+
+// ---- durability#14: /api rename reports registry and grant failures ----------
+
+/// An in-process `ApiServer` on a free port, shut down when dropped.
+struct Srv {
+    server: std::sync::Arc<gstore::http_api::ApiServer>,
+    addr: SocketAddr,
+    serving: Option<std::thread::JoinHandle<gstore::server::ShutdownReport>>,
+}
+
+impl Srv {
+    fn start(root: &Path) -> Srv {
+        let mut config = gstore::config::GStoreConfig::default();
+        config.ip_deny_path = None;
+        let server = std::sync::Arc::new(
+            gstore::http_api::ApiServer::bind(root, "root", "127.0.0.1:0")
+                .unwrap()
+                .with_config(config),
+        );
+        let addr = server.local_addr().unwrap();
+        let serving = {
+            let server = std::sync::Arc::clone(&server);
+            Some(std::thread::spawn(move || server.serve_forever()))
+        };
+        Srv {
+            server,
+            addr,
+            serving,
+        }
+    }
+
+    /// `POST /api` as `user` (password `root` for root, else `pw`).
+    fn api_as(&self, user: &str, pairs: &[(&str, &str)]) -> gstore::json::Json {
+        let pass = if user == "root" { "root" } else { "pw" };
+        let mut body = gstore::json::Json::obj()
+            .with("username", user)
+            .with("password", pass);
+        for (k, v) in pairs {
+            body.set(*k, *v);
+        }
+        let (status, text) =
+            request(&self.addr, "POST", "/api", Some(&body.to_string())).expect("an answer");
+        assert_eq!(status, 200, "{text}");
+        gstore::json::parse(&text).unwrap()
+    }
+
+    fn api(&self, pairs: &[(&str, &str)]) -> gstore::json::Json {
+        self.api_as("root", pairs)
+    }
+}
+
+impl Drop for Srv {
+    fn drop(&mut self) {
+        self.server.shutdown();
+        if let Some(t) = self.serving.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+fn status_code(j: &gstore::json::Json) -> i64 {
+    j.get("StatusCode")
+        .and_then(gstore::json::Json::as_i64)
+        .unwrap_or_else(|| panic!("no StatusCode in {j}"))
+}
+
+/// The names `show` lists.
+fn shown(srv: &Srv) -> Vec<String> {
+    let j = srv.api(&[("operation", "show")]);
+    let mut names: Vec<String> = j
+        .get("ResponseBody")
+        .and_then(gstore::json::Json::as_array)
+        .unwrap()
+        .iter()
+        .filter_map(|d| d.get("database").and_then(gstore::json::Json::as_str))
+        .map(str::to_string)
+        .collect();
+    names.sort();
+    names
+}
+
+/// A failed registry or grant update after the directory rename used to be
+/// ignored: the answer said "renamed" while the grants on the database were
+/// silently lost (or the registry named a missing database). Now the
+/// failure is answered and the rename undone — the directory, the registry
+/// and the grants all keep the old name — and a retry once the store can be
+/// written succeeds. (A save is made to fail by a directory where its temp
+/// file goes.)
+#[test]
+fn api_rename_reports_registry_and_grant_failures_and_undoes_the_rename() {
+    let root = TmpDir::new("api_rename");
+    disk_db(root.path(), "lubm");
+    let srv = Srv::start(root.path());
+    let ok = |j: gstore::json::Json| assert_eq!(status_code(&j), 0, "{j}");
+    ok(srv.api(&[
+        ("operation", "usermanage"),
+        ("type", "1"),
+        ("op_username", "bob"),
+        ("op_password", "pw"),
+    ]));
+    ok(srv.api(&[
+        ("operation", "userprivilegemanage"),
+        ("type", "1"),
+        ("op_username", "bob"),
+        ("db_name", "lubm"),
+        ("privileges", "query,load"),
+    ]));
+    let rename = || {
+        srv.api(&[
+            ("operation", "rename"),
+            ("db_name", "lubm"),
+            ("new_name", "newlubm"),
+        ])
+    };
+    for (store, what) in [("users.db", "grants"), ("system.json", "registry")] {
+        let blocker = root.path().join(format!("{store}.tmp"));
+        fs::create_dir_all(blocker.join("x")).unwrap();
+        let j = rename();
+        assert_ne!(status_code(&j), 0, "{store}: {j}");
+        assert!(j.to_string().contains(what), "{store}: {j}");
+        assert!(
+            j.to_string().contains("nothing was renamed"),
+            "{store}: {j}"
+        );
+        fs::remove_dir_all(&blocker).unwrap();
+        assert!(root.path().join("lubm.db").is_dir(), "{store}");
+        assert!(!root.path().join("newlubm.db").exists(), "{store}");
+        assert_eq!(shown(&srv), ["lubm"], "{store}");
+        // bob's grants are still on the database.
+        ok(srv.api_as("bob", &[("operation", "load"), ("db_name", "lubm")]));
+        ok(srv.api(&[("operation", "unload"), ("db_name", "lubm")]));
+    }
+    ok(rename());
+    assert!(!root.path().join("lubm.db").exists());
+    assert_eq!(shown(&srv), ["newlubm"]);
+    ok(srv.api_as("bob", &[("operation", "load"), ("db_name", "newlubm")]));
+    let j = srv.api_as("bob", &[("operation", "load"), ("db_name", "lubm")]);
+    assert_ne!(status_code(&j), 0, "{j}");
+}
+
