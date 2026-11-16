@@ -191,7 +191,15 @@ objects), now cancellably — review analytics#4.
     shapes, not only iterative graph functions) remains an engine feature
     for later.
   - analytics#5: Jaro stays `O(|a|·|b|)` per row (upstream's window is
-    ~|b| wide); a length cap would change upstream answers.
+    ~|b| wide); a length cap would change upstream answers. The legacy
+    `rs:SIMILARITY` string mode (the engine's own windowed Jaro in
+    `src/query/engine.rs`, outside this package's regions) is the same
+    cost and does not poll the cancel flag yet.
+- **docs/CPP_PARITY.md (row "CSR邻接 + 图算法 + topk", for its owner)**:
+  upstream `src/Query/topk` is the `ORDER BY … LIMIT` query top-k, which
+  this repo implements in `src/query/topk.rs`; the branch-and-bound top-k
+  *subgraph* matcher of `WeightedGraphView` is a library-only extra with
+  no SPARQL or server caller (review analytics#10).
 
 ## Measured numbers
 

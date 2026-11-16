@@ -159,7 +159,8 @@ where
 
 /// [`bfs`] over caller-owned marks (cleared first), so a caller running one
 /// BFS per source allocates its `n`-sized visited set once (review
-/// analytics#7).
+/// analytics#7). Marks sized for a smaller graph are replaced by marks for
+/// `g` (a node they cannot hold would never count as visited).
 #[allow(clippy::too_many_arguments)]
 pub fn bfs_with<B, F>(
     g: &CsrGraph,
@@ -176,6 +177,9 @@ where
 {
     if src as usize >= g.num_nodes() {
         return ControlFlow::Continue(());
+    }
+    if marks.stamp.len() < g.num_nodes() {
+        *marks = NodeMarks::new(g.num_nodes());
     }
     marks.clear();
     let mut queue: std::collections::VecDeque<(Node, u32)> = std::collections::VecDeque::new();
@@ -308,6 +312,34 @@ mod tests {
         assert_eq!(r, ControlFlow::Break(4));
         assert_eq!(seen, 3); // 0, then in-neighbours 2 and 4
         assert!(bfs_order(&g, 99, &f, Direction::Out, NbrOrder::PerPredOutThenIn).is_empty());
+    }
+
+    /// `bfs_with` over reused marks — also marks sized for another graph —
+    /// visits what `bfs` visits.
+    #[test]
+    fn bfs_with_reused_or_undersized_marks() {
+        let g = g();
+        let f = PredFilter::from_ids([0, 1]);
+        for mut marks in [NodeMarks::new(0), NodeMarks::new(2), NodeMarks::new(64)] {
+            for src in [5, 0, 5] {
+                let mut got = Vec::new();
+                let _ = bfs_with(
+                    &g,
+                    &mut marks,
+                    src,
+                    &f,
+                    Direction::Both,
+                    NbrOrder::PerPredOutThenIn,
+                    None,
+                    |n, d| {
+                        got.push((n, d));
+                        ControlFlow::<()>::Continue(())
+                    },
+                );
+                let want = bfs_order(&g, src, &f, Direction::Both, NbrOrder::PerPredOutThenIn);
+                assert_eq!(got, want, "src {src}");
+            }
+        }
     }
 
     #[test]
