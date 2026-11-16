@@ -1503,8 +1503,8 @@ impl Crc32 {
     fn update(&mut self, data: &[u8]) {
         let t = &CRC_TABLES;
         let mut crc = self.0;
-        let mut chunks = data.chunks_exact(8);
-        for c in &mut chunks {
+        let (chunks, rest) = data.as_chunks::<8>();
+        for c in chunks {
             let lo = crc ^ u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
             crc = t[7][(lo & 0xFF) as usize]
                 ^ t[6][((lo >> 8) & 0xFF) as usize]
@@ -1515,7 +1515,7 @@ impl Crc32 {
                 ^ t[1][c[6] as usize]
                 ^ t[0][c[7] as usize];
         }
-        for &b in chunks.remainder() {
+        for &b in rest {
             crc = (crc >> 8) ^ t[0][((crc ^ u32::from(b)) & 0xFF) as usize];
         }
         self.0 = crc;
