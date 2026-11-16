@@ -43,7 +43,7 @@
 //! `0 ↔ 1`; counters that hit `0` are deleted, so `subject_keys`/`object_keys`/
 //! `predicates` can be read by scanning the relevant `stats` prefix. This trades
 //! a handful of extra `stats` writes per triple for O(1), *exact* statistics
-//! (unlike the disk B+tree store, whose counter-based stats are estimates).
+//! (as the disk B+ tree store maintains its own exact counts).
 //!
 //! ## Durability of the dictionary and named graphs
 //!
