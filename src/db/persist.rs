@@ -1581,6 +1581,23 @@ impl Database {
         fsutil::sync_dir(dst)
     }
 
+    /// Delete the database directory `dir` crash-safely: it is renamed aside
+    /// to `<dir>.drop-old` (a name no database scan reads), the rename is
+    /// made durable, and only then is the tree deleted — so neither a crash
+    /// nor an error part-way leaves a half-deleted database under its live
+    /// name (review durability#10). A leftover `<dir>.drop-old` of an
+    /// earlier interrupted drop is removed first, also when `dir` no longer
+    /// exists. Returns whether `dir` existed. Takes `dir`'s lock first
+    /// (shared with one this process holds): fails, touching nothing, while
+    /// another process has the database open. Once the rename is durable the
+    /// database is gone: a failure deleting the moved-aside files is logged,
+    /// and they go with the next drop of the name.
+    pub fn drop_dir<P: AsRef<Path>>(dir: P) -> Result<bool> {
+        let dir = dir.as_ref();
+        let _lock = super::dirlock::DirLock::acquire_existing(dir)?;
+        fsutil::discard_db_dir(dir)
+    }
+
     /// Restore the database held in `backup` (any layout) into directory
     /// `target`, replacing whatever database `target` held. Crash-safe and
     /// validated: the backup is first copied into a staging directory beside

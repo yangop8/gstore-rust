@@ -12,6 +12,13 @@
 //! (status 1). Upstream's `gdrop` deletes without asking; the confirmation is
 //! kept here on purpose, for the upstream spelling too.
 //!
+//! The directory is first renamed to `<db_name>.db.drop-old` and the rename
+//! made durable, then deleted ([`Database::drop_dir`]): a crash or an error
+//! part-way never leaves a half-deleted database under its name. Such a
+//! leftover is not a database to any tool (its name does not end in `.db`)
+//! and the next `gdrop` of the name removes it (it then still reports that
+//! the database does not exist).
+//!
 //! Exit status: 0 dropped, 1 failed or not confirmed, 2 invalid arguments;
 //! `-h`/`--help`.
 
@@ -20,7 +27,7 @@ mod cli;
 
 use std::process::ExitCode;
 
-use gstore::db_dir_for;
+use gstore::{db_dir_for, Database};
 
 const TOOL: cli::Tool = cli::Tool {
     name: "gdrop",
@@ -56,6 +63,10 @@ fn main() -> ExitCode {
     let dir = db_dir_for(&name);
 
     if !std::path::Path::new(&dir).is_dir() {
+        if confirmed {
+            // What an interrupted drop of this name left behind goes now.
+            let _ = Database::drop_dir(&dir);
+        }
         eprintln!("database '{dir}' does not exist");
         return ExitCode::FAILURE;
     }
@@ -67,18 +78,16 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     // A database another process serves from `dir` holds its lock: never
-    // pull the directory from under it (the lock is held while it goes).
-    let _lock = match gstore::db::dirlock::DirLock::acquire_existing(std::path::Path::new(&dir)) {
-        Ok(lock) => lock,
+    // pull the directory from under it (`drop_dir` holds the lock while it
+    // goes). Renamed aside durably first, then deleted.
+    match Database::drop_dir(&dir) {
+        Ok(_) => {
+            gstore::outln!("Dropped database '{dir}'");
+            ExitCode::SUCCESS
+        }
         Err(e) => {
             eprintln!("failed to drop '{dir}': {e}");
-            return ExitCode::FAILURE;
+            ExitCode::FAILURE
         }
-    };
-    if let Err(e) = std::fs::remove_dir_all(&dir) {
-        eprintln!("failed to drop '{dir}': {e}");
-        return ExitCode::FAILURE;
     }
-    gstore::outln!("Dropped database '{dir}'");
-    ExitCode::SUCCESS
 }

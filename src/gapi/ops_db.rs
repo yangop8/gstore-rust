@@ -1635,6 +1635,10 @@ fn drop_db(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         let dir = st.db_dir(&db);
         let loaded = st.dbs.get(&db).map(Arc::clone);
         if loaded.is_none() && !dir.is_dir() {
+            drop(st);
+            // What an interrupted drop of this name left behind (no
+            // database scan reads it) goes now.
+            let _ = crate::db::fsutil::remove_drop_leftover(&dir);
             return GResp::error(
                 Status::OperationFailed,
                 format!("database[{db}] does not exist"),
@@ -1685,10 +1689,14 @@ fn drop_db(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         // A `reasonManage` file operation (which does not wait for the
         // database) is never half-way through its rule directory meanwhile.
         let _rules = RuleStore::dir(&dir).lock();
+        // Durably either way (review durability#10): the logical deletion
+        // is a rename made durable; a deletion renames the directory aside
+        // durably before it deletes it, so a crash or an error part-way
+        // never leaves a half-deleted database under its name.
         let moved = if is_backup {
-            fs::rename(&dir, bak_path(&dir))
+            crate::db::fsutil::rename_dir_durably(&dir, &bak_path(&dir))
         } else {
-            fs::remove_dir_all(&dir)
+            crate::db::fsutil::discard_db_dir(&dir).map(drop)
         };
         if let Err(e) = moved {
             return GResp::error(Status::OperationFailed, format!("Drop fail: {e}"));
