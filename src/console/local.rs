@@ -180,7 +180,8 @@ fn run_query(db: &mut Database, query: &str) -> bool {
         Ok(QueryResult::Ask(b)) => crate::outln!("{b}"),
         Ok(QueryResult::Construct(triples)) => {
             for t in &triples {
-                crate::outln!("{t}");
+                // The escaping serializer (review sparqlconf#11).
+                crate::outln!("{}", t.to_ntriples());
             }
             crate::outln!("[{} triple(s)]", triples.len());
         }

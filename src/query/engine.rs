@@ -4090,6 +4090,12 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             "STRLANG" => {
                 let s = self.eval_value(args.first()?, b, l)?.lexical();
                 let lang = self.eval_value(args.get(1)?, b, l)?.lexical();
+                // A language tag by the shared LANGTAG rule, else an error:
+                // `STRLANG("x", "en> bad")` or `STRLANG("x", "")` would
+                // store a literal no reader reads back (review sparqlconf#11).
+                if !crate::model::term::is_valid_lang_tag(&lang) {
+                    return None;
+                }
                 Some(Value::Str {
                     value: s,
                     lang: Some(lang),
@@ -4099,7 +4105,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 let s = self.eval_value(args.first()?, b, l)?.lexical();
                 let dt = match self.eval_value(args.get(1)?, b, l)? {
                     Value::Iri(iri) => iri,
-                    other => other.lexical(),
+                    // A datatype written as a string must be IRIREF text
+                    // (review sparqlconf#11).
+                    other => {
+                        Some(other.lexical()).filter(|t| crate::model::term::is_valid_iriref(t))?
+                    }
                 };
                 Some(Value::from_term(&Term::Literal {
                     value: s,
@@ -4171,9 +4181,16 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             }
 
             // ---- constructors / terms ------------------------------------
+            // An IRI unchanged; a string only when it is IRIREF text (no
+            // space, control character or `<>"{}|^`\`), else an error — an
+            // IRI holding `>` and a newline would forge statements in
+            // N-Triples output, and no reader reads it back (review
+            // sparqlconf#11).
             "IRI" | "URI" => match self.eval_value(args.first()?, b, l)? {
                 Value::Iri(s) => Some(Value::Iri(s)),
-                other => Some(Value::Iri(other.lexical())),
+                other => Some(other.lexical())
+                    .filter(|t| crate::model::term::is_valid_iriref(t))
+                    .map(Value::Iri),
             },
             "BNODE" => {
                 let label = match args.first() {
@@ -4512,7 +4529,14 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         for a in args {
             argv.push(self.eval_value(a, b, l)?);
         }
-        f(&argv)
+        // A user function's term obeys the term rules of the built-ins:
+        // an IRI with a character IRIREF excludes, or a language tag that
+        // is no LANGTAG, is an error (review sparqlconf#11).
+        f(&argv).filter(|v| match v {
+            Value::Iri(s) => crate::model::term::is_valid_iriref(s),
+            Value::Str { lang: Some(t), .. } => crate::model::term::is_valid_lang_tag(t),
+            _ => true,
+        })
     }
 
     /// Resolve a graph built-in node argument to its dictionary entity id.

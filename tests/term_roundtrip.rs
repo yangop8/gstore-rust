@@ -24,12 +24,19 @@
 //! test ends, also when it fails; servers run in-process on `127.0.0.1:0`.
 
 use std::collections::BTreeSet;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 use gstore::model::term::export_key;
 use gstore::parser::{jsonld, nquads, ntriples, rdfa, rdfxml, trig, turtle};
+use gstore::server::Server;
+use gstore::sparql_results::{self, ResultFormat};
 use gstore::{Database, QueryResult, Term, Triple};
 
 // ---- plumbing ---------------------------------------------------------------
@@ -79,6 +86,12 @@ fn all_keys(db: &mut Database) -> BTreeSet<Vec<String>> {
     }
 }
 
+fn select_cells(db: &mut Database, q: &str) -> Vec<Vec<Option<String>>> {
+    match db.query(q).unwrap() {
+        QueryResult::Select(rs) => rs.rows,
+        other => panic!("{other:?}"),
+    }
+}
 
 /// The language tag of the single literal object `triples` hold.
 fn lang_of(triples: &[Triple]) -> Option<String> {
@@ -608,4 +621,206 @@ fn gbuild_exits_3_when_it_skipped_statements() {
     .unwrap();
     let out = run(env!("CARGO_BIN_EXE_gbuild"), &["e", "e.nt"], &tmp.0);
     assert_eq!(out.status.code(), Some(0), "{out:?}");
+}
+
+// ---- sparqlconf#11: IRI() / STRLANG() and N-Triples output -------------------
+
+/// The review's injection IRI: `>` ends the term, the newline the statement.
+const FORGED: &str = "http://a> <http://evil> <http://c> .\n<http://d";
+
+#[test]
+fn iri_and_strlang_refuse_text_that_is_no_term() {
+    let mut db = Database::new("inj");
+    let q = format!(
+        "INSERT {{ ?s <http://ex/p> \"x\" }} WHERE {{ BIND(IRI(\"{}\") AS ?s) }}",
+        nt_escape(FORGED)
+    );
+    db.query(&q).unwrap();
+    let q = "INSERT { <http://ex/l> <http://ex/q> ?l } WHERE { BIND(STRLANG(\"x\", \"en> bad\") AS ?l) }";
+    db.query(q).unwrap();
+    let q = "INSERT { <http://ex/l> <http://ex/q> ?l } WHERE { BIND(STRLANG(\"x\", \"\") AS ?l) }";
+    db.query(q).unwrap();
+    assert!(
+        all_keys(&mut db).is_empty(),
+        "IRI()/STRLANG() built terms: {:?}",
+        all_keys(&mut db)
+    );
+    // Valid input still works; URI() is IRI().
+    db.query(
+        "INSERT { ?s <http://ex/p> ?l } WHERE { BIND(URI(\"http://ex/ok\") AS ?s) \
+         BIND(STRLANG(\"x\", \"zh-CN\") AS ?l) }",
+    )
+    .unwrap();
+    assert_eq!(
+        all_keys(&mut db),
+        BTreeSet::from([vec![
+            "<http://ex/ok>".to_string(),
+            "<http://ex/p>".to_string(),
+            "\"x\"@zh-CN".to_string()
+        ]])
+    );
+    // A read-only CONSTRUCT that maps stored text to IRIs cannot forge
+    // either (no write access needed for the injection before the fix).
+    db.query(&format!(
+        "INSERT DATA {{ <http://ex/u1> <http://ex/name> \"{}\" }}",
+        nt_escape("bob> <http://ex/role> <http://ex/admin> .\n<http://ex/x")
+    ))
+    .unwrap();
+    let r = db
+        .query(
+            "CONSTRUCT { ?u a <http://ex/User> } WHERE { ?x <http://ex/name> ?n \
+             BIND(IRI(CONCAT(\"http://ex/user/\", ?n)) AS ?u) }",
+        )
+        .unwrap();
+    let QueryResult::Construct(ts) = r else {
+        panic!("{r:?}")
+    };
+    assert!(ts.is_empty(), "{ts:?}");
+}
+
+/// Send one request and read the whole response (`Connection: close`).
+fn http(addr: SocketAddr, method: &str, target: &str, ctype: &str, body: &str) -> (u16, String) {
+    let mut s = TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(120))).unwrap();
+    let raw = format!(
+        "{method} {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: {ctype}\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    s.write_all(raw.as_bytes()).unwrap();
+    let mut resp = Vec::new();
+    s.read_to_end(&mut resp).unwrap();
+    let resp = String::from_utf8_lossy(&resp).into_owned();
+    let (head, body) = resp.split_once("\r\n\r\n").unwrap_or((resp.as_str(), ""));
+    let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+    (status, body.to_string())
+}
+
+/// A database holding terms an older version (or a lenient reader) let in.
+fn odd_database() -> (Database, Vec<Triple>) {
+    let mut db = Database::new("odd");
+    let stored = vec![
+        Triple::new(
+            Term::iri(FORGED),
+            Term::iri("http://ex/p"),
+            lit("x", None, None),
+        ),
+        Triple::new(
+            Term::iri("http://ex/l"),
+            Term::iri("http://ex/q"),
+            lit("x", Some("en> <http://evil> <http://c> .\n<http://d"), None),
+        ),
+        Triple::new(
+            Term::blank("b <http://evil> <http://c> .\n_:d"),
+            Term::iri("http://ex/r"),
+            lit("v\u{1}", None, Some("http://ex/dt> . <x")),
+        ),
+    ];
+    for t in &stored {
+        assert!(db.insert_triple(t));
+    }
+    (db, stored)
+}
+
+#[test]
+fn construct_over_http_cannot_forge_triples() {
+    let (db, stored) = odd_database();
+    let server = Arc::new(Server::bind(db, "127.0.0.1:0").unwrap());
+    let addr = server.local_addr().unwrap();
+    let s2 = Arc::clone(&server);
+    let worker = thread::spawn(move || s2.serve_forever());
+    let (status, body) = http(
+        addr,
+        "POST",
+        "/sparql",
+        "application/sparql-query",
+        "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }",
+    );
+    server.shutdown();
+    let _ = worker.join();
+    assert_eq!(status, 200, "{body}");
+    let lines: Vec<&str> = body.lines().collect();
+    assert_eq!(lines.len(), stored.len(), "one line per triple: {body}");
+    let parsed = ntriples::parse_str(&body).unwrap_or_else(|e| panic!("{e}: {body}"));
+    assert_eq!(parsed.len(), stored.len(), "{body}");
+    // The IRI and the datatype read back exactly; no statement mentions
+    // the injected <http://evil> as a term of its own.
+    assert!(parsed.contains(&stored[0]), "{parsed:?}");
+    for t in &parsed {
+        for term in [&t.subject, &t.predicate, &t.object] {
+            assert_ne!(term, &Term::iri("http://evil"), "{body}");
+        }
+    }
+}
+
+#[test]
+fn gquery_construct_output_cannot_forge_triples() {
+    let tmp = TmpDir::new("gquery");
+    let (db, stored) = odd_database();
+    db.save(tmp.join("odd.db")).unwrap();
+    let out = run(
+        env!("CARGO_BIN_EXE_gquery"),
+        &["odd", "-e", "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }"],
+        &tmp.0,
+    );
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed = ntriples::parse_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+    assert_eq!(parsed.len(), stored.len(), "{stdout}");
+    assert!(parsed.contains(&stored[0]), "{parsed:?}");
+}
+
+// ---- query#15: result serializers --------------------------------------------
+
+fn render(fmt: ResultFormat, rs: &gstore::ResultSet) -> String {
+    let mut buf = Vec::new();
+    sparql_results::write_select(fmt, rs, &mut buf).unwrap();
+    String::from_utf8(buf).unwrap()
+}
+
+#[test]
+fn result_serializers_render_cells_as_the_terms_they_are() {
+    let mut db = Database::new("cells");
+    assert!(db.insert_triple(&Triple::new(
+        Term::iri("http://ex/a>b"),
+        Term::iri("http://ex/p"),
+        lit("a\u{1}b\rc", None, None),
+    )));
+    let r = db.query("SELECT ?s ?o WHERE { ?s ?p ?o }").unwrap();
+    let QueryResult::Select(rs) = r else {
+        panic!("{r:?}")
+    };
+    let json = render(ResultFormat::Json, &rs);
+    assert!(
+        json.contains(r#""s":{"type":"uri","value":"http://ex/a>b"}"#),
+        "{json}"
+    );
+    assert!(json.contains(r#""value":"a\u0001b\rc""#), "{json}");
+    let xml = render(ResultFormat::Xml, &rs);
+    assert!(xml.contains("<uri>http://ex/a&gt;b</uri>"), "{xml}");
+    assert!(
+        !xml.chars().any(|c| c < ' ' && c != '\n' && c != '\t'),
+        "XML 1.0 cannot hold a raw control character: {xml:?}"
+    );
+    assert!(xml.contains("<literal>a\u{FFFD}b&#xD;c</literal>"), "{xml}");
+    let tsv = render(ResultFormat::Tsv, &rs);
+    let row = tsv.lines().nth(1).unwrap();
+    let cells: Vec<&str> = row.split('\t').collect();
+    assert_eq!(cells.len(), 2, "{tsv:?}");
+    assert_eq!(
+        ntriples::parse_term(cells[0]).unwrap(),
+        Term::iri("http://ex/a>b"),
+        "{tsv:?}"
+    );
+    let csv = render(ResultFormat::Csv, &rs);
+    assert!(
+        csv.lines().nth(1).unwrap().starts_with("http://ex/a>b,"),
+        "{csv}"
+    );
+    // Upstream's JSON shape too.
+    let up = sparql_results::upstream_select_json(&rs, None).to_string();
+    assert!(up.contains(r#""type":"uri""#), "{up}");
+    // IRI() of such text is an error now; a stored one keeps its type.
+    let cells = select_cells(&mut db, "SELECT ?s WHERE { ?s <http://ex/p> ?o }");
+    assert_eq!(cells, vec![vec![Some("<http://ex/a>b>".to_string())]]);
 }
