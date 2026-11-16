@@ -132,15 +132,17 @@ pub fn parse_line(line: &str, line_no: usize) -> Result<Option<Triple>> {
     Ok(Some(Triple::new(subject, predicate, object)))
 }
 
-/// A cursor over a single line's characters.
-struct Scanner {
+/// A cursor over a single line's characters: the term scanner of both line
+/// readers, this one and [`crate::parser::nquads`] (one scanner, so the two
+/// cannot drift apart; review parser#6).
+pub(crate) struct Scanner {
     chars: Vec<char>,
     pos: usize,
     line_no: usize,
 }
 
 impl Scanner {
-    fn new(s: &str, line_no: usize) -> Scanner {
+    pub(crate) fn new(s: &str, line_no: usize) -> Scanner {
         Scanner {
             chars: s.chars().collect(),
             pos: 0,
@@ -148,18 +150,18 @@ impl Scanner {
         }
     }
 
-    fn err(&self, msg: impl Into<String>) -> GStoreError {
+    pub(crate) fn err(&self, msg: impl Into<String>) -> GStoreError {
         GStoreError::RdfParse {
             line: self.line_no,
             msg: msg.into(),
         }
     }
 
-    fn peek(&self) -> Option<char> {
+    pub(crate) fn peek(&self) -> Option<char> {
         self.chars.get(self.pos).copied()
     }
 
-    fn bump(&mut self) -> Option<char> {
+    pub(crate) fn bump(&mut self) -> Option<char> {
         let c = self.peek();
         if c.is_some() {
             self.pos += 1;
@@ -167,14 +169,14 @@ impl Scanner {
         c
     }
 
-    fn skip_ws(&mut self) {
+    pub(crate) fn skip_ws(&mut self) {
         while matches!(self.peek(), Some(' ') | Some('\t') | Some('\r')) {
             self.pos += 1;
         }
     }
 
     /// Parse the next RDF term, skipping leading whitespace.
-    fn parse_term(&mut self) -> Result<Term> {
+    pub(crate) fn parse_term(&mut self) -> Result<Term> {
         self.skip_ws();
         match self.peek() {
             Some('<') => self.parse_iri(),
@@ -200,7 +202,9 @@ impl Scanner {
         }
     }
 
-    /// `_:label` — a blank node.
+    /// `_:label` — a blank node. A label never ends with `.`
+    /// (BLANK_NODE_LABEL): a trailing dot is the statement terminator, so
+    /// `_:g.` and `_:g .` name the same node, as in Turtle (review parser#6).
     fn parse_blank(&mut self) -> Result<Term> {
         debug_assert_eq!(self.peek(), Some('_'));
         self.bump(); // consume '_'
@@ -209,12 +213,16 @@ impl Scanner {
         }
         let mut s = String::new();
         while let Some(c) = self.peek() {
-            if c.is_alphanumeric() || c == '_' || c == '-' || c == '.' {
+            if crate::model::term::is_blank_label_char(c) || c == '.' {
                 s.push(c);
                 self.pos += 1;
             } else {
                 break;
             }
+        }
+        while s.ends_with('.') {
+            s.pop();
+            self.pos -= 1;
         }
         if s.is_empty() {
             return Err(self.err("empty blank node label"));
@@ -269,6 +277,10 @@ impl Scanner {
                 }
                 if lang.is_empty() {
                     return Err(self.err("empty language tag after '@'"));
+                }
+                // LANGTAG, the shared rule of every reader (review parser#1).
+                if !crate::model::term::is_valid_lang_tag(&lang) {
+                    return Err(self.err(format!("invalid language tag '@{lang}'")));
                 }
                 Ok(Term::Literal {
                     value,
@@ -397,6 +409,44 @@ mod tests {
     fn unicode_escape_in_literal() {
         let t = parse_line(r#"<a> <b> "é" ."#, 1).unwrap().unwrap();
         assert_eq!(t.object, Term::plain_literal("é"));
+    }
+
+    #[test]
+    fn a_trailing_dot_ends_the_statement_not_the_label() {
+        // review parser#6: `_:b1.` is `_:b1` then the terminator.
+        let t = parse_line("<s> <p> _:b1.", 1).unwrap().unwrap();
+        assert_eq!(t.object, Term::blank("b1"));
+        let t = parse_line("<s> <p> _:b1..", 1);
+        assert!(t.is_err() || t.unwrap().unwrap().object == Term::blank("b1"));
+        // Inner dots stay part of the label.
+        let t = parse_line("_:a.b <p> _:c..d .", 1).unwrap().unwrap();
+        assert_eq!(t.subject, Term::blank("a.b"));
+        assert_eq!(t.object, Term::blank("c..d"));
+        // W3C minimal_whitespace.
+        let ts =
+            parse_str("<http://example/s><http://example/p>_:o.\n_:s<http://example/p>_:bnode1.\n")
+                .unwrap();
+        assert_eq!(ts[0].object, Term::blank("o"));
+        assert_eq!(ts[1].subject, Term::blank("s"));
+        assert_eq!(ts[1].object, Term::blank("bnode1"));
+    }
+
+    #[test]
+    fn language_tags_follow_langtag() {
+        assert!(parse_line("<a> <b> \"x\"@-", 1).is_err());
+        assert!(parse_line("<a> <b> \"x\"@en- .", 1).is_err());
+        assert!(parse_line("<a> <b> \"x\"@1en .", 1).is_err());
+        let t = parse_line("<a> <b> \"x\"@zh-Hant-TW .", 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            t.object,
+            Term::Literal {
+                value: "x".into(),
+                datatype: None,
+                lang: Some("zh-Hant-TW".into())
+            }
+        );
     }
 
     #[test]

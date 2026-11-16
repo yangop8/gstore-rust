@@ -58,6 +58,7 @@ pub fn parse_str_with(content: &str, labels: &mut BlankLabeler) -> Result<Vec<Tr
         triples: Vec::new(),
         labels: std::mem::take(labels),
         budget: TermBudget::for_input(content.len()),
+        error: None,
     };
     let base = find_base(&root).unwrap_or_default();
     let ctx = EvalContext::root(base);
@@ -68,15 +69,21 @@ pub fn parse_str_with(content: &str, labels: &mut BlankLabeler) -> Result<Vec<Tr
         *labels = ex.labels;
         return Err(e);
     }
-    // Author labels go through the labeler now; minted ones carry a marker
-    // no `_:` CURIE can contain, so the two never meet.
+    if let Some(msg) = ex.error.take() {
+        *labels = ex.labels;
+        return Err(crate::error::GStoreError::RdfParse { line: 0, msg });
+    }
+    // Author labels go through the labeler now, minted ones are final: the
+    // provenance tag each got where it was created tells them apart, and no
+    // document text can choose it (review parser#16).
     let mut triples = std::mem::take(&mut ex.triples);
     for t in &mut triples {
-        for term in [&mut t.subject, &mut t.object] {
+        for term in [&mut t.subject, &mut t.predicate, &mut t.object] {
             if let Term::Blank(l) = term {
-                *l = match l.strip_prefix(MINTED) {
-                    Some(m) => m.to_string(),
-                    None => ex.labels.explicit(l),
+                *l = match (l.strip_prefix(MINTED), l.strip_prefix(AUTHOR)) {
+                    (Some(minted), _) => minted.to_string(),
+                    (None, Some(author)) => ex.labels.explicit(author),
+                    (None, None) => ex.labels.explicit(l),
                 };
             }
         }
@@ -85,8 +92,22 @@ pub fn parse_str_with(content: &str, labels: &mut BlankLabeler) -> Result<Vec<Tr
     Ok(triples)
 }
 
-/// Marks a minted blank label until [`parse_str_with`] finishes.
-const MINTED: char = '\u{0}';
+/// The provenance tag of a blank node's label until [`parse_str_with`]
+/// finishes: the first character of every label the walk holds is [`AUTHOR`]
+/// for an author-written `_:` CURIE (added in [`author_blank`], the one place
+/// they are read) or [`MINTED`] for a node the walk minted
+/// ([`Extractor::fresh_blank`]). Being set by where the term was created —
+/// not by its text — a document cannot make its own label look minted (it
+/// once could, with a `&#0;` reference, when minted labels were marked by
+/// a leading NUL).
+const MINTED: char = 'm';
+/// See [`MINTED`].
+const AUTHOR: char = 'a';
+
+/// The walk's term for an author-written `_:suffix` (see [`MINTED`]).
+fn author_blank(suffix: &str) -> Term {
+    Term::Blank(format!("{AUTHOR}{suffix}"))
+}
 
 /// Parse an (X)HTML file containing RDFa into triples.
 pub fn parse_file<P: AsRef<Path>>(path: P) -> Result<Vec<Triple>> {
@@ -564,12 +585,15 @@ struct Extractor {
     labels: BlankLabeler,
     /// Bounds what `triples` holds.
     budget: TermBudget,
+    /// The first error found in the walk (a `lang` that is no language tag),
+    /// which fails the document once the walk ends.
+    error: Option<String>,
 }
 
 impl Extractor {
     /// Mint a fresh, document-unique blank node for a `@typeof`/`@rel` chain.
     /// Its label comes from the [`BlankLabeler`] (round-trippable, never equal
-    /// to an author-written `_:` label); it carries the [`MINTED`] marker
+    /// to an author-written `_:` label); it carries the [`MINTED`] tag
     /// until the parse finishes.
     fn fresh_blank(&mut self) -> Term {
         Term::Blank(format!("{MINTED}{}", self.labels.fresh()))
@@ -619,13 +643,16 @@ impl Extractor {
             }
         }
 
-        // Step 4: language.
+        // Step 4: language, through the shared language-tag rule
+        // (`zh_CN` is `zh-CN`, `""` no language; anything else that is no
+        // tag fails the document; review parser#1).
         if let Some(l) = el.attr("xml:lang").or_else(|| el.attr("lang")) {
-            lang = if l.is_empty() {
-                None
-            } else {
-                Some(l.to_string())
-            };
+            match crate::model::term::normalize_lang_tag(l) {
+                Ok(tag) => lang = tag,
+                Err(msg) => {
+                    self.error.get_or_insert(format!("lang: {msg}"));
+                }
+            }
         }
 
         let local = LocalCtx {
@@ -942,7 +969,7 @@ fn resolve_resource(value: &str, local: &LocalCtx) -> Option<Term> {
     }
     if let Some((prefix, suffix)) = v.split_once(':') {
         if prefix == "_" {
-            return Some(Term::Blank(suffix.to_string()));
+            return Some(author_blank(suffix));
         }
         if suffix.starts_with("//") {
             return Some(Term::Iri(v.to_string()));
@@ -966,7 +993,7 @@ fn resolve_curie(inner: &str, local: &LocalCtx) -> Option<Term> {
     }
     if let Some((prefix, suffix)) = inner.split_once(':') {
         if prefix == "_" {
-            return Some(Term::Blank(suffix.to_string()));
+            return Some(author_blank(suffix));
         }
         if let Some(ns) = local.prefixes.get(prefix) {
             return Some(Term::Iri(format!("{ns}{suffix}")));
@@ -1199,6 +1226,58 @@ mod tests {
             "type must be on the rel object"
         );
         assert_eq!(types[0].object, Term::iri("http://ex/Person"));
+    }
+
+    #[test]
+    fn a_character_reference_cannot_make_an_author_label_minted() {
+        // review parser#16: minted nodes used to carry a leading NUL, which
+        // an author could write as `&#0;`, merging the two.
+        let doc = r#"<html><body>
+            <div about="_:&#0;genid-0" property="http://ex/p">author</div>
+            <div typeof="http://ex/T"><span property="http://ex/q">anon</span></div>
+            <div about="_:genid-0" property="http://ex/r">plain-genid</div>
+            </body></html>"#;
+        let ts = parse_str(doc).unwrap();
+        let subject = |p: &str| find(&ts, p)[0].subject.clone();
+        let (author, minted, plain) = (
+            subject("http://ex/p"),
+            subject("http://ex/q"),
+            subject("http://ex/r"),
+        );
+        assert_eq!(minted, find(&ts, RDF_TYPE)[0].subject);
+        assert_ne!(author, minted, "{ts:?}");
+        assert_ne!(plain, minted, "{ts:?}");
+        assert_ne!(author, plain, "{ts:?}");
+        for t in [&author, &minted, &plain] {
+            let Term::Blank(l) = t else { panic!("{t:?}") };
+            assert!(crate::model::term::is_valid_blank_label(l), "{l:?}");
+        }
+        // Scoped mode: a `&#0;` label stays inside the document's scope.
+        let doc = r#"<div about="_:&#0;x" property="http://ex/p">a</div>
+            <div about="_:x" property="http://ex/p">b</div>"#;
+        let ts = parse_str_with(doc, &mut BlankLabeler::scoped("docA")).unwrap();
+        for t in &ts {
+            let Term::Blank(l) = &t.subject else {
+                panic!("{t:?}")
+            };
+            assert!(l.starts_with("docA_"), "{l:?} escaped its scope");
+        }
+    }
+
+    #[test]
+    fn language_tags_follow_the_shared_rule() {
+        let doc = |lang: &str| {
+            format!(
+                r#"<div about="http://ex/s" lang="{lang}"><span property="http://ex/p">x</span></div>"#
+            )
+        };
+        let lang = |doc: &str| match &parse_str(doc).unwrap()[0].object {
+            Term::Literal { lang, .. } => lang.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(lang(&doc("zh_CN")).as_deref(), Some("zh-CN"));
+        assert_eq!(lang(&doc("")), None);
+        assert!(parse_str(&doc("en US")).is_err());
     }
 
     #[test]
