@@ -600,6 +600,18 @@ fn tquery(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         }
         Ok(result) => {
             let rs = result_table(result);
+            // The result byte budget (`max_result_bytes`, review sec#10), as
+            // for `query`: checked before the JSON document is built.
+            let budget = ctx.inner.config().max_result_bytes;
+            if budget != 0 && result_bytes_exceed(&rs, None, budget) {
+                return txn_error(
+                    "Transaction query fail",
+                    OpError::new(
+                        OpErrorKind::ResultTooLarge,
+                        crate::http_api::result_too_large_msg(budget),
+                    ),
+                );
+            }
             let mut body = upstream_select_json(&rs, None);
             body.set("StatusCode", 0);
             body.set("StatusMsg", "success");

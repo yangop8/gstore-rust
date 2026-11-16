@@ -5669,9 +5669,17 @@ impl ApiInner {
             log_query(&inner.config(), &inner.root, &name, &user, &sparql);
             let qlog = RestQueryLog::start(inner, &name, &sparql, fmt);
             let out = inner.run_in_txn_task(&dbh, &name, tid, &sparql, stmt, &user);
-            qlog.finish(inner, out.as_ref().map(answer_count));
-            match out {
-                Ok(r) => render_result(fmt, &r),
+            // Rendered under `max_result_bytes` before it is logged, as
+            // `/sparql` does: an answer over the budget is logged as the
+            // failure it is answered as (review sec#10).
+            let rendered = match out {
+                Ok(r) => render_result_within(fmt, &r, inner.config().max_result_bytes)
+                    .map(|resp| (resp, answer_count(&r))),
+                Err(e) => Err(e),
+            };
+            qlog.finish(inner, rendered.as_ref().map(|(_, n)| *n));
+            match rendered {
+                Ok((resp, _)) => resp,
                 Err(e) => e.rest(),
             }
         }))
@@ -5683,6 +5691,11 @@ impl ApiInner {
     /// (with no lock held). Must be called with no lock held. The statement
     /// counts as the transaction's activity from here until it releases the
     /// database (see [`TxnStatement`]).
+    ///
+    /// Like every other statement it runs under `query_timeout` (review
+    /// sec#10, robust#5; see [`run_query_job`](Self::run_query_job)): the
+    /// deadline raises the task's cancel flag, and the statement then fails
+    /// as [`OpErrorKind::Timeout`]. The transaction stays open.
     pub(crate) fn run_in_txn_task(
         &self,
         dbh: &DbHandle,
@@ -5699,7 +5712,14 @@ impl ApiInner {
             (task_id, cancel, activity)
         };
         let mut task = TaskGuard::new(self, task_id);
+        let deadline = crate::deadline::arm(&cancel, self.config().query_timeout);
         let out = self.run_in_txn(dbh, name, tid, stmt, Some(cancel), user, activity);
+        let out = match (out, &deadline) {
+            (Err(e), Some(d)) if d.fired() && e.kind != OpErrorKind::Persist => {
+                Err(timed_out_err(e, d))
+            }
+            (out, _) => out,
+        };
         task.set_ok(out.is_ok());
         out
     }
