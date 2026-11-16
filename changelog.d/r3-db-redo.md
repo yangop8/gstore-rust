@@ -214,9 +214,12 @@ none
 ## Measured numbers
 - Not a hot-path package (convention 8 lists pager, RocksDB, engine, topk,
   string index, optimizer, gfun and the HTTP read path); the smoke gate was
-  not run. The only change on a gated path is `apply_update_ops` (the UPDATE
-  path): one `bool` store per request and, with no log enabled, one early
-  return — no allocation, no lock.
+  not run. The changes on write paths are `apply_update_ops` (one `bool`
+  store per request and, with no log enabled, one early return — no
+  allocation, no lock), `run_update`'s `catch_unwind` (no cost unless a
+  panic unwinds) and `redo_batch` in the direct-API batch calls (one early
+  return when no redo log is enabled, which is every server); no read path
+  changed.
 - System calls of one 50-triple `INSERT DATA` on an in-memory database with
   the redo log on: base (the review's db#8 evidence, same code as
   `4f0e075`): 50 opens of `redo.log` and 0 fsync; branch: 1 open, 1
