@@ -276,6 +276,32 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         found
     }
 
+    /// Whether `gp` has a solution that `accept` takes — as
+    /// [`pattern_has_solution`](Self::pattern_has_solution), stopping at the
+    /// first one taken (`EXISTS` whose pattern still binds a variable the
+    /// current solution binds, see [`eval_exists`](Self::eval_exists)).
+    pub(super) fn pattern_has_solution_where(
+        &self,
+        gp: &GraphPattern,
+        layout: &VarLayout,
+        accept: &dyn Fn(&Binding) -> bool,
+    ) -> bool {
+        if !self.topk.early_termination {
+            return self.eval_pattern(gp, layout).iter().any(accept);
+        }
+        self.bump(|s| s.streamed += 1);
+        let mut found = false;
+        let _ = self.stream_pattern(gp, layout, &mut |b| {
+            if accept(&b) {
+                found = true;
+                STOP
+            } else {
+                GO
+            }
+        });
+        found
+    }
+
     /// The first `n` solutions of `gp`, in the full evaluation's order. With
     /// early termination off, all of them (the caller cuts).
     pub(super) fn first_solutions(

@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §12 Subqueries ("only the variables projected out of the subquery
+# will be visible"): the inner ?s is not projected, so the outer ?s does not constrain it
+PREFIX : <http://example.org/>
+SELECT ?s WHERE { ?s :p ?o FILTER EXISTS { { SELECT ?z WHERE { ?s :p ?z } } } }

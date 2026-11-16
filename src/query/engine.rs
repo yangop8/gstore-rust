@@ -3830,9 +3830,16 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     }
 
     /// `EXISTS { pat }` / `NOT EXISTS { pat }`: true iff `pat` has at least one
-    /// solution compatible with the current binding `b`. We substitute `b`'s
-    /// bound variables into `pat` as constants (so inner FILTER/BIND that
-    /// reference outer variables see their values), then test non-emptiness.
+    /// solution compatible with the current binding `b` (SPARQL 1.1 §18.6).
+    /// `b`'s bound variables are substituted into `pat` as constants, so
+    /// inner triple patterns, paths, FILTERs and BINDs see their values. A
+    /// variable the substituted pattern still binds — a `VALUES` block's, a
+    /// sub-SELECT's projected one, a BIND target, a graph name bound to a
+    /// blank node — is joined with `b` instead: only a solution that binds it
+    /// to `b`'s value (or leaves it unbound) counts (review query#4: such
+    /// solutions counted whatever they bound, so `FILTER EXISTS { VALUES ?s
+    /// { :a } }` held for every ?s). A sub-SELECT's own variables stay its
+    /// own; only its projection meets `b`.
     fn eval_exists(
         &self,
         negated: bool,
@@ -3842,8 +3849,51 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     ) -> bool {
         let bound = self.subst_pattern(pat, b, outer);
         let layout = VarLayout::build(&bound);
-        let found = self.pattern_has_solution(&bound, &layout);
+        // (inner slot, outer slot) of each variable `b` binds that the
+        // substituted pattern can still bind.
+        let shared: Vec<(usize, usize)> = layout
+            .names
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| !name.starts_with(PRED_ALIAS_PREFIX))
+            .filter_map(|(i, name)| {
+                let &o = outer.index.get(name)?;
+                b[o].map(|_| (i, o))
+            })
+            .collect();
+        let found = if shared.is_empty() {
+            self.pattern_has_solution(&bound, &layout)
+        } else {
+            self.pattern_has_solution_where(&bound, &layout, &|sol: &Binding| {
+                shared.iter().all(|&(i, o)| {
+                    self.same_term_or_unbound(sol[i], layout.is_pred[i], b[o], outer.is_pred[o])
+                })
+            })
+        };
         found ^ negated
+    }
+
+    /// Whether two slots are compatible: either unbound, or the same RDF
+    /// term — equal ids in one id space are (the dictionary is a bijection,
+    /// a computed term has one synthetic id per query); otherwise the terms
+    /// are compared.
+    fn same_term_or_unbound(
+        &self,
+        a: Option<u32>,
+        a_pred: bool,
+        b: Option<u32>,
+        b_pred: bool,
+    ) -> bool {
+        let (Some(x), Some(y)) = (a, b) else {
+            return true;
+        };
+        if a_pred == b_pred && (x == y || (!is_synth(x) && !is_synth(y))) {
+            return x == y;
+        }
+        match self.id_to_term(x, a_pred) {
+            Some(t) => self.id_to_term(y, b_pred).as_ref() == Some(&t),
+            None => false,
+        }
     }
 
     /// An id resolved back to its RDF term (synthetic, predicate, or

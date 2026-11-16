@@ -1,2 +1,0 @@
-query#4
-EXISTS substitutes outer bindings syntactically and skips VALUES blocks.

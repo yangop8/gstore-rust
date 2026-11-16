@@ -500,6 +500,77 @@ fn insert_where_graph_variable_writes_only_compatible_solutions() {
     }
 }
 
+// ---- EXISTS ----------------------------------------------------------------
+
+fn exists_data() -> Data {
+    Data::parse(
+        ":a :p :o1 .
+         :x :p :o2 .
+         :x :p :o3 .",
+    )
+}
+
+/// EXISTS / NOT EXISTS test the pattern against the current solution also
+/// where substitution does not reach: a VALUES block's rows and a
+/// sub-SELECT's projected variables must be compatible with it (SPARQL 1.1
+/// §8.1, §18.6; review query#4 — they ignored the outer binding).
+#[test]
+fn exists_honours_outer_bindings_in_values_and_sub_selects() {
+    let data = exists_data();
+    let rows =
+        data.rows_everywhere("SELECT ?s WHERE { ?s :p ?o FILTER EXISTS { VALUES ?s { :a } } }");
+    assert_eq!(rows, vec![vec![iri("a")]]);
+    let rows =
+        data.rows_everywhere("SELECT ?s WHERE { ?s :p ?o FILTER NOT EXISTS { VALUES ?s { :a } } }");
+    assert_eq!(rows, vec![vec![iri("x")], vec![iri("x")]]);
+    // A VALUES row with UNDEF is compatible with anything.
+    let rows = data.rows_everywhere(
+        "SELECT ?s WHERE { ?s :p ?o FILTER EXISTS { VALUES (?s ?z) { (:nobody 1) (UNDEF 2) } } }",
+    );
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    let rows = data.rows_everywhere(
+        "SELECT ?s WHERE { ?s :p ?o FILTER EXISTS { \
+           { SELECT ?s WHERE { ?s :p ?z } GROUP BY ?s HAVING (COUNT(*) > 1) } } }",
+    );
+    assert_eq!(rows, vec![vec![iri("x")], vec![iri("x")]]);
+    let rows = data.rows_everywhere(
+        "SELECT ?s WHERE { ?s :p ?o FILTER NOT EXISTS { \
+           { SELECT ?s WHERE { ?s :p ?z } GROUP BY ?s HAVING (COUNT(*) > 1) } } }",
+    );
+    assert_eq!(rows, vec![vec![iri("a")]]);
+    // A variable the sub-SELECT does not project is its own: the outer ?s
+    // does not constrain it.
+    let rows = data.rows_everywhere(
+        "SELECT ?s WHERE { ?s :p ?o FILTER EXISTS { { SELECT ?z WHERE { ?s :p ?z } } } }",
+    );
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    // VALUES joined with a triple pattern inside EXISTS.
+    let rows = data.rows_everywhere(
+        "SELECT ?s ?o WHERE { ?s :p ?o FILTER EXISTS { VALUES ?o { :o1 :o3 } ?s :p ?o } }",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![iri("a"), iri("o1")], vec![iri("x"), iri("o3")]]
+    );
+    // As a SELECT expression and in ASK.
+    let rows =
+        data.rows_everywhere("SELECT ?s (EXISTS { VALUES ?s { :a } } AS ?e) WHERE { ?s :p ?o }");
+    let flag = |b: bool| {
+        Some(format!(
+            "\"{b}\"^^<http://www.w3.org/2001/XMLSchema#boolean>"
+        ))
+    };
+    assert_eq!(
+        rows,
+        vec![
+            vec![iri("a"), flag(true)],
+            vec![iri("x"), flag(false)],
+            vec![iri("x"), flag(false)]
+        ]
+    );
+    assert!(!data.ask_everywhere("ASK { :x :p ?o FILTER EXISTS { VALUES ?o { :o1 } } }"));
+}
+
 // ---- the executors agree ---------------------------------------------------
 
 /// SplitMix64.
