@@ -82,11 +82,13 @@ Behaviour changes first:
   comes in two kinds: `new` / `build` / `insert` keep their strings
   (`search_contains`, `prefix`, `string_of` stay exact; `prefix` now checks
   the trigram candidates of the prefix instead of binary-searching a
-  string-ordered list), and the new `StringIndex::candidates_only` /
-  `build_candidates` keep postings and the id list only (`string_of` is
-  `None`, `search_contains` and `prefix` return the candidates;
-  `keeps_strings` tells which). `query::engine::dictionary_string_index`
-  returns the candidates-only kind. The serde form of `StringIndex` changed
+  string-ordered list, so a prefix shorter than three bytes checks every
+  id; no production path calls it), and the new
+  `StringIndex::candidates_only` / `build_candidates` keep postings and
+  the id list only (`string_of` is `None`, `search_contains` and `prefix`
+  return the candidates; `keeps_strings` tells which).
+  `query::engine::dictionary_string_index` returns the candidates-only
+  kind. The serde form of `StringIndex` changed
   (it is not persisted by any database).
 - New library API: `Database::csr_cancellable` and
   `Database::string_index_cancellable` (`csr()` and `string_index()` keep
@@ -147,7 +149,11 @@ none
   `(s, o)` list, literal pairs included, before they are dropped: filtering
   inside the scan needs a streaming `TripleSource` method (e.g. a
   `for_each_so_by_p` callback) implemented by `DiskTriples`, `DiskSource`
-  and `RocksStore`, outside this package.
+  and `RocksStore`, outside this package. In Stream mode those reads also
+  go through `DiskTriples`' list cache (32 MB, oldest first out): each
+  predicate list of 2,048 pairs or more that fits is copied into it, so one
+  CSR build can push the lists hot queries use out of the cache; the
+  streaming method would bypass it.
 - docs/REFACTOR_BACKLOG.md — db#5 (remainder): the incremental refresh
   walks the whole dictionary once (one identity check per term, no trigram
   work for unchanged terms) and keeps an O(1) copy-on-write clone of the
