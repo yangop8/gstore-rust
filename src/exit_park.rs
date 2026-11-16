@@ -5,11 +5,11 @@
 //! leaving it running past `serve_forever`, deterministically: a thread
 //! left detached is still parked when `serve_forever` returns.
 //!
-//! The threads that call [`exiting`] as their last step: the
+//! The threads that call `exiting` as their last step: the
 //! idle-transaction reaper (`gstore-txn-reaper`), the asynchronous
 //! operations' runners (`gstore-task`) and callback threads
 //! (`gstore-callback`), and the background statistics refreshes
-//! (`gstore-stats-refresh`). Their joiners call [`joining`] right before
+//! (`gstore-stats-refresh`). Their joiners call `joining` right before
 //! they join. With no park armed both cost one atomic load.
 
 use std::sync::atomic::{AtomicBool, Ordering};
