@@ -595,6 +595,46 @@ fn only_committed_statements_reach_the_update_log() {
     assert!(!has(&mut r, "rolled_back"));
 }
 
+/// db#3: triples inferred by `materialize_rdfs` and `run_rules` are written
+/// to the redo log (a restore used to lack them); inferred inside a
+/// rolled-back transaction they are not.
+#[test]
+fn inferred_triples_are_in_the_redo_log() {
+    const DATA: &str = "\
+<http://ex/a> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://ex/C> .
+<http://ex/C> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://ex/D> .
+<http://ex/a> <http://ex/knows> <http://ex/b> .
+";
+    let tmp = TmpDir::new("db3");
+    let log = tmp.path("redo.log");
+    let mut db = Database::build_from_str("rdfs", DATA).unwrap();
+    db.enable_redo_log(&log);
+    assert!(db.materialize_rdfs() > 0);
+    db.add_rule("sym", "?x <http://ex/knows> ?y => ?y <http://ex/knows> ?x")
+        .unwrap();
+    assert!(db.run_rules() > 0);
+    db.begin().unwrap();
+    db.insert_triple(&Triple::new(
+        Term::iri("http://ex/e"),
+        Term::iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+        Term::iri("http://ex/C"),
+    ));
+    db.materialize_rdfs();
+    db.rollback().unwrap();
+    let mut r = Database::build_from_str("rdfs", DATA).unwrap();
+    r.replay_redo_log(&log).unwrap();
+    assert_eq!(r.triple_num(), db.triple_num());
+    assert!(ask(
+        &mut r,
+        "ASK { <http://ex/a> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://ex/D> }"
+    ));
+    assert!(ask(
+        &mut r,
+        "ASK { <http://ex/b> <http://ex/knows> <http://ex/a> }"
+    ));
+    assert!(!ask(&mut r, "ASK { <http://ex/e> ?p ?o }"));
+}
+
 // ---- malformed logs --------------------------------------------------------------
 
 /// db#9: lengths that overflow are errors, never panics (replay used to

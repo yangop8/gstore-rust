@@ -2454,6 +2454,19 @@ impl Database {
                     log.push(UndoOp::Del(None, *t));
                 }
             }
+            // Inferred triples are mutations like any other: their redo
+            // records (review db#3), appended together at the end of the
+            // run (inside a transaction: at its commit).
+            let held = std::mem::replace(&mut self.redo_hold, true);
+            for &t in &added {
+                self.record_redo(b'I', None, t);
+            }
+            self.redo_hold = held;
+            if !held && self.txn.is_none() {
+                // Like a direct-API write (no commit point of its own):
+                // `fdatasync`ed by the next one; a failed append is owed.
+                let _ = self.flush_redo(false);
+            }
             self.persist_inferred(&added);
         }
         n
