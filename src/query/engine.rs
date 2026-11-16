@@ -557,15 +557,25 @@ impl QueryCtx {
 
     /// The key identifying the solution mapping `b` for `BNODE(str)`: its
     /// bindings, without the blank nodes `BNODE` itself minted (see
-    /// [`minted`](Self::minted)).
+    /// [`minted`](Self::minted)) and without trailing unbound slots. A
+    /// solution's columns only grow at the end while it is evaluated — the
+    /// SELECT expressions extend it left to right, each alias appended
+    /// unbound before its expression runs (§18.2.4.4) — and an unbound
+    /// column is no part of the mapping, so `(BNODE(?v) AS ?a) (BNODE(?v) AS
+    /// ?b)` sees one solution in both calls.
     fn solution_key(&self, b: &Binding) -> Box<[Option<u32>]> {
         let minted = self.minted.borrow();
-        if minted.is_empty() {
-            return b.as_slice().into();
+        let mut key: Vec<Option<u32>> = if minted.is_empty() {
+            b.to_vec()
+        } else {
+            b.iter()
+                .map(|slot| slot.filter(|id| !minted.contains(id)))
+                .collect()
+        };
+        while key.last() == Some(&None) {
+            key.pop();
         }
-        b.iter()
-            .map(|slot| slot.filter(|id| !minted.contains(id)))
-            .collect()
+        key.into_boxed_slice()
     }
 }
 
