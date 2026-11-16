@@ -544,11 +544,17 @@ fn exchange(
     if target.tls {
         #[cfg(feature = "tls")]
         {
+            // The handshake reads the peer many times inside the first
+            // write: every one of those reads (and writes) is bounded by
+            // what is left of the deadline (`DeadlineStream`), so neither a
+            // peer that never answers the ClientHello (review gapi#12) nor
+            // one trickling its handshake a byte at a time (round-2 review)
+            // holds the caller past it.
+            let stream = DeadlineStream {
+                inner: stream,
+                deadline,
+            };
             let mut tls = tls_client::connect(stream, &target.host, ca_file)?;
-            // The handshake reads the peer inside the first write: bound it
-            // by the deadline too, or a peer that accepts the connection and
-            // never answers the ClientHello holds the caller for good
-            // (review gapi#12).
             arm()?;
             tls.write_all(request).map_err(|e| match e.kind() {
                 io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => timed_out(),
@@ -569,6 +575,50 @@ fn exchange(
     stream.write_all(request)?;
     stream.flush()?;
     read_to_eof(&mut stream, &arm, limits, &timed_out, what)
+}
+
+/// A TCP stream each of whose reads and writes is bounded by what is left
+/// of `deadline`, failing with `TimedOut` once it has passed — what the TLS
+/// session runs over: rustls drives the whole handshake with many reads
+/// inside one write, and a read timeout armed once before it bounded only
+/// each read, so a peer sending a byte now and then held the caller
+/// indefinitely (round-2 review).
+#[cfg(feature = "tls")]
+struct DeadlineStream {
+    inner: TcpStream,
+    deadline: Instant,
+}
+
+#[cfg(feature = "tls")]
+impl DeadlineStream {
+    fn left(&self) -> io::Result<Duration> {
+        self.deadline
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "deadline passed"))
+    }
+}
+
+#[cfg(feature = "tls")]
+impl Read for DeadlineStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let left = self.left()?;
+        self.inner.set_read_timeout(Some(left))?;
+        self.inner.read(buf)
+    }
+}
+
+#[cfg(feature = "tls")]
+impl Write for DeadlineStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let left = self.left()?;
+        self.inner.set_write_timeout(Some(left))?;
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// Resolve `host:port` within `limit`: the system resolver runs on a helper
@@ -592,6 +642,8 @@ fn resolve_within(
     std::thread::Builder::new()
         .name("gstore-resolve".to_string())
         .spawn(move || {
+            #[cfg(test)]
+            resolve_hook::maybe_hang(&name);
             let found = (name.as_str(), port)
                 .to_socket_addrs()
                 .map(|addrs| addrs.collect::<Vec<_>>());
@@ -603,6 +655,46 @@ fn resolve_within(
             io::ErrorKind::TimedOut,
             format!("{what} timed out resolving '{host}'"),
         )),
+    }
+}
+
+/// Test hook: a resolver that hangs. A name ending in [`HANGING`] blocks its
+/// lookup until [`release`] (or a hang guard) — for the test that the
+/// caller's deadline bounds name resolution.
+#[cfg(test)]
+pub(crate) mod resolve_hook {
+    use std::sync::{Condvar, Mutex, PoisonError};
+    use std::time::Duration;
+
+    /// The suffix of names whose lookup hangs.
+    pub(crate) const HANGING: &str = ".resolver-hangs.invalid";
+
+    /// (lookups hanging now, released)
+    static STATE: Mutex<(u32, bool)> = Mutex::new((0, false));
+    static CHANGED: Condvar = Condvar::new();
+
+    pub(super) fn maybe_hang(name: &str) {
+        if !name.ends_with(HANGING) {
+            return;
+        }
+        let mut st = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+        st.0 += 1;
+        CHANGED.notify_all();
+        let (mut st, _) = CHANGED
+            .wait_timeout_while(st, Duration::from_secs(60), |s| !s.1)
+            .unwrap_or_else(PoisonError::into_inner);
+        st.0 -= 1;
+    }
+
+    /// Whether a lookup is hanging now.
+    pub(crate) fn hanging() -> bool {
+        STATE.lock().unwrap_or_else(PoisonError::into_inner).0 > 0
+    }
+
+    /// Let every hanging lookup (and every later one) go on.
+    pub(crate) fn release() {
+        STATE.lock().unwrap_or_else(PoisonError::into_inner).1 = true;
+        CHANGED.notify_all();
     }
 }
 
@@ -671,7 +763,6 @@ fn parse_reply(raw: &[u8]) -> io::Result<HttpReply> {
 #[cfg(feature = "tls")]
 mod tls_client {
     use std::io;
-    use std::net::TcpStream;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
@@ -705,11 +796,11 @@ mod tls_client {
 
     /// Start a TLS session to `host` over `sock`, verifying the server's
     /// certificate against the CA bundle.
-    pub(super) fn connect(
-        sock: TcpStream,
+    pub(super) fn connect<S: io::Read + io::Write>(
+        sock: S,
         host: &str,
         ca_file: Option<&Path>,
-    ) -> io::Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>> {
+    ) -> io::Result<rustls::StreamOwned<rustls::ClientConnection, S>> {
         let path = bundle_path(ca_file)?;
         let pem = std::fs::read(&path)?;
         let mut roots = rustls::RootCertStore::empty();
@@ -1173,6 +1264,99 @@ mIjSMKbBFgquUgIhAPHupNklmfNjoKbt7eKBPIKOTzsJbKSpBaMVuL/X4bNv
             .expect("the request was still blocked in the handshake")
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+    }
+
+    /// Round-2 review: a peer that trickles its TLS handshake a byte at a
+    /// time — each byte well within the per-read timeout — is bounded by
+    /// the request's deadline too. Before the fix the read timeout was
+    /// armed once before the handshake, every read got a byte in time, and
+    /// the call ended only when the peer gave up (here: with a closed
+    /// connection, not a timeout).
+    #[cfg(feature = "tls")]
+    #[test]
+    fn an_https_peer_trickling_its_handshake_hits_the_deadline() {
+        use std::sync::mpsc;
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "gstore_https_trickle_{}_{}",
+            std::process::id(),
+            crate::sysdb::clock::unix_millis()
+        ));
+        let _cleanup = Cleanup(dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("cert.pem");
+        std::fs::write(&cert, CERT_PEM).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // A handshake record header announcing 16 KiB, then its bytes one
+        // at a time, 50 ms apart (5 s in all), then the connection closes.
+        let trickler = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let _ = sock.write_all(&[0x16, 0x03, 0x03, 0x40, 0x00]);
+            for _ in 0..100 {
+                std::thread::sleep(Duration::from_millis(50));
+                if sock.write_all(&[0x02]).is_err() {
+                    break;
+                }
+            }
+        });
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let opts = PostOptions {
+                limits: Limits {
+                    total: Duration::from_millis(500),
+                    max_response: 1 << 10,
+                },
+                ca_file: Some(cert),
+                refuse_local: false,
+            };
+            let url = format!("https://localhost:{port}/cb");
+            let _ = tx.send(post_with(&url, "application/json", b"{}", &opts));
+        });
+        let outcome = rx.recv_timeout(Duration::from_secs(60));
+        let err = outcome
+            .expect("the request was still blocked in the handshake")
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        trickler.join().unwrap();
+    }
+
+    /// Round-2 review (gapi#12): name resolution is bounded by the request's
+    /// deadline — a resolver that hangs (test hook `resolve_hook`) costs the
+    /// caller its deadline, and the lookup goes on in the background.
+    #[test]
+    fn a_hanging_resolver_costs_the_caller_only_its_deadline() {
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::channel();
+        let url = format!("http://callback{}/cb", resolve_hook::HANGING);
+        std::thread::spawn(move || {
+            let opts = PostOptions {
+                limits: Limits {
+                    total: Duration::from_millis(300),
+                    max_response: 1 << 10,
+                },
+                ca_file: None,
+                refuse_local: false,
+            };
+            let _ = tx.send(post_with(&url, "application/json", b"{}", &opts));
+        });
+        let outcome = rx.recv_timeout(Duration::from_secs(60));
+        let still_hanging = resolve_hook::hanging();
+        resolve_hook::release();
+        let err = outcome
+            .expect("the request waited for the hanging resolver")
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert!(err.to_string().contains("timed out resolving"), "{err}");
+        assert!(
+            still_hanging,
+            "the lookup was still hanging when it gave up"
+        );
     }
 
     /// `post_with` speaks https (feature `tls`), trusting the given CA file
