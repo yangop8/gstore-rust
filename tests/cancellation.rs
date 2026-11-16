@@ -89,6 +89,7 @@ enum Until {
 #[derive(Clone, Copy)]
 enum Build {
     Csr,
+    StringIndex,
 }
 
 impl Park {
@@ -141,6 +142,10 @@ impl Park {
             Build::Csr => {
                 build_hook::set(Some(Arc::new(hook)));
                 || build_hook::set(None)
+            }
+            Build::StringIndex => {
+                gstore::kvstore::string_index::build_hook::set(Some(Arc::new(hook)));
+                || gstore::kvstore::string_index::build_hook::set(None)
             }
         };
         Park {
@@ -202,6 +207,10 @@ const GRAPH_QUERY: &str =
 const GRAPH_UPDATE: &str = "INSERT { <http://ex/r> <http://ex/v> ?r } WHERE { \
                             { SELECT (kHopReachable(<http://ex/n0>, <http://ex/n5>, true, 6, {}) AS ?r) \
                             WHERE {} } }";
+
+/// A query with a mandatory substring filter (the substring index prunes it).
+const SUBSTRING_QUERY: &str =
+    "SELECT ?s WHERE { ?s <http://ex/label> ?l FILTER(CONTAINS(?l, \"number 42\")) }";
 
 /// A plain read (`Database::read_as`): the parked CSR build observes the
 /// raised flag at its next check, the read fails with `Cancelled`, nothing
@@ -523,4 +532,60 @@ fn a_database_kept_busy_delays_only_its_own_save() {
         saved[0].starts_with('b') && saved[1].starts_with('a'),
         "b first, then a: {report:?}"
     );
+}
+
+/// The rows of SELECT `q` on `db`.
+fn rows_of(db: &Database, q: &str, cancel: Option<Arc<AtomicBool>>) -> Result<usize, GStoreError> {
+    match db.query_read(q, cancel, None)? {
+        gstore::QueryResult::Select(rs) => Ok(rs.rows.len()),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The substring-index build of a substring FILTER: the parked build
+/// observes the raised flag at its next check, the query fails with
+/// `Cancelled`, and no index is cached.
+#[test]
+fn a_cancelled_substring_query_stops_its_index_build_and_caches_nothing() {
+    let _serial = serial();
+    let mut db = Database::build_from_str("substr", &chain(200)).unwrap();
+    db.set_query_cache_size(0);
+    let flag = Arc::new(AtomicBool::new(false));
+    let park = Park::install(Build::StringIndex);
+    thread::scope(|s| {
+        let reader = s.spawn(|| rows_of(&db, SUBSTRING_QUERY, Some(Arc::clone(&flag))));
+        park.wait_parked();
+        flag.store(true, Ordering::SeqCst);
+        park.release();
+        let r = reader.join().unwrap();
+        assert!(matches!(r, Err(GStoreError::Cancelled)), "{r:?}");
+    });
+    assert!(
+        db.cached_string_index().is_none(),
+        "a cancelled build must not be cached"
+    );
+    drop(park);
+    let expected = rows_of(&db, SUBSTRING_QUERY, None).unwrap();
+    assert!(db.cached_string_index().is_some());
+    assert_eq!(expected, 1, "n42");
+}
+
+/// A reader never waits for another request's substring-index build: while
+/// one is held, the same query on another thread answers at once (without
+/// the prefilter, exactly), and the held build is cached once it ends.
+#[test]
+fn a_reader_does_not_wait_for_another_requests_index_build() {
+    let _serial = serial();
+    let mut db = Database::build_from_str("nowait", &chain(200)).unwrap();
+    db.set_query_cache_size(0);
+    let hold = Park::hold(Build::StringIndex);
+    thread::scope(|s| {
+        let builder = s.spawn(|| rows_of(&db, SUBSTRING_QUERY, None));
+        hold.wait_parked();
+        assert_eq!(rows_of(&db, SUBSTRING_QUERY, None).unwrap(), 1);
+        assert!(db.cached_string_index().is_none(), "still being built");
+        hold.release();
+        assert_eq!(builder.join().unwrap().unwrap(), 1);
+    });
+    assert!(db.cached_string_index().is_some());
 }

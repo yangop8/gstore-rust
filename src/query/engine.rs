@@ -167,7 +167,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -178,7 +178,7 @@ use crate::analytics::gfun::{self, GCall, GFnKind, GFunCtx, GFunValue, GNode};
 use crate::analytics::GraphView;
 use crate::dict::{Dictionary, Space, TermStr};
 use crate::error::{GStoreError, Result};
-use crate::kvstore::StringIndex;
+use crate::kvstore::{string_index, StringIndex};
 use crate::model::id::is_entity_id;
 use crate::model::id::{PredId, LITERAL_FIRST_ID};
 use crate::model::{Term, Triple};
@@ -2947,7 +2947,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             self.string_index_tried.set(true);
             let idx = match self.string_index_provider {
                 Some(provider) => provider(),
-                None => dictionary_string_index(self.dict),
+                // A cancelled build gives none: the query's own next check
+                // stops it (review conc#5).
+                None => dictionary_string_index_cancellable(self.dict, self.cancel.as_deref())
+                    .ok()
+                    .flatten(),
             };
             *self.string_index.borrow_mut() = idx;
         }
@@ -6408,24 +6412,117 @@ const STRING_INDEX_MIN_ENTRIES: usize = 64;
 /// string somehow fails to re-parse falls back to its raw form (a term the
 /// dictionary stored always re-parses, so this is only a safety net).
 pub fn dictionary_string_index(dict: &Dictionary) -> Option<Arc<StringIndex>> {
+    dictionary_string_index_cancellable(dict, None)
+        .ok()
+        .flatten()
+}
+
+/// How many dictionary terms a substring-index build or refresh walks
+/// between two cancellation checks.
+const STRING_INDEX_POLL: usize = 1024;
+
+/// [`dictionary_string_index`] for a request with a cancel flag: a raised
+/// `cancel` stops the build — checked every [`STRING_INDEX_POLL`] terms —
+/// with [`GStoreError::Cancelled`] (review conc#5). `Ok(None)` when no index
+/// would help (see there).
+pub fn dictionary_string_index_cancellable(
+    dict: &Dictionary,
+    cancel: Option<&AtomicBool>,
+) -> Result<Option<Arc<StringIndex>>> {
     if dict.is_disk_backed() || dict.entity_num() + dict.literal_num() < STRING_INDEX_MIN_ENTRIES {
-        return None;
+        return Ok(None);
     }
+    string_index::poll(cancel)?;
     // A candidates-only index (the FILTER checks every candidate): each form
     // is posted as it is computed, and no copy of it is kept.
     let mut idx = StringIndex::candidates_only();
     let mut ids: Vec<u32> = Vec::with_capacity(dict.entity_num() + dict.literal_num());
+    let mut walked = 0usize;
+    let mut stopped = None;
     for space in [Space::Entity, Space::Literal] {
         // In memory: cannot fail.
         let _ = dict.for_each_term(space, space.first_id(), |id, s| {
+            walked += 1;
+            if walked.is_multiple_of(STRING_INDEX_POLL) {
+                if let Err(e) = string_index::poll(cancel) {
+                    stopped = Some(e);
+                    return ControlFlow::Break(());
+                }
+            }
             index_substring_forms(&mut idx, id, s);
             ids.push(id);
             ControlFlow::Continue(())
         });
+        if let Some(e) = stopped {
+            return Err(e);
+        }
     }
+    string_index::poll(cancel)?;
     idx.add_ids(ids);
     idx.shrink();
-    Some(Arc::new(idx))
+    Ok(Some(Arc::new(idx)))
+}
+
+/// Bring `idx` — the substring index of `base`, an earlier state of the
+/// in-memory dictionary `dict` (an O(1) copy-on-write clone of it) — up to
+/// date with `dict`: post every term whose string is new or changed since
+/// `base` (a new id, or a freed id reused for another term), counting them
+/// in `posted`. An unchanged term shares its string with `base`, so the
+/// comparison is by identity (`base` keeps every string it had alive: an
+/// address cannot be reused for another term meanwhile), one look-up per
+/// term — no trigram work for what did not change. The postings of a
+/// term freed since `base` stay: a superset (the FILTER checks every
+/// candidate). Review db#5.
+///
+/// `Ok(false)` as soon as `posted` passes `limit` (a full build is cheaper
+/// then: `idx` holds part of the change, still a superset for `base`);
+/// [`GStoreError::Cancelled`] when `cancel` is raised (checked every
+/// [`STRING_INDEX_POLL`] terms; the same holds for `idx`).
+pub(crate) fn refresh_string_index(
+    idx: &mut StringIndex,
+    base: &Dictionary,
+    dict: &Dictionary,
+    posted: &mut usize,
+    limit: usize,
+    cancel: Option<&AtomicBool>,
+) -> Result<bool> {
+    string_index::poll(cancel)?;
+    let mut walked = 0usize;
+    let mut stopped = None;
+    let mut over = false;
+    let mut ids: Vec<u32> = Vec::new();
+    for space in [Space::Entity, Space::Literal] {
+        let _ = dict.for_each_term(space, space.first_id(), |id, s| {
+            walked += 1;
+            if walked.is_multiple_of(STRING_INDEX_POLL) {
+                if let Err(e) = string_index::poll(cancel) {
+                    stopped = Some(e);
+                    return ControlFlow::Break(());
+                }
+            }
+            let same = base
+                .resolve(space, id)
+                .is_some_and(|old| old.as_ptr() == s.as_ptr() && old.len() == s.len());
+            if !same {
+                index_substring_forms(idx, id, s);
+                ids.push(id);
+                *posted += 1;
+                if *posted > limit {
+                    over = true;
+                    return ControlFlow::Break(());
+                }
+            }
+            ControlFlow::Continue(())
+        });
+        if stopped.is_some() || over {
+            break;
+        }
+    }
+    idx.add_ids(ids);
+    match stopped {
+        Some(e) => Err(e),
+        None => Ok(!over),
+    }
 }
 
 /// Post `id` (dict key `s`) under the strings a substring filter may compare

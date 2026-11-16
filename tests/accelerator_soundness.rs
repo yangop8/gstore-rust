@@ -302,3 +302,72 @@ fn the_database_index_keeps_no_copy_of_the_strings() {
         with_strings.heap_bytes()
     );
 }
+
+/// review db#5: a write that adds or frees terms no longer throws the
+/// cached substring index away: the next substring query extends it with
+/// the new terms (and the terms of reused ids) — exactly as a fresh index
+/// would answer — and only a change of more than a quarter of the
+/// dictionary rebuilds it from scratch.
+#[test]
+fn adding_or_freeing_terms_extends_the_index_instead_of_rebuilding_it() {
+    let mut text = String::new();
+    for i in 0..400 {
+        text.push_str(&format!(
+            "<http://ex/n{i}> <http://ex/label> \"plain label {i}\" .\n"
+        ));
+    }
+    let mut db = Database::build_from_str("churn", &text).unwrap();
+    db.set_query_cache_size(0);
+    let count = |db: &Database, needle: &str| {
+        let q = format!(
+            "SELECT ?s WHERE {{ ?s <http://ex/label> ?o FILTER(CONTAINS(?o, \"{needle}\")) }}"
+        );
+        let pushed = rows(db, &q).len();
+        let q = format!(
+            "SELECT ?s WHERE {{ ?s <http://ex/label> ?o FILTER(CONTAINS(?o, \"{needle}\") || false) }}"
+        );
+        assert_eq!(pushed, rows(db, &q).len(), "{needle}");
+        pushed
+    };
+    assert_eq!(count(&db, "label 12"), 11);
+    assert_eq!(db.string_index_builds(), (1, 0));
+
+    // New terms: the index is extended, and finds them.
+    db.query("INSERT DATA { <http://ex/fresh> <http://ex/label> \"MARKER fresh\" }")
+        .unwrap();
+    assert_eq!(count(&db, "MARKER"), 1);
+    assert_eq!(db.string_index_builds(), (1, 1));
+
+    // Freed terms (reclaimed ids) and a new term that may reuse one.
+    db.query("DELETE DATA { <http://ex/n7> <http://ex/label> \"plain label 7\" }")
+        .unwrap();
+    db.query("INSERT DATA { <http://ex/n8> <http://ex/label> \"MARKER reused\" }")
+        .unwrap();
+    assert_eq!(count(&db, "MARKER"), 2);
+    assert_eq!(count(&db, "label 7"), 10);
+    assert_eq!(db.string_index_builds(), (1, 2));
+
+    // The extended index finds whatever a fresh one finds.
+    let cached = db.cached_string_index().unwrap();
+    let fresh = gstore::query::engine::dictionary_string_index(db.dict()).unwrap();
+    for needle in ["MARKER", "reused", "label 7", "label 39", "ex/n8", "fresh"] {
+        let c = cached.contains_candidates(needle);
+        for id in fresh.contains_candidates(needle) {
+            assert!(c.binary_search(&id).is_ok(), "{needle}: id {id} lost");
+        }
+    }
+    drop(cached);
+
+    // A large change (more than a quarter of the terms, and more than the
+    // floor of 4096) is rebuilt from scratch.
+    let mut big = String::from("INSERT DATA {\n");
+    for i in 0..5000 {
+        big.push_str(&format!(
+            "<http://ex/m{i}> <http://ex/label> \"bulk label {i}\" .\n"
+        ));
+    }
+    big.push('}');
+    db.query(&big).unwrap();
+    assert_eq!(count(&db, "bulk label 4999"), 1);
+    assert_eq!(db.string_index_builds(), (2, 2));
+}

@@ -48,11 +48,60 @@
 //! scan, still exactly).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::{GStoreError, Result};
+
 /// Substring length used for the trigram inverted index.
 const GRAM: usize = 3;
+
+/// One cancellation check of a substring-index build or refresh over a
+/// dictionary (see `query::engine::dictionary_string_index_cancellable`):
+/// the [`build_hook`] (tests), then `cancel`.
+pub(crate) fn poll(cancel: Option<&AtomicBool>) -> Result<()> {
+    build_hook::poll(cancel);
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        Err(GStoreError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+/// A process-wide hook that runs at every cancellation check of a
+/// dictionary substring-index build or refresh with the request's cancel
+/// flag — so a test can park a build at a check and prove that a `/cancel`
+/// raised meanwhile is observed at the next one. Not for production use.
+#[doc(hidden)]
+pub mod build_hook {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    /// What runs at a check: it gets the build's flag (`None`: the build
+    /// cannot be cancelled).
+    pub type Hook = Arc<dyn Fn(Option<&AtomicBool>) + Send + Sync>;
+
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+
+    /// Install (`Some`) or remove (`None`) the hook.
+    pub fn set(hook: Option<Hook>) {
+        let mut slot = HOOK.lock().unwrap_or_else(PoisonError::into_inner);
+        INSTALLED.store(hook.is_some(), Ordering::SeqCst);
+        *slot = hook;
+    }
+
+    pub(crate) fn poll(cancel: Option<&AtomicBool>) {
+        if !INSTALLED.load(Ordering::Acquire) {
+            return;
+        }
+        let hook = HOOK.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        if let Some(hook) = hook {
+            hook(cancel);
+        }
+    }
+}
 
 /// A secondary index over `(id, string)` pairs for substring / prefix lookups
 /// (see the module docs for its two kinds).
