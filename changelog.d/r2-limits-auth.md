@@ -6,9 +6,11 @@ Behaviour changes first:
 
 - **Failed-login lockout per account and address, on every password path
   (review gapi#5, sec#7, http#6; D1 secure default).** Failures are now
-  counted per account *and* client address: after `login_lockout_failures`
-  (default 4, upstream's count) failures that account is locked for that
-  address — 1 s at first, each further failure doubling the lock up to
+  counted per account *and* client address (an IPv6 client by its /64
+  network, an IPv4-mapped one by its IPv4 address — round-2 review): after
+  more than `login_lockout_failures` failures (the next failure locks;
+  default 4, so the 5th locks, as upstream's `errornum > 4`) that account is
+  locked for that address — 1 s at first, each further failure doubling the lock up to
   `login_lockout_max_seconds` (default 900) — and the counts are forgotten
   after an hour without a failure. Every path that checks a password asks the
   lockout **before** the PBKDF2 hash runs: `/api` `login`, `testConnect` and
@@ -19,12 +21,17 @@ Behaviour changes first:
   Requests` with `Retry-After`. A success clears only its own account's count
   at that address (one account's login no longer unlocks another), and a lock
   refuses only that account's password checks — other users, other
-  operations and logged-in sessions from the address keep working, so one
-  client behind a proxy or NAT can no longer lock everyone out until a
-  restart. Failures of every account from one address also lock the address's
-  password checks once there are more than `8 × login_lockout_failures`
-  (default 32) of them, with the same back-off, so guessing across many user
-  names gets no free hashes either. **Upstream-compat switch**
+  operations and logged-in sessions from the address keep working. Failures
+  of every account from one address also lock the address's password checks
+  once there are more than `8 × login_lockout_failures` (default 32) of them,
+  with the same back-off, so guessing across many user names gets no free
+  hashes either; that address-wide lock spares the accounts that
+  authenticated successfully from the address within the last hour (round-2
+  review: before, it refused every account behind a shared proxy or NAT
+  address, `root` included, with the account lock's message) and says
+  "too many failed logins from this address". The key is the TCP peer's
+  address: behind a reverse proxy all clients share the proxy's. The three
+  keys are applied by `refreshconf` too (round-2 review). **Upstream-compat switch**
   `upstream_login_lockout=on` restores upstream's rule (per address; `login`,
   `testConnect` and REST `/login` exempt and still evaluating guesses; any
   successful login resets the address; until restart); `gserver` then warns
@@ -35,7 +42,10 @@ Behaviour changes first:
   — REST `/sparql` and `/update`, `/api` `query` (synchronous or `async`), the
   single-database server's `/sparql` and `/update` — is stopped at its next
   cancellation check and answered as timed out: REST and single-database
-  `503` with a `{"error":"query timed out after … (query_timeout) …"}` body,
+  `503` with a `{"error":"query timed out after … (query_timeout) …"}` body
+  (the single-database `/update` too since the round-2 review fix — it
+  answered `400`; an UPDATE stopped after applying some of its operations is
+  the `400` query error that says so),
   `/api` `1005 "Query fail: query timed out …"`. It releases the database it
   held, so an UPDATE queued behind a runaway read (which, with std's
   writer-preferring lock, blocked every later reader) now completes. The
@@ -45,8 +55,11 @@ Behaviour changes first:
 - **`max_result_bytes` (review sec#10).** New `[server]` key (bytes; default
   1 GiB, `0` = off). An answer whose serialization passes it is refused as
   soon as it does — REST and single-database `503 {"error":"result too
-  large: …"}`, `/api` `1005` (the cells of the returned rows are summed up
-  before the JSON document is built); a streamed single-database answer
+  large: …"}`, `/api` `1005` (an upper bound of the returned rows'
+  serialized size — names and values counted as escaped JSON strings since
+  the round-2 review fix, which found raw lengths letting escape-heavy
+  answers through at several times the budget — is summed up before the
+  JSON document is built); a streamed single-database answer
   (`?stream=true`) is cut off without its closing chunk. `format=file` /
   `n-triple-file` results (written to disk) are not limited.
 - **Failed `/api` queries are in the query log (review gapi#8)** with their
@@ -66,16 +79,29 @@ Behaviour changes first:
   (`TaskConfig::callback_workers`, default 2; queue bounded by
   `max_pending`, beyond which a delivery is recorded as failed), never by a
   task runner, so a slow or silent callback host no longer starves other
-  users' asynchronous operations. Name resolution of `http_client` requests
-  (callbacks, `SERVICE`, downloads) is bounded by the request's deadline, and
-  with the `tls` feature the TLS handshake is too (an `https://` peer that
-  never answered the ClientHello used to block forever).
+  users' asynchronous operations. Since the round-2 review fix a queued
+  callback holds a spilled result as its file's name (read when it is
+  delivered), and the queue is also bounded by bytes
+  (`TaskConfig::callback_queue_bytes`, default 64 MiB) and per user
+  (`TaskConfig::callback_pending_per_user`, default 32): before, every queued
+  callback kept its whole result in memory. Name resolution of `http_client`
+  requests (callbacks, `SERVICE`, downloads) is bounded by the request's
+  deadline, and with the `tls` feature the TLS handshake is too — every read
+  of it since the round-2 review fix (an `https://` peer that never answered
+  the ClientHello used to block forever; one trickling its handshake still
+  did).
 - Asynchronous operations and callbacks run on threads with the HTTP
   workers' stack size (`WORKER_STACK_SIZE`), not the 2 MiB default: a deep
   but allowed async query no longer aborts an unoptimized server (review
   design#8). A runner that panics outside the operation's `catch_unwind`
   gives its slot back (and is replaced when work waits) instead of leaking
   it until no runner starts any more (review gapi#20).
+- Library behaviour change: `IpFilter::locked_out` (with `note_failure`,
+  upstream's per-address lockout) locks out only a filter built
+  `with_upstream_lockout(true)`; a filter from `IpFilter::new` counts
+  `note_failure`s but `locked_out` stays `false` — the default lockout is
+  `auth_refusal` / `note_auth_failure` (review gapi#5). Embedders that used
+  `new` + `note_failure` + `locked_out` add `.with_upstream_lockout(true)`.
 - Library: `gapi::ipfilter::{LoginLockout, LockoutPolicy}` and
   `IpFilter::{auth_refusal, note_auth_failure, note_auth_success,
   note_login_success, with_upstream_lockout, with_lockout_policy}`;
@@ -245,9 +271,9 @@ to back in one session.
   `max_result_bytes` — those functions belong to r2-txn this round; arming
   is one `crate::deadline::arm(&cancel, config.query_timeout)` and rendering
   through `render_result_within`.
-- **For r3-rest-parity:** the single-database server's `/update` endpoint
-  (`ServerInner::run_update`, not in this package's regions) answers a
-  timed-out UPDATE `400` with the "query timed out" message; `/sparql`
-  answers it `503`.
+- ~~For r3-rest-parity: the single-database server's `/update` answers a
+  timed-out UPDATE `400`~~ — done by the round-2 review fix
+  (`ServerInner::run_update` has the `Timeout` arm `/sparql` has;
+  `tests/single_database_update_timeout_is_503.rs`).
 - Partial / deferred ids: none (remaining refactors listed under Docs notes
   → REFACTOR_BACKLOG).

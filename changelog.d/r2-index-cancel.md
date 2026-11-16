@@ -73,8 +73,15 @@ Behaviour changes first:
   connection workers (at most 2 s; a worker still serving a connection then
   is left to finish and logged), `ApiServer` joins its statistics refreshes,
   and the shared cancel-bridge thread ends once nothing is registered (the
-  next registration starts another), so a program that stops a server and
-  starts another in the same process keeps none of the old one's threads.
+  next registration starts another). The round-2 review found threads that
+  could still outlive it — a refresh started between `stop_stats_refreshes`
+  and the retire, a refresh whose handle was not stored yet, and the
+  asynchronous operations' runner and callback threads, which nothing
+  joined — and fixed them (r2-integration fragment): a program that stops a
+  server and starts another in the same process keeps none of the old one's
+  threads, except a runner whose operation ignored its cancel past
+  `shutdown_wait` or a callback still being delivered (bounded by
+  `callback_timeout`), which finish on their own.
 - **The substring index a database caches keeps candidates only**
   (gap-accel-soundness#3): no second copy of every term string and no
   string-sorted id list (about a third of the resident index: 32.4 % of

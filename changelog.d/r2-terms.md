@@ -133,6 +133,16 @@ none
   skipped statements: check for it in migration scripts, and rebuild with
   `--strict` to keep ill-typed literals that a strict import or an older
   version stored.
+- README.md (upgrade section) and docs/DEPLOY.md (round-2 review,
+  tests-compat): data an older version loaded with a malformed language tag
+  or blank-node label (`"x"@zh_CN`, a JSON-LD `_:a b`) is stored as it was,
+  but the readers now normalise the tag (`zh-CN`) and hash the label, so
+  removing it by re-reading its source — `gsub`, `/api` `batchRemove`, REST
+  `/batchRemove` — does not match it: the command succeeds, counting those
+  statements as read but not removed, and the legacy terms stay. Remove them by
+  their stored form instead, e.g. `DELETE { ?s ?p ?o } WHERE { ?s ?p ?o
+  FILTER(lang(?o) = "zh_CN") }` (`LANG()` returns the stored tag), or
+  export, normalise and rebuild the database.
 - README.md (SPARQL semantics): `sameTerm` is the store's term identity
   (`"v"` and `"v"^^xsd:string` are two terms). `IRI()` / `URI()` /
   `STRLANG()` / `STRDT()` reject text that is not an IRI or a language tag.
