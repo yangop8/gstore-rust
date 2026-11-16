@@ -528,9 +528,16 @@ pub struct Evaluator<'a, S: TripleSource = TripleStore> {
     /// Work counters ([`stats`](Self::stats)), shared with `GRAPH`
     /// sub-evaluators so their work counts too.
     stats: Rc<std::cell::Cell<EvalStats>>,
-    /// The most bytes of JSON one graph-function call may produce
+    /// The most bytes of JSON the graph-function and PFN calls of one query
+    /// may produce together
     /// ([`with_gfun_max_output_bytes`](Self::with_gfun_max_output_bytes)).
     gfun_max_output: usize,
+    /// The graph-function output this query produced so far (bytes): every
+    /// graph-function and PFN call charges its text against
+    /// `gfun_max_output` — each GROUP BY group, and calls inside `GRAPH`
+    /// sub-evaluators (shared `Rc`) — so the bound is a per-query budget
+    /// (review gap-gfun-fuzz#5).
+    gfun_spent: Rc<std::cell::Cell<usize>>,
     /// Who calls `PFN.name(…)` functions, from which registry
     /// ([`with_pfn`](Self::with_pfn)); `None` = PFN calls fail.
     pfn: Option<crate::pfn::PfnCaller>,
@@ -589,6 +596,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             topk: TopKOptions::default(),
             stats: Rc::default(),
             gfun_max_output: crate::analytics::gfun::paths::MAX_OUTPUT_BYTES,
+            gfun_spent: Rc::default(),
             pfn: None,
         }
     }
@@ -620,6 +628,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             topk: TopKOptions::default(),
             stats: Rc::default(),
             gfun_max_output: crate::analytics::gfun::paths::MAX_OUTPUT_BYTES,
+            gfun_spent: Rc::default(),
             pfn: None,
         }
     }
@@ -732,11 +741,14 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         self
     }
 
-    /// Bound the JSON one call of a gStore advanced graph function may
-    /// produce (default
-    /// [`paths::MAX_OUTPUT_BYTES`](crate::analytics::gfun::paths::MAX_OUTPUT_BYTES));
-    /// a call that would exceed it fails the query (see
-    /// [`GFunCtx::with_max_output_bytes`]).
+    /// Bound the JSON the gStore advanced graph functions (and `PFN.name`
+    /// calls) of one query may produce together (default
+    /// [`paths::MAX_OUTPUT_BYTES`](crate::analytics::gfun::paths::MAX_OUTPUT_BYTES)):
+    /// a per-query budget that every call is charged against — each GROUP
+    /// BY group and every call inside a `GRAPH` block — and that each call
+    /// also checks while it builds its text (see
+    /// [`GFunCtx::with_max_output_bytes`]). A query that would exceed it
+    /// fails.
     pub fn with_gfun_max_output_bytes(mut self, bytes: usize) -> Evaluator<'a, S> {
         self.gfun_max_output = bytes;
         self
@@ -1577,15 +1589,31 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     lang: None,
                 },
             };
+            self.charge_gfun_output(call.kind.name(), value.lexical().len())?;
             return Ok(Some(self.value_to_id(&value)));
         }
         let mut args = call.to_gargs(srcs, dsts, self.dict);
         args.where_empty = constant;
-        let mut ctx = GFunCtx::new(&csr, self.dict).with_max_output_bytes(self.gfun_max_output);
+        // The call is bounded by what is left of the query's budget.
+        let left = self.gfun_output_left();
+        let mut ctx = GFunCtx::new(&csr, self.dict).with_max_output_bytes(left);
         if let Some(flag) = &self.cancel {
             ctx = ctx.with_cancel(flag);
         }
-        let value = match gfun::eval(call.kind, &ctx, &args)? {
+        let out = gfun::eval(call.kind, &ctx, &args).map_err(|e| {
+            // The call's own bound error, once earlier calls of the query
+            // spent part of the budget, is the query's budget error.
+            let at_budget = matches!(&e, GStoreError::Query(m)
+                if m.starts_with(&format!("{}: more than ", call.kind.name()))
+                    && m.contains(&format!(" {left} bytes of output"))
+                    && !m.contains(" paths or "));
+            if left < self.gfun_max_output && at_budget {
+                gfun::query_output_budget_exceeded(call.kind.name(), self.gfun_max_output)
+            } else {
+                e
+            }
+        })?;
+        let value = match out {
             // Upstream stores the JSON text as a plain literal (GE:1578,
             // GE:2019). `confidenceDegree`'s `pfn_type` result replaces the
             // whole upstream response with `{"results": …}`; this engine has
@@ -1598,7 +1626,32 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             GFunValue::Int(v) => Value::Int(v),
             GFunValue::Num(v) => Value::Double(v),
         };
+        let bytes = match &value {
+            Value::Str { value, .. } => value.len(),
+            v => v.lexical().len(),
+        };
+        self.charge_gfun_output(call.kind.name(), bytes)?;
         Ok(Some(self.value_to_id(&value)))
+    }
+
+    /// The graph-function output this query may still produce (see
+    /// [`with_gfun_max_output_bytes`](Self::with_gfun_max_output_bytes)).
+    fn gfun_output_left(&self) -> usize {
+        self.gfun_max_output.saturating_sub(self.gfun_spent.get())
+    }
+
+    /// Charge `bytes` of graph-function / PFN output (by the call `label`)
+    /// to the query's budget; an error once the query's output passes it.
+    fn charge_gfun_output(&self, label: &str, bytes: usize) -> Result<()> {
+        let spent = self.gfun_spent.get().saturating_add(bytes);
+        if spent > self.gfun_max_output {
+            return Err(gfun::query_output_budget_exceeded(
+                label,
+                self.gfun_max_output,
+            ));
+        }
+        self.gfun_spent.set(spent);
+        Ok(())
     }
 
     /// Evaluate a projected graph function or PFN call (see
@@ -1661,6 +1714,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         })?;
         let csr = self.gfun_csr()?;
         let graph = crate::pfn::CsrGraphCtx::new(&csr, self.dict);
+        // Bounded by what is left of the query's graph-function budget.
+        let left = self.gfun_output_left();
         let var_values = |var: &str| -> Option<Vec<String>> {
             let &idx = layout.index.get(var)?;
             if bind_only.contains(var) {
@@ -1685,27 +1740,15 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             // (`SLOG_ERROR("run dynamic function fail: …")`).
             crate::gs_debug!("PFN.{name}: calling with {params}");
             caller
-                .run(
-                    &func,
-                    params,
-                    &graph,
-                    self.cancel.as_deref(),
-                    self.gfun_max_output,
-                )
+                .run(&func, params, &graph, self.cancel.as_deref(), left)
                 .inspect_err(|e| {
                     if !matches!(e, GStoreError::Cancelled) {
                         crate::gs_warn!("PFN.{name}: the call failed: {e}");
                     }
                 })
         };
-        let text = crate::pfn::call::evaluate(
-            name,
-            &args,
-            constant,
-            var_values,
-            run,
-            self.gfun_max_output,
-        )?;
+        let text = crate::pfn::call::evaluate(name, &args, constant, var_values, run, left)?;
+        self.charge_gfun_output(&format!("PFN.{name}"), text.len())?;
         Ok(Some(self.value_to_id(&Value::Str {
             value: text,
             lang: None,
@@ -1869,6 +1912,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         };
 
         let mut grows: Vec<Binding> = Vec::new();
+        // Variable-free graph-function values: item index → (id, bytes).
+        let mut fixed_gfn: HashMap<usize, (Option<u32>, usize)> = HashMap::new();
         for key in &order {
             let sols: Vec<&Binding> = groups[key].iter().map(|&i| &solutions[i]).collect();
             let gb = self.group_row(&sols, layout, &glayout, &aggs);
@@ -1880,13 +1925,34 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 continue;
             }
             // An advanced graph function over the group's solutions
-            // (upstream: once per GROUP BY group, GE:2546-2620).
+            // (upstream: once per GROUP BY group, GE:2546-2620). One whose
+            // vertex arguments name no variable has the same value in every
+            // group: it is computed once, and its output is charged to the
+            // query's budget for every group that shows it (review
+            // gap-gfun-fuzz#5).
             let mut gfn_values: Vec<Option<Option<u32>>> = Vec::with_capacity(items.len());
-            for it in items {
+            for (idx, it) in items.iter().enumerate() {
                 gfn_values.push(match it {
                     SelectItem::Expr(Expr::GraphFn { func, args }, _) => {
                         let call = GCall::from_ast(*func, args)?;
-                        Some(self.eval_graph_fn(&call, &sols, layout, bind_only, false)?)
+                        let fixed = !matches!(call.src, Some(VarOrIri::Var(_)))
+                            && !matches!(call.dst, Some(VarOrIri::Var(_)));
+                        match fixed_gfn.get(&idx) {
+                            Some(&(id, bytes)) if fixed => {
+                                self.check_cancel()?;
+                                self.charge_gfun_output(call.kind.name(), bytes)?;
+                                Some(id)
+                            }
+                            _ => {
+                                let before = self.gfun_spent.get();
+                                let id =
+                                    self.eval_graph_fn(&call, &sols, layout, bind_only, false)?;
+                                if fixed {
+                                    fixed_gfn.insert(idx, (id, self.gfun_spent.get() - before));
+                                }
+                                Some(id)
+                            }
+                        }
                     }
                     SelectItem::Expr(Expr::Pfn { name, json }, _) => {
                         Some(self.eval_pfn(name, json, &sols, layout, bind_only, false)?)
@@ -2476,6 +2542,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             topk: self.topk,
             stats: Rc::clone(&self.stats),
             gfun_max_output: self.gfun_max_output,
+            gfun_spent: Rc::clone(&self.gfun_spent),
             pfn: self.pfn.clone(),
         }
     }

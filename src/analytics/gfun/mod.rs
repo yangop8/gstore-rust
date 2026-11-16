@@ -907,6 +907,18 @@ pub(crate) fn output_bound_exceeded(kind: GFnKind, max_bytes: usize) -> GStoreEr
     ))
 }
 
+/// The error of a query whose graph-function output — every graph-function
+/// and PFN call of it together, GROUP BY groups and `GRAPH` blocks included
+/// — passed `max_bytes` (the engine's per-query budget, review
+/// gap-gfun-fuzz#5). `label` names the call that crossed it.
+pub(crate) fn query_output_budget_exceeded(label: &str, max_bytes: usize) -> GStoreError {
+    GStoreError::Query(format!(
+        "{label}: more than {max_bytes} bytes of output in this query (the graph-function \
+         output bound is shared by every graph-function and PFN call of a query, GROUP BY \
+         groups and GRAPH blocks included); narrow the query"
+    ))
+}
+
 /// Evaluate `kind` over `ctx` with `args`, producing the full upstream output.
 ///
 /// Every function's JSON is bounded by [`GFunCtx::max_output_bytes`] while

@@ -578,3 +578,84 @@ fn core_truss_stops_at_the_output_bound_while_built() {
         full.len()
     );
 }
+
+// ---------------------------------------------------------------------------
+// the per-query output budget (gap-gfun-fuzz#5)
+// ---------------------------------------------------------------------------
+
+/// `<s0> <p> <s1> . … <s{n-1}> <p> <sn> .` in the default graph.
+fn chain_nt(n: usize) -> String {
+    (0..n)
+        .map(|i| format!("<http://x/s{i}> <http://x/p> <http://x/s{}> .\n", i + 1))
+        .collect()
+}
+
+/// The length of `WCC({})`'s text on `db`.
+fn wcc_len(db: &mut Database) -> usize {
+    let rs = db.select("SELECT (WCC({}) AS ?w) WHERE {}").unwrap();
+    rs.rows[0][0].as_ref().unwrap().len()
+}
+
+fn expect_budget_error<T: std::fmt::Debug>(r: gstore::error::Result<T>, what: &str) {
+    match r {
+        Err(GStoreError::Query(m)) => {
+            assert!(m.contains("bytes of output in this query"), "{what}: {m}")
+        }
+        other => {
+            let shown: String = format!("{other:?}").chars().take(300).collect();
+            panic!("{what}: expected the per-query output budget, got {shown}")
+        }
+    }
+}
+
+/// Under GROUP BY every group shows the function's value: each group is
+/// charged against the query's budget, so the bound holds for the query as
+/// a whole, not per call.
+#[test]
+fn group_by_groups_share_the_output_budget() {
+    let _s = serial();
+    let mut db = Database::build_from_str("gfun-budget-groups", &chain_nt(40)).unwrap();
+    let one = wcc_len(&mut db);
+    // room for three values, not for ten
+    db.set_gfun_max_output_bytes(3 * one + one / 2);
+    let q = |n: usize| {
+        format!("SELECT ?s (WCC({{}}) AS ?w) WHERE {{ ?s <http://x/p> ?o }} GROUP BY ?s LIMIT {n}")
+    };
+    let rs = db
+        .select("SELECT ?s (WCC({}) AS ?w) WHERE { ?s <http://x/p> ?o FILTER(?s IN (<http://x/s1>, <http://x/s2>, <http://x/s3>)) } GROUP BY ?s")
+        .unwrap();
+    assert_eq!(rs.rows.len(), 3);
+    expect_budget_error(db.select(&q(10)), "ten groups");
+    db.set_gfun_max_output_bytes(400);
+    // A per-group (variable) argument is charged the same way.
+    expect_budget_error(
+        db.select(
+            "SELECT ?s (kHopCount(?s, true, 1, {}) AS ?x) WHERE { ?s <http://x/p> ?o } GROUP BY ?s",
+        ),
+        "groups with a variable argument",
+    );
+}
+
+/// A graph function inside a `GRAPH` block charges the same budget as the
+/// rest of the query.
+#[test]
+fn graph_blocks_share_the_output_budget() {
+    let _s = serial();
+    let mut db = Database::build_from_str("gfun-budget-graph", &chain_nt(40)).unwrap();
+    let one = wcc_len(&mut db);
+    let named: String = chain_nt(40).lines().map(|l| format!("{l}\n")).collect();
+    db.query(&format!(
+        "INSERT DATA {{ GRAPH <http://x/g> {{ {named} }} }}"
+    ))
+    .unwrap();
+    let both = "SELECT ?a ?b WHERE { { SELECT (WCC({}) AS ?a) WHERE {} } \
+                GRAPH <http://x/g> { { SELECT (WCC({}) AS ?b) WHERE {} } } }";
+    // Either call alone fits, and so do both under a large enough budget.
+    db.set_gfun_max_output_bytes(2 * one + 64);
+    let rs = db.select(both).unwrap();
+    assert_eq!(rs.rows.len(), 1, "{rs:?}");
+    assert!(rs.rows[0].iter().all(Option::is_some), "{rs:?}");
+    db.set_gfun_max_output_bytes(one + one / 2);
+    assert_eq!(wcc_len(&mut db), one);
+    expect_budget_error(db.select(both), "a GRAPH block");
+}
