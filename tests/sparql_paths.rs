@@ -110,6 +110,21 @@ fn both_executors_return_path_solutions_in_the_same_order() {
         format!("SELECT ?s ?o WHERE {{ ?s ({P}|{Q})* ?o }} LIMIT 1000"),
         format!("SELECT ?s ?o WHERE {{ ?s !{Q} ?o }} LIMIT 1000"),
         format!("SELECT ?s ?o WHERE {{ ?s !(^{P}|{Q}) ?o }} LIMIT 1000"),
+        // Paths joined from an end point another pattern binds (review
+        // sparqlconf#9): the subject side, the object side, both, a path
+        // linking two otherwise unconnected patterns, two paths in a row,
+        // and an end point OPTIONAL leaves unbound in some solutions.
+        format!("SELECT ?s ?o WHERE {{ ?s {P} <http://ex/b3> . ?s {P}/{Q} ?o }} LIMIT 1000"),
+        format!("SELECT ?s ?o WHERE {{ ?o ^{Q} <http://ex/b2> . ?s {P}/{Q} ?o }} LIMIT 1000"),
+        format!("SELECT ?s ?o WHERE {{ ?s {P} ?b . ?b {Q} ?o . ?s ({P}/{Q})? ?o }} LIMIT 1000"),
+        format!(
+            "SELECT ?s ?o WHERE {{ ?s {P} <http://ex/b1> . ?o ^{Q} <http://ex/b1> . ?s {P}/{Q} ?o }} LIMIT 1000"
+        ),
+        format!("SELECT ?s ?m ?o WHERE {{ ?s {P} <http://ex/b4> . ?s {P} ?m . ?m {Q}* ?o }} LIMIT 1000"),
+        format!("SELECT ?s ?b ?o WHERE {{ ?s {P} <http://ex/b5> . ?s ({P}|{Q})+ ?b . ?b {Q}+ ?o }} LIMIT 1000"),
+        format!(
+            "SELECT ?s ?t ?o WHERE {{ ?s {P} ?b OPTIONAL {{ ?s <http://ex/none> ?t }} ?t {Q}? ?o }} LIMIT 1000"
+        ),
     ];
     for q in &queries {
         let full = rows(&db, q, TopKOptions::NONE);
@@ -117,4 +132,120 @@ fn both_executors_return_path_solutions_in_the_same_order() {
         assert!(stats.streamed > 0, "{q}: {stats:?}");
         assert_eq!(streamed, full, "{q}");
     }
+}
+
+// ---- review sparqlconf#9: a path with a bound end point ---------------------
+
+/// A chain of `n` nodes, `n_i :next n_(i+1)`, each with `n_i :id i`.
+fn chain(n: usize) -> Database {
+    let mut nt = String::new();
+    for i in 0..n {
+        nt.push_str(&format!("<http://ex/n{i}> <http://ex/id> \"{i}\"^^<http://www.w3.org/2001/XMLSchema#integer> .\n"));
+        if i + 1 < n {
+            nt.push_str(&format!(
+                "<http://ex/n{i}> <http://ex/next> <http://ex/n{}> .\n",
+                i + 1
+            ));
+        }
+    }
+    Database::build_from_str("chain", &nt).unwrap()
+}
+
+/// The queries of the scaling test over a chain of `n` nodes, with the rows
+/// each must return: the end point bound by another pattern of the group,
+/// subject side and object side, and both.
+fn bound_end_point_queries(n: usize) -> Vec<(String, usize)> {
+    let near_end = n - 10;
+    vec![
+        // The review's repro: `?s :id 2990 . ?s :next* ?x` on 3,000 nodes.
+        (
+            format!("SELECT ?x WHERE {{ ?s <http://ex/id> {near_end} . ?s <http://ex/next>* ?x }}"),
+            10,
+        ),
+        (
+            format!("SELECT ?x WHERE {{ ?s <http://ex/id> {near_end} . ?s <http://ex/next>+ ?x }}"),
+            9,
+        ),
+        // The object end bound: walked backwards from it.
+        (
+            "SELECT ?s WHERE { ?x <http://ex/id> 10 . ?s <http://ex/next>* ?x }".to_string(),
+            11,
+        ),
+        // Both ends bound, by two separate patterns.
+        (
+            format!(
+                "SELECT ?s ?x WHERE {{ ?s <http://ex/id> {near_end} . ?x <http://ex/id> {} . \
+                 ?s <http://ex/next>* ?x }}",
+                n - 1
+            ),
+            1,
+        ),
+        // A pattern on the far end, connected to the rest only by the path.
+        (
+            format!(
+                "SELECT ?x ?k WHERE {{ ?s <http://ex/id> {near_end} . ?s <http://ex/next>* ?x . \
+                 ?x <http://ex/id> ?k }}"
+            ),
+            10,
+        ),
+    ]
+}
+
+#[test]
+fn a_path_with_a_bound_end_point_costs_what_the_bound_side_reaches() {
+    // Before review sparqlconf#9 the path ran from every node of the graph
+    // (both ends free) and was joined afterwards: about n²/2 steps on a
+    // chain, 4.5 million for the review's 3,000 nodes. Evaluated from the
+    // bound end point it takes the same few steps whatever the chain's
+    // length, in both executors.
+    let small = chain(3000);
+    let large = chain(6000);
+    for (i, (q, expected_rows)) in bound_end_point_queries(3000).iter().enumerate() {
+        let (q_large, _) = &bound_end_point_queries(6000)[i];
+        for options in EXECUTORS {
+            // The streaming executor runs for a LIMIT.
+            let (q, q_large) = if options == TopKOptions::ALL {
+                (
+                    format!("{q} LIMIT 100000"),
+                    format!("{q_large} LIMIT 100000"),
+                )
+            } else {
+                (q.clone(), q_large.clone())
+            };
+            let (rows_small, stats_small) = run(&small, &q, options);
+            let (rows_large, stats_large) = run(&large, &q_large, options);
+            assert_eq!(rows_small.len(), *expected_rows, "{q} ({options:?})");
+            assert_eq!(rows_large.len(), *expected_rows, "{q_large} ({options:?})");
+            if options == TopKOptions::ALL {
+                assert!(stats_small.streamed > 0, "{q}: {stats_small:?}");
+            }
+            assert!(
+                stats_small.path_steps <= 64,
+                "{q} ({options:?}): {} path steps on 3,000 nodes",
+                stats_small.path_steps
+            );
+            assert_eq!(
+                stats_small.path_steps, stats_large.path_steps,
+                "{q} ({options:?}): the path's work grows with the graph"
+            );
+            eprintln!(
+                "{q} ({options:?}): {} path steps on 3,000 and 6,000 nodes",
+                stats_small.path_steps
+            );
+        }
+    }
+}
+
+#[test]
+fn counting_over_a_bound_path_on_the_reviews_chain() {
+    let db = chain(3000);
+    let q = "SELECT (COUNT(*) AS ?c) WHERE { ?s <http://ex/id> 2990 . ?s <http://ex/next>* ?x }";
+    let (rows, stats) = run(&db, q, TopKOptions::NONE);
+    assert_eq!(
+        rows,
+        vec![vec![Some(
+            "\"10\"^^<http://www.w3.org/2001/XMLSchema#integer>".to_string()
+        )]]
+    );
+    assert!(stats.path_steps <= 64, "{stats:?}");
 }

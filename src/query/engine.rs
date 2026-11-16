@@ -164,6 +164,7 @@
 //! solution; the [`Database`](crate::Database) chooses the WHERE dataset
 //! (`WITH`, `USING`, `USING NAMED`) and applies the quads.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::rc::Rc;
@@ -2764,6 +2765,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
 
     /// Evaluate a conjunction of patterns, joining smallest/connected first.
     fn eval_join(&self, conjuncts: &[&GraphPattern], layout: &VarLayout) -> Vec<Binding> {
+        // A property path whose end point another conjunct binds runs from
+        // the bound values instead of from every node (review sparqlconf#9).
+        if let Some(group) = PathJoin::new(conjuncts, layout) {
+            return self.eval_path_join(&group, layout);
+        }
         // Evaluate each conjunct independently, recording its variable set.
         let mut parts: Vec<Option<(Vec<Binding>, Vec<usize>)>> = conjuncts
             .iter()
@@ -2803,6 +2809,134 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             }
         }
         acc
+    }
+
+    /// [`eval_join`](Self::eval_join) for a group with a property path
+    /// whose end point another conjunct binds (see [`PathJoin`]): the parts
+    /// are joined in [`PathJoin::order`]; a [`PathJoinStep::Bound`] path
+    /// extends each solution so far from the value it gives the end point.
+    fn eval_path_join(&self, group: &PathJoin<'_>, layout: &VarLayout) -> Vec<Binding> {
+        let (mut rows, steps) = self.path_join_plan(group, layout);
+        let mut acc: Vec<Binding> = Vec::new();
+        let mut acc_vars: Vec<usize> = Vec::new();
+        for (k, step) in steps.into_iter().enumerate() {
+            // Cooperative cancellation between the joins (review robust#5).
+            if self.cancelled() {
+                return Vec::new();
+            }
+            match step {
+                PathJoinStep::Rows(i) => {
+                    let rb = rows[i]
+                        .take()
+                        .unwrap_or_else(|| self.eval_pattern(&group.parts[i], layout));
+                    acc = if k == 0 {
+                        rb
+                    } else {
+                        join_sets(&acc, &acc_vars, &rb, &group.vars[i])
+                    };
+                }
+                PathJoinStep::Bound(i) => {
+                    let GraphPattern::Path(p) = group.parts[i].as_ref() else {
+                        unreachable!("only a path is joined from its bound end point");
+                    };
+                    let mut cache = BoundPathCache::default();
+                    let mut next = Vec::new();
+                    for (n, l) in acc.iter().enumerate() {
+                        if n % 64 == 63 && self.cancelled() {
+                            return Vec::new();
+                        }
+                        for &pair in self.bound_path_pairs(p, l, layout, &mut cache).iter() {
+                            if let Some(m) = extend_by_path(l, p, pair, layout) {
+                                next.push(m);
+                            }
+                        }
+                    }
+                    acc = next;
+                }
+            }
+            for &v in &group.vars[step.part()] {
+                if !acc_vars.contains(&v) {
+                    acc_vars.push(v);
+                }
+            }
+            if acc.is_empty() {
+                break;
+            }
+        }
+        acc
+    }
+
+    /// The solutions of every part of `group` that is evaluated on its own
+    /// (`None` for the paths joined from a bound end point, see
+    /// [`PathJoin`]) and the order the parts are joined in — shared by both
+    /// executors, so they produce the same solutions in the same order.
+    fn path_join_plan(
+        &self,
+        group: &PathJoin<'_>,
+        layout: &VarLayout,
+    ) -> (Vec<Option<Vec<Binding>>>, Vec<PathJoinStep>) {
+        let rows: Vec<Option<Vec<Binding>>> = group
+            .parts
+            .iter()
+            .zip(&group.ends)
+            .map(|(part, ends)| ends.is_empty().then(|| self.eval_pattern(part, layout)))
+            .collect();
+        let sizes: Vec<Option<usize>> = rows.iter().map(|r| r.as_ref().map(Vec::len)).collect();
+        let steps = group.order(&sizes);
+        (rows, steps)
+    }
+
+    /// The `(start, end)` pairs of path pattern `p` that may extend the
+    /// solution `l` of a bind join: walked from the subject when `l` binds
+    /// it, else backwards from the object when `l` binds that, else (an
+    /// end point left unbound, e.g. by OPTIONAL) with both ends free —
+    /// each computed once per value in `cache`. Together with
+    /// [`extend_by_path`] this is exactly the join of `l` with the path's
+    /// own solutions.
+    fn bound_path_pairs(
+        &self,
+        p: &PathPattern,
+        l: &Binding,
+        layout: &VarLayout,
+        cache: &mut BoundPathCache,
+    ) -> Rc<Vec<(u32, u32)>> {
+        let bound = |t: &PatternTerm| match t {
+            PatternTerm::Var(v) => l[layout.index[v]],
+            PatternTerm::Term(_) => None,
+        };
+        let from = match (bound(&p.subject), bound(&p.object)) {
+            (Some(s), _) => (false, s),
+            (None, Some(o)) => (true, o),
+            (None, None) => {
+                return Rc::clone(
+                    cache
+                        .free
+                        .get_or_insert_with(|| Rc::new(self.path_pattern_pairs(p))),
+                )
+            }
+        };
+        Rc::clone(cache.from.entry(from).or_insert_with(|| {
+            let (backwards, v) = from;
+            // The path's own solutions over a variable end point start at
+            // the graph's nodes (§18.4: the zero-length matches are
+            // `nodes(G)`), so a value bound elsewhere that is no node of
+            // the graph — a VALUES or BIND term, a node of another graph —
+            // matches nothing, not even itself.
+            if !self.is_graph_node(v) {
+                return Rc::new(Vec::new());
+            }
+            Rc::new(if backwards {
+                self.path_pairs(&p.path, None, Some(v))
+            } else {
+                self.path_pairs(&p.path, Some(v), None)
+            })
+        }))
+    }
+
+    /// Whether `id` is a node of the active graph: the subject or object of
+    /// one of its triples.
+    fn is_graph_node(&self, id: u32) -> bool {
+        !is_synth(id) && (self.store.has_subject(id) || self.store.has_object(id))
     }
 
     /// Evaluate a basic graph pattern from scratch (index-pushed, ordered).
@@ -6302,6 +6436,228 @@ fn flatten_join<'a>(gp: &'a GraphPattern, out: &mut Vec<&'a GraphPattern>) {
         }
         other => out.push(other),
     }
+}
+
+/// A group of conjuncts in which a property path with two variable end
+/// points shares an end point with another conjunct (review sparqlconf#9).
+///
+/// Evaluated on its own, such a path runs from every node of the graph
+/// (both ends free) and is joined afterwards: `O(nodes × reach)` work for a
+/// group like `?s :id 2990 . ?s :next* ?x`. Here the path is a *bind join*:
+/// the conjuncts that bind its end point come first, and each of their
+/// solutions is extended by the path walked from the value it binds
+/// ([`Evaluator::bound_path_pairs`], once per distinct value) — the same
+/// solutions as the join of the path's own ones (§18.5), at the cost of the
+/// bound side. Both executors run the parts in [`order`](Self::order): the
+/// materializing one level by level ([`Evaluator::eval_path_join`]), the
+/// streaming one depth first (`topk`), so they agree on the solution order.
+struct PathJoin<'g> {
+    /// The conjuncts, each BGP split into its connected components: the
+    /// path, not a cross product inside the BGP, is what links them.
+    parts: Vec<Cow<'g, GraphPattern>>,
+    /// The variables each part binds.
+    vars: Vec<Vec<usize>>,
+    /// The end-point variables of each path joined from a bound end point;
+    /// empty for every other part (those are evaluated on their own).
+    ends: Vec<Vec<usize>>,
+}
+
+/// One step of a [`PathJoin`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PathJoinStep {
+    /// Join part `i`'s own solutions (a path among them evaluated with both
+    /// ends free, when nothing before it binds an end point).
+    Rows(usize),
+    /// Extend every solution so far by path part `i`, walked from the end
+    /// point the solution binds.
+    Bound(usize),
+}
+
+impl PathJoinStep {
+    /// The part this step joins.
+    fn part(self) -> usize {
+        match self {
+            PathJoinStep::Rows(i) | PathJoinStep::Bound(i) => i,
+        }
+    }
+}
+
+impl<'g> PathJoin<'g> {
+    /// The group's parts, or `None` when no path qualifies (then the group
+    /// joins as before, by [`greedy_join_order`]).
+    fn new(conjuncts: &[&'g GraphPattern], layout: &VarLayout) -> Option<PathJoin<'g>> {
+        let vars: Vec<Vec<usize>> = conjuncts.iter().map(|c| pattern_vars(c, layout)).collect();
+        let bound_elsewhere = |i: usize, v: usize| {
+            vars.iter()
+                .enumerate()
+                .any(|(j, vs)| j != i && vs.contains(&v))
+        };
+        let ends: Vec<Vec<usize>> = conjuncts
+            .iter()
+            .enumerate()
+            .map(|(i, c)| match c {
+                GraphPattern::Path(p) => match (&p.subject, &p.object) {
+                    (PatternTerm::Var(s), PatternTerm::Var(o)) => {
+                        let (s, o) = (layout.index[s], layout.index[o]);
+                        if bound_elsewhere(i, s) || bound_elsewhere(i, o) {
+                            if s == o {
+                                vec![s]
+                            } else {
+                                vec![s, o]
+                            }
+                        } else {
+                            Vec::new()
+                        }
+                    }
+                    // A constant end point already fixes where the walk
+                    // starts.
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            })
+            .collect();
+        if ends.iter().all(Vec::is_empty) {
+            return None;
+        }
+        let mut group = PathJoin {
+            parts: Vec::new(),
+            vars: Vec::new(),
+            ends: Vec::new(),
+        };
+        for (i, &c) in conjuncts.iter().enumerate() {
+            match c {
+                GraphPattern::Bgp(tps) => {
+                    let components = bgp_components(tps);
+                    if components.len() == 1 {
+                        group.push(Cow::Borrowed(c), vars[i].clone(), Vec::new());
+                    } else {
+                        for tps in components {
+                            let part = GraphPattern::Bgp(tps);
+                            let part_vars = pattern_vars(&part, layout);
+                            group.push(Cow::Owned(part), part_vars, Vec::new());
+                        }
+                    }
+                }
+                _ => group.push(Cow::Borrowed(c), vars[i].clone(), ends[i].clone()),
+            }
+        }
+        Some(group)
+    }
+
+    fn push(&mut self, part: Cow<'g, GraphPattern>, vars: Vec<usize>, ends: Vec<usize>) {
+        self.parts.push(part);
+        self.vars.push(vars);
+        self.ends.push(ends);
+    }
+
+    /// The join order, given the solution count of every part evaluated on
+    /// its own (`None` for the bind-joined paths): the smallest part first;
+    /// then repeatedly the smallest part connected to what is joined so far,
+    /// else a bind-joined path one of whose end points is bound by now (the
+    /// first in the group), else the smallest unconnected part, else the
+    /// first remaining path, evaluated with both ends free. Ties go to the
+    /// earlier part.
+    fn order(&self, sizes: &[Option<usize>]) -> Vec<PathJoinStep> {
+        let mut left: Vec<usize> = (0..self.parts.len()).collect();
+        let mut acc_vars: Vec<usize> = Vec::new();
+        let mut steps = Vec::with_capacity(left.len());
+        while !left.is_empty() {
+            let connected = |i: usize| self.vars[i].iter().any(|v| acc_vars.contains(v));
+            let smallest = |want_connected: bool| {
+                left.iter()
+                    .copied()
+                    .filter(|&i| sizes[i].is_some() && (!want_connected || connected(i)))
+                    .min_by_key(|&i| sizes[i])
+            };
+            let step = if steps.is_empty() {
+                smallest(false).map(PathJoinStep::Rows)
+            } else {
+                smallest(true).map(PathJoinStep::Rows).or_else(|| {
+                    left.iter()
+                        .copied()
+                        .find(|&i| {
+                            sizes[i].is_none() && self.ends[i].iter().any(|v| acc_vars.contains(v))
+                        })
+                        .map(PathJoinStep::Bound)
+                })
+            };
+            let step = step
+                .or_else(|| smallest(false).map(PathJoinStep::Rows))
+                .unwrap_or(PathJoinStep::Rows(left[0]));
+            let i = step.part();
+            left.retain(|&j| j != i);
+            for &v in &self.vars[i] {
+                if !acc_vars.contains(&v) {
+                    acc_vars.push(v);
+                }
+            }
+            steps.push(step);
+        }
+        steps
+    }
+}
+
+/// The memo of one bind-joined path ([`Evaluator::bound_path_pairs`]): its
+/// `(start, end)` pairs per bound value and side, and with both ends free.
+#[derive(Default)]
+struct BoundPathCache {
+    from: HashMap<(bool, u32), Rc<Vec<(u32, u32)>>, FxBuildHasher>,
+    free: Option<Rc<Vec<(u32, u32)>>>,
+}
+
+/// The solution `l` extended by the path solution `(s, o)`; `None` when
+/// they disagree on an end point.
+fn extend_by_path(
+    l: &Binding,
+    p: &PathPattern,
+    (s, o): (u32, u32),
+    layout: &VarLayout,
+) -> Option<Binding> {
+    let mut b = l.clone();
+    (bind_node(&mut b, &p.subject, s, layout) && bind_node(&mut b, &p.object, o, layout))
+        .then_some(b)
+}
+
+/// The connected components of a BGP — triple patterns linked through a
+/// shared variable, in any position — each in the BGP's order, ordered by
+/// their first pattern.
+fn bgp_components(tps: &[TriplePattern]) -> Vec<Vec<TriplePattern>> {
+    fn vars_of(tp: &TriplePattern) -> Vec<&str> {
+        [&tp.subject, &tp.predicate, &tp.object]
+            .into_iter()
+            .filter_map(|t| match t {
+                PatternTerm::Var(v) => Some(v.as_str()),
+                PatternTerm::Term(_) => None,
+            })
+            .collect()
+    }
+    let vars: Vec<Vec<&str>> = tps.iter().map(vars_of).collect();
+    // Union-find over the patterns (the root is the smallest index).
+    let mut parent: Vec<usize> = (0..tps.len()).collect();
+    fn root(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    for i in 0..tps.len() {
+        for j in 0..i {
+            if vars[i].iter().any(|v| vars[j].contains(v)) {
+                let (a, b) = (root(&mut parent, i), root(&mut parent, j));
+                parent[a.max(b)] = a.min(b);
+            }
+        }
+    }
+    let mut components: Vec<(usize, Vec<TriplePattern>)> = Vec::new();
+    for (i, tp) in tps.iter().enumerate() {
+        let r = root(&mut parent, i);
+        match components.iter_mut().find(|(cr, _)| *cr == r) {
+            Some((_, c)) => c.push(tp.clone()),
+            None => components.push((r, vec![tp.clone()])),
+        }
+    }
+    components.into_iter().map(|(_, c)| c).collect()
 }
 
 /// Per-BGP translation caches of a mixed pipeline (both directions):

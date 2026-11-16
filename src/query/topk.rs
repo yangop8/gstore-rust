@@ -32,7 +32,11 @@
 //! * **A group of several conjuncts** (`{ … } { … }`, a BGP next to
 //!   `VALUES`, a sub-SELECT, a path, …) — each conjunct is evaluated in full,
 //!   because their sizes decide the join order; the join itself then streams
-//!   (depth first over hash-indexed conjuncts, no intermediate result).
+//!   (depth first over hash-indexed conjuncts, no intermediate result). A
+//!   property path whose end point another conjunct binds is the exception:
+//!   it is walked from the value each streamed solution binds, once per
+//!   distinct value, in the order the full evaluation uses (`PathJoin`,
+//!   review sparqlconf#9).
 //! * **VALUES, sub-SELECT, property path, SERVICE** — evaluated in full
 //!   (a sub-SELECT applies these optimizations to itself).
 //!
@@ -464,13 +468,18 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
 
     /// Stream a group of conjuncts (see [`eval_join`](Self::eval_join)):
     /// every conjunct is evaluated in full, as their sizes decide the join
-    /// order; the join then runs depth first.
+    /// order; the join then runs depth first. A property path whose end
+    /// point another conjunct binds is not evaluated in full but walked
+    /// from each bound value (see [`PathJoin`], review sparqlconf#9).
     fn stream_join(
         &self,
         conjuncts: &[&GraphPattern],
         layout: &VarLayout,
         sink: &mut Sink<'_>,
     ) -> Flow {
+        if let Some(group) = PathJoin::new(conjuncts, layout) {
+            return self.stream_path_join(&group, layout, sink);
+        }
         let mut parts: Vec<Option<(Vec<Binding>, Vec<usize>)>> = conjuncts
             .iter()
             .map(|c| Some((self.eval_pattern(c, layout), pattern_vars(c, layout))))
@@ -509,6 +518,88 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             join_dfs(&probes, b, sink)?;
         }
         GO
+    }
+
+    /// [`eval_path_join`](Self::eval_path_join), depth first: the first
+    /// part's solutions stream through the other parts in the same
+    /// [`PathJoin::order`] — a part evaluated on its own as a hash-indexed
+    /// [`Probe`], a bind-joined path walked from the end point each solution
+    /// binds — so the solutions come in the materializing executor's order.
+    fn stream_path_join(
+        &self,
+        group: &PathJoin<'_>,
+        layout: &VarLayout,
+        sink: &mut Sink<'_>,
+    ) -> Flow {
+        let (mut rows, steps) = self.path_join_plan(group, layout);
+        let Some((&first, rest)) = steps.split_first() else {
+            return GO;
+        };
+        let mut part_rows = |i: usize| {
+            rows[i]
+                .take()
+                .unwrap_or_else(|| self.eval_pattern(&group.parts[i], layout))
+        };
+        let start = part_rows(first.part());
+        let mut acc_vars = group.vars[first.part()].clone();
+        let mut probes = Vec::with_capacity(rest.len());
+        for &step in rest {
+            let i = step.part();
+            probes.push(match step {
+                PathJoinStep::Rows(_) => {
+                    let shared: Vec<usize> = acc_vars
+                        .iter()
+                        .copied()
+                        .filter(|v| group.vars[i].contains(v))
+                        .collect();
+                    JoinProbe::Rows(Probe::new(part_rows(i), &shared))
+                }
+                PathJoinStep::Bound(_) => {
+                    let GraphPattern::Path(p) = group.parts[i].as_ref() else {
+                        unreachable!("only a path is joined from its bound end point");
+                    };
+                    JoinProbe::Path(p, std::cell::RefCell::default())
+                }
+            });
+            for &v in &group.vars[i] {
+                if !acc_vars.contains(&v) {
+                    acc_vars.push(v);
+                }
+            }
+        }
+        for b in start {
+            self.path_join_dfs(&probes, layout, b, sink)?;
+        }
+        GO
+    }
+
+    /// Join `b` with each step of a [`PathJoin`] in turn, depth first (as
+    /// [`join_dfs`] does for plain probes).
+    fn path_join_dfs(
+        &self,
+        probes: &[JoinProbe<'_>],
+        layout: &VarLayout,
+        b: Binding,
+        sink: &mut Sink<'_>,
+    ) -> Flow {
+        match probes.split_first() {
+            None => sink(b),
+            Some((JoinProbe::Rows(probe), rest)) => {
+                probe.for_each_compatible(&b, &mut |m| self.path_join_dfs(rest, layout, m, sink))
+            }
+            Some((JoinProbe::Path(p, cache), rest)) => {
+                if self.cancelled() {
+                    return STOP;
+                }
+                let pairs = self.bound_path_pairs(p, &b, layout, &mut cache.borrow_mut());
+                for &pair in pairs.iter() {
+                    if let Some(m) = extend_by_path(&b, p, pair, layout) {
+                        self.path_join_dfs(rest, layout, m, sink)?;
+                    }
+                }
+                GO
+            }
+        }
     }
 
     /// Stream a BGP with the plan [`eval_bgp_constrained`](Self::eval_bgp_constrained)
@@ -1616,6 +1707,14 @@ fn join_dfs(probes: &[Probe], b: Binding, sink: &mut Sink<'_>) -> Flow {
         None => sink(b),
         Some((p, rest)) => p.for_each_compatible(&b, &mut |m| join_dfs(rest, m, sink)),
     }
+}
+
+/// One step of a streamed [`PathJoin`] after its first part.
+enum JoinProbe<'g> {
+    /// A part evaluated on its own.
+    Rows(Probe),
+    /// A path walked from the end point each solution binds, with its memo.
+    Path(&'g PathPattern, std::cell::RefCell<BoundPathCache>),
 }
 
 /// The columns and layouts the full path's `ORDER BY` uses: SELECT
