@@ -257,6 +257,7 @@ use crate::sparql_results::{self, json_str, ResultFormat};
 use crate::store::read_scope::ReadScope;
 use crate::store::{TripleSource, TripleStore};
 use crate::sysdb::SysDb;
+use crate::zipio::ExportFormat;
 
 const JSON: &str = "application/json";
 const SPARQL_JSON: &str = "application/sparql-results+json";
@@ -1120,6 +1121,94 @@ impl ReadSnapshot {
             None => Ok(stats),
         }
     }
+}
+
+impl ReadSnapshot {
+    /// Write the snapshot to `out` as `format` (`None`: N-Quads when a named
+    /// graph holds a triple, else N-Triples — what
+    /// [`ExportFormat::for_database`] picks for a database), as
+    /// [`crate::zipio::write_export`] writes a database: the default graph's
+    /// statements, then (N-Quads) each named graph's, every term through
+    /// the escaping serializer. Returns the format written and the
+    /// statement count. The REST `/export` of a database whose transaction
+    /// is open (its committed state; review http#11). Inside a
+    /// [`ReadScope`]: a read error fails it (C2). The caller holds the
+    /// database's shared guard, so the transaction cannot commit (and an
+    /// on-disk view expire) meanwhile.
+    fn write_export(
+        &self,
+        format: Option<ExportFormat>,
+        out: &mut dyn Write,
+    ) -> crate::Result<(ExportFormat, u64)> {
+        let format = format.unwrap_or(if self.named.values().any(|g| g.triple_count() > 0) {
+            ExportFormat::NQuads
+        } else {
+            ExportFormat::NTriples
+        });
+        let scope = ReadScope::enter();
+        let mut write = |default: Vec<crate::model::IdTriple>| -> crate::Result<u64> {
+            let mut count = export_triples(&self.dict, &default, None, out)?;
+            if format == ExportFormat::NQuads {
+                for (&gid, graph) in &self.named {
+                    let Some(g) = self.dict.term(gid) else {
+                        continue;
+                    };
+                    let g = crate::model::term::export_key(&g).into_owned();
+                    let triples: Vec<_> = graph.iter_all().collect();
+                    count += export_triples(&self.dict, &triples, Some(&g), out)?;
+                }
+            }
+            Ok(count)
+        };
+        let count = match &self.store {
+            SnapStore::Mem(store) => write(store.iter_all().collect())?,
+            // The dictionary of an on-disk snapshot is read inside the
+            // view's gate only.
+            SnapStore::Disk(view) => view
+                .with_base(|base, _| write(DiskSource::new(base).iter_all()))
+                .map_err(|e| {
+                    GStoreError::Database(format!(
+                        "the transaction's read snapshot could not be exported: {e}"
+                    ))
+                })??,
+        };
+        if let Some(e) = scope.take_error() {
+            return Err(crate::store::read_scope::read_failure(
+                "exporting the transaction's read snapshot",
+                e,
+            ));
+        }
+        drop(scope);
+        out.flush()?;
+        Ok((format, count))
+    }
+}
+
+/// Write the id triples `triples` as N-Triples lines — or N-Quads lines of
+/// graph `graph` (its N-Triples form) — resolving each term in `dict`
+/// (a statement whose term does not resolve is skipped, as
+/// [`crate::zipio::write_export`] does). Returns the number written.
+fn export_triples(
+    dict: &Dictionary,
+    triples: &[crate::model::IdTriple],
+    graph: Option<&str>,
+    out: &mut dyn Write,
+) -> crate::Result<u64> {
+    use crate::model::term::export_key;
+    let mut count = 0;
+    for t in triples {
+        let (Some(s), Some(p), Some(o)) = (dict.term(t.sub), dict.pred(t.pred), dict.term(t.obj))
+        else {
+            continue;
+        };
+        let (s, p, o) = (export_key(&s), export_key(&p), export_key(&o));
+        match graph {
+            Some(g) => writeln!(out, "{s} {p} {o} {g} .")?,
+            None => writeln!(out, "{s} {p} {o} .")?,
+        }
+        count += 1;
+    }
+    Ok(count)
 }
 
 /// The default graph of a [`ReadSnapshot`].
@@ -2063,15 +2152,10 @@ impl DbSlot {
         warning
     }
 
-    /// Run a read on behalf of a *non-transactional* caller: against the
-    /// begin-time snapshot while a transaction is open (never its uncommitted
-    /// writes), else against the live database — on a shared guard (an
-    /// UPDATE is refused).
-    pub(crate) fn read(&self, sparql: &str) -> crate::Result<QueryResult> {
-        self.read_cancellable(sparql, None)
-    }
-
-    /// [`read`](Self::read) under the cancel flag `cancel`.
+    /// Run a read on behalf of a *non-transactional* caller, under the
+    /// cancel flag `cancel`: against the begin-time snapshot while a
+    /// transaction is open (never its uncommitted writes), else against the
+    /// live database — on a shared guard (an UPDATE is refused).
     pub(crate) fn read_cancellable(
         &self,
         sparql: &str,
@@ -4854,24 +4938,42 @@ impl ApiInner {
                 Ok(loaded) => loaded,
                 Err(r) => return r,
             };
-            let installed = {
-                // No `reasonManage` file operation is half-way through the
-                // rule directory meanwhile. A rebuild replaces the database,
-                // as a drop and a build do: the old one's rules (executed,
-                // with ledgers naming triples the new data asserts) go.
-                let _rules = RuleStore::dir(&dir).lock();
-                crate::db::fsutil::remove_dir_if_exists(&dir.join(RULE_DIR))
-                    .map_err(|e| format!("build failed: {e}"))
-                    .and_then(|()| db.save(&dir).map_err(|e| format!("save failed: {e}")))
-            };
-            if let Err(msg) = installed {
+            // No `reasonManage` file operation is half-way through the rule
+            // directory meanwhile. A rebuild replaces the database, as a drop
+            // and a build do: the old one's rules (executed, with ledgers
+            // naming triples the new data asserts) go — once the new
+            // database is saved, not before (review http#10: a failed save
+            // served the previous database again without its rules and
+            // ledgers). As the bulk layouts' install: a crash between the
+            // save and the removal leaves them (docs/REFACTOR_BACKLOG.md).
+            let rules = RuleStore::dir(&dir);
+            let rules_lock = rules.lock();
+            if let Err(e) = db.save(&dir) {
+                drop(rules_lock);
                 // The snapshot set is replaced atomically: the directory
-                // holds the previous database (saved above), served again
-                // with every write it acknowledged.
+                // holds the previous database (saved above), with its rules,
+                // served again with every write it acknowledged.
                 if was_loaded {
                     inner.serve_again(&name, &dir);
                 }
-                return Resp::fail(500, &msg);
+                return fail_with(&e, OpErrorKind::Failed, &format!("save failed: {e}"));
+            }
+            let replaced = crate::db::fsutil::remove_dir_if_exists(&dir.join(RULE_DIR));
+            drop(rules_lock);
+            if let Err(e) = replaced {
+                // Built, but the replaced rules are still there: not served
+                // (they would reason over the new data), as a bulk build
+                // whose install did not finish.
+                register_built(&mut locked(&inner.state), &name, vanished, &creator);
+                return fail_with(
+                    &e,
+                    OpErrorKind::Failed,
+                    &format!(
+                        "database '{name}' was built, but the rules of the database it replaced \
+                         could not be removed ({e}); it is not loaded: remove its \
+                         {RULE_DIR} directory, then load it"
+                    ),
+                );
             }
             inner.serve_built(&name, db, dir, vanished, &creator)
         }))
@@ -5169,7 +5271,12 @@ impl ApiInner {
     /// or — if neither exists yet — a fresh empty database is created (mirrors
     /// gStore's `LoadFile`, which may target a not-yet-built db). The result is
     /// saved under the check_point policy.
-    fn handle_upload(&self, st: &mut ApiState, req: &Request, _user: &str) -> Dispatch {
+    ///
+    /// A database the upload creates is registered for the caller, as
+    /// `/build` registers one — forgetting the grants of a registered name
+    /// whose directory was removed outside the server, so the new data does
+    /// not inherit them (review http#16).
+    fn handle_upload(&self, st: &mut ApiState, req: &Request, user: &str) -> Dispatch {
         let Some(name) = self.req_db_name(req) else {
             return Dispatch::Done(Resp::fail(400, "missing or invalid db_name"));
         };
@@ -5201,6 +5308,11 @@ impl ApiInner {
         let format = upload_format(req);
         let content = req.body_str();
         let dir = st.db_dir(&name);
+        // Still registered, but neither loaded nor on disk: dropped outside
+        // the server (`gdrop`). A database created here must not inherit
+        // its grants (as `/build`).
+        let vanished = loaded.is_none() && st.sysdb.contains(&name) && !dir.exists();
+        let creator = user.to_string();
         Dispatch::Deferred(Box::new(move |inner| {
             let busy = loaded.is_none().then(|| BusyGuard {
                 inner,
@@ -5237,6 +5349,9 @@ impl ApiInner {
                             let h =
                                 DbSlot::handle(db, dir, fresh, &st.load_policy, &st.query_settings);
                             st.dbs.insert(name.clone(), Arc::clone(&h));
+                            if fresh {
+                                register_built(&mut st, &name, vanished, &creator);
+                            }
                             h
                         }
                         Err(e) => {
@@ -6663,16 +6778,22 @@ impl ApiInner {
                 Ok(slot) => slot,
                 Err(r) => return r,
             };
-            // Claim the directory for this database before writing into it.
-            let claimed = fs::create_dir_all(&path)
+            // Recorded as a backup of this database once complete, as the
+            // `/api` `backup` does (review design#4): a directory being
+            // written, or left by a backup that failed, holds no record, so
+            // `/restore` never takes it for a backup of the database. An
+            // earlier backup of it being replaced loses its record first.
+            let created = !path.exists();
+            let started = fs::create_dir_all(&path)
                 .map_err(GStoreError::from)
                 .and_then(|()| {
-                    crate::db::fsutil::atomic_write(&path.join(BACKUP_OWNER_FILE), name.as_bytes())
+                    crate::db::fsutil::remove_file_if_exists(&path.join(BACKUP_OWNER_FILE))
                 });
-            if let Err(e) = claimed {
-                return fail_with(&e, OpErrorKind::Failed, &format!("backup failed: {e}"));
-            }
-            match slot.db.backup(&path) {
+            let backed_up = started
+                .and_then(|()| slot.db.backup(&path))
+                .and_then(|()| mark_backup(&path, &name));
+            drop(slot);
+            match backed_up {
                 Ok(()) => {
                     let body = format!(
                         "{{\"StatusCode\":0,\"StatusMsg\":\"backup success\",\"path\":{}}}",
@@ -6680,7 +6801,21 @@ impl ApiInner {
                     );
                     Resp::new(200, JSON, body.into_bytes())
                 }
-                Err(e) => fail_with(&e, OpErrorKind::Failed, &format!("backup failed: {e}")),
+                Err(e) => {
+                    // A directory this backup made goes again (as the `/api`
+                    // backup's); one it wrote into stays, without a record.
+                    let note = if created {
+                        let _ = fs::remove_dir_all(&path);
+                        ""
+                    } else {
+                        "; the directory is no longer recorded as a backup"
+                    };
+                    fail_with(
+                        &e,
+                        OpErrorKind::Failed,
+                        &format!("backup failed: {e}{note}"),
+                    )
+                }
             }
         }))
     }
@@ -6831,8 +6966,13 @@ impl ApiInner {
                     if fresh && st.sysdb.contains(&name) {
                         let _ = st.users.forget_database(&name);
                     }
+                    // Built at the backup's time (its `<db>.db_<timestamp>`
+                    // name), as the `/api` `restore` registers it (review
+                    // design#4), else now.
                     if fresh || !st.sysdb.contains(&name) {
-                        let _ = st.sysdb.register(&name, &user);
+                        let built = backup_time(&path)
+                            .unwrap_or_else(|| crate::sysdb::clock::now().datetime());
+                        let _ = st.sysdb.register_at(&name, &user, &built);
                     }
                     Resp::ok(&format!("database '{name}' restored"))
                 }
@@ -6855,42 +6995,73 @@ impl ApiInner {
         }))
     }
 
-    /// `GET /export?db_name=<name>[&download=0]` — the whole database as
-    /// N-Triples (its committed state, while a transaction is open). Sent as a
-    /// file download (`Content-Disposition: attachment`) by default; pass
-    /// `download=0`/`false`/`no`/`off` for an inline (browser-rendered)
-    /// response instead.
-    fn handle_export(&self, st: &mut ApiState, req: &Request, _user: &str) -> Dispatch {
+    /// `GET /export?db_name=<name>[&format=nt|nq][&download=0]` — the whole
+    /// database: N-Triples, or N-Quads (the default graph, then every named
+    /// graph) when it has a non-empty named graph, so nothing is lost —
+    /// `format` (`nt` / `nq`, as the `/api` `export`'s) picks one. Its
+    /// committed state while a transaction is open. Sent as a file download
+    /// (`Content-Disposition: attachment; filename="<name>.nt|nq"`) by
+    /// default; pass `download=0`/`false`/`no`/`off` for an inline
+    /// (browser-rendered) response instead.
+    ///
+    /// The `/api` `export`'s serializer ([`export_slot`], review http#11 /
+    /// design#4: the endpoint wrote only the default graph). It runs as a
+    /// task — listed by `/tasklist`, stopped by `/cancel` at its next
+    /// statement (`503`) — writing to an unnamed scratch file in the export
+    /// directory under the database's shared guard; the guard released, the
+    /// file is streamed in bounded chunks (never held in memory, never
+    /// compressed) and is gone once sent.
+    fn handle_export(&self, st: &mut ApiState, req: &Request, user: &str) -> Dispatch {
         let Some(name) = self.pick_db(st, req) else {
             return Dispatch::Done(Resp::fail(400, "missing or ambiguous db parameter"));
+        };
+        let format = match req.param("format").filter(|f| !f.trim().is_empty()) {
+            None => None,
+            Some(f) => match ExportFormat::parse(&f) {
+                Some(format) => Some(format),
+                None => {
+                    return Dispatch::Done(Resp::fail(
+                        400,
+                        &format!(
+                            "the export format '{f}' is not supported (use nt for N-Triples or \
+                             nq for N-Quads)"
+                        ),
+                    ))
+                }
+            },
         };
         let Some(dbh) = st.dbs.get(&name).map(Arc::clone) else {
             return Dispatch::Done(Resp::fail(404, &format!("database '{name}' is not loaded")));
         };
         let inline = wants_inline(req);
-        Dispatch::Deferred(Box::new(move |_| {
-            let exported = {
-                let slot = match dbh.read() {
-                    Ok(slot) => slot,
-                    Err(e) => return e.rest(),
-                };
-                if slot.retired {
-                    return Resp::fail(404, &format!("database '{name}' is not loaded"));
-                }
-                slot.read("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }")
-            };
-            match exported {
-                Ok(QueryResult::Construct(ts)) => {
-                    let mut resp = Resp::new(200, "application/n-triples", ntriples_body(&ts));
+        let scratch_dir = st
+            .gapi
+            .export_dir
+            .clone()
+            .unwrap_or_else(|| self.root.join("export"));
+        let (task_id, cancel) =
+            self.tasks
+                .register("export", &name, &format!("export {name}"), user);
+        Dispatch::Deferred(Box::new(move |inner| {
+            // Ends the task (also on a panic) once the export is written.
+            let mut task = TaskGuard::new(inner, task_id);
+            let written = rest_export(&dbh, &name, format, &scratch_dir, &cancel);
+            task.set_ok(written.is_ok());
+            match written {
+                Ok((format, body)) => {
+                    let (ctype, ext) = match format {
+                        ExportFormat::NTriples => ("application/n-triples", "nt"),
+                        ExportFormat::NQuads => ("application/n-quads", "nq"),
+                    };
+                    let mut resp = Resp::stream(200, ctype, body);
                     let disposition = if inline { "inline" } else { "attachment" };
                     resp.extra.push((
                         "Content-Disposition".to_string(),
-                        format!("{disposition}; filename=\"{name}.nt\""),
+                        format!("{disposition}; filename=\"{name}.{ext}\""),
                     ));
                     resp
                 }
-                Ok(_) => Resp::fail(500, "export produced an unexpected result"),
-                Err(e) => Resp::fail(500, &format!("export failed: {e}")),
+                Err(e) => e.rest(),
             }
         }))
     }
@@ -6914,7 +7085,9 @@ impl ApiInner {
     /// other update operations: a malformed payload is a `400` parse error and
     /// nothing is applied. Reports `parsed`, `applied` (= `changed`) and
     /// `failed` (parsed but not applied: duplicates on insert, absent triples on
-    /// remove, or a literal/blank in a position RDF does not allow). A triple
+    /// remove, or a literal/blank in a position RDF does not allow), and the
+    /// `/api` operation's `success_num` (= `applied`) and `failed_num` (the
+    /// statements skipped as invalid). A triple
     /// that cannot be applied — an id space exhausted, a read error looking up
     /// its terms (C2), a broken store — stops the batch with a `500` naming
     /// how many were applied before it.
@@ -6967,6 +7140,9 @@ impl ApiInner {
                 return txn_conflict(&name, open.tid);
             }
             let parsed = triples.len();
+            // Statements RDF does not allow (a literal or blank node out of
+            // place), skipped: upstream's `failed_num`.
+            let skipped = triples.iter().filter(|t| !valid_ground_triple(t)).count();
             let mut applied = 0usize;
             let mut failure = None;
             for t in triples.iter().filter(|t| valid_ground_triple(t)) {
@@ -6999,8 +7175,13 @@ impl ApiInner {
             let failed = parsed - applied;
             let verb = if insert { "inserted" } else { "removed" };
             // Applied but not saved: a failure (HTTP 500), review durability#2.
+            // `success_num` / `failed_num` mean what the `/api` operation's
+            // do (review design#4): statements applied, and statements
+            // skipped as invalid — a duplicate (insert) or absent triple
+            // (remove) is neither, as upstream counts them. `failed` keeps
+            // counting every statement not applied.
             let fields = format!(
-                ",\"format\":{},\"parsed\":{parsed},\"applied\":{applied},\"failed\":{failed},\"changed\":{applied},\"success_num\":{applied},\"failed_num\":{failed}",
+                ",\"format\":{},\"parsed\":{parsed},\"applied\":{applied},\"failed\":{failed},\"changed\":{applied},\"success_num\":{applied},\"failed_num\":{skipped}",
                 json_str(format),
             );
             Resp::write_outcome(&format!("batch {verb}"), &fields, &warning)
@@ -7400,6 +7581,27 @@ fn resolved_path(path: &Path) -> Option<PathBuf> {
 /// database's data.
 pub(crate) fn may_restore_from(users: &UserStore, user: &str, db: &str, source: &Path) -> bool {
     user == ROOT_USER || users.is_superuser(user) || backup_owner(source).as_deref() == Some(db)
+}
+
+/// The built time a backup's name records (`…_YYYYmmddHHMMSS` →
+/// `YYYY-MM-DD HH:MM:SS`, upstream `Util::get_backup_time`): the registry's
+/// built time of a database a restore from it creates (REST and `/api`).
+pub(crate) fn backup_time(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let ts = name.rsplit_once('_')?.1;
+    let ts = ts.strip_suffix(".zip").unwrap_or(ts);
+    if ts.len() != 14 || !ts.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(format!(
+        "{}-{}-{} {}:{}:{}",
+        &ts[0..4],
+        &ts[4..6],
+        &ts[6..8],
+        &ts[8..10],
+        &ts[10..12],
+        &ts[12..14]
+    ))
 }
 
 /// The database a path component named like upstream's backups
@@ -7908,6 +8110,127 @@ fn render_result_within(
         return Err(too_large());
     }
     Ok(Resp::new(200, ctype, out.into_inner()))
+}
+
+/// Export served database `slot` (whose shared guard the caller holds) to
+/// `out` as `format` — `None`: the format that loses nothing, N-Quads when it
+/// has a non-empty named graph ([`ExportFormat::for_database`]) — and return
+/// the format written and the statement count. The export of the REST
+/// `/export` and the `/api` `export` alike (review http#11, design#4): its
+/// live state ([`crate::zipio::write_export`]), or — while a transaction is
+/// open — the transaction's begin-time snapshot (the `/api` caller refuses
+/// that case first, as upstream). A raised `cancel` stops it at its next
+/// statement ([`OpErrorKind::Cancelled`]); a read error fails it (contract
+/// C2).
+pub(crate) fn export_slot(
+    slot: &DbSlot,
+    format: Option<ExportFormat>,
+    out: &mut dyn Write,
+    cancel: Option<&AtomicBool>,
+) -> Result<(ExportFormat, u64), OpError> {
+    let mut out = CancellableWriter { out, cancel };
+    let written = match &slot.txn {
+        None => {
+            let format = format.unwrap_or_else(|| ExportFormat::for_database(&slot.db));
+            crate::zipio::write_export(&slot.db, format, &mut out).map(|n| (format, n))
+        }
+        Some(open) => open.snapshot.write_export(format, &mut out),
+    };
+    written.map_err(|e| {
+        if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+            OpError::new(OpErrorKind::Cancelled, "export cancelled")
+        } else {
+            OpError::of(&e, OpErrorKind::Failed, e.to_string())
+        }
+    })
+}
+
+/// A writer that fails once `cancel` is raised: how an export stops at its
+/// next statement after a `/cancel`.
+struct CancellableWriter<'a> {
+    out: &'a mut dyn Write,
+    cancel: Option<&'a AtomicBool>,
+}
+
+impl Write for CancellableWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+            return Err(std::io::Error::other("export cancelled"));
+        }
+        self.out.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.out.flush()
+    }
+}
+
+/// The REST `/export` of loaded database `name` (`dbh`): [`export_slot`]
+/// under a shared guard into an unnamed scratch file in `scratch_dir` (the
+/// export directory), returned — with the guard released — as a streamed
+/// body positioned at its start. The file is unlinked once open (where
+/// the platform allows; elsewhere when the body is dropped), so neither a
+/// failure nor a crash leaves it behind. `cancel` is the task's flag.
+fn rest_export(
+    dbh: &DbHandle,
+    name: &str,
+    format: Option<ExportFormat>,
+    scratch_dir: &Path,
+    cancel: &AtomicBool,
+) -> Result<(ExportFormat, crate::gapi::envelope::FileBody), OpError> {
+    use std::io::{Seek, SeekFrom};
+    /// Removes the scratch file once the body that reads it is dropped.
+    struct Scratch(PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+    let failed = |e: std::io::Error| {
+        OpError::new(
+            OpErrorKind::Failed,
+            format!("export failed: cannot write its scratch file: {e}"),
+        )
+    };
+    fs::create_dir_all(scratch_dir).map_err(failed)?;
+    static SCRATCH: AtomicU64 = AtomicU64::new(0);
+    let path = scratch_dir.join(format!(
+        ".rest-export-{}-{}-{}.tmp",
+        std::process::id(),
+        SCRATCH.fetch_add(1, Ordering::Relaxed),
+        now_millis()
+    ));
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(failed)?;
+    let scratch = Scratch(path);
+    // Unnamed from now on where the platform allows it.
+    let _ = fs::remove_file(&scratch.0);
+    let written = {
+        let slot = dbh.read()?;
+        if slot.retired {
+            return Err(OpError::new(
+                OpErrorKind::NotLoaded,
+                format!("database '{name}' is not loaded"),
+            ));
+        }
+        txn_park(name, TxnParkPoint::StatementHolding);
+        let mut out = std::io::BufWriter::new(&mut file);
+        let written = export_slot(&slot, format, &mut out, Some(cancel));
+        drop(out);
+        written
+    };
+    let (format, _) = written.map_err(|e| match e.kind {
+        OpErrorKind::Cancelled => e,
+        kind => OpError::new(kind, format!("export failed: {}", e.msg)),
+    })?;
+    let len = file.seek(SeekFrom::End(0)).map_err(failed)?;
+    file.seek(SeekFrom::Start(0)).map_err(failed)?;
+    let body = crate::gapi::envelope::FileBody::new(file, 0, len).with_permit(scratch);
+    Ok((format, body))
 }
 
 /// The error message of an UPDATE that failed after applying part of its

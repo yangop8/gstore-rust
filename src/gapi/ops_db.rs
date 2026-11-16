@@ -51,8 +51,8 @@ use super::{check_db_name, required, tasks, Ctx, OpSpec, Registry};
 use crate::db::dirlock::DirLock;
 use crate::db::SchemaGraph;
 use crate::http_api::{
-    build_layout, bulk_target, dir_size, may_restore_from, ApiInner, BackupClaim, BusyGuard,
-    DbCell, DbHandle, DbSlot, OpError, OpErrorKind,
+    backup_time, build_layout, bulk_target, dir_size, may_restore_from, ApiInner, BackupClaim,
+    BusyGuard, DbCell, DbHandle, DbSlot, OpError, OpErrorKind,
 };
 use crate::http_users::ROOT_USER;
 use crate::json::Json;
@@ -973,7 +973,12 @@ fn load(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
             };
         }
         let dir = st.db_dir(&db);
-        if !st.busy.contains(&db) && !dir.is_dir() {
+        // A restore interrupted mid-swap leaves the directory moved aside
+        // (`<db>.db.restore-old`): it still exists, and the open below
+        // finishes the swap (review design#4: this answered "does not
+        // exist" where the REST `/load` loaded it).
+        let exists = dir.is_dir() || crate::db::fsutil::RESTORE_SWAP.in_progress(&dir);
+        if !st.busy.contains(&db) && !exists {
             return GResp::error(
                 Status::OperationFailed,
                 format!("database[{db}] does not exist."),
@@ -991,6 +996,16 @@ fn load(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         inner: ctx.inner,
         name: db.clone(),
     };
+    // Finish an interrupted restore of the directory first, as the REST
+    // `/load` does (the open would too, but only once the directory is
+    // back in place).
+    let _ = Database::recover_restore(&dir);
+    if !dir.is_dir() {
+        return GResp::error(
+            Status::OperationFailed,
+            format!("database[{db}] does not exist."),
+        );
+    }
     progress("loading", 0);
     match ctx.inner.open_db(&dir) {
         Ok(opened) => {
@@ -2154,26 +2169,6 @@ fn backups_of(dir: &Path, db: &str) -> Vec<String> {
     out
 }
 
-/// The built time a backup's name records (`…_YYYYmmddHHMMSS` →
-/// `YYYY-MM-DD HH:MM:SS`, upstream `Util::get_backup_time`).
-fn backup_time(path: &Path) -> Option<String> {
-    let name = path.file_name()?.to_str()?;
-    let ts = name.rsplit_once('_')?.1;
-    let ts = ts.strip_suffix(".zip").unwrap_or(ts);
-    if ts.len() != 14 || !ts.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    Some(format!(
-        "{}-{}-{} {}:{}:{}",
-        &ts[0..4],
-        &ts[4..6],
-        &ts[6..8],
-        &ts[8..10],
-        &ts[10..12],
-        &ts[12..14]
-    ))
-}
-
 /// Remove the oldest backups of `db` in `dir` until at most `max` (at least
 /// one: the newest) remain.
 fn rotate_backups(dir: &Path, db: &str, max: usize) {
@@ -2700,6 +2695,8 @@ fn export(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         return fail(e.to_string());
     }
     ops_file::sweep_files(ctx);
+    // Refused while a transaction is open (upstream; the REST `/export`
+    // writes the committed state instead).
     let slot = match ApiInner::lock_for_op_read(&dbh, &db, "exporting") {
         Ok(s) => s,
         Err(e) => return op_error(&db, "Export fail: ", e),
@@ -2717,12 +2714,13 @@ fn export(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         Err(e) => return fail(e.to_string()),
     };
     let mut out = BufWriter::new(file);
-    let written = zipio::write_export(&slot.db, format, &mut out);
+    // The serializer REST `/export` shares (review design#4, http#11).
+    let written = crate::http_api::export_slot(&slot, Some(format), &mut out, None);
     drop(slot);
     drop(out);
     if let Err(e) = written {
         ops_file::remove_with_owner(ctx, &target.join(&name));
-        return fail(e.to_string());
+        return fail(e.msg);
     }
     let name = if compress {
         // `<stem>.zip` beside the file (a free name: another export of the
