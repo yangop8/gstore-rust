@@ -81,6 +81,9 @@ use std::sync::{MutexGuard, OnceLock};
 use std::time::Instant;
 
 pub use envelope::{GBody, GResp, Status};
+#[doc(hidden)]
+pub use ops_db::stats_refresh_hook;
+pub(crate) use ops_db::stop_stats_refreshes;
 pub use params::{Params, UploadedFile};
 
 use crate::http_api::{ApiInner, ApiState};

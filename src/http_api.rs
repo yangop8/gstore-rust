@@ -1245,7 +1245,12 @@ impl ReadSnapshot {
             SnapStore::Mem(store) => {
                 // The snapshot never changes, so its CSR is cached under one
                 // generation for the transaction's lifetime.
-                let csr = || self.csr.get_or_build(0, || CsrGraph::build(store));
+                let flag = cancel.clone();
+                let csr = || {
+                    self.csr.get_or_build_cancellable(0, flag.as_deref(), || {
+                        CsrGraph::build_from_memory(store, flag.as_deref())
+                    })
+                };
                 let mut eval = self.configure(Evaluator::new(&self.dict, store), &csr, pfn);
                 if let Some(c) = cancel {
                     eval = eval.with_cancel(c);
@@ -1353,11 +1358,13 @@ fn evaluate_in_scope<S: TripleSource>(
 /// only one: an on-disk snapshot read watches its gate's flag (which a
 /// writer raises), and the request's own flag (`/cancel`, a shutdown past
 /// its grace period) is forwarded to it by one shared, lazily started
-/// thread. It polls the registered pairs every few milliseconds, and sleeps
-/// while none is registered. Its lock is a leaf: nothing is called under it.
+/// thread. It polls the registered pairs every few milliseconds and ends
+/// once none is registered (the next registration starts another), so a
+/// stopped server can join it ([`quiesce`](cancel_bridge::quiesce)). Its
+/// lock is a leaf: nothing is called under it.
 mod cancel_bridge {
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+    use std::sync::{Arc, Mutex, OnceLock, PoisonError};
     use std::time::Duration;
 
     /// How often the registered flags are polled.
@@ -1370,20 +1377,26 @@ mod cancel_bridge {
     struct Links {
         next: u64,
         pairs: Vec<Pair>,
+        /// The thread runs (it ends, under the lock, once no pair is left).
         started: bool,
+        /// The latest thread started (joined by [`quiesce`]).
+        thread: Option<std::thread::JoinHandle<()>>,
     }
 
-    fn bridge() -> &'static (Mutex<Links>, Condvar) {
-        static BRIDGE: OnceLock<(Mutex<Links>, Condvar)> = OnceLock::new();
-        BRIDGE.get_or_init(|| (Mutex::new(Links::default()), Condvar::new()))
+    fn bridge() -> &'static Mutex<Links> {
+        static BRIDGE: OnceLock<Mutex<Links>> = OnceLock::new();
+        BRIDGE.get_or_init(|| Mutex::new(Links::default()))
     }
 
     fn run() {
-        let (links, wake) = bridge();
+        let links = bridge();
         let mut g = links.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
-            while g.pairs.is_empty() {
-                g = wake.wait(g).unwrap_or_else(PoisonError::into_inner);
+            // Idle: end (the next `forward` starts another), so no thread
+            // outlives the reads that needed it (review conc#14).
+            if g.pairs.is_empty() {
+                g.started = false;
+                return;
             }
             for (_, from, to) in &g.pairs {
                 if from.load(Ordering::SeqCst) {
@@ -1402,21 +1415,57 @@ mod cancel_bridge {
         if from.load(Ordering::SeqCst) {
             to.store(true, Ordering::SeqCst);
         }
-        let (links, wake) = bridge();
-        let mut g = links.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut g = bridge().lock().unwrap_or_else(PoisonError::into_inner);
         if !g.started {
             // Without the thread a cancel is honoured only when the read
             // ends (the caller checks its flag then): later, not wrong.
-            g.started = std::thread::Builder::new()
+            match std::thread::Builder::new()
                 .name("gstore-cancel-bridge".into())
                 .spawn(run)
-                .is_ok();
+            {
+                Ok(t) => {
+                    g.started = true;
+                    // An earlier thread has ended (or is about to: it gave
+                    // up the lock with `started` cleared).
+                    g.thread = Some(t);
+                }
+                Err(_) => g.started = false,
+            }
         }
         let id = g.next;
         g.next += 1;
         g.pairs.push((id, Arc::clone(from), Arc::clone(to)));
-        wake.notify_all();
         Forward { id }
+    }
+
+    /// Join the bridge thread if it has nothing left to forward (it ends at
+    /// its next poll then), waiting at most a few polls. A thread still
+    /// forwarding for someone — another server's reads in this process,
+    /// also ones registered meanwhile — is left running.
+    pub(super) fn quiesce() {
+        let thread = {
+            let mut g = bridge().lock().unwrap_or_else(PoisonError::into_inner);
+            if !g.pairs.is_empty() {
+                return;
+            }
+            g.thread.take()
+        };
+        let Some(t) = thread else {
+            return;
+        };
+        let deadline = std::time::Instant::now() + 20 * POLL;
+        while !t.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(POLL / 5);
+        }
+        if t.is_finished() {
+            let _ = t.join();
+        } else {
+            // Busy again: give the handle back (unless a newer one is there).
+            let mut g = bridge().lock().unwrap_or_else(PoisonError::into_inner);
+            if g.thread.is_none() {
+                g.thread = Some(t);
+            }
+        }
     }
 
     /// A registered forwarding, removed when dropped.
@@ -1426,8 +1475,7 @@ mod cancel_bridge {
 
     impl Drop for Forward {
         fn drop(&mut self) {
-            let (links, _) = bridge();
-            let mut g = links.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut g = bridge().lock().unwrap_or_else(PoisonError::into_inner);
             g.pairs.retain(|(id, _, _)| *id != self.id);
         }
     }
@@ -3314,7 +3362,7 @@ impl ApiServer {
         // The body caps, budget and pre-body hook of this run (see
         // `crate::preauth`).
         let ingest = crate::preauth::api_ingest(&self.http, &self.inner, self.addr);
-        let drained = run_accept_loop(
+        let (drained, workers) = run_accept_loop(
             &self.listener,
             &self.life,
             self.inner.grace,
@@ -3336,7 +3384,9 @@ impl ApiServer {
                 })
             },
         );
-        self.finish_shutdown(drained)
+        let report = self.finish_shutdown(drained);
+        self.join_threads(workers);
+        report
     }
 
     /// Like [`serve_forever`](Self::serve_forever) but terminates TLS in-process
@@ -3349,7 +3399,7 @@ impl ApiServer {
         // The body caps, budget and pre-body hook of this run (see
         // `crate::preauth`).
         let ingest = crate::preauth::api_ingest(&self.http, &self.inner, self.addr);
-        let drained = run_accept_loop(
+        let (drained, workers) = run_accept_loop(
             &self.listener,
             &self.life,
             self.inner.grace,
@@ -3376,7 +3426,19 @@ impl ApiServer {
                 })
             },
         );
-        self.finish_shutdown(drained)
+        let report = self.finish_shutdown(drained);
+        self.join_threads(workers);
+        report
+    }
+
+    /// After a shutdown: join the connection workers and the cancel bridge
+    /// (if no other server uses it), bounded, so a program that stops this
+    /// server and starts another in the same process is not left with this
+    /// one's threads — nor with the database handles they hold (review
+    /// conc#14; the statistics refreshes were joined by `finish_shutdown`).
+    fn join_threads(&self, workers: crate::server::WorkerThreads) {
+        crate::server::join_workers(workers);
+        cancel_bridge::quiesce();
     }
 
     /// The tail of a graceful shutdown, after the listener closed and in-flight
@@ -3385,7 +3447,10 @@ impl ApiServer {
     /// every database with unsaved changes, and retire every slot so a request
     /// that is still queued on one can no longer apply a write nobody would
     /// save. From the start, every write still in flight saves itself before it
-    /// is acknowledged (see [`ApiInner::closing`]).
+    /// is acknowledged (see [`ApiInner::closing`]). The databases nobody holds
+    /// are done first; one a cancelled statement still holds is waited for
+    /// afterwards (it stops at its next cancellation check), so it never holds
+    /// up the others' saves.
     fn finish_shutdown(&self, mut drained: bool) -> ShutdownReport {
         let inner = &self.inner;
         inner.closing.store(true, Ordering::SeqCst);
@@ -3414,16 +3479,19 @@ impl ApiServer {
             .map(|(n, h)| (n.clone(), Arc::clone(h)))
             .collect();
         handles.sort_by(|a, b| a.0.cmp(&b.0));
-        for (name, h) in handles {
-            let mut slot = match h.write() {
-                Ok(slot) => slot,
-                Err(e) => {
-                    crate::gs_error!("shutdown: {}", e.msg);
-                    continue;
-                }
-            };
+        // A background statistics refresh holds a shared guard for one of
+        // its passes: stop them first (they end at their next pass; review
+        // conc#9) — joined, bounded, once the databases are saved.
+        let refreshes = crate::gapi::stop_stats_refreshes(
+            &handles
+                .iter()
+                .map(|(_, h)| Arc::clone(h))
+                .collect::<Vec<_>>(),
+        );
+        // Roll back, save and retire one database, its guard held.
+        let mut finish = |name: String, mut slot: SlotWrite<'_>| {
             if slot.retired {
-                continue;
+                return;
             }
             if let Some(open) = slot.txn.take() {
                 let _ = slot.db.rollback();
@@ -3458,6 +3526,30 @@ impl ApiServer {
                 }
             }
             slot.retire();
+        };
+        // Every database nobody holds first; then wait for the ones a
+        // statement still reads (it was cancelled above and stops at its
+        // next check — an index build included), so a database kept busy
+        // delays only its own save, never the others' (review conc#5).
+        let mut busy = Vec::new();
+        for (name, h) in &handles {
+            match h.try_write() {
+                Some(slot) => finish(name.clone(), slot),
+                None => busy.push((name, h)),
+            }
+        }
+        for (name, h) in busy {
+            match h.write() {
+                Ok(slot) => finish(name.clone(), slot),
+                Err(e) => crate::gs_error!("shutdown: {}", e.msg),
+            }
+        }
+        let lingering = refreshes.join(crate::server::THREAD_JOIN_WAIT);
+        if lingering > 0 {
+            crate::gs_warn!(
+                "shutdown: {lingering} statistics refresh thread(s) did not stop in time and \
+                 were left to finish on their own"
+            );
         }
         report
     }

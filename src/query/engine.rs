@@ -167,7 +167,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -178,7 +178,7 @@ use crate::analytics::gfun::{self, GCall, GFnKind, GFunCtx, GFunValue, GNode};
 use crate::analytics::GraphView;
 use crate::dict::{Dictionary, Space, TermStr};
 use crate::error::{GStoreError, Result};
-use crate::kvstore::StringIndex;
+use crate::kvstore::{string_index, StringIndex};
 use crate::model::id::is_entity_id;
 use crate::model::id::{PredId, LITERAL_FIRST_ID};
 use crate::model::{Term, Triple};
@@ -761,7 +761,14 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         }
         let csr = match self.csr_provider {
             Some(provider) => provider()?,
-            None => Arc::new(CsrGraph::build(self.store)?),
+            // This query's own CSR, read one predicate at a time; the
+            // query's cancel flag stops the build (review conc#5).
+            None => {
+                let never = std::sync::atomic::AtomicBool::new(false);
+                let cancel = self.cancel.as_deref().unwrap_or(&never);
+                let preds = Space::Predicate.first_id()..self.dict.id_limit(Space::Predicate);
+                Arc::new(CsrGraph::build_cancellable(self.store, preds, cancel)?)
+            }
         };
         *self.gfun_csr.borrow_mut() = Some(Arc::clone(&csr));
         Ok(csr)
@@ -2962,7 +2969,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             self.string_index_tried.set(true);
             let idx = match self.string_index_provider {
                 Some(provider) => provider(),
-                None => dictionary_string_index(self.dict),
+                // A cancelled build gives none: the query's own next check
+                // stops it (review conc#5).
+                None => dictionary_string_index_cancellable(self.dict, self.cancel.as_deref())
+                    .ok()
+                    .flatten(),
             };
             *self.string_index.borrow_mut() = idx;
         }
@@ -6443,31 +6454,156 @@ const STRING_INDEX_MIN_ENTRIES: usize = 64;
 /// run without the prefilter, which is still exact) or one too small for
 /// indexing to beat a linear scan.
 ///
-/// The index is keyed by each term's **`STR()`/lexical value** — the exact
-/// string a substring `FILTER` compares against — NOT the raw N-Triples dict
-/// key. This keeps candidate pruning sound: indexing the escaped/quoted dict
-/// form would miss a needle containing an escaped character (`"`, `\`, a
-/// newline) or a numeric whose canonical lexical differs from its stored form,
-/// silently dropping true matches. A term whose dict string somehow fails to
-/// re-parse falls back to its raw form (a term the dictionary stored always
-/// re-parses, so this is only a safety net).
+/// The index is keyed by the strings a substring `FILTER` compares — NOT the
+/// raw N-Triples dict key, whose escaped/quoted form would miss a needle
+/// holding an escaped character (`"`, `\`, a newline). A filter compares one
+/// of two strings: through `STR(?v)` the term's
+/// own lexical form (`"0012"^^xsd:integer` is `"0012"`, an IRI its text), and
+/// through a bare `?v` its value's canonical form (`12`). The two differ for
+/// numbers and booleans with a non-canonical lexical form (leading zeros, a
+/// sign, an exponent, padding, a derived integer type, `"1"` for `true`), so
+/// such a term is indexed under both — the candidates of either target stay
+/// a sound superset (review query#1, gap-accel-soundness#2). A term whose dict
+/// string somehow fails to re-parse falls back to its raw form (a term the
+/// dictionary stored always re-parses, so this is only a safety net).
 pub fn dictionary_string_index(dict: &Dictionary) -> Option<Arc<StringIndex>> {
+    dictionary_string_index_cancellable(dict, None)
+        .ok()
+        .flatten()
+}
+
+/// How many dictionary terms a substring-index build or refresh walks
+/// between two cancellation checks.
+const STRING_INDEX_POLL: usize = 1024;
+
+/// [`dictionary_string_index`] for a request with a cancel flag: a raised
+/// `cancel` stops the build — checked every 1,024 terms —
+/// with [`GStoreError::Cancelled`] (review conc#5). `Ok(None)` when no index
+/// would help (see there).
+pub fn dictionary_string_index_cancellable(
+    dict: &Dictionary,
+    cancel: Option<&AtomicBool>,
+) -> Result<Option<Arc<StringIndex>>> {
     if dict.is_disk_backed() || dict.entity_num() + dict.literal_num() < STRING_INDEX_MIN_ENTRIES {
-        return None;
+        return Ok(None);
     }
-    let mut lexical: Vec<(u32, String)> =
-        Vec::with_capacity(dict.entity_num() + dict.literal_num());
+    string_index::poll(cancel)?;
+    // A candidates-only index (the FILTER checks every candidate): each form
+    // is posted as it is computed, and no copy of it is kept.
+    let mut idx = StringIndex::candidates_only();
+    let mut ids: Vec<u32> = Vec::with_capacity(dict.entity_num() + dict.literal_num());
+    let mut walked = 0usize;
+    let mut stopped = None;
     for space in [Space::Entity, Space::Literal] {
         // In memory: cannot fail.
         let _ = dict.for_each_term(space, space.first_id(), |id, s| {
-            let key = key_term(s)
-                .map(|t| Value::from_term(&t).lexical())
-                .unwrap_or_else(|| s.to_string());
-            lexical.push((id, key));
+            walked += 1;
+            if walked.is_multiple_of(STRING_INDEX_POLL) {
+                if let Err(e) = string_index::poll(cancel) {
+                    stopped = Some(e);
+                    return ControlFlow::Break(());
+                }
+            }
+            index_substring_forms(&mut idx, id, s);
+            ids.push(id);
             ControlFlow::Continue(())
         });
+        if let Some(e) = stopped {
+            return Err(e);
+        }
     }
-    Some(Arc::new(StringIndex::build(lexical)))
+    string_index::poll(cancel)?;
+    idx.add_ids(ids);
+    idx.shrink();
+    Ok(Some(Arc::new(idx)))
+}
+
+/// Bring `idx` — the substring index of `base`, an earlier state of the
+/// in-memory dictionary `dict` (an O(1) copy-on-write clone of it) — up to
+/// date with `dict`: post every term whose string is new or changed since
+/// `base` (a new id, or a freed id reused for another term), counting them
+/// in `posted`. An unchanged term shares its string with `base`, so the
+/// comparison is by identity (`base` keeps every string it had alive: an
+/// address cannot be reused for another term meanwhile), one look-up per
+/// term — no trigram work for what did not change. The postings of a
+/// term freed since `base` stay: a superset (the FILTER checks every
+/// candidate). Review db#5.
+///
+/// `Ok(false)` as soon as `posted` passes `limit` (a full build is cheaper
+/// then: `idx` holds part of the change, still a superset for `base`);
+/// [`GStoreError::Cancelled`] when `cancel` is raised (checked every
+/// [`STRING_INDEX_POLL`] terms; the same holds for `idx`).
+pub(crate) fn refresh_string_index(
+    idx: &mut StringIndex,
+    base: &Dictionary,
+    dict: &Dictionary,
+    posted: &mut usize,
+    limit: usize,
+    cancel: Option<&AtomicBool>,
+) -> Result<bool> {
+    string_index::poll(cancel)?;
+    let mut walked = 0usize;
+    let mut stopped = None;
+    let mut over = false;
+    let mut ids: Vec<u32> = Vec::new();
+    for space in [Space::Entity, Space::Literal] {
+        let _ = dict.for_each_term(space, space.first_id(), |id, s| {
+            walked += 1;
+            if walked.is_multiple_of(STRING_INDEX_POLL) {
+                if let Err(e) = string_index::poll(cancel) {
+                    stopped = Some(e);
+                    return ControlFlow::Break(());
+                }
+            }
+            let same = base
+                .resolve(space, id)
+                .is_some_and(|old| old.as_ptr() == s.as_ptr() && old.len() == s.len());
+            if !same {
+                index_substring_forms(idx, id, s);
+                ids.push(id);
+                *posted += 1;
+                if *posted > limit {
+                    over = true;
+                    return ControlFlow::Break(());
+                }
+            }
+            ControlFlow::Continue(())
+        });
+        if stopped.is_some() || over {
+            break;
+        }
+    }
+    idx.add_ids(ids);
+    match stopped {
+        Some(e) => Err(e),
+        None => Ok(!over),
+    }
+}
+
+/// Post `id` (dict key `s`) under the strings a substring filter may compare
+/// for it (see [`substring_forms`]).
+fn index_substring_forms(idx: &mut StringIndex, id: u32, s: &str) {
+    let (canonical, raw) = substring_forms(s);
+    idx.post(id, &canonical);
+    if let Some(raw) = raw {
+        idx.post(id, &raw);
+    }
+}
+
+/// The strings a substring filter may compare for the term of dict key `s`:
+/// its value's canonical form (a bare `?v`), and — only when it differs —
+/// its own lexical form (`STR(?v)`; see [`dictionary_string_index`]).
+fn substring_forms(s: &str) -> (String, Option<String>) {
+    let Some(t) = key_term(s) else {
+        return (s.to_string(), None);
+    };
+    let canonical = Value::from_term(&t).lexical();
+    let raw = match t {
+        Term::Literal { value, .. } => value,
+        Term::Iri(v) | Term::Blank(v) => v,
+    };
+    let raw = (raw != canonical).then_some(raw);
+    (canonical, raw)
 }
 
 /// Walk a `FILTER` expression collecting mandatory-substring constraints for
@@ -6507,9 +6643,11 @@ fn collect_substr_constraints(e: &Expr, layout: &VarLayout, out: &mut HashMap<us
 }
 
 /// The variable index a substring builtin's first argument denotes, if it is a
-/// bare variable or `STR(?v)` (both preserve the value's bytes). Case-folding
-/// wrappers (`LCASE`/`UCASE`) yield `None`: their substring is not the variable's
-/// own bytes, so index pruning would be unsound.
+/// bare variable or `STR(?v)`. The two compare different strings (a bare
+/// variable its value's canonical form, `STR` the term's lexical form); the
+/// index holds both wherever they differ (see [`dictionary_string_index`]).
+/// Case-folding wrappers (`LCASE`/`UCASE`) yield `None`: their substring is
+/// not either form's bytes, so index pruning would be unsound.
 fn substr_target_var(e: &Expr, layout: &VarLayout) -> Option<usize> {
     match e {
         Expr::Var(v) => layout.index.get(v).copied(),

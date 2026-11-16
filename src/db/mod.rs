@@ -34,7 +34,7 @@ use crate::parser::sparql;
 use crate::parser::sparql::ast::{
     GraphPattern, GraphTarget, GroundTriple, QuadPattern, Query, UpdateOp, RDF_TYPE,
 };
-use crate::query::engine::dictionary_string_index;
+use crate::query::engine::dictionary_string_index_cancellable;
 use crate::query::{Evaluator, FunctionRegistry, IntegerDivision, QueryResult, TopKOptions};
 use crate::signature::{EdgeDir, Signature, VsTree};
 use crate::store::read_scope::ReadScope;
@@ -406,20 +406,68 @@ pub struct Database {
 }
 
 /// The cached dictionary substring index of a [`Database`] (see
-/// [`Database::string_index`]): `(dictionary generation, index)`. Its `Debug`
-/// shows only the generation and the index size.
+/// [`Database::string_index`]). Its lock is held only to look at or swap
+/// the entry, never while an index is built or refreshed. Its `Debug` shows
+/// only the generation and the index size.
 #[derive(Default)]
-struct StringIndexCache(Mutex<Option<(u64, Arc<StringIndex>)>>);
+struct StringIndexCache(Mutex<StringIndexSlot>);
+
+#[derive(Default)]
+struct StringIndexSlot {
+    /// The index and what it was built from (absent while one is built or
+    /// refreshed, and before the first).
+    entry: Option<CachedStringIndex>,
+    /// A build or refresh is running (with the lock released): other
+    /// readers go on without the prefilter meanwhile (still exact).
+    refreshing: bool,
+    /// Full builds and incremental refreshes so far (see
+    /// [`Database::string_index_builds`]).
+    builds: (u64, u64),
+}
+
+/// A cached substring index, current for dictionary `generation`.
+struct CachedStringIndex {
+    generation: u64,
+    index: Arc<StringIndex>,
+    /// The dictionary as it was then: an O(1) copy-on-write clone (an
+    /// in-memory dictionary's clone takes no pin) that a refresh compares
+    /// the current one with (see `refresh_string_index`).
+    base: Dictionary,
+    /// Terms posted since the index was last built from scratch: each is a
+    /// new term, or a freed id reused, whose old postings stay.
+    posted: usize,
+}
+
+impl StringIndexCache {
+    fn lock(&self) -> MutexGuard<'_, StringIndexSlot> {
+        // A plain value; a panicking build left the entry out (it is rebuilt).
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
 
 impl std::fmt::Debug for StringIndexCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.0.try_lock().as_deref() {
-            Ok(Some((g, idx))) => write!(f, "StringIndex(generation {g}, {} terms)", idx.len()),
-            Ok(None) => f.write_str("None"),
+            Ok(StringIndexSlot { entry: Some(e), .. }) => write!(
+                f,
+                "StringIndex(generation {}, {} terms)",
+                e.generation,
+                e.index.len()
+            ),
+            Ok(StringIndexSlot {
+                refreshing: true, ..
+            }) => f.write_str("<building>"),
+            Ok(_) => f.write_str("None"),
             Err(_) => f.write_str("<locked>"),
         }
     }
 }
+
+/// The fewest terms a cached substring index may post since its last full
+/// build (see [`CachedStringIndex::posted`]) before a refresh rebuilds it
+/// from scratch instead of extending it — or a quarter of the dictionary,
+/// if more: it bounds the stale postings freed terms leave behind.
+const STRING_INDEX_STALE_MIN: usize = 4096;
 
 /// Build-pipeline stage, reported through the progress callback of
 /// [`Database::build_from_str_with_progress`] (gStore's `DatabaseProgressStatus`).
@@ -680,18 +728,44 @@ impl Database {
     ///
     /// A Stream-mode database whose on-disk store is broken (C5) refuses,
     /// also a CSR cached before the failure (it may hold a failed
-    /// transaction's triples).
+    /// transaction's triples). The build cannot be cancelled: a request
+    /// uses [`csr_cancellable`](Self::csr_cancellable).
     pub fn csr(&self) -> Result<std::sync::Arc<CsrGraph>> {
+        self.csr_cancellable(None)
+    }
+
+    /// [`csr`](Self::csr) for a request with a cancel flag (review conc#5):
+    /// a raised `cancel` stops the build at its next check — between two
+    /// predicates, every [`POLL_PAIRS`](crate::analytics::csr::POLL_PAIRS)
+    /// triples of an in-memory one, between the build's phases — or ends a
+    /// wait for another request's build, with [`GStoreError::Cancelled`],
+    /// and nothing is cached. The store is read one predicate at a time
+    /// (an in-memory store in place), keeping only entity→entity edges:
+    /// literal triples are never all held at once (review analytics#6). The
+    /// cache's lock is not held during the build, so a reader that only
+    /// asks whether a CSR is cached ([`cached_csr`](Self::cached_csr)) never
+    /// waits for one.
+    pub fn csr_cancellable(&self, cancel: Option<&AtomicBool>) -> Result<std::sync::Arc<CsrGraph>> {
         self.check_store_readable()?;
-        self.csr_cache.get_or_build(self.mutations, || {
-            // A read error while building fails the build (nothing is cached).
-            let scope = ReadScope::enter();
-            let graph = CsrGraph::build(&self.store);
-            match scope.take_error() {
-                Some(e) => Err(read_failure("building the CSR", e)),
-                None => graph,
-            }
-        })
+        self.csr_cache
+            .get_or_build_cancellable(self.mutations, cancel, || {
+                // A read error while building fails the build (nothing is
+                // cached).
+                let scope = ReadScope::enter();
+                let graph = match self.store.as_memory() {
+                    Some(mem) => CsrGraph::build_from_memory(mem, cancel),
+                    None => {
+                        let never = AtomicBool::new(false);
+                        let preds = crate::dict::Space::Predicate.first_id()
+                            ..self.dict.id_limit(crate::dict::Space::Predicate);
+                        CsrGraph::build_cancellable(&self.store, preds, cancel.unwrap_or(&never))
+                    }
+                };
+                match scope.take_error() {
+                    Some(e) => Err(read_failure("building the CSR", e)),
+                    None => graph,
+                }
+            })
     }
 
     /// Build the CSR now instead of on the first graph-function query —
@@ -727,58 +801,152 @@ impl Database {
         self.query_cache_mut().clear();
         self.csr_cache.clear();
         self.mutations += 1;
-        // The substring index covers the dictionary: keep it while the
-        // dictionary is unchanged, drop it as soon as a term came or went.
+        // The substring index covers the dictionary: kept across a change
+        // that adds or frees terms (the next substring query extends it,
+        // see `string_index_cancellable`) — unless the dictionary shrank by
+        // more than a quarter: a rebuild is due then, and the entry's old
+        // dictionary state would keep the freed strings alive meanwhile.
         let generation = self.dict.generation();
-        let index = self
+        let live = self.dict.entity_num() + self.dict.literal_num();
+        let slot = self
             .string_index
             .0
             .get_mut()
             .unwrap_or_else(|e| e.into_inner());
-        if index.as_ref().is_some_and(|(g, _)| *g != generation) {
-            *index = None;
+        if slot
+            .entry
+            .as_ref()
+            .is_some_and(|e| e.generation != generation && live < e.index.len() - e.index.len() / 4)
+        {
+            slot.entry = None;
         }
     }
 
     /// The dictionary substring index for the current dictionary (see
-    /// [`dictionary_string_index`]): built on first use and cached until a
-    /// term is added or freed, so a second query with a substring `FILTER`
-    /// does not rebuild it. `None` for an out-of-core or a small dictionary,
-    /// where substring filters run without the prefilter (still exact).
+    /// [`dictionary_string_index`](crate::query::engine::dictionary_string_index)):
+    /// built on first use and cached, so a
+    /// second query with a substring `FILTER` does not rebuild it; a change
+    /// that adds or frees terms makes the next use extend it (see
+    /// [`string_index_cancellable`](Self::string_index_cancellable)). `None`
+    /// for an out-of-core or a small dictionary, where substring filters
+    /// run without the prefilter (still exact). The build cannot be
+    /// cancelled: a request uses `string_index_cancellable`.
     pub fn string_index(&self) -> Option<Arc<StringIndex>> {
+        self.string_index_cancellable(None)
+    }
+
+    /// [`string_index`](Self::string_index) for a request with a cancel
+    /// flag. The index is built, or refreshed, with the cache's lock
+    /// released: a reader that finds a build running goes on without the
+    /// prefilter (exact all the same) instead of waiting for it, and a
+    /// raised `cancel` stops the build at its next check (every thousand
+    /// terms or so) — nothing new is
+    /// cached then (review conc#5). After a change that added or freed
+    /// terms, the cached index is extended with the terms that are new or
+    /// changed (one identity check per term, trigram work only for what
+    /// changed) instead of being rebuilt from scratch; a full rebuild comes
+    /// only once more than a quarter of the dictionary (at least
+    /// 4,096 terms) was posted that way (review db#5).
+    pub fn string_index_cancellable(
+        &self,
+        cancel: Option<&AtomicBool>,
+    ) -> Option<Arc<StringIndex>> {
         if self.dict.is_disk_backed() {
             return None;
         }
         let generation = self.dict.generation();
-        // Built under the lock: concurrent readers wait for one build
-        // instead of each building its own.
-        let mut slot = match self.string_index.0.lock() {
-            Ok(g) => g,
-            Err(poisoned) => {
-                self.string_index.0.clear_poison();
-                let mut g = poisoned.into_inner();
-                *g = None;
-                g
+        let stale = {
+            let mut slot = self.string_index.lock();
+            if let Some(e) = &slot.entry {
+                if e.generation == generation {
+                    return Some(Arc::clone(&e.index));
+                }
             }
+            if slot.refreshing {
+                return None;
+            }
+            slot.refreshing = true;
+            slot.entry.take()
         };
-        if let Some((g, idx)) = slot.as_ref() {
-            if *g == generation {
-                return Some(Arc::clone(idx));
+        /// Ends the build — also when it panics.
+        struct Refreshing<'a>(&'a StringIndexCache);
+        impl Drop for Refreshing<'_> {
+            fn drop(&mut self) {
+                self.0.lock().refreshing = false;
             }
         }
-        let idx = dictionary_string_index(&self.dict)?;
-        *slot = Some((generation, Arc::clone(&idx)));
-        Some(idx)
+        let _refreshing = Refreshing(&self.string_index);
+        let live = self.dict.entity_num() + self.dict.literal_num();
+        let limit = (live / 4).max(STRING_INDEX_STALE_MIN);
+        if let Some(e) = stale.filter(|e| e.posted <= limit) {
+            // Extend it in place (a copy if someone still holds it).
+            let mut index = Arc::try_unwrap(e.index).unwrap_or_else(|shared| (*shared).clone());
+            let mut posted = e.posted;
+            match crate::query::engine::refresh_string_index(
+                &mut index,
+                &e.base,
+                &self.dict,
+                &mut posted,
+                limit,
+                cancel,
+            ) {
+                Ok(true) => {
+                    let index = Arc::new(index);
+                    let mut slot = self.string_index.lock();
+                    slot.builds.1 += 1;
+                    slot.entry = Some(CachedStringIndex {
+                        generation,
+                        index: Arc::clone(&index),
+                        base: self.dict.clone(),
+                        posted,
+                    });
+                    return Some(index);
+                }
+                // Too much changed: build it from scratch below.
+                Ok(false) => {}
+                // Cancelled: keep what there was (with the part of the
+                // change posted, a superset still for its dictionary state).
+                Err(_) => {
+                    self.string_index.lock().entry = Some(CachedStringIndex {
+                        index: Arc::new(index),
+                        posted,
+                        ..e
+                    });
+                    return None;
+                }
+            }
+        }
+        let index = dictionary_string_index_cancellable(&self.dict, cancel)
+            .ok()
+            .flatten()?;
+        let mut slot = self.string_index.lock();
+        slot.builds.0 += 1;
+        slot.entry = Some(CachedStringIndex {
+            generation,
+            index: Arc::clone(&index),
+            base: self.dict.clone(),
+            posted: 0,
+        });
+        Some(index)
     }
 
     /// The cached substring index, if one is cached for the current
     /// dictionary (never builds). For tests and monitoring.
     pub fn cached_string_index(&self) -> Option<Arc<StringIndex>> {
         let generation = self.dict.generation();
-        let slot = self.string_index.0.lock().ok()?;
-        slot.as_ref()
-            .filter(|(g, _)| *g == generation)
-            .map(|(_, idx)| Arc::clone(idx))
+        let slot = self.string_index.lock();
+        slot.entry
+            .as_ref()
+            .filter(|e| e.generation == generation)
+            .map(|e| Arc::clone(&e.index))
+    }
+
+    /// How many times this database built its substring index from scratch
+    /// and how many times it extended it (`(full, incremental)`). For tests
+    /// and diagnostics.
+    #[doc(hidden)]
+    pub fn string_index_builds(&self) -> (u64, u64) {
+        self.string_index.lock().builds
     }
 
     /// The query cache, through its lock. A lock poisoned by a panic is
@@ -2346,8 +2514,9 @@ impl Database {
         // The advanced graph functions run on this database's cached
         // CSR (see `csr`), built only when a query needs it; substring
         // filters on its cached dictionary index (see `string_index`).
-        let csr = || self.csr();
-        let string_index = || self.string_index();
+        let flag = cancel.clone();
+        let csr = || self.csr_cancellable(flag.as_deref());
+        let string_index = || self.string_index_cancellable(flag.as_deref());
         // Use the VS-tree as a candidate filter only while it is
         // consistent with the store; otherwise evaluate without it.
         let mut eval = if self.vstree_usable() {
@@ -3056,8 +3225,8 @@ impl Database {
                 .with_named(&self.named);
             return eval.eval_update_modify(delete, insert, pattern);
         }
-        let csr = || self.csr();
-        let string_index = || self.string_index();
+        let csr = || self.csr_cancellable(cancel.map(|c| &**c));
+        let string_index = || self.string_index_cancellable(cancel.map(|c| &**c));
         let eval = prepare(self, Evaluator::new(&self.dict, &self.store), cancel, pfn)
             .with_named(&self.named)
             .with_csr_provider(&csr)

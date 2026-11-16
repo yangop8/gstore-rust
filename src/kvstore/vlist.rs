@@ -16,9 +16,9 @@
 //! count), so [`decode_u32s`] reconstructs the exact original list.
 //!
 //! This is the codec; [`super::store`] wires it into the disk store's value
-//! (de)serialization (see `DiskStore::compact`). Values larger than a page are
-//! gStore's "VList overflow block" case — bounded here by the caller (see the
-//! REFACTOR backlog / task 4 note).
+//! (de)serialization (see `DiskStore::compact`). A value larger than fits
+//! inline — gStore's "VList overflow block" case — is stored by the disk store
+//! in an overflow page chain, so the codec itself has no size bound.
 
 /// Append `v` to `out` as an unsigned LEB128 varint.
 pub fn write_varint(out: &mut Vec<u8>, mut v: u32) {
