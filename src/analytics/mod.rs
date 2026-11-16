@@ -2556,7 +2556,12 @@ struct TopkState {
 /// deterministic iteration.
 ///
 /// Construction is O(E log E).  Dijkstra is O(E log V); weighted PageRank is
-/// O(V + E) per iteration; top-k complexity is documented on the query methods.
+/// O(V + E) per iteration; top-k complexity is documented on the query methods
+/// (the matcher keeps every complete match until it sorts: memory
+/// `O(matches)`, not `O(k)`).
+///
+/// Library API only: no SPARQL function or server path uses it (see the
+/// module docs, "Library-only APIs").
 pub struct WeightedGraphView {
     nodes: Vec<EntityLiteralId>,
     id_to_idx: HashMap<EntityLiteralId, usize>,

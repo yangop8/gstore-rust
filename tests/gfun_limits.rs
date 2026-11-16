@@ -41,10 +41,13 @@ struct Counting;
 
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
+/// Every byte ever allocated (never decreases).
+static TOTAL: AtomicUsize = AtomicUsize::new(0);
 
 fn grew(by: usize) {
     let now = CURRENT.fetch_add(by, Ordering::SeqCst) + by;
     PEAK.fetch_max(now, Ordering::SeqCst);
+    TOTAL.fetch_add(by, Ordering::SeqCst);
 }
 
 // SAFETY: every method forwards to `System` with the caller's arguments; the
@@ -1013,4 +1016,304 @@ fn similarity_of_long_literals_stops_at_a_mid_run_cancel() {
         rs.rows[0][0].as_deref().unwrap().starts_with("\"0"),
         "{rs:?}"
     );
+}
+
+/// The per-source functions allocate their `n`-sized working sets once per
+/// call and reset them sparsely, not once per source (review analytics#7:
+/// 400 sources on a 4M-vertex graph took 7.9 s in degreeCorrelation, each
+/// source allocating and clearing three `n`-sized arrays).
+#[test]
+fn per_source_working_sets_are_allocated_once_per_call() {
+    let _s = serial();
+    const PAIRS: u32 = 100_000; // n = 200 000 vertices
+    const SOURCES: u32 = 400;
+    let g = graph((0..PAIRS).map(|i| (2 * i, 2 * i + 1)));
+    let n = g.num_nodes();
+    let d = Dictionary::new();
+    let srcs: Vec<GNode> = (0..SOURCES)
+        .map(|i| GNode::from_node(&g, g.node_of(2 * i).unwrap()))
+        .collect();
+    let cases: [(GFnKind, Box<dyn Fn(&mut GArgs)>); 4] = [
+        (GFnKind::DegreeCorrelation, Box::new(|a| a.k = Some(1))),
+        (
+            GFnKind::ClosenessCentrality,
+            Box::new(|a| a.directed = false),
+        ),
+        (
+            GFnKind::BetweennessCentrality,
+            Box::new(|a| a.directed = false),
+        ),
+        (
+            GFnKind::JaccardSimilarity,
+            Box::new(|a| {
+                a.k = Some(2);
+                a.ret_num = Some(10);
+            }),
+        ),
+    ];
+    for (kind, set) in cases {
+        let mut a = args(&g, |a| a.srcs = srcs.clone());
+        set(&mut a);
+        let before = TOTAL.load(Ordering::SeqCst);
+        let r = gfun::eval(kind, &GFunCtx::new(&g, &d), &a);
+        let total = TOTAL.load(Ordering::SeqCst) - before;
+        assert!(r.is_ok(), "{kind}: {r:?}");
+        // a few n-sized arrays once, not 400 times
+        assert!(
+            total < 40 * n,
+            "{kind}: allocated {total} bytes for {SOURCES} sources on {n} vertices"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// edge cases (gap-gfun-fuzz#6, analytics#11)
+// ---------------------------------------------------------------------------
+
+/// Every function answers on a graph without vertices — an empty store and
+/// a literal-only one — instead of panicking (maximumKplex panicked for
+/// k <= 2, review gap-gfun-fuzz#1).
+#[test]
+fn every_function_answers_on_a_graph_without_vertices() {
+    let _s = serial();
+    for (name, data) in [
+        ("empty", ""),
+        (
+            "literals",
+            "<http://x/a> <http://x/name> \"A\" .\n<http://x/b> <http://x/age> \"3\" .\n",
+        ),
+    ] {
+        let db = Database::build_from_str(name, data).unwrap();
+        let csr = db.csr().unwrap();
+        assert_eq!(csr.num_nodes(), 0, "{name}");
+        let ctx = GFunCtx::new(&csr, db.dict());
+        for kind in GFnKind::ALL {
+            for k in [1, 2, 3] {
+                let a = GArgs {
+                    srcs: vec![GNode::MISSING],
+                    dsts: vec![GNode::MISSING],
+                    k: Some(k),
+                    ret_num: Some(3),
+                    alpha: Some(0.85),
+                    max_iter: Some(5.0),
+                    tol: Some(0.001),
+                    increase: Some(0.0),
+                    nums: vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+                    preds: PredFilter::resolve::<&str>(&[], &[], db.dict()),
+                    ..GArgs::default()
+                };
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    gfun::eval(kind, &ctx, &a)
+                }));
+                match r {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(GStoreError::Query(_))) => {}
+                    Ok(Err(e)) => panic!("{name}: {kind}(k={k}) failed: {e}"),
+                    Err(_) => panic!("{name}: {kind}(k={k}) panicked"),
+                }
+            }
+        }
+    }
+}
+
+/// `shortestPathCount` on a 2-wide ladder whose path count wraps C `int`
+/// (2^40 paths) answers upstream's wrapped value instead of exhausting
+/// memory (review H-8 / analytics#1, fixed in round 1; this is the SPARQL
+/// guard analytics#11 asked for).
+#[test]
+fn shortest_path_count_survives_wrapping_counts() {
+    let _s = serial();
+    let mut nt = String::new();
+    let v = |i: usize, side: &str| format!("<http://x/{side}{i}>");
+    // s → {a1, b1}; {ai, bi} → {ai+1, bi+1}; {a40, b40} → t
+    for side in ["a", "b"] {
+        nt.push_str(&format!("<http://x/s> <http://x/p> {} .\n", v(1, side)));
+        nt.push_str(&format!("{} <http://x/p> <http://x/t> .\n", v(40, side)));
+    }
+    for i in 1..40 {
+        for from in ["a", "b"] {
+            for to in ["a", "b"] {
+                nt.push_str(&format!("{} <http://x/p> {} .\n", v(i, from), v(i + 1, to)));
+            }
+        }
+    }
+    let mut db = Database::build_from_str("ladder", &nt).unwrap();
+    let rs = db
+        .select("SELECT (shortestPathCount(<http://x/s>, <http://x/t>, true, {}) AS ?c) WHERE {}")
+        .unwrap();
+    let cell = rs.rows[0][0].clone().unwrap();
+    // 2^40 wraps to 0 as a C int
+    assert!(
+        cell.contains("\\\"count\\\":0") || cell.contains("\"count\":0"),
+        "{cell}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// end to end: a REST /cancel while the computation is parked
+// ---------------------------------------------------------------------------
+
+mod rest {
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
+
+    pub struct Reply {
+        pub status: u16,
+        pub body: String,
+    }
+
+    fn basic() -> String {
+        const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let input = b"root:root";
+        let mut out = String::new();
+        for chunk in input.chunks(3) {
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
+            let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    out.push(A[((n >> (18 - 6 * i)) & 63) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        format!("Basic {out}")
+    }
+
+    /// One request as root (password `root`).
+    pub fn send(addr: &SocketAddr, method: &str, target: &str, body: &str) -> Reply {
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(120))).unwrap();
+        let raw = format!(
+            "{method} {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: {}\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            basic(),
+            body.len()
+        );
+        s.write_all(raw.as_bytes()).unwrap();
+        let mut resp = Vec::new();
+        s.read_to_end(&mut resp).unwrap();
+        let split = resp
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("header end");
+        let head = String::from_utf8_lossy(&resp[..split]).into_owned();
+        let status = head
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|c| c.parse().ok())
+            .expect("status");
+        Reply {
+            status,
+            body: String::from_utf8_lossy(&resp[split + 4..]).into_owned(),
+        }
+    }
+}
+
+/// Removes a directory when dropped (also when the test fails).
+struct TmpDir(std::path::PathBuf);
+
+impl Drop for TmpDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The whole path: a REST query computing WCC over a giant component is
+/// parked by the test hook inside the component's BFS; a REST `/cancel`
+/// arrives meanwhile; released, the computation stops at its next poll and
+/// the query answers the cancel.
+#[test]
+fn rest_cancel_stops_a_parked_graph_function() {
+    use gstore::http_api::ApiServer;
+    use std::sync::mpsc;
+    let _s = serial();
+    let root = TmpDir(
+        std::env::temp_dir().join(format!("gstore_gfun_limits_rest_{}", std::process::id())),
+    );
+    let _ = std::fs::remove_dir_all(&root.0);
+    let server = Arc::new(ApiServer::bind(&root.0, "root", "127.0.0.1:0").unwrap());
+    let addr = server.local_addr().unwrap();
+    let s2 = Arc::clone(&server);
+    let serving = std::thread::spawn(move || s2.serve_forever());
+    let r = rest::send(&addr, "POST", "/build?db_name=big", &chain_nt(20_000));
+    assert_eq!(r.status, 200, "{}", r.body);
+
+    // Park at the first WCC poll; count the polls after the release.
+    let (parked_tx, parked_rx) = mpsc::channel::<()>();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let go_rx = Mutex::new(go_rx);
+    let parked_tx = Mutex::new(Some(parked_tx));
+    let after = Arc::new(AtomicUsize::new(0));
+    let after2 = Arc::clone(&after);
+    let hook = HookGuard::install(move |s| {
+        if s != "wcc" {
+            return;
+        }
+        let first = parked_tx.lock().unwrap().take();
+        match first {
+            Some(tx) => {
+                let _ = tx.send(());
+                // hang guard only: the test releases it right after /cancel
+                let _ = go_rx.lock().unwrap().recv_timeout(Duration::from_secs(120));
+            }
+            None => {
+                after2.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    });
+    let query = std::thread::spawn(move || {
+        rest::send(
+            &addr,
+            "POST",
+            "/sparql?db_name=big",
+            "SELECT (WCC({}) AS ?w) WHERE {}",
+        )
+    });
+    parked_rx
+        .recv_timeout(Duration::from_secs(120))
+        .expect("the query never reached WCC's loop");
+    // The running query's task id, from the task list.
+    let list = rest::send(&addr, "GET", "/tasklist", "");
+    assert_eq!(list.status, 200, "{}", list.body);
+    let j = gstore::json::parse(&list.body).unwrap();
+    let tasks = j
+        .get("tasks")
+        .or_else(|| j.get("list"))
+        .and_then(gstore::json::Json::as_array)
+        .unwrap_or_else(|| panic!("{}", list.body))
+        .to_vec();
+    let id = tasks
+        .iter()
+        .find_map(|t| {
+            let id = t.get("id").or_else(|| t.get("opt_id"))?;
+            id.as_i64()
+                .map(|i| i.to_string())
+                .or_else(|| id.as_str().map(str::to_string))
+        })
+        .unwrap_or_else(|| panic!("no running task in {}", list.body));
+    let c = rest::send(&addr, "POST", &format!("/cancel?id={id}"), "");
+    assert_eq!(c.status, 200, "{}", c.body);
+    go_tx.send(()).unwrap();
+    let answer = query.join().unwrap();
+    drop(hook);
+    assert_eq!(answer.status, 400, "{}", answer.body);
+    assert!(
+        answer.body.to_lowercase().contains("cancel"),
+        "{}",
+        answer.body
+    );
+    assert_eq!(
+        after.load(Ordering::SeqCst),
+        0,
+        "WCC polled again after the cancel"
+    );
+    server.shutdown();
+    serving.join().unwrap();
 }
