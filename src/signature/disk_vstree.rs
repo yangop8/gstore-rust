@@ -31,8 +31,19 @@
 //! exact signature contains the query. The result is therefore a sound superset
 //! of the true matches — identical (as a set) to the in-memory tree's, exactly
 //! what the query engine's candidate filter requires.
+//!
+//! ## Validation (review disk#4)
+//! The file is a derived index and its pages carry no checksum, so nothing it
+//! holds is trusted. Every node a scan reads is checked: its kind byte is 0 or
+//! 1, its entry count at most [`DISK_FANOUT`], every child id lies in
+//! `1..page_count` and below the parent's id (both writers write children
+//! before their parent, so a tree is acyclic by construction), every leaf
+//! lies at the same depth, and no path is longer than [`MAX_DEPTH`] nodes.
+//! [`open`](DiskTree::open) checks the header (root id, entity count). A
+//! violation is a [`GStoreError::Serialize`] error ("corrupt"); as a
+//! [`SigFilter`] the tree then degrades to "no filtering", which is sound.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{GStoreError, Result};
@@ -62,6 +73,13 @@ const ENTRY_SIZE: usize = SIG_BYTES + 4; // 124
 /// Max entries (leaf entities / internal children) that fit in one node page.
 pub(super) const DISK_FANOUT: usize = (PAGE_SIZE - OFF_ENTRIES) / ENTRY_SIZE; // 32
 
+/// Longest root-to-leaf path (in nodes) a valid tree can have: entity ids are
+/// `u32`, so a tree holds at most 2^32 entities, 2^27 full leaves and
+/// `ceil(27 / 5) = 6` internal levels above them — 7 nodes. One level of
+/// slack; a deeper path is corruption (review disk#4: a cyclic or chained
+/// file used to recurse until the stack overflowed).
+pub(super) const MAX_DEPTH: usize = 8;
+
 /// Compile-time guarantee that a full node (header + node signature + entries)
 /// fits within one page.
 const _: () = assert!(OFF_ENTRIES + DISK_FANOUT * ENTRY_SIZE <= PAGE_SIZE);
@@ -72,6 +90,8 @@ pub(super) struct DiskTree {
     /// only briefly latches the pager's own cache), so candidate scans run on
     /// `&self` and the type stays `Send + Sync`.
     pager: Pager,
+    /// The file's path, for error messages.
+    path: PathBuf,
     /// Root node page id (`0` = empty tree).
     root: PageId,
     entity_count: usize,
@@ -105,11 +125,19 @@ impl DiskTree {
     }
 
     /// [`build`](Self::build) from entries already in clustering order.
+    ///
+    /// An existing file at `path` is replaced, with its write-ahead log
+    /// (review disk#5: the pager used to open it and append the new tree
+    /// after the old one, which leaked its pages, and a stale `<path>.wal`
+    /// was replayed into the new file). The caller owns `path`: the old file
+    /// is unlinked, so a handle another `DiskTree` holds on it keeps reading
+    /// the old tree.
     pub(super) fn build_sorted(
         path: &Path,
         entries: Vec<(EntityLiteralId, Signature)>,
     ) -> Result<DiskTree> {
         let entity_count = entries.len();
+        Pager::remove_with_wal(path)?;
         let mut pager = Pager::open(path, CACHE_PAGES)?;
         no_features(&pager, path)?;
 
@@ -119,6 +147,7 @@ impl DiskTree {
             pager.flush()?;
             return Ok(DiskTree {
                 pager,
+                path: path.to_path_buf(),
                 root: 0,
                 entity_count: 0,
                 reads: AtomicU64::new(0),
@@ -160,6 +189,7 @@ impl DiskTree {
         pager.flush()?;
         Ok(DiskTree {
             pager,
+            path: path.to_path_buf(),
             root,
             entity_count,
             reads: AtomicU64::new(0),
@@ -168,15 +198,52 @@ impl DiskTree {
 
     /// Open a previously-[`build`](Self::build)t out-of-core VS-tree at `path`.
     /// A file using a pager feature bit is refused (see [`no_features`]).
+    ///
+    /// A missing or empty file is an error (review disk#15: the pager would
+    /// create it and the caller got an empty tree instead of a failure), and
+    /// so is a header whose root id lies outside the file or whose entity
+    /// count no leaf layout of the file can hold (review disk#4).
     pub(super) fn open(path: &Path) -> Result<DiskTree> {
+        let meta = std::fs::metadata(path).map_err(|e| {
+            GStoreError::Io(std::io::Error::new(
+                e.kind(),
+                format!("cannot open VS-tree file '{}': {e}", path.display()),
+            ))
+        })?;
+        if !meta.is_file() {
+            return Err(GStoreError::Database(format!(
+                "'{}' is not a VS-tree file: not a regular file",
+                path.display()
+            )));
+        }
+        if meta.len() == 0 {
+            return Err(GStoreError::Serialize(format!(
+                "VS-tree file '{}' is empty (corrupt; remove it to rebuild the index)",
+                path.display()
+            )));
+        }
         let pager = Pager::open(path, CACHE_PAGES)?;
         no_features(&pager, path)?;
-        let root = pager.root(ROOT_SLOT) as PageId;
-        let entity_count = pager.root(COUNT_SLOT) as usize;
+        let pages = u64::from(pager.page_count());
+        let root = pager.root(ROOT_SLOT);
+        let entity_count = pager.root(COUNT_SLOT);
+        if root >= pages.max(1) {
+            return Err(corrupt(
+                path,
+                &format!("its root node id {root} is outside its {pages} pages"),
+            ));
+        }
+        if entity_count > pages.saturating_mul(DISK_FANOUT as u64) {
+            return Err(corrupt(
+                path,
+                &format!("its entity count {entity_count} exceeds what {pages} pages can hold"),
+            ));
+        }
         Ok(DiskTree {
             pager,
-            root,
-            entity_count,
+            path: path.to_path_buf(),
+            root: root as PageId,
+            entity_count: entity_count as usize,
             reads: AtomicU64::new(0),
         })
     }
@@ -202,20 +269,50 @@ impl DiskTree {
             return Ok(None);
         }
         let mut out = Vec::new();
-        self.search(self.root, query, &mut out)?;
+        let mut leaf_depth = None;
+        self.search(self.root, 1, query, &mut leaf_depth, &mut out)?;
         Ok(Some(out))
     }
 
+    /// Visit node `page` at `depth` (the root is at 1). `leaf_depth` is the
+    /// depth of the first leaf reached; every other leaf must lie there too.
     fn search(
         &self,
         page: PageId,
+        depth: usize,
         query: &Signature,
+        leaf_depth: &mut Option<usize>,
         out: &mut Vec<EntityLiteralId>,
     ) -> Result<()> {
+        if depth > MAX_DEPTH {
+            return Err(self.corrupt_page(
+                page,
+                &format!("the path to it is longer than {MAX_DEPTH} nodes"),
+            ));
+        }
         self.reads.fetch_add(1, Ordering::Relaxed);
         let buf = self.pager.read_page(page)?;
-        let is_leaf = buf[OFF_IS_LEAF] != 0;
-        let count = u16::from_le_bytes(buf[OFF_COUNT..OFF_COUNT + 2].try_into().unwrap()) as usize;
+        let is_leaf = match buf[OFF_IS_LEAF] {
+            0 => false,
+            1 => true,
+            other => return Err(self.corrupt_page(page, &format!("node kind byte {other}"))),
+        };
+        let count = u16::from_le_bytes([buf[OFF_COUNT], buf[OFF_COUNT + 1]]) as usize;
+        if count > DISK_FANOUT {
+            return Err(self.corrupt_page(
+                page,
+                &format!("{count} entries (at most {DISK_FANOUT} fit in a node)"),
+            ));
+        }
+        if is_leaf && *leaf_depth.get_or_insert(depth) != depth {
+            return Err(self.corrupt_page(
+                page,
+                &format!(
+                    "a leaf at depth {depth}, another at depth {}",
+                    leaf_depth.unwrap_or(depth)
+                ),
+            ));
+        }
         let nsig = Signature::read_le(&buf[OFF_NODE_SIG..OFF_NODE_SIG + SIG_BYTES]);
         // Prune: a subtree can hold a match only if its union contains the query.
         if !nsig.contains(query) {
@@ -224,22 +321,40 @@ impl DiskTree {
         for i in 0..count {
             let off = OFF_ENTRIES + i * ENTRY_SIZE;
             let sig = Signature::read_le(&buf[off..off + SIG_BYTES]);
-            let value = u32::from_le_bytes(
-                buf[off + SIG_BYTES..off + SIG_BYTES + 4]
-                    .try_into()
-                    .unwrap(),
-            );
+            let at = off + SIG_BYTES;
+            let value = u32::from_le_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]);
             if !sig.contains(query) {
                 continue;
             }
             if is_leaf {
                 out.push(value); // value = entity id; its exact sig contains query
             } else {
-                self.search(value, query, out)?; // value = child page id
+                // value = child page id: never the header, inside the file,
+                // and below its parent (children are written first).
+                if value == 0 || value >= page || value >= self.pager.page_count() {
+                    return Err(self.corrupt_page(
+                        page,
+                        &format!("child node id {value} (a child lies in 1..{page})"),
+                    ));
+                }
+                self.search(value, depth + 1, query, leaf_depth, out)?;
             }
         }
         Ok(())
     }
+
+    /// The error for a malformed node `page` of this tree's file.
+    fn corrupt_page(&self, page: PageId, what: &str) -> GStoreError {
+        corrupt(&self.path, &format!("node page {page} holds {what}"))
+    }
+}
+
+/// A corruption error for the VS-tree file at `path` (review disk#4).
+fn corrupt(path: &Path, what: &str) -> GStoreError {
+    GStoreError::Serialize(format!(
+        "VS-tree file '{}' is corrupt: {what} (remove it to rebuild the index)",
+        path.display()
+    ))
 }
 
 /// Refuse a `vstree.kv` whose pager header has feature bits: the format
@@ -258,8 +373,9 @@ fn no_features(pager: &Pager, path: &Path) -> Result<()> {
 
 /// The out-of-core VS-tree as a [`SigFilter`]: identical candidate semantics to
 /// the in-memory tree, but reading only the nodes a query traverses from disk.
-/// An I/O error during a scan degrades to `None` ("no filtering") — still
-/// correct (unpruned, never a false negative); a healthy store never hits it.
+/// An I/O error or a corrupt node (review disk#4) during a scan degrades to
+/// `None` ("no filtering") — still correct (unpruned, never a false
+/// negative); a healthy store never hits it.
 impl SigFilter for DiskTree {
     fn candidates(&self, query: &Signature) -> Option<Vec<EntityLiteralId>> {
         DiskTree::candidates(self, query).unwrap_or(None)
@@ -488,8 +604,14 @@ mod tests {
             set_feature_bit(&path, bit);
             assert!(DiskTree::open(&path).is_err(), "bit {bit:#x} accepted");
             assert!(super::super::VsTree::open_disk(&path).is_err());
-            // Nor is a tree built over it (its header would keep the bit).
-            assert!(DiskTree::build(&path, vec![(2, sig)]).is_err());
+            // review disk#5: a build replaces the file instead of opening it
+            // (it used to be refused here because the pager kept the old
+            // header and its bit), so the rebuilt file is a plain VS-tree.
+            drop(DiskTree::build(&path, vec![(2, sig)]).unwrap());
+            assert!(
+                DiskTree::open(&path).is_ok(),
+                "bit {bit:#x} survived a rebuild"
+            );
         }
     }
 
@@ -612,6 +734,300 @@ mod tests {
             "candidate scan read {read} of {total_pages} pages (should be a fraction)"
         );
         std::fs::remove_file(&path).ok();
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    //! review disk#4 / disk#5 / disk#15: a damaged `vstree.kv` is an error,
+    //! never a panic or a stack overflow; a build replaces the file; opening
+    //! never creates one.
+    use super::*;
+    use crate::signature::EdgeDir;
+
+    /// A scratch directory removed on drop (also when an assertion fails).
+    struct Tmp(PathBuf);
+    impl Tmp {
+        fn new(tag: &str) -> Tmp {
+            let d = std::env::temp_dir()
+                .join(format!("gstore_diskvs_valid_{tag}_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            Tmp(d)
+        }
+        fn path(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// `n` entities whose signatures all contain the empty query.
+    fn entries(n: u32) -> Vec<(EntityLiteralId, Signature)> {
+        (0..n)
+            .map(|i| {
+                let mut s = Signature::new();
+                s.encode_edge(i % 7, i, EdgeDir::Out);
+                (i, s)
+            })
+            .collect()
+    }
+
+    /// Rewrite node page `page` of the file at `path` with `f`.
+    fn patch_page(path: &Path, page: u32, f: impl FnOnce(&mut [u8])) {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let at = u64::from(page) * PAGE_SIZE as u64;
+        let mut buf = vec![0u8; PAGE_SIZE];
+        file.seek(SeekFrom::Start(at)).unwrap();
+        file.read_exact(&mut buf).unwrap();
+        f(&mut buf);
+        file.seek(SeekFrom::Start(at)).unwrap();
+        file.write_all(&buf).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    /// Set the child id of entry `i` of an internal node page.
+    fn set_child(buf: &mut [u8], i: usize, child: u32) {
+        let at = OFF_ENTRIES + i * ENTRY_SIZE + SIG_BYTES;
+        buf[at..at + 4].copy_from_slice(&child.to_le_bytes());
+    }
+
+    /// A two-level tree of 40 entities: leaves on pages 1 and 2, the root
+    /// (internal, two children) on page 3. Returns its file.
+    fn two_level(tmp: &Tmp, name: &str) -> PathBuf {
+        let path = tmp.path(name);
+        let t = DiskTree::build(&path, entries(40)).unwrap();
+        assert_eq!((t.root, t.pager.page_count()), (3, 4));
+        path
+    }
+
+    /// Open the (patched) file and scan it with the empty query, which
+    /// every node contains: the error, or the candidates.
+    fn scan(path: &Path) -> Result<Option<Vec<EntityLiteralId>>> {
+        DiskTree::open(path)?.candidates(&Signature::new())
+    }
+
+    fn assert_corrupt(r: Result<Option<Vec<EntityLiteralId>>>, what: &str) {
+        match r {
+            Err(e @ GStoreError::Serialize(_)) => {
+                assert!(e.to_string().contains("corrupt"), "{what}: {e}")
+            }
+            other => panic!("{what}: expected a corruption error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_intact_tree_passes_validation() {
+        let tmp = Tmp::new("intact");
+        let path = two_level(&tmp, "t1.kv");
+        let mut got = scan(&path).unwrap().unwrap();
+        got.sort_unstable();
+        assert_eq!(got, (0..40).collect::<Vec<_>>());
+        // A tree deep enough to have three levels validates too.
+        let deep = tmp.path("deep.kv");
+        drop(DiskTree::build(&deep, entries(32 * 32 + 1)).unwrap());
+        assert_eq!(scan(&deep).unwrap().unwrap().len(), 32 * 32 + 1);
+    }
+
+    #[test]
+    fn an_entry_count_above_the_fanout_is_an_error() {
+        let tmp = Tmp::new("count");
+        for page in [1u32, 3] {
+            let path = two_level(&tmp, &format!("count{page}.kv"));
+            patch_page(&path, page, |b| {
+                b[OFF_COUNT..OFF_COUNT + 2].copy_from_slice(&40u16.to_le_bytes())
+            });
+            assert_corrupt(scan(&path), &format!("count 40 on page {page}"));
+        }
+    }
+
+    #[test]
+    fn a_child_id_of_the_header_page_is_an_error() {
+        let tmp = Tmp::new("child0");
+        let path = two_level(&tmp, "t3.kv");
+        patch_page(&path, 3, |b| set_child(b, 0, 0));
+        assert_corrupt(scan(&path), "child 0");
+    }
+
+    #[test]
+    fn a_child_id_past_the_file_is_an_error() {
+        let tmp = Tmp::new("childpast");
+        let path = two_level(&tmp, "t4.kv");
+        patch_page(&path, 3, |b| set_child(b, 1, 1000));
+        assert_corrupt(scan(&path), "child 1000");
+    }
+
+    #[test]
+    fn a_cycle_is_an_error_not_a_stack_overflow() {
+        let tmp = Tmp::new("cycle");
+        // The root names itself.
+        let path = two_level(&tmp, "t5.kv");
+        patch_page(&path, 3, |b| set_child(b, 0, 3));
+        assert_corrupt(scan(&path), "self cycle");
+        // A one-leaf tree whose leaf turns into an internal node naming
+        // itself (the review's reproduction: it aborted the process).
+        let one = tmp.path("one.kv");
+        drop(DiskTree::build(&one, entries(3)).unwrap());
+        patch_page(&one, 1, |b| {
+            b[OFF_IS_LEAF] = 0;
+            set_child(b, 0, 1);
+        });
+        assert_corrupt(scan(&one), "leaf turned self cycle");
+    }
+
+    #[test]
+    fn a_path_longer_than_the_maximum_depth_is_an_error() {
+        // Build a chain: page 1 a leaf, pages 2..=k internal nodes with one
+        // child each, the page below — acyclic, but deeper than any tree
+        // of u32 entity ids can be.
+        let tmp = Tmp::new("chain");
+        let path = tmp.path("chain.kv");
+        let k = (MAX_DEPTH + 2) as u32;
+        {
+            let mut pager = Pager::open(&path, 16).unwrap();
+            let mut sig = Signature::new();
+            sig.encode_edge(1, 1, EdgeDir::Out);
+            for page in 1..=k {
+                assert_eq!(pager.alloc().unwrap(), page);
+                let node = if page == 1 {
+                    build_node(true, &sig, std::iter::once((sig, 7u32)))
+                } else {
+                    build_node(false, &sig, std::iter::once((sig, page - 1)))
+                };
+                pager.write_page(page, &node).unwrap();
+            }
+            pager.set_root(ROOT_SLOT, u64::from(k));
+            pager.set_root(COUNT_SLOT, 1);
+            pager.flush().unwrap();
+        }
+        assert_corrupt(scan(&path), "chain");
+    }
+
+    #[test]
+    fn leaves_at_different_depths_are_an_error() {
+        // A three-level tree; the root's second child is redirected from an
+        // internal node to a leaf one level too high.
+        let tmp = Tmp::new("depth");
+        let path = tmp.path("vstree.kv");
+        let t = DiskTree::build(&path, entries(32 * 32 + 1)).unwrap();
+        let root = t.root;
+        drop(t);
+        patch_page(&path, root, |b| set_child(b, 1, 1));
+        assert_corrupt(scan(&path), "uneven leaves");
+    }
+
+    #[test]
+    fn a_bad_node_kind_byte_is_an_error() {
+        let tmp = Tmp::new("kind");
+        let path = two_level(&tmp, "t6.kv");
+        patch_page(&path, 1, |b| b[OFF_IS_LEAF] = 7);
+        assert_corrupt(scan(&path), "kind 7");
+    }
+
+    #[test]
+    fn a_bad_header_is_refused_at_open() {
+        let tmp = Tmp::new("header");
+        let path = two_level(&tmp, "t7.kv");
+        let slot = |i: usize| 16 + i * 8;
+        patch_page(&path, 0, |b| {
+            b[slot(ROOT_SLOT)..slot(ROOT_SLOT) + 8].copy_from_slice(&99u64.to_le_bytes())
+        });
+        assert_corrupt(DiskTree::open(&path).map(|_| None), "root 99");
+        let path = two_level(&tmp, "t8.kv");
+        patch_page(&path, 0, |b| {
+            b[slot(COUNT_SLOT)..slot(COUNT_SLOT) + 8].copy_from_slice(&u64::MAX.to_le_bytes())
+        });
+        assert_corrupt(DiskTree::open(&path).map(|_| None), "count u64::MAX");
+    }
+
+    #[test]
+    fn a_corrupt_tree_filters_nothing_through_the_public_api() {
+        // As a candidate filter the damaged tree degrades to "no filtering"
+        // (`None`), which is sound, instead of panicking.
+        let tmp = Tmp::new("public");
+        let path = two_level(&tmp, "t9.kv");
+        patch_page(&path, 3, |b| set_child(b, 0, 3));
+        let tree = super::super::VsTree::open_disk(&path).unwrap();
+        assert_eq!(tree.candidates(&Signature::new()), None);
+        let mut q = Signature::new();
+        q.encode_query_edge(Some(1), None, EdgeDir::Out);
+        assert_eq!(tree.candidates(&q), None);
+    }
+
+    #[test]
+    fn building_over_an_existing_file_replaces_it() {
+        // review disk#5: three builds at one path used to grow the file
+        // (671744, 1339392, 2007040 bytes for 5000 entities).
+        let tmp = Tmp::new("rebuild");
+        let path = tmp.path("vstree.kv");
+        let mut sizes = Vec::new();
+        for _ in 0..3 {
+            drop(super::super::VsTree::build_disk(&path, entries(5000)).unwrap());
+            sizes.push(std::fs::metadata(&path).unwrap().len());
+        }
+        assert!(sizes.iter().all(|&s| s == sizes[0]), "sizes {sizes:?}");
+        // The rebuilt file is byte-identical to a fresh build elsewhere.
+        let fresh = tmp.path("fresh.kv");
+        drop(super::super::VsTree::build_disk(&fresh, entries(5000)).unwrap());
+        assert!(std::fs::read(&path).unwrap() == std::fs::read(&fresh).unwrap());
+        // A smaller tree over a larger one leaves no trace of it.
+        drop(super::super::VsTree::build_disk(&path, entries(3)).unwrap());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            2 * PAGE_SIZE as u64
+        );
+        let t = super::super::VsTree::open_disk(&path).unwrap();
+        assert_eq!(t.entity_count(), 3);
+    }
+
+    #[test]
+    fn building_drops_a_stale_write_ahead_log() {
+        let tmp = Tmp::new("stalewal");
+        let path = tmp.path("vstree.kv");
+        let wal = Pager::wal_path(&path);
+        std::fs::write(&wal, b"not a log of this file").unwrap();
+        drop(super::super::VsTree::build_disk(&path, entries(10)).unwrap());
+        assert!(!wal.exists(), "the stale log outlived the build");
+        assert_eq!(
+            super::super::VsTree::open_disk(&path)
+                .unwrap()
+                .entity_count(),
+            10
+        );
+    }
+
+    #[test]
+    fn opening_a_missing_or_empty_file_is_an_error_and_creates_nothing() {
+        // review disk#15: the pager created the file, and the caller got an
+        // empty tree (no filtering) instead of an error.
+        let tmp = Tmp::new("missing");
+        let path = tmp.path("vstree.kv");
+        let e = super::super::VsTree::open_disk(&path).unwrap_err();
+        assert!(
+            matches!(&e, GStoreError::Io(io) if io.kind() == std::io::ErrorKind::NotFound),
+            "{e}"
+        );
+        assert!(!path.exists(), "open_disk created the file");
+        assert!(!Pager::wal_path(&path).exists());
+        std::fs::write(&path, b"").unwrap();
+        let e = super::super::VsTree::open_disk(&path).unwrap_err();
+        assert!(e.to_string().contains("empty"), "{e}");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            0,
+            "the empty file was written"
+        );
+        // A directory is not a VS-tree file either.
+        let e = super::super::VsTree::open_disk(&tmp.0).unwrap_err();
+        assert!(e.to_string().contains("not a regular file"), "{e}");
     }
 }
 
