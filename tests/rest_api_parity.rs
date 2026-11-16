@@ -725,24 +725,38 @@ fn load_finishes_an_interrupted_restore_on_both_surfaces() {
 // backup / restore
 // ---------------------------------------------------------------------------
 
+/// A failed REST `/backup` over an earlier backup of the database keeps that
+/// one, recorded as a backup of it: each store is replaced as a whole, so
+/// the directory still holds the earlier backup (or, past the store's
+/// replacement, the new one). Dropping its record would orphan it: a user
+/// who may restore the database only from its own backups could no longer,
+/// and every later `/backup` into the directory — the default `<db>.backup`
+/// is reused by every REST backup of the database — would be refused for
+/// good as "data that is not a backup" (`409`).
 #[test]
-fn a_failed_backup_leaves_no_directory_recorded_as_a_backup() {
+fn a_failed_backup_over_an_earlier_one_keeps_it_and_can_be_retried() {
     let srv = Srv::start("backupfail");
     srv.ok("POST", "/build?db_name=bkp", DATA);
-    // An earlier backup of 'bkp' is replaced: its record goes before the
-    // backup writes, and a failure leaves none.
-    let r = srv.ok("POST", "/backup?db_name=bkp&path=keep", "");
+    let earlier = srv.statements("bkp");
+    let r = srv.ok("POST", "/backup?db_name=bkp", "");
     let target = PathBuf::from(r.json().get("path").and_then(Json::as_str).unwrap());
     assert_eq!(fs::read_to_string(target.join("BACKUP_OF")).unwrap(), "bkp");
-    fs::create_dir_all(target.join("dict.bin.tmp").join("blocker")).unwrap();
-    let r = srv.rest("POST", "/backup?db_name=bkp&path=keep", "");
+    let insert = "INSERT DATA { <http://ex/n> <http://ex/p> <http://ex/m> }";
+    srv.ok("POST", "/update?db_name=bkp", insert);
+    // The next backup there fails (a directory stands where its staging file
+    // goes: what an I/O error does).
+    let blocker = target.join("dict.bin.tmp");
+    fs::create_dir_all(blocker.join("blocker")).unwrap();
+    let r = srv.rest("POST", "/backup?db_name=bkp", "");
     assert_eq!(r.status, 500, "{}", r.body);
-    assert!(
-        !target.join("BACKUP_OF").exists(),
-        "a failed backup is still recorded as a backup of 'bkp'"
+    assert_eq!(
+        fs::read_to_string(target.join("BACKUP_OF")).unwrap(),
+        "bkp",
+        "the earlier backup is no longer recorded as one"
     );
-    // So a user who may restore `bkp` from its own backups only (root and
-    // admin users may restore from anything) cannot restore it as one.
+    fs::remove_dir_all(&blocker).unwrap();
+    // A user who may restore `bkp` from its own backups only (root and admin
+    // users may restore from anything) restores the earlier backup.
     srv.ok(
         "POST",
         "/user/create?op_username=carol&op_password=Carol-pass-123&privileges=restore&db_name=bkp",
@@ -754,7 +768,13 @@ fn a_failed_backup_leaves_no_directory_recorded_as_a_backup() {
         enc(&target.to_string_lossy())
     );
     let r = send(srv.addr, carol, "POST", &restore, "");
-    assert_eq!(r.status, 403, "restored from a failed backup: {}", r.body);
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(srv.statements("bkp"), earlier);
+    // The fault gone, the next backup into the same directory succeeds.
+    srv.ok("POST", "/update?db_name=bkp", insert);
+    let r = srv.rest("POST", "/backup?db_name=bkp", "");
+    assert_eq!(r.status, 200, "a retry is refused: {}", r.body);
+    assert_eq!(fs::read_to_string(target.join("BACKUP_OF")).unwrap(), "bkp");
     // The `/api` backup, which records only a complete backup, agrees on a
     // good one; and a good REST backup is recorded.
     let j = srv.api_ok(&[("operation", "backup"), ("db_name", "bkp")]);
@@ -1011,6 +1031,20 @@ fn a_backup_that_fails_part_way_leaves_no_directory_on_either_surface() {
         !backups.join("fresh").exists(),
         "a failed backup left its directory"
     );
+    // Into an empty directory made beforehand (a mount point, say): left
+    // empty again — neither recorded as a backup nor holding data a later
+    // `/backup` there would refuse as "not a backup" (409).
+    let empty = backups.join("empty");
+    fs::create_dir(&empty).unwrap();
+    let r = send(addr, ROOT, "POST", "/backup?db_name=bigdb&path=empty", "");
+    assert_eq!(r.status, 500, "{}", r.body);
+    let held: Vec<_> = fs::read_dir(&empty)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert!(held.is_empty(), "a failed backup left {held:?}");
+    fs::remove_dir(&empty).unwrap();
 
     let body = Json::obj()
         .with("username", "root")

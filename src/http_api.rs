@@ -6785,17 +6785,15 @@ impl ApiInner {
                 Err(r) => return r,
             };
             // Recorded as a backup of this database once complete, as the
-            // `/api` `backup` does (review design#4): a directory being
-            // written, or left by a backup that failed, holds no record, so
-            // `/restore` never takes it for a backup of the database. An
-            // earlier backup of it being replaced loses its record first.
+            // `/api` `backup` does (review design#4): a directory this backup
+            // makes holds no record while it is written, and goes again if
+            // the backup fails, so `/restore` never takes it for a backup of
+            // the database. `backup_target` allows only a new directory, an
+            // empty one or an earlier backup of this database here.
             let created = !path.exists();
-            let started = fs::create_dir_all(&path)
+            let earlier = !created && backup_owner(&path).as_deref() == Some(name.as_str());
+            let backed_up = fs::create_dir_all(&path)
                 .map_err(GStoreError::from)
-                .and_then(|()| {
-                    crate::db::fsutil::remove_file_if_exists(&path.join(BACKUP_OWNER_FILE))
-                });
-            let backed_up = started
                 .and_then(|()| slot.db.backup(&path))
                 .and_then(|()| mark_backup(&path, &name));
             drop(slot);
@@ -6809,12 +6807,23 @@ impl ApiInner {
                 }
                 Err(e) => {
                     // A directory this backup made goes again (as the `/api`
-                    // backup's); one it wrote into stays, without a record.
+                    // backup's), and an empty one it wrote into is emptied
+                    // again: neither is left holding data a later backup
+                    // there would refuse as "not a backup" (409). An earlier
+                    // backup it was replacing keeps its record: each store
+                    // is replaced as a whole, so the directory still holds a
+                    // complete backup of the database (the earlier one, or —
+                    // past the store's replacement — this one), and a retry
+                    // into it is allowed.
                     let note = if created {
                         let _ = fs::remove_dir_all(&path);
                         ""
+                    } else if earlier {
+                        "; the directory still holds the earlier backup, or this one where its \
+                         store was replaced before the failure"
                     } else {
-                        "; the directory is no longer recorded as a backup"
+                        empty_dir(&path);
+                        ""
                     };
                     fail_with(
                         &e,
@@ -7511,6 +7520,19 @@ pub(crate) fn backup_owner(dir: &Path) -> Option<String> {
 /// Record the backup at `dir` as one of database `db`.
 pub(crate) fn mark_backup(dir: &Path, db: &str) -> crate::Result<()> {
     crate::db::fsutil::atomic_write(&dir.join(BACKUP_OWNER_FILE), db.as_bytes())
+}
+
+/// Best effort: remove everything in directory `dir`, keeping `dir` itself —
+/// a REST `/backup` into a directory that was empty (perhaps a mount point)
+/// leaves it as it found it when the backup fails.
+fn empty_dir(dir: &Path) {
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        let _ = match entry.file_type() {
+            Ok(t) if t.is_dir() => fs::remove_dir_all(&path),
+            _ => fs::remove_file(&path),
+        };
+    }
 }
 
 /// One backup request's claim on its destination directory: backups into

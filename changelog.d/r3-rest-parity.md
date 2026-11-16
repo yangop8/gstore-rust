@@ -77,12 +77,17 @@ Behaviour changes first:
     database moved aside to `<db>.db.restore-old`, the copy staged as
     `<db>.db.restore-new`) and loads it — it answered `1005 "database[…]
     does not exist."`, where REST `/load` recovered it;
-  - REST `/backup` records its directory as a backup of the database
-    (`BACKUP_OF`) only once the backup is complete, removes a directory it
-    created when the backup fails, and drops the record of an earlier
-    backup it was replacing before writing — before, a failed backup left
-    a directory recorded as a backup of the database, which users allowed
-    to restore only from that database's backups could restore;
+  - REST `/backup` records a directory it creates as a backup of the
+    database (`BACKUP_OF`) only once the backup is complete, and removes it
+    when the backup fails; an empty directory it wrote into is emptied
+    again — before, a failed backup left a directory recorded as a backup
+    of the database, which users allowed to restore only from that
+    database's backups could restore. An earlier backup of the database
+    that a failed backup was replacing keeps its record: each store is
+    replaced as a whole, so the directory still holds a complete backup
+    (the earlier one, or the new one where its store was replaced before
+    the failure), and a retry into it — the default `<db>.backup` is reused
+    by every REST backup of the database — is allowed;
   - REST `/restore` registers a database it creates at the backup's time
     (a `<db>.db_<YYYYmmddHHMMSS>` backup), as `/api` `restore` does —
     before, at the time of the restore;
@@ -99,8 +104,9 @@ Behaviour changes first:
   codes unchanged), `tests/rest_api_parity.rs` (the parity suite: export,
   export inside a transaction, export cancelled, upload registration,
   failed rebuild, build/load/unload/drop, load after an interrupted
-  restore, failed backups — one in a fresh directory under `RLIMIT_FSIZE`
-  — restore registration time, batchInsert/batchRemove, users),
+  restore, failed backups — over an earlier backup (kept and retried), and
+  into a fresh and an empty directory under `RLIMIT_FSIZE` — restore
+  registration time, batchInsert/batchRemove, users),
   `http_api::tests::errors_map_to_the_status_of_their_kind` (the status
   table) and `error::tests`.
 
@@ -200,6 +206,20 @@ building an N-Triples string.
   the previous database is served again with the acknowledged write, and
   checks the unremovable rule directory separately (built, not served,
   `500`). Each is commented `review <id>`.
+- Review correction (D6): the package's first `/backup` fix dropped the
+  record of an earlier backup it was replacing before writing. A failure
+  then orphaned a directory that still held a complete backup (each store
+  is replaced as a whole), and `backup_target` refused every later
+  `/backup` into it as "data that is not a backup" (`409`) — for the
+  default `<db>.backup` path, every later REST backup of the database —
+  and an empty directory written into stayed non-empty and unrecorded,
+  with the same effect. The earlier backup now keeps its record and an
+  empty directory is emptied again;
+  `tests/rest_api_parity.rs::a_failed_backup_over_an_earlier_one_keeps_it_and_can_be_retried`
+  (replacing `a_failed_backup_leaves_no_directory_recorded_as_a_backup`,
+  whose first half pinned the dropped record) and the empty-directory case
+  of `a_backup_that_fails_part_way_leaves_no_directory_on_either_surface`
+  fail on the first fix.
 - Seen once, unrelated: `tests/no_background_thread_outlives_serve_forever.rs`
   `the_asynchronous_operation_runner_is_joined` failed in the stream-mode
   workspace run while a `--features zip` run built in the same target
