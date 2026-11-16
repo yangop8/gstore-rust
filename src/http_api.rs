@@ -784,10 +784,18 @@ pub fn debug_wait_txn_reaper_pass(root: &Path, wake: u64, hang_guard: Duration) 
     beat.1 >= wake
 }
 
-/// Where a test can park a transaction step ([`debug_park_txn`]).
+/// Where a test can park a step of a transaction or a statement
+/// ([`debug_park_txn`]; the single-database [`Server`](crate::server::Server)
+/// knows the two statement points too).
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxnParkPoint {
+    /// A statement (inside a transaction or not) is about to wait for its
+    /// database's guard; its `query_timeout` has not started.
+    StatementQueued,
+    /// A statement (inside a transaction or not) holds its database's guard
+    /// and its `query_timeout` has started; it is about to be evaluated.
+    StatementHolding,
     /// A `/tquery` statement has ended (its activity is stamped) but still
     /// holds its database's guard.
     StatementEnded,
@@ -797,6 +805,14 @@ pub enum TxnParkPoint {
     /// A RocksDB `/begin` has its copy and holds no guard yet (a write may
     /// slip in before it registers the transaction).
     BeginCaptured,
+    /// A RocksDB `/begin` found another `/begin` of the same database
+    /// copying it, and is about to wait for that one to finish (it then
+    /// sees the transaction that one opened, and copies nothing).
+    BeginQueued,
+    /// A `/commit` or `/rollback` was accepted (its transaction was live,
+    /// and it now counts as activity) and is about to wait for the
+    /// database's guard.
+    EndQueued,
 }
 
 /// A parked step: [`wait_parked`](Self::wait_parked) until a thread reaches
@@ -838,6 +854,12 @@ pub fn debug_park_txn(db: &str, point: TxnParkPoint) -> TxnPark {
 impl TxnPark {
     /// Wait (at most `hang_guard`) until a thread is parked here.
     pub fn wait_parked(&self, hang_guard: Duration) -> bool {
+        self.wait_parked_n(1, hang_guard)
+    }
+
+    /// Wait (at most `hang_guard`) until `n` threads have reached this
+    /// point (parked, or passed it once released).
+    pub fn wait_parked_n(&self, n: u64, hang_guard: Duration) -> bool {
         let g = self
             .gate
             .state
@@ -846,9 +868,19 @@ impl TxnPark {
         let (g, _) = self
             .gate
             .changed
-            .wait_timeout_while(g, hang_guard, |(n, _)| *n == 0)
+            .wait_timeout_while(g, hang_guard, |(reached, _)| *reached < n)
             .unwrap_or_else(PoisonError::into_inner);
-        g.0 > 0
+        g.0 >= n
+    }
+
+    /// How many threads have reached this point so far (parked, or passed
+    /// it once released).
+    pub fn parked(&self) -> u64 {
+        self.gate
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .0
     }
 
     /// Let the parked thread (and every later one) go on.
@@ -876,7 +908,7 @@ impl Drop for TxnPark {
 }
 
 /// Park here if a test armed `point` for `db` ([`debug_park_txn`]).
-fn txn_park(db: &str, point: TxnParkPoint) {
+pub(crate) fn txn_park(db: &str, point: TxnParkPoint) {
     if !TXN_PARKS_ARMED.load(Ordering::SeqCst) {
         return;
     }
@@ -1596,6 +1628,10 @@ pub(crate) struct DbCell {
     /// How an on-disk database answers queries (`None` for the other
     /// layouts; fixed for the slot's life).
     pub(crate) query_mode: Option<crate::db::DiskQueryMode>,
+    /// Held by a RocksDB `/begin` from before its whole-store copy until it
+    /// registered its transaction (or failed): one copy per database at a
+    /// time ([`ApiInner::begin_txn`]).
+    begin_copy: Mutex<()>,
 }
 
 /// What a [`DbCell`]'s directory size was measured for.
@@ -1749,6 +1785,7 @@ impl DbCell {
             }),
             layout: slot.db.storage(),
             query_mode: slot.db.disk_query_mode(),
+            begin_copy: Mutex::new(()),
             slot: RwLock::new(slot),
         }
     }
@@ -2193,16 +2230,82 @@ impl OpError {
     }
 }
 
-/// The [`OpErrorKind::Timeout`] error of a job whose deadline `d` stopped it
-/// (`e`: what the stopped job reported — for an UPDATE stopped part-way,
-/// which operations stayed applied).
-fn timed_out_err(e: OpError, d: &crate::deadline::Deadline) -> OpError {
+/// The [`OpErrorKind::Timeout`] error of a job whose `query_timeout` stopped
+/// it (`clock`; `e`: what the stopped job reported — for an UPDATE stopped
+/// part-way, which operations stayed applied).
+fn timed_out_err(e: OpError, clock: &StatementClock) -> OpError {
     let msg = if e.msg.contains("applied") {
-        format!("{} ({})", d.message(), e.msg)
+        format!("{} ({})", clock.message(), e.msg)
     } else {
-        d.message()
+        clock.message()
     };
     OpError::new(OpErrorKind::Timeout, msg)
+}
+
+/// The `query_timeout` clock of one statement (review sec#10, robust#5): it
+/// measures the statement's evaluation only. It [`start`](Self::start)s once
+/// the statement holds its database's guard — time spent queued behind
+/// another holder of the guard (a long write, a save, a backup) is not the
+/// statement's, so a trivial statement that waited is never answered as
+/// timed out — and [`stop`](Self::stop)s as soon as the evaluation returned,
+/// before the save of what an UPDATE applied, so a deadline passing during
+/// that save never relabels the statement's real outcome. A job is
+/// [`timed_out`](Self::timed_out) when the deadline had raised its cancel
+/// flag by the time the evaluation returned.
+pub(crate) struct StatementClock {
+    cancel: Arc<AtomicBool>,
+    timeout: Duration,
+    deadline: RefCell<Option<crate::deadline::Deadline>>,
+    started: std::cell::Cell<bool>,
+    timed_out: std::cell::Cell<bool>,
+}
+
+impl StatementClock {
+    /// The clock of a statement whose cancel flag is `cancel` (also raised
+    /// by `/cancel` and a shutdown), allowed `timeout` (zero: no limit).
+    pub(crate) fn new(cancel: &Arc<AtomicBool>, timeout: Duration) -> StatementClock {
+        StatementClock {
+            cancel: Arc::clone(cancel),
+            timeout,
+            deadline: RefCell::new(None),
+            started: std::cell::Cell::new(false),
+            timed_out: std::cell::Cell::new(false),
+        }
+    }
+
+    /// The statement holds its database's guard: its time starts now (only
+    /// the first call counts — a read retried on the live database keeps
+    /// the time it started with).
+    fn start(&self) {
+        if !self.started.replace(true) {
+            *self.deadline.borrow_mut() = crate::deadline::arm(&self.cancel, self.timeout);
+        }
+    }
+
+    /// The evaluation returned: disarm the deadline, remembering whether it
+    /// had fired (and so stopped the evaluation).
+    fn stop(&self) {
+        if let Some(d) = self.deadline.borrow_mut().take() {
+            if d.fired() {
+                self.timed_out.set(true);
+            }
+        }
+    }
+
+    /// Whether the deadline stopped the evaluation.
+    fn timed_out(&self) -> bool {
+        self.timed_out.get()
+    }
+
+    /// The statement's cancel flag.
+    fn cancel(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancel)
+    }
+
+    /// "query timed out after … (query_timeout)".
+    fn message(&self) -> String {
+        crate::deadline::timeout_message(self.timeout)
+    }
 }
 
 /// What a [`QueryJob`] produced.
@@ -3872,24 +3975,30 @@ impl ApiInner {
     /// once its time is up, the evaluator stops at its next cancellation
     /// check and releases the database (a writer queued behind a runaway
     /// read is no longer blocked for good), and the job fails as
-    /// [`OpErrorKind::Timeout`].
+    /// [`OpErrorKind::Timeout`]. Only the evaluation counts towards it
+    /// ([`StatementClock`]): not the wait for the database's guard, nor the
+    /// save after an UPDATE.
     pub(crate) fn run_query_job(&self, job: QueryJob) -> Result<JobOutput, OpError> {
         // Ends the task (also on a panic) once the job — and so its db lock —
         // is done.
         let mut task = TaskGuard::new(self, job.task_id);
-        let deadline = crate::deadline::arm(&job.cancel, self.config().query_timeout);
-        let out = self.run_query_job_locked(job);
-        let out = match (out, &deadline) {
-            (Err(e), Some(d)) if d.fired() && e.kind != OpErrorKind::Persist => {
-                Err(timed_out_err(e, d))
+        let clock = StatementClock::new(&job.cancel, self.config().query_timeout);
+        let out = self.run_query_job_locked(job, &clock);
+        let out = match out {
+            Err(e) if clock.timed_out() && e.kind != OpErrorKind::Persist => {
+                Err(timed_out_err(e, &clock))
             }
-            (out, _) => out,
+            out => out,
         };
         task.set_ok(out.is_ok());
         out
     }
 
-    fn run_query_job_locked(&self, job: QueryJob) -> Result<JobOutput, OpError> {
+    fn run_query_job_locked(
+        &self,
+        job: QueryJob,
+        clock: &StatementClock,
+    ) -> Result<JobOutput, OpError> {
         #[cfg(test)]
         if job.sparql.contains("__gstore_test_panic__") {
             let _slot = job.db.write();
@@ -3918,10 +4027,11 @@ impl ApiInner {
             });
         };
         if !stmt.is_update() {
-            return self
-                .read_committed(&job.db, &job.name, &stmt, &job.cancel, &caller)
-                .map(JobOutput::Read);
+            let out = self.read_committed(&job.db, &job.name, &stmt, clock, &caller);
+            clock.stop();
+            return out.map(JobOutput::Read);
         }
+        txn_park(&job.name, TxnParkPoint::StatementQueued);
         let mut slot = job.db.write()?;
         if slot.retired {
             return Err(unloaded());
@@ -3931,7 +4041,12 @@ impl ApiInner {
         }
         self.sync_query_settings(&mut slot);
         let before = slot.db.mutation_count();
-        let result = slot.db.execute_as(stmt, Some(job.cancel), Some(&caller));
+        clock.start();
+        txn_park(&job.name, TxnParkPoint::StatementHolding);
+        let result = slot
+            .db
+            .execute_as(stmt, Some(clock.cancel()), Some(&caller));
+        clock.stop();
         // Whether data changed — also by an UPDATE that failed part-way: the
         // operations before the failing one stay applied, so the database is
         // dirty and (under check_point) saved like after any other write.
@@ -3986,12 +4101,15 @@ impl ApiInner {
     /// of [`SNAPSHOT_READ_ATTEMPTS`] runs keeps the guard while it reads,
     /// which no commit can pass. `Closed` (and a database no longer served)
     /// is answered as `Closed`: the caller reports it as not loaded.
+    ///
+    /// The statement's `query_timeout` `clock` starts once it first holds
+    /// the guard (the caller stops it).
     pub(crate) fn read_committed(
         &self,
         dbh: &DbHandle,
         name: &str,
         stmt: &Statement,
-        cancel: &Arc<AtomicBool>,
+        clock: &StatementClock,
         caller: &crate::pfn::PfnCaller,
     ) -> Result<QueryResult, OpError> {
         let unloaded = || {
@@ -4002,14 +4120,17 @@ impl ApiInner {
         };
         let query_err = |e: GStoreError| OpError::new(OpErrorKind::Query, e.to_string());
         for attempt in 1..=SNAPSHOT_READ_ATTEMPTS {
+            txn_park(name, TxnParkPoint::StatementQueued);
             let slot = self.read_synced(dbh)?;
             if slot.retired {
                 return Err(unloaded());
             }
+            clock.start();
+            txn_park(name, TxnParkPoint::StatementHolding);
             let Some(open) = &slot.txn else {
                 return slot
                     .db
-                    .read_as(stmt, Some(Arc::clone(cancel)), Some(caller))
+                    .read_as(stmt, Some(clock.cancel()), Some(caller))
                     .map_err(query_err);
             };
             let snapshot = Arc::clone(&open.snapshot);
@@ -4020,7 +4141,7 @@ impl ApiInner {
                 drop(slot);
                 None
             };
-            let read = snapshot.read_as(stmt, Some(Arc::clone(cancel)), Some(caller));
+            let read = snapshot.read_as(stmt, Some(clock.cancel()), Some(caller));
             if matches!(read, Err(SnapshotReadError::Expired)) {
                 EXPIRED_SNAPSHOT_READS.fetch_add(1, Ordering::Relaxed);
             }
@@ -5424,6 +5545,13 @@ impl ApiInner {
     /// slipped in makes it copy again; after [`BEGIN_CAPTURE_ATTEMPTS`] it
     /// copies under the exclusive guard). The other layouts' snapshots cost
     /// O(1) and are taken under the exclusive guard.
+    ///
+    /// Concurrent RocksDB begins of one database copy it one at a time: each
+    /// holds the database's begin lock from before its copy until it
+    /// registered its transaction (or failed), so a begin that arrives
+    /// meanwhile waits, then finds that transaction open and is refused
+    /// without copying anything — never several whole-store copies at once
+    /// that all but one throw away.
     pub(crate) fn begin_txn(
         &self,
         dbh: &DbHandle,
@@ -5434,6 +5562,16 @@ impl ApiInner {
         let mut copied: Option<CapturedSnapshot> = None;
         let mut copies = 0;
         let rocks = dbh.layout == StorageKind::RocksDb;
+        let _copying = rocks.then(|| match dbh.begin_copy.try_lock() {
+            Ok(g) => g,
+            Err(TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                txn_park(name, TxnParkPoint::BeginQueued);
+                dbh.begin_copy
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+            }
+        });
         let (mut slot, snapshot) = loop {
             if rocks && copied.is_none() && copies < BEGIN_CAPTURE_ATTEMPTS {
                 copied = self.capture_shared(dbh, name)?;
@@ -5706,7 +5844,10 @@ impl ApiInner {
     /// Like every other statement it runs under `query_timeout` (review
     /// sec#10, robust#5; see [`run_query_job`](Self::run_query_job)): the
     /// deadline raises the task's cancel flag, and the statement then fails
-    /// as [`OpErrorKind::Timeout`]. The transaction stays open.
+    /// as [`OpErrorKind::Timeout`]; only its evaluation counts
+    /// ([`StatementClock`]). The transaction stays open — with the
+    /// operations a multi-operation UPDATE applied before it was stopped,
+    /// which the answer names (see [`run_in_txn`](Self::run_in_txn)).
     pub(crate) fn run_in_txn_task(
         &self,
         dbh: &DbHandle,
@@ -5723,13 +5864,13 @@ impl ApiInner {
             (task_id, cancel, activity)
         };
         let mut task = TaskGuard::new(self, task_id);
-        let deadline = crate::deadline::arm(&cancel, self.config().query_timeout);
-        let out = self.run_in_txn(dbh, name, tid, stmt, Some(cancel), user, activity);
-        let out = match (out, &deadline) {
-            (Err(e), Some(d)) if d.fired() && e.kind != OpErrorKind::Persist => {
-                Err(timed_out_err(e, d))
+        let clock = StatementClock::new(&cancel, self.config().query_timeout);
+        let out = self.run_in_txn(dbh, name, tid, stmt, &clock, user, activity);
+        let out = match out {
+            Err(e) if clock.timed_out() && e.kind != OpErrorKind::Persist => {
+                Err(timed_out_err(e, &clock))
             }
-            (out, _) => out,
+            out => out,
         };
         task.set_ok(out.is_ok());
         out
@@ -5781,7 +5922,8 @@ impl ApiInner {
 
     /// Run `stmt` (a parsed statement, or the error parsing it gave) inside
     /// open transaction `tid` on database `name` (handle `dbh`), cancellable
-    /// through `cancel` when given. Must be called with no lock held. The
+    /// through `clock`'s flag, whose `query_timeout` starts once the
+    /// statement holds the guard. Must be called with no lock held. The
     /// transaction is re-checked under the db guard — `/commit` and
     /// `/rollback` take the exclusive guard before they end it — so the
     /// statement either runs inside transaction `tid` or is refused, never
@@ -5789,6 +5931,12 @@ impl ApiInner {
     /// transaction's own writes), an UPDATE the exclusive one. `activity`
     /// ends (stamping the transaction's activity) before the guard is
     /// released.
+    ///
+    /// A multi-operation UPDATE that fails (or is stopped) part-way keeps
+    /// the operations before the failing one applied inside the
+    /// transaction, as it does outside one: the error says so ("operations
+    /// before the failing one were applied"), so the client knows to roll
+    /// the transaction back rather than commit a half-applied statement.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn run_in_txn(
         &self,
@@ -5796,7 +5944,7 @@ impl ApiInner {
         name: &str,
         tid: u64,
         stmt: crate::Result<Statement>,
-        cancel: Option<Arc<AtomicBool>>,
+        clock: &StatementClock,
         user: &str,
         activity: TxnStatement<'_>,
     ) -> Result<QueryResult, OpError> {
@@ -5822,28 +5970,41 @@ impl ApiInner {
             }
         };
         if !stmt.is_update() {
+            txn_park(name, TxnParkPoint::StatementQueued);
             let slot = self.read_synced(dbh)?;
             if !open_here(&slot) {
                 return Err(not_open());
             }
+            clock.start();
+            txn_park(name, TxnParkPoint::StatementHolding);
             let out = slot
                 .db
-                .read_as(&stmt, cancel, Some(&caller))
+                .read_as(&stmt, Some(clock.cancel()), Some(&caller))
                 .map_err(query_err);
+            clock.stop();
             activity.end();
             txn_park(name, TxnParkPoint::StatementEnded);
             drop(slot);
             return out;
         }
+        txn_park(name, TxnParkPoint::StatementQueued);
         let mut slot = dbh.write()?;
         if !open_here(&slot) {
             return Err(not_open());
         }
         self.sync_query_settings(&mut slot);
         let before = slot.db.mutation_count();
-        let result = slot.db.execute_as(stmt, cancel, Some(&caller));
-        // Also a failing UPDATE may have applied part of its operations.
-        if slot.db.mutation_count() != before {
+        clock.start();
+        txn_park(name, TxnParkPoint::StatementHolding);
+        let result = slot
+            .db
+            .execute_as(stmt, Some(clock.cancel()), Some(&caller));
+        clock.stop();
+        // Also a failing UPDATE may have applied part of its operations:
+        // they stay in the transaction, and the answer says so (as outside
+        // one, see `run_query_job_locked`).
+        let wrote = slot.db.mutation_count() != before;
+        if wrote {
             if let Some(open) = slot.txn.as_mut() {
                 open.changed = true;
             }
@@ -5851,7 +6012,13 @@ impl ApiInner {
         activity.end();
         txn_park(name, TxnParkPoint::StatementEnded);
         drop(slot);
-        result.map_err(query_err)
+        result.map_err(|e| {
+            if wrote {
+                OpError::new(OpErrorKind::Query, partial_update_msg(&e, None))
+            } else {
+                query_err(e)
+            }
+        })
     }
 
     fn handle_commit(&self, st: &mut ApiState, req: &Request, user: &str) -> Dispatch {
@@ -5905,6 +6072,13 @@ impl ApiInner {
     /// could no longer be undone, applied but not durable ([`NOT_DURABLE`],
     /// [`OpErrorKind::Persist`]; the database needs a reload). Either way
     /// the transaction log records it as aborted.
+    ///
+    /// A commit or rollback that was accepted while its transaction was live
+    /// counts as the transaction's activity until it has ended it, like a
+    /// statement in flight ([`TxnStatement`]): the wait for the database's
+    /// guard behind another holder (a save, a long read, a CSR build) can
+    /// therefore not turn it into an idle rollback, nor can a reaper roll
+    /// the transaction back meanwhile.
     pub(crate) fn end_txn(
         &self,
         dbh: Option<&DbHandle>,
@@ -5913,11 +6087,17 @@ impl ApiInner {
         user: &str,
         commit: bool,
     ) -> Result<Option<String>, OpError> {
+        let id = tid.tid;
+        let activity = {
+            let mut st = locked(&self.state);
+            self.txn_for(&st, Some(db), tid, user)?;
+            self.txn_statement(&mut st, db, id)
+        };
+        txn_park(db, TxnParkPoint::EndQueued);
         let mut slot = match dbh {
             Some(h) => Some(h.write()?),
             None => None,
         };
-        let id = tid.tid;
         // Checked while the db lock is held (race-free with /begin, /tquery,
         // a concurrent /commit of the same tid and the reapers, which all
         // take the guard before they touch it). The registry entry is
@@ -5959,6 +6139,8 @@ impl ApiInner {
             }
             txn
         };
+        // The registry entry is gone: nothing left to stamp.
+        activity.end();
         drop(slot);
         if let Some(txn) = txn {
             self.log_txn_end(&txn, id, user, ended.logged, ended.state);

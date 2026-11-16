@@ -3361,6 +3361,13 @@ impl ServerInner {
                 "application/json",
                 err_json("/update expects a SPARQL UPDATE request"),
             ),
+            // Stopped by `query_timeout` before it applied anything: a
+            // refused request, as on `/sparql` (an UPDATE stopped after
+            // applying part of its operations is the query error that says
+            // so).
+            Err(e @ crate::GStoreError::Timeout(_)) => {
+                Reply::buffered(503, "application/json", err_json(&e.to_string()))
+            }
             Err(e) => Reply::buffered(
                 failure_status(&warning),
                 "application/json",
@@ -3401,26 +3408,39 @@ impl ServerInner {
     /// ([`Server::with_query_timeout`], review sec#10): its own cancel flag,
     /// raised by its deadline or by the server's shutdown flag; one stopped
     /// by its deadline fails as [`GStoreError::Timeout`](crate::GStoreError::Timeout).
+    /// Only the evaluation counts: the deadline is armed once the statement
+    /// holds the database's lock (a statement queued behind a long write is
+    /// not charged for the wait) and disarmed when the evaluation returned
+    /// (not during the save after an UPDATE).
     fn execute(&self, sparql: &str) -> (crate::Result<QueryResult>, Option<String>) {
         let stmt = match Statement::parse(sparql) {
             Ok(stmt) => stmt,
             Err(e) => return (Err(e), None),
         };
-        let (flag, deadline) = crate::deadline::arm_linked(&self.cancel, self.query_timeout);
-        let timed_out = |r: crate::Result<QueryResult>| match (&r, &deadline) {
+        let timed_out = |r: crate::Result<QueryResult>,
+                         deadline: Option<crate::deadline::Deadline>| match (
+            &r, &deadline,
+        ) {
             (Err(crate::GStoreError::Cancelled), Some(d)) if d.fired() => {
                 Err(crate::GStoreError::Timeout(d.timeout()))
             }
             _ => r,
         };
-        let cancel = Some(flag);
+        use crate::http_api::{txn_park, TxnParkPoint};
+        txn_park(&self.name, TxnParkPoint::StatementQueued);
         if !stmt.is_update() {
             let db = read_locked(&self.db);
-            return (timed_out(db.read_as(&stmt, cancel, None)), None);
+            let (flag, deadline) = crate::deadline::arm_linked(&self.cancel, self.query_timeout);
+            txn_park(&self.name, TxnParkPoint::StatementHolding);
+            let result = db.read_as(&stmt, Some(flag), None);
+            return (timed_out(result, deadline), None);
         }
         let mut db = write_locked(&self.db);
         let before = db.mutation_count();
-        let mut result = timed_out(db.execute_as(stmt, cancel, None));
+        let (flag, deadline) = crate::deadline::arm_linked(&self.cancel, self.query_timeout);
+        txn_park(&self.name, TxnParkPoint::StatementHolding);
+        let result = db.execute_as(stmt, Some(flag), None);
+        let mut result = timed_out(result, deadline);
         let mut warning = None;
         if db.mutation_count() != before {
             self.dirty.store(true, Ordering::SeqCst);

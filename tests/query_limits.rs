@@ -4,8 +4,10 @@
 //! * `query_timeout`: a runaway statement — a three-way cross product with
 //!   an expensive FILTER — is stopped once its time is up and answered as
 //!   timed out (REST `503`, `/api` `1005`), releasing its database: an
-//!   UPDATE queued behind it then completes. The timeout is tiny and the
-//!   statement takes far longer, so the outcome does not depend on timing.
+//!   UPDATE queued behind it then completes. The timeout is short and the
+//!   statement takes far longer, so the outcome does not depend on timing;
+//!   the writer is sent only once the read holds the database, and waits
+//!   for it longer than `query_timeout` (test hooks `debug_park_txn`).
 //! * `max_result_bytes`: an answer whose serialization passes the budget is
 //!   refused (REST and single-database `503`, `/api` `1005`); a streamed one
 //!   is cut off without its closing chunk.
@@ -20,7 +22,7 @@ use std::thread;
 use std::time::Duration;
 
 use gstore::config::GStoreConfig;
-use gstore::http_api::ApiServer;
+use gstore::http_api::{self, ApiServer, TxnParkPoint};
 use gstore::json::{self, Json};
 use gstore::server::Server;
 use gstore::Database;
@@ -31,7 +33,20 @@ const HANG_GUARD: Duration = Duration::from_secs(120);
 const CROSS: &str = "SELECT ?a ?d ?g WHERE { ?a ?b ?c . ?d ?e ?f . ?g ?h ?i . \
                      FILTER(STR(?c) = CONCAT(STR(?f), STR(?i), \"x\")) }";
 
-const INSERT: &str = "INSERT DATA { <http://ex/new> <http://ex/p> \"new\" }";
+/// A writer with a WHERE clause (evaluated under its own `query_timeout`):
+/// moves the first subject's value to `<http://ex/new>`.
+const MOVE: &str = "DELETE { ?s <http://example.org/p> ?o } \
+                    INSERT { <http://ex/new> <http://ex/p> ?o } \
+                    WHERE { ?s <http://example.org/p> ?o \
+                    FILTER(?s = <http://example.org/a/rather/long/subject/0>) }";
+
+/// The `query_timeout` of the queued-writer tests: far longer than the
+/// writer's evaluation, far shorter than the runaway read's.
+const QUEUE_TIMEOUT_MS: u64 = 500;
+
+/// How long the read keeps the database while the writer waits for it:
+/// past [`QUEUE_TIMEOUT_MS`] (the scenario itself, not a synchronisation).
+const QUEUE_HOLD: Duration = Duration::from_millis(1500);
 
 /// `n` triples with long-ish terms.
 fn data(n: usize) -> String {
@@ -247,12 +262,42 @@ fn timeout_config(timeout_ms: u64) -> GStoreConfig {
 
 // ---- query_timeout --------------------------------------------------------------
 
+/// Send the statement `start` makes once the read `holding` parked holds
+/// database `db`, observe it reaching the database, let it wait there for
+/// [`QUEUE_HOLD`], then let the read go on: the statement's answer.
+fn queue_writer_behind<T: Send + 'static>(
+    db: &str,
+    holding: &http_api::TxnPark,
+    start: impl FnOnce() -> T + Send + 'static,
+) -> mpsc::Receiver<T> {
+    let queued = http_api::debug_park_txn(db, TxnParkPoint::StatementQueued);
+    let write = guarded(start);
+    assert!(
+        queued.wait_parked(HANG_GUARD),
+        "the writer reached the database"
+    );
+    queued.release();
+    thread::sleep(QUEUE_HOLD);
+    holding.release();
+    write
+}
+
 #[test]
 fn a_runaway_rest_query_times_out_and_a_queued_writer_then_completes() {
+    // review sec#10/robust#5 (round-2 land review): the read and the writer
+    // were sent at once, so the writer could run first and no writer ever
+    // waited behind the read; and a writer with a WHERE clause shows that
+    // its wait is not counted as its own time.
+    let db = "crossq";
     let dir = TmpDir::new("rest_timeout");
-    let addr = api_server(&dir, timeout_config(50), "cross", 100);
-    let read = guarded(move || rest_query(addr, "cross", CROSS));
-    let write = guarded(move || rest_update(addr, "cross", INSERT));
+    let addr = api_server(&dir, timeout_config(QUEUE_TIMEOUT_MS), db, 300);
+    let holding = http_api::debug_park_txn(db, TxnParkPoint::StatementHolding);
+    let read = guarded(move || rest_query(addr, db, CROSS));
+    assert!(
+        holding.wait_parked(HANG_GUARD),
+        "the read holds the database"
+    );
+    let write = queue_writer_behind(db, &holding, move || rest_update(addr, db, MOVE));
     let r = read
         .recv_timeout(HANG_GUARD)
         .expect("the query was never answered");
@@ -265,8 +310,8 @@ fn a_runaway_rest_query_times_out_and_a_queued_writer_then_completes() {
     // The database serves on.
     let r = rest_query(
         addr,
-        "cross",
-        "ASK { <http://ex/new> <http://ex/p> \"new\" }",
+        db,
+        "ASK { <http://ex/new> <http://ex/p> \"value number 0 of the data\" }",
     );
     assert_eq!(r.status, 200, "{}", r.body);
     assert!(r.body.contains("true"), "{}", r.body);
@@ -299,15 +344,19 @@ fn a_runaway_api_query_times_out_with_1005_and_is_logged() {
 
 #[test]
 fn a_runaway_query_on_the_single_database_server_times_out() {
-    let db = Database::build_from_str("cross", &data(100)).unwrap();
+    // review sec#10/robust#5 (round-2 land review): as in the REST test
+    // above, the writer is sent only once the read holds the database.
+    let name = "crosssingle";
+    let db = Database::build_from_str(name, &data(300)).unwrap();
     let server = Arc::new(
         Server::bind(db, "127.0.0.1:0")
             .unwrap()
-            .with_query_timeout(Duration::from_millis(50)),
+            .with_query_timeout(Duration::from_millis(QUEUE_TIMEOUT_MS)),
     );
     let addr = server.local_addr().unwrap();
     let s2 = Arc::clone(&server);
     thread::spawn(move || s2.serve_forever());
+    let holding = http_api::debug_park_txn(name, TxnParkPoint::StatementHolding);
     let read = guarded(move || {
         send(
             addr,
@@ -317,13 +366,17 @@ fn a_runaway_query_on_the_single_database_server_times_out() {
             "",
         )
     });
-    let write = guarded(move || {
+    assert!(
+        holding.wait_parked(HANG_GUARD),
+        "the read holds the database"
+    );
+    let write = queue_writer_behind(name, &holding, move || {
         send(
             addr,
             "POST",
             "/update",
             &[("Content-Type", "application/sparql-update")],
-            INSERT,
+            MOVE,
         )
     });
     let r = read
