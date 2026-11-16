@@ -1,0 +1,8 @@
+{
+  "head": {"vars": ["z"]},
+  "results": {"bindings": [
+    {"z": {"type": "uri", "value": "http://example.com/m1"}},
+    {"z": {"type": "uri", "value": "http://example.com/m2"}},
+    {"z": {"type": "uri", "value": "http://example.com/m1"}}
+  ]}
+}

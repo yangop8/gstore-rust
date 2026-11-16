@@ -1,0 +1,7 @@
+{
+  "head": {"vars": ["s", "gt"]},
+  "results": {"bindings": [
+    {"s": {"type": "uri", "value": "http://example.com/a"}, "gt": {"type": "literal", "value": "true", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"}},
+    {"s": {"type": "uri", "value": "http://example.com/b"}}
+  ]}
+}

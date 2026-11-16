@@ -1,0 +1,10 @@
+# spec: SPARQL 1.1 Query §16.2.1 Templates with Blank Nodes, written with the
+# abbreviation [ … ] of §4.1.4: a fresh blank node for every solution
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX vcard: <http://www.w3.org/2001/vcard-rdf/3.0#>
+CONSTRUCT { ?x vcard:N [ vcard:givenName ?gname ; vcard:familyName ?fname ] }
+WHERE
+ {
+    { ?x foaf:firstname ?gname } UNION { ?x foaf:givenname ?gname } .
+    { ?x foaf:surname ?fname } UNION { ?x foaf:family_name ?fname } .
+ }

@@ -1,0 +1,6 @@
+{
+  "head": {"vars": ["len", "sub", "sub1", "u", "l", "st", "en", "con", "bef", "aft", "cat"]},
+  "results": {"bindings": [
+    {"len": {"type": "literal", "value": "4", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}, "sub": {"type": "literal", "value": "bar"}, "sub1": {"type": "literal", "value": "b"}, "u": {"type": "literal", "value": "FOO"}, "l": {"type": "literal", "value": "bar"}, "st": {"type": "literal", "value": "true", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"}, "en": {"type": "literal", "value": "true", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"}, "con": {"type": "literal", "value": "true", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"}, "bef": {"type": "literal", "value": "a"}, "aft": {"type": "literal", "value": "c"}, "cat": {"type": "literal", "value": "foobar"}}
+  ]}
+}

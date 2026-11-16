@@ -1,0 +1,3 @@
+# spec: SPARQL 1.1 Query §18.5.1 Min / Max (they use the ORDER BY ordering of §15.1, where
+# IRIs sort before literals)
+SELECT (MIN(?v) AS ?min) (MAX(?v) AS ?max) WHERE { VALUES ?v { <http://example.org/z> 3 } }

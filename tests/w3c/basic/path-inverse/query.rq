@@ -1,0 +1,3 @@
+# spec: SPARQL 1.1 Query §9.1 Property Path Syntax (^elt)
+PREFIX : <http://example/>
+SELECT ?x { :c ^:knows ?x }

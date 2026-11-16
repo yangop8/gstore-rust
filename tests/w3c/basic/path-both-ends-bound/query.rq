@@ -1,0 +1,3 @@
+# spec: SPARQL 1.1 Query §9.4 Arbitrary Length Path Matching with both end points given
+PREFIX : <http://example/>
+ASK { :a :knows+ :d }

@@ -1,0 +1,3 @@
+# spec: SPARQL 1.1 Query §13.3.1 Accessing Graph Names (GRAPH ?g ranges over the named graphs)
+PREFIX : <http://example.org/>
+SELECT ?g ?v WHERE { GRAPH ?g { ?s :p ?v } }

@@ -1,0 +1,3 @@
+# spec: SPARQL 1.1 Query §11.2 GROUP BY and §18.2.4.1: GROUP BY (expr AS ?var) binds ?var
+PREFIX : <http://example.org/>
+SELECT ?len (COUNT(*) AS ?c) WHERE { ?s :name ?n } GROUP BY (STRLEN(?n) AS ?len)

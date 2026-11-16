@@ -1,0 +1,10 @@
+# spec: SPARQL 1.1 Query §11.1 Aggregate Example (org1: 9 + 5 + 7 = 21; org2: 7 is filtered)
+PREFIX : <http://books.example/>
+SELECT (SUM(?lprice) AS ?totalPrice)
+WHERE {
+  ?org :affiliates ?auth .
+  ?auth :writesBook ?book .
+  ?book :price ?lprice .
+}
+GROUP BY ?org
+HAVING (SUM(?lprice) > 10)

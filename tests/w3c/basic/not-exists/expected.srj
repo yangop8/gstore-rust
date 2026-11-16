@@ -1,0 +1,6 @@
+{
+  "head": {"vars": ["person"]},
+  "results": {"bindings": [
+    {"person": {"type": "uri", "value": "http://example/bob"}}
+  ]}
+}

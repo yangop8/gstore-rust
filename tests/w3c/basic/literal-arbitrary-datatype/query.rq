@@ -1,0 +1,2 @@
+# spec: SPARQL 1.1 Query §2.3.3 Matching Literals with Arbitrary Datatypes
+SELECT ?v WHERE { ?v ?p "abc"^^<http://example.org/datatype#specialDatatype> }

@@ -1,0 +1,5 @@
+# spec: SPARQL 1.1 Query §17.4.2.9 BNODE: BNODE(str) gives the same blank node for the same
+# simple literal within one solution, and blank nodes distinct from those of other solutions
+# (cf. the W3C test functions/bnode01): one node per row, used twice in it
+PREFIX : <http://example.com/>
+SELECT ?s (BNODE(?v) AS ?b1) (BNODE(?v) AS ?b2) WHERE { ?s :str ?v }

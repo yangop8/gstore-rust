@@ -1,0 +1,8 @@
+# spec: SPARQL 1.1 Query §12 Subqueries, §8.1.1 NOT EXISTS and §19.8 Grammar rule [53] GroupGraphPattern ::= '{' ( SubSelect | GroupGraphPatternSub ) '}': FILTER NOT EXISTS { SELECT … }
+# The sub-query has a solution (dave), so NOT EXISTS is false everywhere.
+PREFIX : <http://example.org/>
+SELECT ?p
+WHERE {
+  ?p :age ?a
+  FILTER NOT EXISTS { SELECT ?x WHERE { ?x :knows :alice } }
+}

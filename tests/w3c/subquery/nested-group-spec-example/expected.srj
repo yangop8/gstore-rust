@@ -1,0 +1,7 @@
+{
+  "head": {"vars": ["y", "minName"]},
+  "results": {"bindings": [
+    {"y": {"type": "uri", "value": "http://people.example/bob"}, "minName": {"type": "literal", "value": "B. Bar"}},
+    {"y": {"type": "uri", "value": "http://people.example/carol"}, "minName": {"type": "literal", "value": "C. Baz"}}
+  ]}
+}

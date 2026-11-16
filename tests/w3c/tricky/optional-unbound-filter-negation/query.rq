@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §8 Negation (introduction: OPTIONAL + FILTER(!BOUND(?v)))
+# and §17.4.1.1 BOUND
+PREFIX : <http://example.com/>
+SELECT ?s WHERE { ?s :p :o OPTIONAL { ?s :q ?w } FILTER(!BOUND(?w)) }

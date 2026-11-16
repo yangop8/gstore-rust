@@ -1,0 +1,5 @@
+# spec: SPARQL 1.1 Query §18.5.1 Sum, Avg, Min, Max over xsd:integer values
+# Avg = Sum / Count = 60 / 3 with op:numeric-divide: an xsd:decimal (canonical form "20.0").
+PREFIX : <http://example.org/>
+SELECT (MIN(?v) AS ?min) (MAX(?v) AS ?max) (SUM(?v) AS ?sum) (AVG(?v) AS ?avg)
+WHERE { :s :v ?v }

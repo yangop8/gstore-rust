@@ -1,0 +1,8 @@
+# spec: SPARQL 1.1 Query §12 Subqueries, §8.1.2 EXISTS and §19.8 Grammar rule [53] GroupGraphPattern ::= '{' ( SubSelect | GroupGraphPatternSub ) '}': FILTER EXISTS { SELECT … }
+# The sub-query (who knows alice: dave) shares no variable with the outer pattern.
+PREFIX : <http://example.org/>
+SELECT ?p
+WHERE {
+  ?p :age ?a
+  FILTER EXISTS { SELECT ?x WHERE { ?x :knows :alice } }
+}

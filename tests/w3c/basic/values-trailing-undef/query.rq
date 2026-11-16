@@ -1,0 +1,12 @@
+# spec: SPARQL 1.1 Query §10.2.2 VALUES Examples (trailing VALUES with UNDEF)
+PREFIX dc: <http://purl.org/dc/elements/1.1/>
+PREFIX : <http://example.org/book/>
+PREFIX ns: <http://example.org/ns#>
+SELECT * WHERE {
+  ?book dc:title ?title ;
+        ns:price ?price .
+}
+VALUES (?book ?title)
+{ (UNDEF "SPARQL Tutorial")
+  (:book2 UNDEF)
+}

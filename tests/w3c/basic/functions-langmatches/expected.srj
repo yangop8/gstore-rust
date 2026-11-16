@@ -1,0 +1,6 @@
+{
+  "head": {"vars": ["prefix", "longer", "star", "empty"]},
+  "results": {"bindings": [
+    {"prefix": {"type": "literal", "value": "true", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"}, "longer": {"type": "literal", "value": "false", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"}, "star": {"type": "literal", "value": "true", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"}, "empty": {"type": "literal", "value": "false", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"}}
+  ]}
+}

@@ -1,0 +1,6 @@
+{
+  "head": {"vars": ["min", "max", "sum", "avg"]},
+  "results": {"bindings": [
+    {"min": {"type": "literal", "value": "10", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}, "max": {"type": "literal", "value": "30", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}, "sum": {"type": "literal", "value": "60", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}, "avg": {"type": "literal", "value": "20.0", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}}
+  ]}
+}

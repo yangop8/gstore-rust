@@ -1,0 +1,6 @@
+{
+  "head": {"vars": ["min", "max"]},
+  "results": {"bindings": [
+    {"min": {"type": "uri", "value": "http://example.org/z"}, "max": {"type": "literal", "value": "3", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}}
+  ]}
+}

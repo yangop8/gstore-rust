@@ -1,0 +1,6 @@
+{
+  "head": {"vars": ["eq", "same", "eqLex", "sameLex"]},
+  "results": {"bindings": [
+    {"eq": {"type": "literal", "value": "true", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"}, "same": {"type": "literal", "value": "false", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"}, "eqLex": {"type": "literal", "value": "true", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"}, "sameLex": {"type": "literal", "value": "false", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"}}
+  ]}
+}

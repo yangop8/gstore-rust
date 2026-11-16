@@ -1,0 +1,8 @@
+# spec: SPARQL 1.1 Query §12 Subqueries, §7 UNION and §19.8 Grammar rule [53] GroupGraphPattern ::= '{' ( SubSelect | GroupGraphPatternSub ) '}': { … } UNION { SELECT … }
+PREFIX : <http://example.org/>
+SELECT ?p
+WHERE {
+  { ?p :age 35 }
+  UNION
+  { SELECT ?p WHERE { ?p :knows :alice } }
+}

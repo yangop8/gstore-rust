@@ -1,0 +1,6 @@
+{
+  "head": {"vars": ["sub", "u", "bef", "aft", "same", "mixed"]},
+  "results": {"bindings": [
+    {"sub": {"type": "literal", "value": "bar", "xml:lang": "en"}, "u": {"type": "literal", "value": "FOO", "xml:lang": "en"}, "bef": {"type": "literal", "value": "a", "xml:lang": "en"}, "aft": {"type": "literal", "value": "c", "xml:lang": "en"}, "same": {"type": "literal", "value": "foobar", "xml:lang": "en"}, "mixed": {"type": "literal", "value": "foobar"}}
+  ]}
+}

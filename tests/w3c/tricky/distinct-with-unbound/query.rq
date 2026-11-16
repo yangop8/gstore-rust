@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §15.3.1 DISTINCT: two solutions with the same bindings (an
+# unbound ?y in both) are duplicates
+PREFIX : <http://example.com/>
+SELECT DISTINCT ?x ?y WHERE { ?x :q ?m OPTIONAL { ?x <http://example.com/none> ?y } }

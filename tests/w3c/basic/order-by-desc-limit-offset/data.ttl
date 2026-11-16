@@ -1,0 +1,4 @@
+@prefix : <http://example.org/> .
+:a :name "Carol" ; :age 30 .
+:b :name "Alice" ; :age 25 .
+:c :name "Bob" ; :age 35 .

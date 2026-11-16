@@ -1,0 +1,7 @@
+{
+  "head": {"vars": ["g", "avg"]},
+  "results": {"bindings": [
+    {"g": {"type": "uri", "value": "http://example.com/g1"}},
+    {"g": {"type": "uri", "value": "http://example.com/g2"}, "avg": {"type": "literal", "value": "15.0", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}}
+  ]}
+}

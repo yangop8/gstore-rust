@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §5.2.2 Scope of Filters: a FILTER restricts the whole group,
+# wherever it appears in it
+PREFIX : <http://example.com/>
+SELECT ?x WHERE { FILTER(?n > 1) ?x :p ?n }

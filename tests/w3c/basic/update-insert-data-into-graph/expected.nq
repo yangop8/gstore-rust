@@ -1,0 +1,2 @@
+<http://example/book1> <http://purl.org/dc/elements/1.1/title> "Fundamentals of Compiler Design" <http://example/bookStore> .
+<http://example/book1> <http://example.org/ns#price> "42"^^<http://www.w3.org/2001/XMLSchema#integer> <http://example/bookStore> .

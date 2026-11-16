@@ -1,0 +1,8 @@
+{
+  "head": {"vars": ["name", "mbox"]},
+  "results": {"bindings": [
+    {"name": {"type": "literal", "value": "Alice"}, "mbox": {"type": "uri", "value": "mailto:alice@example.com"}},
+    {"name": {"type": "literal", "value": "Alice"}, "mbox": {"type": "uri", "value": "mailto:alice@work.example"}},
+    {"name": {"type": "literal", "value": "Bob"}}
+  ]}
+}

@@ -1,0 +1,3 @@
+<http://example/book1> <http://example.org/ns#price> "42"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<http://example/book1> <http://purl.org/dc/elements/1.1/title> "A new book" .
+<http://example/book1> <http://purl.org/dc/elements/1.1/creator> "A.N.Other" .

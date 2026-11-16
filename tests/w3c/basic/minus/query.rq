@@ -1,0 +1,6 @@
+# spec: SPARQL 1.1 Query §8.2 Removing Possible Solutions (the section's example)
+PREFIX : <http://example/>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+SELECT DISTINCT ?s
+WHERE { ?s ?p ?o .
+        MINUS { ?s foaf:givenName "Bob" . } }

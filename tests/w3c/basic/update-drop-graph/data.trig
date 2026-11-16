@@ -1,0 +1,4 @@
+@prefix : <http://example.org/> .
+:x :p "default" .
+:g1 { :a :p "one" . }
+:g2 { :b :p "two" . }

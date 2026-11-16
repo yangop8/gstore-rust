@@ -1,0 +1,8 @@
+# spec: SPARQL 1.1 Query §12 Subqueries, §6 OPTIONAL and §19.8 Grammar rule [53] GroupGraphPattern ::= '{' ( SubSelect | GroupGraphPatternSub ) '}': OPTIONAL { SELECT … }
+# carol knows nobody, so her ?friends stays unbound.
+PREFIX : <http://example.org/>
+SELECT ?p ?friends
+WHERE {
+  ?p :age ?a
+  OPTIONAL { SELECT ?p (COUNT(?f) AS ?friends) WHERE { ?p :knows ?f } GROUP BY ?p }
+}

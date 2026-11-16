@@ -1,0 +1,9 @@
+{
+  "head": {"vars": ["v"]},
+  "results": {"bindings": [
+    {"v": {"type": "literal", "value": "lit"}},
+    {"v": {"type": "uri", "value": "http://example.org/z"}},
+    {"v": {"type": "bnode", "value": "b"}},
+    {}
+  ]}
+}

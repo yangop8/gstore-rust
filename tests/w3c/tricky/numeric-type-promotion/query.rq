@@ -1,0 +1,5 @@
+# spec: SPARQL 1.1 Query §17.3 Operator Mapping / §17.1 numeric type promotion (XPath
+# op:numeric-add, -multiply, -divide): integer + decimal is a decimal, integer * integer an
+# integer, and integer / integer a decimal
+SELECT (1 + 2.0 AS ?sum) (2 * 3 AS ?product) (7 / 2 AS ?quotient) (6 / 3 AS ?exact)
+WHERE {}

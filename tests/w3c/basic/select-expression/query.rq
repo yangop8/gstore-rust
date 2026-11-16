@@ -1,0 +1,9 @@
+# spec: SPARQL 1.1 Query §16.1.2 SELECT Expressions (the section's example)
+# 42 * (1 - 0.2) = 33.6, 23 * (1 - 0.25) = 17.25, both xsd:decimal.
+PREFIX dc: <http://purl.org/dc/elements/1.1/>
+PREFIX ns: <http://example.org/ns#>
+SELECT ?title (?p*(1-?discount) AS ?price)
+{ ?x ns:price ?p .
+  ?x dc:title ?title .
+  ?x ns:discount ?discount
+}

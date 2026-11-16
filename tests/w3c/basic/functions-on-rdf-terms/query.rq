@@ -1,0 +1,7 @@
+# spec: SPARQL 1.1 Query §17.4.2 Functions on RDF Terms (isIRI, isBlank, isLiteral,
+# isNumeric, str, lang, datatype)
+SELECT (isIRI(<http://example.org/a>) AS ?isIri) (isBlank(<http://example.org/a>) AS ?isBlank)
+       (isLiteral("x") AS ?isLit) (isNumeric(12) AS ?isNum) (isNumeric("12") AS ?notNum)
+       (STR(<http://example.org/a>) AS ?str) (LANG("chat"@fr) AS ?lang) (LANG("chat") AS ?noLang)
+       (DATATYPE(42) AS ?dt) (DATATYPE("x") AS ?dtStr)
+WHERE {}

@@ -1,0 +1,8 @@
+# spec: SPARQL 1.1 Query §12 Subqueries: "only variables projected out of the subquery
+# will be visible ... to the outside query" (?a is not projected, so it is unbound outside)
+PREFIX : <http://example.org/>
+SELECT ?p ?a
+WHERE {
+  ?p :knows :carol .
+  { SELECT ?p WHERE { ?p :age ?a } }
+}

@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §2.4 Blank Node Labels in Query Results
+# Two distinct blank nodes; their labels are arbitrary.
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+SELECT ?x ?name WHERE { ?x foaf:name ?name }

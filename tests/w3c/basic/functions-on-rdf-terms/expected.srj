@@ -1,0 +1,6 @@
+{
+  "head": {"vars": ["isIri", "isBlank", "isLit", "isNum", "notNum", "str", "lang", "noLang", "dt", "dtStr"]},
+  "results": {"bindings": [
+    {"isIri": {"type": "literal", "value": "true", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"}, "isBlank": {"type": "literal", "value": "false", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"}, "isLit": {"type": "literal", "value": "true", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"}, "isNum": {"type": "literal", "value": "true", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"}, "notNum": {"type": "literal", "value": "false", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"}, "str": {"type": "literal", "value": "http://example.org/a"}, "lang": {"type": "literal", "value": "fr"}, "noLang": {"type": "literal", "value": ""}, "dt": {"type": "uri", "value": "http://www.w3.org/2001/XMLSchema#integer"}, "dtStr": {"type": "uri", "value": "http://www.w3.org/2001/XMLSchema#string"}}
+  ]}
+}

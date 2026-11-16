@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §8.3.3 Example: Inner FILTERs
+# Inside MINUS, ?n is not bound, so the FILTER is an error and removes nothing.
+PREFIX : <http://example.com/>
+SELECT * WHERE { ?x :p ?n MINUS { ?x :q ?m . FILTER(?n = ?m) } }

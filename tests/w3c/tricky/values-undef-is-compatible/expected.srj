@@ -1,0 +1,7 @@
+{
+  "head": {"vars": ["s", "o"]},
+  "results": {"bindings": [
+    {"s": {"type": "uri", "value": "http://example.com/a"}, "o": {"type": "literal", "value": "1", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}},
+    {"s": {"type": "uri", "value": "http://example.com/b"}, "o": {"type": "literal", "value": "2", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}}
+  ]}
+}

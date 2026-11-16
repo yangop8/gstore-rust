@@ -1,0 +1,7 @@
+{
+  "head": {"vars": ["x", "name"]},
+  "results": {"bindings": [
+    {"x": {"type": "bnode", "value": "c"}, "name": {"type": "literal", "value": "Alice"}},
+    {"x": {"type": "bnode", "value": "d"}, "name": {"type": "literal", "value": "Bob"}}
+  ]}
+}

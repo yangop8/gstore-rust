@@ -1,0 +1,2 @@
+query#3
+GRAPH ?g overwrites the inner binding of ?g instead of joining on it.

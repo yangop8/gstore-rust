@@ -1,0 +1,5 @@
+# spec: SPARQL 1.1 Query §12 Subqueries, §10.2 VALUES and §19.8 Grammar rule [53] GroupGraphPattern ::= '{' ( SubSelect | GroupGraphPatternSub ) '}': the sub-query's own
+# trailing ValuesClause (rule [8] SubSelect ::= SelectClause WhereClause SolutionModifier ValuesClause)
+PREFIX : <http://example.org/>
+SELECT *
+WHERE { SELECT ?p ?a WHERE { ?p :age ?a } VALUES ?p { :bob } }

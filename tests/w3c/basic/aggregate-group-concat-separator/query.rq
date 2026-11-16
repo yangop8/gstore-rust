@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §18.5.1 GroupConcat with SEPARATOR (two equal values, so the
+# unspecified order does not matter)
+PREFIX : <http://example.org/>
+SELECT (GROUP_CONCAT(?n ; SEPARATOR = "|") AS ?all) WHERE { ?s :n ?n }

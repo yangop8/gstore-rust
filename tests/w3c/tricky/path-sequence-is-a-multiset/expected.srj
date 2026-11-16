@@ -1,0 +1,7 @@
+{
+  "head": {"vars": ["y"]},
+  "results": {"bindings": [
+    {"y": {"type": "uri", "value": "http://example.com/y"}},
+    {"y": {"type": "uri", "value": "http://example.com/y"}}
+  ]}
+}

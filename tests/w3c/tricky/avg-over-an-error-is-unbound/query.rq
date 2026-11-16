@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §18.5.1 Avg (Sum / Count; Sum over "x" is an error) and §11.5:
+# an aggregate error leaves the variable unbound; g2: 30 / 2 = 15 as xsd:decimal
+PREFIX : <http://example.com/>
+SELECT ?g (AVG(?v) AS ?avg) WHERE { ?g :v ?v } GROUP BY ?g
