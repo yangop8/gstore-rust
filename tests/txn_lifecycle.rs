@@ -1237,6 +1237,9 @@ fn a_rocksdb_begin_copies_without_blocking_readers_and_recopies_after_a_write() 
     assert_eq!(code(&j), 0, "{j}");
     let tid = text(&j, "TID");
     // Other clients read the begin-time snapshot: it has the write.
-    assert!(api.ask("rkdb", "slipped"), "the snapshot predates the write");
+    assert!(
+        api.ask("rkdb", "slipped"),
+        "the snapshot predates the write"
+    );
     assert_eq!(code(&api.end("root", "rollback", "rkdb", &tid)), 0);
 }

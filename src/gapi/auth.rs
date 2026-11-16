@@ -382,7 +382,6 @@ mod tests {
             "tquery",
             "begin",
             "commit",
-            "rollback",
             "checkpoint",
             "batchInsert",
             "update",
@@ -393,6 +392,11 @@ mod tests {
                 "{op}"
             );
         }
+        // review gap-txn-lifecycle#5: rollback is open to every user (the
+        // transaction handlers let only the owner or a superuser end a
+        // transaction, so an owner whose update privilege was revoked can
+        // still roll back); upstream requires the update privilege.
+        assert_eq!(requirement("rollback"), Requirement::Anyone);
         assert_eq!(
             requirement("export"),
             Requirement::Privilege(Privilege::Export)

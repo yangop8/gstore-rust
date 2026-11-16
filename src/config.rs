@@ -1921,8 +1921,9 @@ upload_allow_compress_packages = "zip"
                     [system]\nmin_memory=1\nmin_million_disk=2\nmin_million_memory=3\n\
                     resource_check=on\ndb_home=/data/gs\ndb_suffix=.gdb\nroot_username=admin\n\
                     root_password=s3cret\nsystem_username=sys\npfn_base_path=/p\nlicensetype=x\n\
-                    check_point=off\nbuild_multi_thread=off\nbuild_memory_mb=128\n\
-                    build_threads=3\nbuild_tmp_dir=/scratch\nbuild_fill_factor=75\nid_reclaim=off\n\
+                    check_point=off\ntxn_idle_timeout=30\nbuild_multi_thread=off\n\
+                    build_memory_mb=128\nbuild_threads=3\nbuild_tmp_dir=/scratch\n\
+                    build_fill_factor=75\nid_reclaim=off\n\
                     [log]\nlog_mode=l.properties\nquerylog_mode=0\nquerylog_path=q/\n\
                     querylog_days=9\naccesslog_mode=0\naccesslog_path=a/\naccesslog_days=8\n\
                     log_level=DEBUG\nlog_file=diag/gs.log\nlog_days=7\nlog_stderr=off\n\
@@ -1973,6 +1974,7 @@ upload_allow_compress_packages = "zip"
             (1, 2, 3)
         );
         assert!(c.resource_check && !c.check_point && !c.build_multi_thread);
+        assert_eq!(c.txn_idle_timeout, 30);
         assert_eq!(
             (c.build_memory_mb, c.build_threads, c.build_fill_factor),
             (128, 3, 75)
