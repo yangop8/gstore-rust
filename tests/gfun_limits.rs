@@ -1376,7 +1376,9 @@ fn rest_cancel_stops_a_parked_graph_function() {
     go_tx.send(()).unwrap();
     let answer = query.join().unwrap();
     drop(hook);
-    assert_eq!(answer.status, 400, "{}", answer.body);
+    // review design#3: a cancelled statement is a refused request (503), no
+    // longer a 400 query error.
+    assert_eq!(answer.status, 503, "{}", answer.body);
     assert!(
         answer.body.to_lowercase().contains("cancel"),
         "{}",

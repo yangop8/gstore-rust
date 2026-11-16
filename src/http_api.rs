@@ -30,7 +30,13 @@
 //!   are written only inside the server's backup directory (`<root>/backups`,
 //!   or `conf.ini`'s `backup_path`) and never over another database's files;
 //!   `/restore` reads from there, or from a directory the [`LoadPolicy`]
-//!   allows.
+//!   allows. `/export` shares the `/api` `export`'s serializer (N-Quads when
+//!   a named graph holds a triple) and streams it as a cancellable task.
+//! * **Errors** — one classification for every protocol layer
+//!   (`OpErrorKind::of`, review design#3): a lock another process holds
+//!   is `409` on every endpoint, a storage failure `500`, a cancelled or
+//!   timed-out statement `503`, a syntax error `400`; `/api` keeps HTTP 200
+//!   and its `StatusCode`s.
 //! * **Batch operations** — `/batchInsert`, `/batchRemove`: the payload is
 //!   parsed as RDF (N-Triples, or Turtle) and the ground triples are applied
 //!   directly — no SPARQL text is ever built from user input.
@@ -257,6 +263,7 @@ use crate::sparql_results::{self, json_str, ResultFormat};
 use crate::store::read_scope::ReadScope;
 use crate::store::{TripleSource, TripleStore};
 use crate::sysdb::SysDb;
+use crate::zipio::ExportFormat;
 
 const JSON: &str = "application/json";
 const SPARQL_JSON: &str = "application/sparql-results+json";
@@ -1120,6 +1127,94 @@ impl ReadSnapshot {
             None => Ok(stats),
         }
     }
+}
+
+impl ReadSnapshot {
+    /// Write the snapshot to `out` as `format` (`None`: N-Quads when a named
+    /// graph holds a triple, else N-Triples — what
+    /// [`ExportFormat::for_database`] picks for a database), as
+    /// [`crate::zipio::write_export`] writes a database: the default graph's
+    /// statements, then (N-Quads) each named graph's, every term through
+    /// the escaping serializer. Returns the format written and the
+    /// statement count. The REST `/export` of a database whose transaction
+    /// is open (its committed state; review http#11). Inside a
+    /// [`ReadScope`]: a read error fails it (C2). The caller holds the
+    /// database's shared guard, so the transaction cannot commit (and an
+    /// on-disk view expire) meanwhile.
+    fn write_export(
+        &self,
+        format: Option<ExportFormat>,
+        out: &mut dyn Write,
+    ) -> crate::Result<(ExportFormat, u64)> {
+        let format = format.unwrap_or(if self.named.values().any(|g| g.triple_count() > 0) {
+            ExportFormat::NQuads
+        } else {
+            ExportFormat::NTriples
+        });
+        let scope = ReadScope::enter();
+        let mut write = |default: Vec<crate::model::IdTriple>| -> crate::Result<u64> {
+            let mut count = export_triples(&self.dict, &default, None, out)?;
+            if format == ExportFormat::NQuads {
+                for (&gid, graph) in &self.named {
+                    let Some(g) = self.dict.term(gid) else {
+                        continue;
+                    };
+                    let g = crate::model::term::export_key(&g).into_owned();
+                    let triples: Vec<_> = graph.iter_all().collect();
+                    count += export_triples(&self.dict, &triples, Some(&g), out)?;
+                }
+            }
+            Ok(count)
+        };
+        let count = match &self.store {
+            SnapStore::Mem(store) => write(store.iter_all().collect())?,
+            // The dictionary of an on-disk snapshot is read inside the
+            // view's gate only.
+            SnapStore::Disk(view) => view
+                .with_base(|base, _| write(DiskSource::new(base).iter_all()))
+                .map_err(|e| {
+                    GStoreError::Database(format!(
+                        "the transaction's read snapshot could not be exported: {e}"
+                    ))
+                })??,
+        };
+        if let Some(e) = scope.take_error() {
+            return Err(crate::store::read_scope::read_failure(
+                "exporting the transaction's read snapshot",
+                e,
+            ));
+        }
+        drop(scope);
+        out.flush()?;
+        Ok((format, count))
+    }
+}
+
+/// Write the id triples `triples` as N-Triples lines — or N-Quads lines of
+/// graph `graph` (its N-Triples form) — resolving each term in `dict`
+/// (a statement whose term does not resolve is skipped, as
+/// [`crate::zipio::write_export`] does). Returns the number written.
+fn export_triples(
+    dict: &Dictionary,
+    triples: &[crate::model::IdTriple],
+    graph: Option<&str>,
+    out: &mut dyn Write,
+) -> crate::Result<u64> {
+    use crate::model::term::export_key;
+    let mut count = 0;
+    for t in triples {
+        let (Some(s), Some(p), Some(o)) = (dict.term(t.sub), dict.pred(t.pred), dict.term(t.obj))
+        else {
+            continue;
+        };
+        let (s, p, o) = (export_key(&s), export_key(&p), export_key(&o));
+        match graph {
+            Some(g) => writeln!(out, "{s} {p} {o} {g} .")?,
+            None => writeln!(out, "{s} {p} {o} .")?,
+        }
+        count += 1;
+    }
+    Ok(count)
 }
 
 /// The default graph of a [`ReadSnapshot`].
@@ -2063,15 +2158,10 @@ impl DbSlot {
         warning
     }
 
-    /// Run a read on behalf of a *non-transactional* caller: against the
-    /// begin-time snapshot while a transaction is open (never its uncommitted
-    /// writes), else against the live database — on a shared guard (an
-    /// UPDATE is refused).
-    pub(crate) fn read(&self, sparql: &str) -> crate::Result<QueryResult> {
-        self.read_cancellable(sparql, None)
-    }
-
-    /// [`read`](Self::read) under the cancel flag `cancel`.
+    /// Run a read on behalf of a *non-transactional* caller, under the
+    /// cancel flag `cancel`: against the begin-time snapshot while a
+    /// transaction is open (never its uncommitted writes), else against the
+    /// live database — on a shared guard (an UPDATE is refused).
     pub(crate) fn read_cancellable(
         &self,
         sparql: &str,
@@ -2157,7 +2247,10 @@ fn txn_conflict_err(name: &str, tid: u64) -> OpError {
 /// Why a database / transaction operation shared by the REST endpoints and
 /// the upstream `/api` layer ([`crate::gapi`]) was refused or failed. Each
 /// front end renders it its own way: REST as an HTTP status ([`OpError::rest`]),
-/// `/api` as an upstream `StatusCode` (see `crate::gapi::ops_query`).
+/// `/api` as an upstream `StatusCode` (see `crate::gapi::ops_query`). An
+/// operation that failed with a [`GStoreError`] gets its kind from
+/// [`OpErrorKind::of`], the one place the protocol layers classify one
+/// (review design#3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OpError {
     pub(crate) kind: OpErrorKind,
@@ -2180,10 +2273,11 @@ pub(crate) enum OpErrorKind {
     Conflict,
     /// The server is shutting down — REST `503`.
     ShuttingDown,
-    /// The SPARQL statement failed (syntax, evaluation, cancellation) — REST
-    /// `400` with a `{"error":…}` body.
+    /// The SPARQL statement failed (syntax, evaluation) — REST `400` with a
+    /// `{"error":…}` body.
     Query,
-    /// An internal failure (I/O, save, begin/commit) — REST `500`.
+    /// An internal failure (I/O, a failed read, corrupt data, save,
+    /// begin/commit) — REST `500`.
     Failed,
     /// A write was applied in memory but persisting it failed (an UPDATE that
     /// failed part-way and whose applied part could not be saved) — REST
@@ -2196,6 +2290,52 @@ pub(crate) enum OpErrorKind {
     /// The serialized answer passed `max_result_bytes` (review sec#10) —
     /// REST `503` with a `{"error":…}` body, `/api` `1005`.
     ResultTooLarge,
+    /// The statement or export was stopped by a cancellation request
+    /// (`/cancel`, `operationTaskCancel`, a shutdown) — REST `503` with a
+    /// `{"error":…}` body (it was a `400` query error: review design#3),
+    /// `/api` `1005` as before.
+    Cancelled,
+}
+
+impl OpErrorKind {
+    /// The kind of an operation that failed with `e` — the one place the
+    /// protocol layers classify a [`GStoreError`] (review design#3), by its
+    /// [`kind`](GStoreError::kind): a syntax or evaluation error is
+    /// [`Query`](Self::Query) (REST `400`); a lock another process holds
+    /// (or a transaction conflict) [`Conflict`](Self::Conflict), `409` on
+    /// every endpoint; a cancellation [`Cancelled`](Self::Cancelled) and a
+    /// time limit [`Timeout`](Self::Timeout), `503`; a storage failure — an
+    /// I/O error, a failed read, a broken store, corrupt data —
+    /// [`Failed`](Self::Failed), `500` (as is a write applied but not made
+    /// durable, [`Persist`](Self::Persist), which the callers that save
+    /// report themselves). An untyped error
+    /// ([`ErrorKind::Other`](crate::error::ErrorKind::Other)) is `untyped`:
+    /// what the endpoint answered such an error as before errors were typed.
+    pub(crate) fn of(e: &GStoreError, untyped: OpErrorKind) -> OpErrorKind {
+        use crate::error::ErrorKind;
+        match e.kind() {
+            ErrorKind::Parse | ErrorKind::Query => OpErrorKind::Query,
+            ErrorKind::Locked | ErrorKind::Conflict => OpErrorKind::Conflict,
+            ErrorKind::Cancelled => OpErrorKind::Cancelled,
+            ErrorKind::Timeout => OpErrorKind::Timeout,
+            ErrorKind::Storage | ErrorKind::Corrupt => OpErrorKind::Failed,
+            _ => untyped,
+        }
+    }
+
+    /// The REST endpoints' (and the single-database server's) HTTP status
+    /// for this kind.
+    pub(crate) fn http(self) -> u16 {
+        match self {
+            OpErrorKind::NotLoaded | OpErrorKind::TxnUnknown => 404,
+            OpErrorKind::TxnEnded | OpErrorKind::Conflict => 409,
+            OpErrorKind::NotOwner => 403,
+            OpErrorKind::ShuttingDown => 503,
+            OpErrorKind::Timeout | OpErrorKind::ResultTooLarge | OpErrorKind::Cancelled => 503,
+            OpErrorKind::Query => 400,
+            OpErrorKind::Failed | OpErrorKind::Persist => 500,
+        }
+    }
 }
 
 impl OpError {
@@ -2206,29 +2346,46 @@ impl OpError {
         }
     }
 
+    /// The error `msg` of an operation that failed with `e`, of the kind
+    /// [`OpErrorKind::of`] gives it (`untyped`: the kind of an unclassified
+    /// error).
+    pub(crate) fn of(e: &GStoreError, untyped: OpErrorKind, msg: impl Into<String>) -> OpError {
+        OpError::new(OpErrorKind::of(e, untyped), msg)
+    }
+
+    /// A failed SPARQL statement: `e`, as its message, of the kind
+    /// [`OpErrorKind::of`] gives it — an unclassified error is a
+    /// [`Query`](OpErrorKind::Query) error, as every statement error was
+    /// before errors were typed.
+    pub(crate) fn statement(e: &GStoreError) -> OpError {
+        OpError::of(e, OpErrorKind::Query, e.to_string())
+    }
+
     /// The REST endpoints' HTTP status for this error.
-    fn http(&self) -> u16 {
-        match self.kind {
-            OpErrorKind::NotLoaded | OpErrorKind::TxnUnknown => 404,
-            OpErrorKind::TxnEnded | OpErrorKind::Conflict => 409,
-            OpErrorKind::NotOwner => 403,
-            OpErrorKind::ShuttingDown => 503,
-            OpErrorKind::Timeout | OpErrorKind::ResultTooLarge => 503,
-            OpErrorKind::Query => 400,
-            OpErrorKind::Failed | OpErrorKind::Persist => 500,
-        }
+    pub(crate) fn http(&self) -> u16 {
+        self.kind.http()
     }
 
     /// The REST rendering: `{"StatusCode":<http>,"StatusMsg":…}`, or for a
     /// failed SPARQL statement the SPARQL endpoints' `{"error":…}` body.
     fn rest(&self) -> Resp {
         match self.kind {
-            OpErrorKind::Query | OpErrorKind::Timeout | OpErrorKind::ResultTooLarge => {
-                Resp::new(self.http(), SPARQL_JSON, err_json(&self.msg))
-            }
+            OpErrorKind::Query
+            | OpErrorKind::Timeout
+            | OpErrorKind::ResultTooLarge
+            | OpErrorKind::Cancelled => Resp::new(self.http(), SPARQL_JSON, err_json(&self.msg)),
             _ => Resp::fail(self.http(), &self.msg),
         }
     }
+}
+
+/// The REST failure `msg` of a lifecycle operation that failed with `e`:
+/// `{"StatusCode":<http>,"StatusMsg":msg}` at the status of
+/// [`OpErrorKind::of`] — `409` for a lock another process holds, `500` for
+/// a storage failure, … — or of `untyped` for an unclassified error (the
+/// endpoint's status for it before errors were typed). Review design#3.
+fn fail_with(e: &GStoreError, untyped: OpErrorKind, msg: &str) -> Resp {
+    Resp::fail(OpErrorKind::of(e, untyped).http(), msg)
 }
 
 /// The [`OpErrorKind::Timeout`] error of a job whose `query_timeout` stopped
@@ -4058,7 +4215,7 @@ impl ApiInner {
                 ),
             )
         };
-        let query_err = |e: GStoreError| OpError::new(OpErrorKind::Query, e.to_string());
+        let query_err = |e: GStoreError| OpError::statement(&e);
         let caller = self.pfn_caller(&job.user);
         let Some(stmt) = job.stmt else {
             // A syntax error: answered once the database is known to be
@@ -4117,10 +4274,12 @@ impl ApiInner {
                 };
                 // A failed save of the applied part is a persistence failure
                 // (REST 500), not a query error (400): review durability#2.
+                // Otherwise the statement's own error decides (design#3): a
+                // read or storage failure is a 500, a cancellation a 503.
                 let kind = if warning.is_some() {
                     OpErrorKind::Persist
                 } else {
-                    OpErrorKind::Query
+                    OpErrorKind::of(&e, OpErrorKind::Query)
                 };
                 let msg = if wrote {
                     partial_update_msg(&e, warning)
@@ -4163,7 +4322,7 @@ impl ApiInner {
                 format!("database '{name}' was unloaded while this request waited"),
             )
         };
-        let query_err = |e: GStoreError| OpError::new(OpErrorKind::Query, e.to_string());
+        let query_err = |e: GStoreError| OpError::statement(&e);
         for attempt in 1..=SNAPSHOT_READ_ATTEMPTS {
             txn_park(name, TxnParkPoint::StatementQueued);
             let slot = self.read_synced(dbh)?;
@@ -4766,13 +4925,15 @@ impl ApiInner {
             };
             let db = match built {
                 Ok(db) => db,
-                Err(e) => return Resp::fail(400, &format!("build failed: {e}")),
+                Err(e) => return fail_with(&e, OpErrorKind::Query, &format!("build failed: {e}")),
             };
             // No other process may have the directory open while it is
             // rewritten (shares the lock a loaded copy holds in this process).
             let _dir_lock = match DirLock::acquire_existing(&dir) {
                 Ok(lock) => lock,
-                Err(e) => return Resp::fail(409, &format!("build failed: {e}")),
+                Err(e) => {
+                    return fail_with(&e, OpErrorKind::Conflict, &format!("build failed: {e}"))
+                }
             };
             // A rebuilt database replaces the loaded one: retire it (closing
             // its files and releasing its handle on the directory) before its
@@ -4783,24 +4944,42 @@ impl ApiInner {
                 Ok(loaded) => loaded,
                 Err(r) => return r,
             };
-            let installed = {
-                // No `reasonManage` file operation is half-way through the
-                // rule directory meanwhile. A rebuild replaces the database,
-                // as a drop and a build do: the old one's rules (executed,
-                // with ledgers naming triples the new data asserts) go.
-                let _rules = RuleStore::dir(&dir).lock();
-                crate::db::fsutil::remove_dir_if_exists(&dir.join(RULE_DIR))
-                    .map_err(|e| format!("build failed: {e}"))
-                    .and_then(|()| db.save(&dir).map_err(|e| format!("save failed: {e}")))
-            };
-            if let Err(msg) = installed {
+            // No `reasonManage` file operation is half-way through the rule
+            // directory meanwhile. A rebuild replaces the database, as a drop
+            // and a build do: the old one's rules (executed, with ledgers
+            // naming triples the new data asserts) go — once the new
+            // database is saved, not before (review http#10: a failed save
+            // served the previous database again without its rules and
+            // ledgers). As the bulk layouts' install: a crash between the
+            // save and the removal leaves them (docs/REFACTOR_BACKLOG.md).
+            let rules = RuleStore::dir(&dir);
+            let rules_lock = rules.lock();
+            if let Err(e) = db.save(&dir) {
+                drop(rules_lock);
                 // The snapshot set is replaced atomically: the directory
-                // holds the previous database (saved above), served again
-                // with every write it acknowledged.
+                // holds the previous database (saved above), with its rules,
+                // served again with every write it acknowledged.
                 if was_loaded {
                     inner.serve_again(&name, &dir);
                 }
-                return Resp::fail(500, &msg);
+                return fail_with(&e, OpErrorKind::Failed, &format!("save failed: {e}"));
+            }
+            let replaced = crate::db::fsutil::remove_dir_if_exists(&dir.join(RULE_DIR));
+            drop(rules_lock);
+            if let Err(e) = replaced {
+                // Built, but the replaced rules are still there: not served
+                // (they would reason over the new data), as a bulk build
+                // whose install did not finish.
+                register_built(&mut locked(&inner.state), &name, vanished, &creator);
+                return fail_with(
+                    &e,
+                    OpErrorKind::Failed,
+                    &format!(
+                        "database '{name}' was built, but the rules of the database it replaced \
+                         could not be removed ({e}); it is not loaded: remove its \
+                         {RULE_DIR} directory, then load it"
+                    ),
+                );
             }
             inner.serve_built(&name, db, dir, vanished, &creator)
         }))
@@ -4878,7 +5057,7 @@ impl ApiInner {
             RestBuildSource::File(file) => match crate::parser::import::sources_from_paths(&[file])
             {
                 Ok(s) => s,
-                Err(e) => return Resp::fail(400, &format!("build failed: {e}")),
+                Err(e) => return fail_with(&e, OpErrorKind::Query, &format!("build failed: {e}")),
             },
             RestBuildSource::Text(_) => Vec::new(),
         };
@@ -4903,7 +5082,7 @@ impl ApiInner {
         };
         match DirLock::acquire_existing(dir) {
             Ok(probe) => drop(probe),
-            Err(e) => return Resp::fail(409, &format!("build failed: {e}")),
+            Err(e) => return fail_with(&e, OpErrorKind::Conflict, &format!("build failed: {e}")),
         }
         let existed = dir.exists();
         let was_loaded = match self.retire_loaded_saved(name) {
@@ -4941,7 +5120,7 @@ impl ApiInner {
                         }
                     }
                 }
-                return Resp::fail(400, &format!("build failed: {e}"));
+                return fail_with(&e, OpErrorKind::Query, &format!("build failed: {e}"));
             }
         };
         if !report.warnings.is_empty() {
@@ -4965,7 +5144,11 @@ impl ApiInner {
             Ok(db) => self.serve_built(name, db, dir.to_path_buf(), vanished, creator),
             Err(e) => {
                 register_built(&mut locked(&self.state), name, vanished, creator);
-                Resp::fail(500, &format!("built, but opening it failed: {e}"))
+                fail_with(
+                    &e,
+                    OpErrorKind::Failed,
+                    &format!("built, but opening it failed: {e}"),
+                )
             }
         }
     }
@@ -5046,8 +5229,9 @@ impl ApiInner {
                         st.dbs.insert(name.clone(), slot);
                         Resp::ok_with_warning(&format!("database '{name}' reopened"), &warning)
                     }
-                    Err(e) => Resp::fail(
-                        500,
+                    Err(e) => fail_with(
+                        &e,
+                        OpErrorKind::Failed,
                         &format!("load failed: {e} ({warning}; it is unloaded now)"),
                     ),
                 }
@@ -5078,7 +5262,7 @@ impl ApiInner {
                     st.dbs.insert(name.clone(), slot);
                     Resp::ok(&format!("database '{name}' loaded"))
                 }
-                Err(e) => Resp::fail(500, &format!("load failed: {e}")),
+                Err(e) => fail_with(&e, OpErrorKind::Failed, &format!("load failed: {e}")),
             }
         }))
     }
@@ -5093,7 +5277,12 @@ impl ApiInner {
     /// or — if neither exists yet — a fresh empty database is created (mirrors
     /// gStore's `LoadFile`, which may target a not-yet-built db). The result is
     /// saved under the check_point policy.
-    fn handle_upload(&self, st: &mut ApiState, req: &Request, _user: &str) -> Dispatch {
+    ///
+    /// A database the upload creates is registered for the caller, as
+    /// `/build` registers one — forgetting the grants of a registered name
+    /// whose directory was removed outside the server, so the new data does
+    /// not inherit them (review http#16).
+    fn handle_upload(&self, st: &mut ApiState, req: &Request, user: &str) -> Dispatch {
         let Some(name) = self.req_db_name(req) else {
             return Dispatch::Done(Resp::fail(400, "missing or invalid db_name"));
         };
@@ -5125,6 +5314,11 @@ impl ApiInner {
         let format = upload_format(req);
         let content = req.body_str();
         let dir = st.db_dir(&name);
+        // Still registered, but neither loaded nor on disk: dropped outside
+        // the server (`gdrop`). A database created here must not inherit
+        // its grants (as `/build`).
+        let vanished = loaded.is_none() && st.sysdb.contains(&name) && !dir.exists();
+        let creator = user.to_string();
         Dispatch::Deferred(Box::new(move |inner| {
             let busy = loaded.is_none().then(|| BusyGuard {
                 inner,
@@ -5132,7 +5326,13 @@ impl ApiInner {
             });
             let triples = match parse_rdf(&format, &content) {
                 Ok(ts) => ts,
-                Err(e) => return Resp::fail(400, &format!("upload parse failed ({format}): {e}")),
+                Err(e) => {
+                    return fail_with(
+                        &e,
+                        OpErrorKind::Query,
+                        &format!("upload parse failed ({format}): {e}"),
+                    )
+                }
             };
             let parsed = triples.len();
             let dbh = match loaded {
@@ -5155,10 +5355,17 @@ impl ApiInner {
                             let h =
                                 DbSlot::handle(db, dir, fresh, &st.load_policy, &st.query_settings);
                             st.dbs.insert(name.clone(), Arc::clone(&h));
+                            if fresh {
+                                register_built(&mut st, &name, vanished, &creator);
+                            }
                             h
                         }
                         Err(e) => {
-                            return Resp::fail(500, &format!("upload failed to open database: {e}"))
+                            return fail_with(
+                                &e,
+                                OpErrorKind::Failed,
+                                &format!("upload failed to open database: {e}"),
+                            )
                         }
                     }
                 }
@@ -5333,7 +5540,9 @@ impl ApiInner {
             // holds in this process, so it stays locked once that is retired).
             let _dir_lock = match DirLock::acquire_existing(&dir) {
                 Ok(lock) => lock,
-                Err(e) => return Resp::fail(409, &format!("drop failed: {e}")),
+                Err(e) => {
+                    return fail_with(&e, OpErrorKind::Conflict, &format!("drop failed: {e}"))
+                }
             };
             // Retire (closing its store files) before the directory is deleted.
             let was_loaded = match inner.retire_loaded(&name) {
@@ -5350,7 +5559,7 @@ impl ApiInner {
                 // part-way never leaves a half-deleted database under its
                 // name (review durability#10).
                 if let Err(e) = crate::db::fsutil::discard_db_dir(&dir) {
-                    return Resp::fail(500, &format!("drop failed: {e}"));
+                    return fail_with(&e, OpErrorKind::Failed, &format!("drop failed: {e}"));
                 }
             } else {
                 // What an interrupted drop of this name left behind (no
@@ -6001,7 +6210,7 @@ impl ApiInner {
         };
         let open_here =
             |slot: &DbSlot| !slot.retired && slot.txn.as_ref().map(|t| t.tid) == Some(tid);
-        let query_err = |e: GStoreError| OpError::new(OpErrorKind::Query, e.to_string());
+        let query_err = |e: GStoreError| OpError::statement(&e);
         let caller = self.pfn_caller(user);
         let stmt = match stmt {
             Ok(stmt) => stmt,
@@ -6059,7 +6268,7 @@ impl ApiInner {
         drop(slot);
         result.map_err(|e| {
             if wrote {
-                OpError::new(OpErrorKind::Query, partial_update_msg(&e, None))
+                OpError::of(&e, OpErrorKind::Query, partial_update_msg(&e, None))
             } else {
                 query_err(e)
             }
@@ -6575,16 +6784,20 @@ impl ApiInner {
                 Ok(slot) => slot,
                 Err(r) => return r,
             };
-            // Claim the directory for this database before writing into it.
-            let claimed = fs::create_dir_all(&path)
+            // Recorded as a backup of this database once complete, as the
+            // `/api` `backup` does (review design#4): a directory this backup
+            // makes holds no record while it is written, and goes again if
+            // the backup fails, so `/restore` never takes it for a backup of
+            // the database. `backup_target` allows only a new directory, an
+            // empty one or an earlier backup of this database here.
+            let created = !path.exists();
+            let earlier = !created && backup_owner(&path).as_deref() == Some(name.as_str());
+            let backed_up = fs::create_dir_all(&path)
                 .map_err(GStoreError::from)
-                .and_then(|()| {
-                    crate::db::fsutil::atomic_write(&path.join(BACKUP_OWNER_FILE), name.as_bytes())
-                });
-            if let Err(e) = claimed {
-                return Resp::fail(500, &format!("backup failed: {e}"));
-            }
-            match slot.db.backup(&path) {
+                .and_then(|()| slot.db.backup(&path))
+                .and_then(|()| mark_backup(&path, &name));
+            drop(slot);
+            match backed_up {
                 Ok(()) => {
                     let body = format!(
                         "{{\"StatusCode\":0,\"StatusMsg\":\"backup success\",\"path\":{}}}",
@@ -6592,7 +6805,32 @@ impl ApiInner {
                     );
                     Resp::new(200, JSON, body.into_bytes())
                 }
-                Err(e) => Resp::fail(500, &format!("backup failed: {e}")),
+                Err(e) => {
+                    // A directory this backup made goes again (as the `/api`
+                    // backup's), and an empty one it wrote into is emptied
+                    // again: neither is left holding data a later backup
+                    // there would refuse as "not a backup" (409). An earlier
+                    // backup it was replacing keeps its record: each store
+                    // is replaced as a whole, so the directory still holds a
+                    // complete backup of the database (the earlier one, or —
+                    // past the store's replacement — this one), and a retry
+                    // into it is allowed.
+                    let note = if created {
+                        let _ = fs::remove_dir_all(&path);
+                        ""
+                    } else if earlier {
+                        "; the directory still holds the earlier backup, or this one where its \
+                         store was replaced before the failure"
+                    } else {
+                        empty_dir(&path);
+                        ""
+                    };
+                    fail_with(
+                        &e,
+                        OpErrorKind::Failed,
+                        &format!("backup failed: {e}{note}"),
+                    )
+                }
             }
         }))
     }
@@ -6677,14 +6915,18 @@ impl ApiInner {
             // the swap (as the `/api` restore; shares a loaded copy's lock).
             let probe = match Database::lock_restore_target(&dir) {
                 Ok(lock) => lock,
-                Err(e) => return Resp::fail(409, &format!("restore failed: {e}")),
+                Err(e) => {
+                    return fail_with(&e, OpErrorKind::Conflict, &format!("restore failed: {e}"))
+                }
             };
             // Copy the backup beside the database's own directory and validate
             // the copy — never open the backup in place, or later writes would
             // land in the backup. The loaded database is untouched so far.
             let staged = match Database::stage_restore(&path, &dir) {
                 Ok(staged) => staged,
-                Err(e) => return Resp::fail(500, &format!("restore failed: {e}")),
+                Err(e) => {
+                    return fail_with(&e, OpErrorKind::Failed, &format!("restore failed: {e}"))
+                }
             };
             let loaded = locked(&inner.state).dbs.get(&name).map(Arc::clone);
             if let Some(h) = &loaded {
@@ -6739,13 +6981,19 @@ impl ApiInner {
                     if fresh && st.sysdb.contains(&name) {
                         let _ = st.users.forget_database(&name);
                     }
+                    // Built at the backup's time (its `<db>.db_<timestamp>`
+                    // name), as the `/api` `restore` registers it (review
+                    // design#4), else now.
                     if fresh || !st.sysdb.contains(&name) {
-                        let _ = st.sysdb.register(&name, &user);
+                        let built = backup_time(&path)
+                            .unwrap_or_else(|| crate::sysdb::clock::now().datetime());
+                        let _ = st.sysdb.register_at(&name, &user, &built);
                     }
                     Resp::ok(&format!("database '{name}' restored"))
                 }
-                (Ok(()), Err(e)) => Resp::fail(
-                    500,
+                (Ok(()), Err(e)) => fail_with(
+                    &e,
+                    OpErrorKind::Failed,
                     &format!("restore failed to open the restored copy: {e}"),
                 ),
                 (Err(e), reopened) => {
@@ -6756,48 +7004,79 @@ impl ApiInner {
                             DbSlot::handle(db, dir, false, &st.load_policy, &st.query_settings);
                         st.dbs.insert(name.clone(), slot);
                     }
-                    Resp::fail(500, &format!("restore failed: {e}"))
+                    fail_with(&e, OpErrorKind::Failed, &format!("restore failed: {e}"))
                 }
             }
         }))
     }
 
-    /// `GET /export?db_name=<name>[&download=0]` — the whole database as
-    /// N-Triples (its committed state, while a transaction is open). Sent as a
-    /// file download (`Content-Disposition: attachment`) by default; pass
-    /// `download=0`/`false`/`no`/`off` for an inline (browser-rendered)
-    /// response instead.
-    fn handle_export(&self, st: &mut ApiState, req: &Request, _user: &str) -> Dispatch {
+    /// `GET /export?db_name=<name>[&format=nt|nq][&download=0]` — the whole
+    /// database: N-Triples, or N-Quads (the default graph, then every named
+    /// graph) when it has a non-empty named graph, so nothing is lost —
+    /// `format` (`nt` / `nq`, as the `/api` `export`'s) picks one. Its
+    /// committed state while a transaction is open. Sent as a file download
+    /// (`Content-Disposition: attachment; filename="<name>.nt|nq"`) by
+    /// default; pass `download=0`/`false`/`no`/`off` for an inline
+    /// (browser-rendered) response instead.
+    ///
+    /// The `/api` `export`'s serializer ([`export_slot`], review http#11 /
+    /// design#4: the endpoint wrote only the default graph). It runs as a
+    /// task — listed by `/tasklist`, stopped by `/cancel` at its next
+    /// statement (`503`) — writing to an unnamed scratch file in the export
+    /// directory under the database's shared guard; the guard released, the
+    /// file is streamed in bounded chunks (never held in memory, never
+    /// compressed) and is gone once sent.
+    fn handle_export(&self, st: &mut ApiState, req: &Request, user: &str) -> Dispatch {
         let Some(name) = self.pick_db(st, req) else {
             return Dispatch::Done(Resp::fail(400, "missing or ambiguous db parameter"));
+        };
+        let format = match req.param("format").filter(|f| !f.trim().is_empty()) {
+            None => None,
+            Some(f) => match ExportFormat::parse(&f) {
+                Some(format) => Some(format),
+                None => {
+                    return Dispatch::Done(Resp::fail(
+                        400,
+                        &format!(
+                            "the export format '{f}' is not supported (use nt for N-Triples or \
+                             nq for N-Quads)"
+                        ),
+                    ))
+                }
+            },
         };
         let Some(dbh) = st.dbs.get(&name).map(Arc::clone) else {
             return Dispatch::Done(Resp::fail(404, &format!("database '{name}' is not loaded")));
         };
         let inline = wants_inline(req);
-        Dispatch::Deferred(Box::new(move |_| {
-            let exported = {
-                let slot = match dbh.read() {
-                    Ok(slot) => slot,
-                    Err(e) => return e.rest(),
-                };
-                if slot.retired {
-                    return Resp::fail(404, &format!("database '{name}' is not loaded"));
-                }
-                slot.read("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }")
-            };
-            match exported {
-                Ok(QueryResult::Construct(ts)) => {
-                    let mut resp = Resp::new(200, "application/n-triples", ntriples_body(&ts));
+        let scratch_dir = st
+            .gapi
+            .export_dir
+            .clone()
+            .unwrap_or_else(|| self.root.join("export"));
+        let (task_id, cancel) =
+            self.tasks
+                .register("export", &name, &format!("export {name}"), user);
+        Dispatch::Deferred(Box::new(move |inner| {
+            // Ends the task (also on a panic) once the export is written.
+            let mut task = TaskGuard::new(inner, task_id);
+            let written = rest_export(&dbh, &name, format, &scratch_dir, &cancel);
+            task.set_ok(written.is_ok());
+            match written {
+                Ok((format, body)) => {
+                    let (ctype, ext) = match format {
+                        ExportFormat::NTriples => ("application/n-triples", "nt"),
+                        ExportFormat::NQuads => ("application/n-quads", "nq"),
+                    };
+                    let mut resp = Resp::stream(200, ctype, body);
                     let disposition = if inline { "inline" } else { "attachment" };
                     resp.extra.push((
                         "Content-Disposition".to_string(),
-                        format!("{disposition}; filename=\"{name}.nt\""),
+                        format!("{disposition}; filename=\"{name}.{ext}\""),
                     ));
                     resp
                 }
-                Ok(_) => Resp::fail(500, "export produced an unexpected result"),
-                Err(e) => Resp::fail(500, &format!("export failed: {e}")),
+                Err(e) => e.rest(),
             }
         }))
     }
@@ -6821,7 +7100,9 @@ impl ApiInner {
     /// other update operations: a malformed payload is a `400` parse error and
     /// nothing is applied. Reports `parsed`, `applied` (= `changed`) and
     /// `failed` (parsed but not applied: duplicates on insert, absent triples on
-    /// remove, or a literal/blank in a position RDF does not allow). A triple
+    /// remove, or a literal/blank in a position RDF does not allow), and the
+    /// `/api` operation's `success_num` (= `applied`) and `failed_num` (the
+    /// statements skipped as invalid). A triple
     /// that cannot be applied — an id space exhausted, a read error looking up
     /// its terms (C2), a broken store — stops the batch with a `500` naming
     /// how many were applied before it.
@@ -6874,6 +7155,9 @@ impl ApiInner {
                 return txn_conflict(&name, open.tid);
             }
             let parsed = triples.len();
+            // Statements RDF does not allow (a literal or blank node out of
+            // place), skipped: upstream's `failed_num`.
+            let skipped = triples.iter().filter(|t| !valid_ground_triple(t)).count();
             let mut applied = 0usize;
             let mut failure = None;
             for t in triples.iter().filter(|t| valid_ground_triple(t)) {
@@ -6906,8 +7190,13 @@ impl ApiInner {
             let failed = parsed - applied;
             let verb = if insert { "inserted" } else { "removed" };
             // Applied but not saved: a failure (HTTP 500), review durability#2.
+            // `success_num` / `failed_num` mean what the `/api` operation's
+            // do (review design#4): statements applied, and statements
+            // skipped as invalid — a duplicate (insert) or absent triple
+            // (remove) is neither, as upstream counts them. `failed` keeps
+            // counting every statement not applied.
             let fields = format!(
-                ",\"format\":{},\"parsed\":{parsed},\"applied\":{applied},\"failed\":{failed},\"changed\":{applied},\"success_num\":{applied},\"failed_num\":{failed}",
+                ",\"format\":{},\"parsed\":{parsed},\"applied\":{applied},\"failed\":{failed},\"changed\":{applied},\"success_num\":{applied},\"failed_num\":{skipped}",
                 json_str(format),
             );
             Resp::write_outcome(&format!("batch {verb}"), &fields, &warning)
@@ -7233,6 +7522,19 @@ pub(crate) fn mark_backup(dir: &Path, db: &str) -> crate::Result<()> {
     crate::db::fsutil::atomic_write(&dir.join(BACKUP_OWNER_FILE), db.as_bytes())
 }
 
+/// Best effort: remove everything in directory `dir`, keeping `dir` itself —
+/// a REST `/backup` into a directory that was empty (perhaps a mount point)
+/// leaves it as it found it when the backup fails.
+fn empty_dir(dir: &Path) {
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        let _ = match entry.file_type() {
+            Ok(t) if t.is_dir() => fs::remove_dir_all(&path),
+            _ => fs::remove_file(&path),
+        };
+    }
+}
+
 /// One backup request's claim on its destination directory: backups into
 /// one directory — REST `/backup`s of a database into its `<db>.backup`,
 /// `/api backup`s of a database in the same second (one `<db>.db_<time>`
@@ -7307,6 +7609,27 @@ fn resolved_path(path: &Path) -> Option<PathBuf> {
 /// database's data.
 pub(crate) fn may_restore_from(users: &UserStore, user: &str, db: &str, source: &Path) -> bool {
     user == ROOT_USER || users.is_superuser(user) || backup_owner(source).as_deref() == Some(db)
+}
+
+/// The built time a backup's name records (`…_YYYYmmddHHMMSS` →
+/// `YYYY-MM-DD HH:MM:SS`, upstream `Util::get_backup_time`): the registry's
+/// built time of a database a restore from it creates (REST and `/api`).
+pub(crate) fn backup_time(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let ts = name.rsplit_once('_')?.1;
+    let ts = ts.strip_suffix(".zip").unwrap_or(ts);
+    if ts.len() != 14 || !ts.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(format!(
+        "{}-{}-{} {}:{}:{}",
+        &ts[0..4],
+        &ts[4..6],
+        &ts[6..8],
+        &ts[8..10],
+        &ts[10..12],
+        &ts[12..14]
+    ))
 }
 
 /// The database a path component named like upstream's backups
@@ -7817,6 +8140,127 @@ fn render_result_within(
     Ok(Resp::new(200, ctype, out.into_inner()))
 }
 
+/// Export served database `slot` (whose shared guard the caller holds) to
+/// `out` as `format` — `None`: the format that loses nothing, N-Quads when it
+/// has a non-empty named graph ([`ExportFormat::for_database`]) — and return
+/// the format written and the statement count. The export of the REST
+/// `/export` and the `/api` `export` alike (review http#11, design#4): its
+/// live state ([`crate::zipio::write_export`]), or — while a transaction is
+/// open — the transaction's begin-time snapshot (the `/api` caller refuses
+/// that case first, as upstream). A raised `cancel` stops it at its next
+/// statement ([`OpErrorKind::Cancelled`]); a read error fails it (contract
+/// C2).
+pub(crate) fn export_slot(
+    slot: &DbSlot,
+    format: Option<ExportFormat>,
+    out: &mut dyn Write,
+    cancel: Option<&AtomicBool>,
+) -> Result<(ExportFormat, u64), OpError> {
+    let mut out = CancellableWriter { out, cancel };
+    let written = match &slot.txn {
+        None => {
+            let format = format.unwrap_or_else(|| ExportFormat::for_database(&slot.db));
+            crate::zipio::write_export(&slot.db, format, &mut out).map(|n| (format, n))
+        }
+        Some(open) => open.snapshot.write_export(format, &mut out),
+    };
+    written.map_err(|e| {
+        if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+            OpError::new(OpErrorKind::Cancelled, "export cancelled")
+        } else {
+            OpError::of(&e, OpErrorKind::Failed, e.to_string())
+        }
+    })
+}
+
+/// A writer that fails once `cancel` is raised: how an export stops at its
+/// next statement after a `/cancel`.
+struct CancellableWriter<'a> {
+    out: &'a mut dyn Write,
+    cancel: Option<&'a AtomicBool>,
+}
+
+impl Write for CancellableWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+            return Err(std::io::Error::other("export cancelled"));
+        }
+        self.out.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.out.flush()
+    }
+}
+
+/// The REST `/export` of loaded database `name` (`dbh`): [`export_slot`]
+/// under a shared guard into an unnamed scratch file in `scratch_dir` (the
+/// export directory), returned — with the guard released — as a streamed
+/// body positioned at its start. The file is unlinked once open (where
+/// the platform allows; elsewhere when the body is dropped), so neither a
+/// failure nor a crash leaves it behind. `cancel` is the task's flag.
+fn rest_export(
+    dbh: &DbHandle,
+    name: &str,
+    format: Option<ExportFormat>,
+    scratch_dir: &Path,
+    cancel: &AtomicBool,
+) -> Result<(ExportFormat, crate::gapi::envelope::FileBody), OpError> {
+    use std::io::{Seek, SeekFrom};
+    /// Removes the scratch file once the body that reads it is dropped.
+    struct Scratch(PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+    let failed = |e: std::io::Error| {
+        OpError::new(
+            OpErrorKind::Failed,
+            format!("export failed: cannot write its scratch file: {e}"),
+        )
+    };
+    fs::create_dir_all(scratch_dir).map_err(failed)?;
+    static SCRATCH: AtomicU64 = AtomicU64::new(0);
+    let path = scratch_dir.join(format!(
+        ".rest-export-{}-{}-{}.tmp",
+        std::process::id(),
+        SCRATCH.fetch_add(1, Ordering::Relaxed),
+        now_millis()
+    ));
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(failed)?;
+    let scratch = Scratch(path);
+    // Unnamed from now on where the platform allows it.
+    let _ = fs::remove_file(&scratch.0);
+    let written = {
+        let slot = dbh.read()?;
+        if slot.retired {
+            return Err(OpError::new(
+                OpErrorKind::NotLoaded,
+                format!("database '{name}' is not loaded"),
+            ));
+        }
+        txn_park(name, TxnParkPoint::StatementHolding);
+        let mut out = std::io::BufWriter::new(&mut file);
+        let written = export_slot(&slot, format, &mut out, Some(cancel));
+        drop(out);
+        written
+    };
+    let (format, _) = written.map_err(|e| match e.kind {
+        OpErrorKind::Cancelled => e,
+        kind => OpError::new(kind, format!("export failed: {}", e.msg)),
+    })?;
+    let len = file.seek(SeekFrom::End(0)).map_err(failed)?;
+    file.seek(SeekFrom::Start(0)).map_err(failed)?;
+    let body = crate::gapi::envelope::FileBody::new(file, 0, len).with_permit(scratch);
+    Ok((format, body))
+}
+
 /// The error message of an UPDATE that failed after applying part of its
 /// operations (which stay applied — and were saved, unless `warning` says the
 /// save failed: the message then starts with that warning, `"applied in
@@ -8042,6 +8486,62 @@ fn new_system_password() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// review design#3: the status-mapping table — one classification for
+    /// every protocol layer. A statement error and a lifecycle failure get
+    /// the status of their kind; an unclassified one keeps the endpoint's
+    /// own (`untyped`).
+    #[test]
+    fn errors_map_to_the_status_of_their_kind() {
+        let io = |kind| GStoreError::Io(std::io::Error::new(kind, "x"));
+        let read = crate::store::read_scope::read_failure("evaluating the query", "page 7");
+        let table: Vec<(GStoreError, u16, u16, u16)> = vec![
+            // (error, as a statement, as a lifecycle step whose unclassified
+            // errors were 409, … whose unclassified errors were 500)
+            (GStoreError::SparqlParse("x".into()), 400, 400, 400),
+            (
+                GStoreError::RdfParse {
+                    line: 1,
+                    msg: "x".into(),
+                },
+                400,
+                400,
+                400,
+            ),
+            (GStoreError::Query("x".into()), 400, 400, 400),
+            (GStoreError::Locked("x".into()), 409, 409, 409),
+            (GStoreError::Conflict("x".into()), 409, 409, 409),
+            (io(std::io::ErrorKind::PermissionDenied), 500, 500, 500),
+            (io(std::io::ErrorKind::Other), 500, 500, 500),
+            (read.duplicate(), 500, 500, 500),
+            (GStoreError::StorageFailed("x".into()), 500, 500, 500),
+            (GStoreError::Serialize("x".into()), 500, 500, 500),
+            (GStoreError::Cancelled, 503, 503, 503),
+            (GStoreError::Timeout(Duration::from_secs(1)), 503, 503, 503),
+            (GStoreError::Database("x".into()), 400, 409, 500),
+        ];
+        for (e, statement, conflict, failed) in table {
+            assert_eq!(OpError::statement(&e).http(), statement, "{e}");
+            assert_eq!(
+                fail_with(&e, OpErrorKind::Conflict, "m").status,
+                conflict,
+                "{e}"
+            );
+            assert_eq!(
+                fail_with(&e, OpErrorKind::Failed, "m").status,
+                failed,
+                "{e}"
+            );
+        }
+        // A statement's refusals keep the SPARQL endpoints' body.
+        let cancelled = OpError::statement(&GStoreError::Cancelled).rest();
+        assert_eq!(
+            (cancelled.status, cancelled.ctype.as_str()),
+            (503, SPARQL_JSON)
+        );
+        let failed = OpError::statement(&read).rest();
+        assert_eq!(failed.status, 500);
+    }
 
     /// review sec#10: the result byte budget stops a serializer at the
     /// write that passes it — an oversized answer is never produced whole.
@@ -9129,7 +9629,9 @@ mod tests {
         let (s, body) = post(&format!("/cancel?id={task}"), "");
         assert_eq!(s, 200, "{body}");
         let (s, body) = query.join().unwrap();
-        assert_eq!(s, 400, "a cancelled /tquery fails: {body}");
+        // review design#3: a cancelled statement is a refused request (503),
+        // no longer a 400 query error.
+        assert_eq!(s, 503, "a cancelled /tquery fails: {body}");
         assert!(body.to_lowercase().contains("cancel"), "{body}");
         // The task is gone and the transaction is still usable.
         let (_, body) = split_status_body(&raw_request(&addr, "GET", "/tasklist", Some(&root), ""));
@@ -9274,9 +9776,10 @@ mod tests {
         );
 
         // The query, whose cancel flag was flipped while it ran, returns the
-        // cancellation error (HTTP 400 + "query cancelled").
+        // cancellation error (HTTP 503 + "query cancelled"; review design#3:
+        // it was a 400 query error).
         let (qstatus, qbody) = split_status_body(&query_thread.join().unwrap());
-        assert_eq!(qstatus, 400, "a cancelled query returns 400: {qbody}");
+        assert_eq!(qstatus, 503, "a cancelled query returns 503: {qbody}");
         assert!(
             qbody.to_lowercase().contains("cancel"),
             "expected a cancellation error, got: {qbody}"
@@ -10803,7 +11306,21 @@ mod tests {
             "INSERT DATA { <http://ex/c> <http://ex/p> <http://ex/d> }",
         );
         assert_eq!(s, 200, "{b}");
-        // A file where the rule directory belongs cannot be removed as one.
+        // review http#10: the rebuild's save fails (a directory stands where
+        // its staging file goes) — the fault used to be a rule directory
+        // that cannot be removed, which no longer precedes the save: the
+        // replaced rules go only once the new database is saved.
+        let blocker = server.root_dir().join("x.db").join("dict.bin.tmp");
+        fs::create_dir_all(blocker.join("blocker")).unwrap();
+        let (s, b) = post("/build?db_name=x&layout=snapshot", data);
+        assert_eq!(s, 500, "{b}");
+        let (s, b) = post("/sparql?db_name=x", ask);
+        assert_eq!(s, 200, "served again: {b}");
+        assert!(b.contains("true"), "the acknowledged insert survived: {b}");
+        fs::remove_dir_all(&blocker).unwrap();
+        // A rebuild saved over a rule directory it cannot remove (a file
+        // there) is in place, but not served — as a bulk build whose
+        // install did not finish — and the old rules are reported.
         fs::write(
             server.root_dir().join("x.db").join(RULE_DIR),
             "not a directory",
@@ -10811,9 +11328,9 @@ mod tests {
         .unwrap();
         let (s, b) = post("/build?db_name=x&layout=snapshot", data);
         assert_eq!(s, 500, "{b}");
+        assert!(b.contains(RULE_DIR), "{b}");
         let (s, b) = post("/sparql?db_name=x", ask);
-        assert_eq!(s, 200, "served again: {b}");
-        assert!(b.contains("true"), "the acknowledged insert survived: {b}");
+        assert_eq!(s, 404, "not served: {b}");
         stop_cp(&server, serving);
     }
 
@@ -10903,7 +11420,9 @@ mod tests {
             "/build?db_name=race&layout=disk",
             "<http://ex/a> <http://ex/p> <http://ex/b> .",
         );
-        assert_eq!(s, 400, "{b}");
+        // review design#3: a lock another process holds is a conflict (409)
+        // on every endpoint, no longer a 400.
+        assert_eq!(s, 409, "{b}");
         assert!(b.contains("locked by another process"), "{b}");
         assert!(
             dir.join("other-process-work").is_file(),

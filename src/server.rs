@@ -3339,16 +3339,12 @@ impl ServerInner {
                 crate::http_api::write_ntriples(&ts, w)
             }),
             Ok(QueryResult::Update { changed }) => update_reply(changed, warning),
-            // A statement stopped by `query_timeout`: a refused request
-            // (SPARQL Protocol), not a query error.
-            Err(e @ crate::GStoreError::Timeout(_)) => {
-                Reply::plain(503, SPARQL_JSON, &err_json(&e.to_string()))
-            }
-            Err(e) => Reply::plain(
-                failure_status(&warning),
-                SPARQL_JSON,
-                &err_json(&e.to_string()),
-            ),
+            // The status of the error's kind, as the REST endpoints answer
+            // it (review design#3): a syntax or evaluation error 400, a
+            // statement stopped by `query_timeout` — a refused request
+            // (SPARQL Protocol) — or cancelled 503, a storage failure or a
+            // write that could not be saved 500.
+            Err(e) => Reply::plain(e.http(), SPARQL_JSON, &err_json(&e.msg)),
         }
     }
 
@@ -3361,18 +3357,10 @@ impl ServerInner {
                 "application/json",
                 err_json("/update expects a SPARQL UPDATE request"),
             ),
-            // Stopped by `query_timeout` before it applied anything: a
-            // refused request, as on `/sparql` (an UPDATE stopped after
-            // applying part of its operations is the query error that says
-            // so).
-            Err(e @ crate::GStoreError::Timeout(_)) => {
-                Reply::buffered(503, "application/json", err_json(&e.to_string()))
-            }
-            Err(e) => Reply::buffered(
-                failure_status(&warning),
-                "application/json",
-                err_json(&e.to_string()),
-            ),
+            // As on `/sparql`: stopped by `query_timeout` (also after
+            // applying part of its operations, which the message names, as
+            // REST's `/update` answers it) is a refused request, 503.
+            Err(e) => Reply::buffered(e.http(), "application/json", err_json(&e.msg)),
         }
     }
 
@@ -3392,7 +3380,8 @@ impl ServerInner {
     /// broken until it is reopened, which discards the write
     /// ([`Database::storage_failure`]). The caller answers a
     /// statement with a warning as a failure, HTTP 500 ([`update_reply`],
-    /// [`failure_status`]) — never as an acknowledged write (review
+    /// [`OpErrorKind::Persist`](crate::http_api::OpErrorKind::Persist)) —
+    /// never as an acknowledged write (review
     /// durability#2).
     ///
     /// With check_point off an on-disk / RocksDB database's statement is made
@@ -3412,10 +3401,23 @@ impl ServerInner {
     /// holds the database's lock (a statement queued behind a long write is
     /// not charged for the wait) and disarmed when the evaluation returned
     /// (not during the save after an UPDATE).
-    fn execute(&self, sparql: &str) -> (crate::Result<QueryResult>, Option<String>) {
+    ///
+    /// A failure is an [`OpError`](crate::http_api::OpError): the statement's
+    /// error classified by [`OpErrorKind::of`](crate::http_api::OpErrorKind::of)
+    /// — the same classification the REST endpoints use (review design#3) —
+    /// or, for a statement whose applied part could not be saved,
+    /// [`Persist`](crate::http_api::OpErrorKind::Persist).
+    fn execute(
+        &self,
+        sparql: &str,
+    ) -> (
+        Result<QueryResult, crate::http_api::OpError>,
+        Option<String>,
+    ) {
+        use crate::http_api::{OpError, OpErrorKind};
         let stmt = match Statement::parse(sparql) {
             Ok(stmt) => stmt,
-            Err(e) => return (Err(e), None),
+            Err(e) => return (Err(OpError::statement(&e)), None),
         };
         let timed_out = |r: crate::Result<QueryResult>,
                          deadline: Option<crate::deadline::Deadline>| match (
@@ -3433,14 +3435,17 @@ impl ServerInner {
             let (flag, deadline) = crate::deadline::arm_linked(&self.cancel, self.query_timeout);
             txn_park(&self.name, TxnParkPoint::StatementHolding);
             let result = db.read_as(&stmt, Some(flag), None);
-            return (timed_out(result, deadline), None);
+            return (
+                timed_out(result, deadline).map_err(|e| OpError::statement(&e)),
+                None,
+            );
         }
         let mut db = write_locked(&self.db);
         let before = db.mutation_count();
         let (flag, deadline) = crate::deadline::arm_linked(&self.cancel, self.query_timeout);
         txn_park(&self.name, TxnParkPoint::StatementHolding);
         let result = db.execute_as(stmt, Some(flag), None);
-        let mut result = timed_out(result, deadline);
+        let mut result = timed_out(result, deadline).map_err(|e| OpError::statement(&e));
         let mut warning = None;
         if db.mutation_count() != before {
             self.dirty.store(true, Ordering::SeqCst);
@@ -3474,13 +3479,21 @@ impl ServerInner {
                     // A persistence failure (answered 500), not a query error.
                     // The failure may be the statement's commit point (then
                     // every operation was applied) or one of its operations.
-                    Some(w) => crate::GStoreError::Database(format!(
-                        "{w} (the update failed: {e}; the operations before the failing one \
-                         were applied — all of them when the commit point failed)"
-                    )),
-                    None => crate::GStoreError::Query(format!(
-                        "{e} (operations before the failing one were applied)"
-                    )),
+                    Some(w) => OpError::new(
+                        OpErrorKind::Persist,
+                        format!(
+                            "{w} (the update failed: {}; the operations before the failing \
+                             one were applied — all of them when the commit point failed)",
+                            e.msg
+                        ),
+                    ),
+                    // The statement's own failure (a 400 query error, a 503
+                    // timeout, a 500 storage failure), naming its applied
+                    // part.
+                    None => OpError::new(
+                        e.kind,
+                        format!("{} (operations before the failing one were applied)", e.msg),
+                    ),
                 });
             }
             self.counters.publish(&db);
@@ -3551,17 +3564,6 @@ fn changed_json(changed: usize, warning: Option<String>) -> Vec<u8> {
 fn update_reply(changed: usize, warning: Option<String>) -> Reply {
     let status = if warning.is_some() { 500 } else { 200 };
     Reply::buffered(status, "application/json", changed_json(changed, warning))
-}
-
-/// The HTTP status of a failed statement: 500 when the save of what it
-/// applied failed (`warning`: the failure is the server's, and the change is
-/// not durable), else 400.
-fn failure_status(warning: &Option<String>) -> u16 {
-    if warning.is_some() {
-        500
-    } else {
-        400
-    }
 }
 
 /// A parsed HTTP request (method, path, query string, headers, body).

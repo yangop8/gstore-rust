@@ -392,7 +392,9 @@ fn single_server_shutdown_cancels_a_running_query_and_saves() {
     assert_eq!(report.saved, vec![dir.clone()], "{report:?}");
     assert!(on_disk_has_new_triple(&dir));
     let (s, b) = slow.join().unwrap();
-    assert_eq!(s, 400, "{b}");
+    // review design#3: a statement the shutdown cancelled is a refused
+    // request (503), no longer a 400 query error.
+    assert_eq!(s, 503, "{b}");
     assert!(b.to_lowercase().contains("cancel"), "{b}");
 }
 
