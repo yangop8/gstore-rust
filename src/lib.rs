@@ -68,6 +68,11 @@ pub mod zipio;
 
 pub mod db;
 
+// A transaction's commit outcome under injected storage failures (review
+// gap-txn-lifecycle#3, gap-rocksdb-exec#5): the crate's test-only failpoints.
+#[cfg(test)]
+mod txn_commit_tests;
+
 /// The gStore database-directory suffix (gStore C++ uses the same `.db`).
 pub const DB_SUFFIX: &str = ".db";
 

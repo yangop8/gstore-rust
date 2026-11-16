@@ -469,6 +469,93 @@ enum UndoOp {
     Del(Option<u32>, IdTriple),
 }
 
+/// Why [`Database::commit_checked`] did not commit cleanly — what became of
+/// the transaction, so that a caller (a server answering `/commit`) can say
+/// truthfully whether its writes stand. [`Database::commit`] reports the
+/// same failures as a plain error.
+#[derive(Debug)]
+pub enum CommitFailure {
+    /// Nothing happened: there is no transaction, or the commit was refused
+    /// before anything was taken (a Stream-mode commit from inside one of
+    /// the store's own snapshot reads) and the transaction is still open.
+    NotCommitted(GStoreError),
+    /// The commit point failed and the transaction was rolled back: none of
+    /// its writes is visible any more, and none becomes durable later. On
+    /// an on-disk database whose store the failure broke
+    /// ([`Database::storage_failure`]) every later commit point still fails
+    /// until the database is reopened, which brings back its last committed
+    /// state.
+    RolledBack(GStoreError),
+    /// The commit point failed after the transaction could no longer be
+    /// undone: its writes stay applied (visible) but are not known to be
+    /// durable. On an on-disk database the store is broken (reopen it: it
+    /// then holds what its write-ahead log committed — the transaction, or
+    /// the part of a transaction larger than the page cache that was
+    /// written before the failure); on RocksDB either the write-ahead log
+    /// could not be synced, or the journal of a commit that failed could not
+    /// be replayed yet (writes are refused until it is, and the next open
+    /// replays it: the transaction is then undone).
+    NotDurable(GStoreError),
+    /// The transaction is committed and durable, but a step after its
+    /// commit point failed (its records could not be appended to the redo
+    /// log, [`Database::enable_redo_log`]).
+    CommittedWithError(GStoreError),
+}
+
+impl CommitFailure {
+    /// The underlying error.
+    pub fn error(&self) -> &GStoreError {
+        match self {
+            CommitFailure::NotCommitted(e)
+            | CommitFailure::RolledBack(e)
+            | CommitFailure::NotDurable(e)
+            | CommitFailure::CommittedWithError(e) => e,
+        }
+    }
+
+    /// The underlying error, by value.
+    pub fn into_error(self) -> GStoreError {
+        match self {
+            CommitFailure::NotCommitted(e)
+            | CommitFailure::RolledBack(e)
+            | CommitFailure::NotDurable(e)
+            | CommitFailure::CommittedWithError(e) => e,
+        }
+    }
+}
+
+impl std::fmt::Display for CommitFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CommitFailure::NotCommitted(e) => write!(f, "not committed: {e}"),
+            CommitFailure::RolledBack(e) => {
+                write!(
+                    f,
+                    "the commit failed and the transaction was rolled back: {e}"
+                )
+            }
+            CommitFailure::NotDurable(e) => write!(
+                f,
+                "the commit failed; the transaction stays applied but is not durable: {e}"
+            ),
+            CommitFailure::CommittedWithError(e) => {
+                write!(f, "the transaction is committed, but: {e}")
+            }
+        }
+    }
+}
+
+/// Which journal step undoes a transaction's RocksDB writes (see
+/// [`Database::undo_transaction`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RocksUndo {
+    /// A rollback: the journal is still recording.
+    Rollback,
+    /// A commit whose journal deletion failed: the journal is stale and
+    /// must be replayed instead (`RocksStore::rollback_uncleared_journal`).
+    FailedCommit,
+}
+
 /// The graph-to-graph UPDATE operations (SPARQL 1.1 Update §3.2.3-3.2.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GraphTransfer {
@@ -1627,67 +1714,198 @@ impl Database {
         Ok(())
     }
 
-    /// Commit the active transaction, discarding its undo log. Buffered redo
-    /// records (this transaction's mutations) are flushed to the redo log, since
-    /// the transaction is now durable.
+    /// Commit the active transaction. Its buffered redo records (this
+    /// transaction's mutations) are appended to the redo log once it is
+    /// durable.
     ///
     /// On a persistent layout this is a commit point: the transaction's queued
     /// write-through reaches the store and is made durable (see [`StorageKind`]).
+    /// The outcome is binary where the layout allows it: when the commit
+    /// point fails, the transaction is rolled back (none of its writes stays
+    /// visible or becomes durable later) unless it can no longer be undone —
+    /// see [`commit_checked`](Self::commit_checked), which tells the cases
+    /// apart; this method reports each of them as an error.
     pub fn commit(&mut self) -> Result<()> {
+        self.commit_checked().map_err(CommitFailure::into_error)
+    }
+
+    /// [`commit`](Self::commit), reporting what became of the transaction
+    /// when it did not commit cleanly ([`CommitFailure`]).
+    ///
+    /// The undo log is kept until the commit point succeeded: the queued
+    /// write-through is applied and flushed first (RocksDB: the undo journal
+    /// is deleted — that is the commit — with the terms the transaction
+    /// freed in the same batch). If the commit point fails before anything
+    /// of the transaction can have reached the store (an on-disk store's
+    /// write-ahead log of the failed flush never got its name, and no flush
+    /// the page cache made in between did either; RocksDB: the journal could
+    /// not be deleted), the transaction is undone in memory — RocksDB: its
+    /// journal is replayed — and [`CommitFailure::RolledBack`] is returned;
+    /// otherwise its writes stay applied and [`CommitFailure::NotDurable`]
+    /// says so. Only a committed transaction frees the ids its deletes left
+    /// unreferenced (written to an on-disk store at the next commit point)
+    /// and reaches the redo log.
+    pub fn commit_checked(&mut self) -> std::result::Result<(), CommitFailure> {
         if self.txn.is_none() {
-            return Err(GStoreError::Database("no active transaction".into()));
+            return Err(CommitFailure::NotCommitted(GStoreError::Database(
+                "no active transaction".into(),
+            )));
         }
+        // On-disk stores: a new write-ahead log from here on means the
+        // commit may survive (in part) whatever happens next.
+        let batches = self.wal_batches();
         // Stream mode: apply the overlay (named-graph operations, removals,
         // additions) under the store's writer gate.
+        let mut overlay_failure = None;
         if let Some(dt) = self.store.as_disk_mut() {
             if let Err(e) = dt.commit() {
                 if dt.in_transaction() {
                     // Refused before anything was taken (from inside one of
                     // the store's own snapshot reads): still open.
-                    return Err(e);
+                    return Err(CommitFailure::NotCommitted(e));
                 }
-                // The store is broken: the transaction is gone, and so are
-                // its redo records (nothing of it is acknowledged), and the
-                // cached answers and CSR built from its overlay.
-                self.txn = None;
-                self.redo_pending.clear();
-                self.query_cache_mut().clear();
-                self.csr_cache.clear();
-                self.dict.track_allocations(false);
-                self.reclaim.clear();
-                self.run_deferred_rebuild();
-                return Err(e);
+                // The store is broken (every read is refused until it is
+                // reopened) and the overlay is gone.
+                overlay_failure = Some(e);
             }
         }
-        self.txn = None;
+        let log = self.txn.take().unwrap_or_default();
+        let minted = self.dict.take_allocations();
         self.dict.track_allocations(false);
+        if let Some(e) = overlay_failure {
+            return Err(self.failed_commit(log, minted, e, batches, false));
+        }
+        // Materialize: apply the queued write-through to the on-disk store.
         self.disk_commit_pending();
-        let redo = self.flush_redo();
-        // The transaction's frees, as one batch, after its writes and redo
-        // records: the ids its deletes left unreferenced in the committed
-        // state.
-        let dead = self.committed_dead();
-        // RocksDB: deleting the undo journal is what commits the transaction;
-        // the freed terms leave the `dict` CF in the same atomic batch.
-        let journal = self.rocks_commit_journal_with(&dead);
-        if journal.is_ok() {
+        // RocksDB: deleting the undo journal is what commits the
+        // transaction; the terms it freed leave the `dict` CF in the same
+        // atomic batch.
+        let rocks = self.rocks_journaling();
+        if rocks {
+            let dead = self.committed_dead();
+            if let Err(e) = self.rocks_commit_journal_with(&dead) {
+                // Not committed: a later write would still delete the
+                // journal (committing it) while a reopen would replay it
+                // (undoing it). Undo it now, through the journal.
+                return Err(self.undo_failed_commit(log, minted, e, RocksUndo::FailedCommit));
+            }
             self.free_dead(dead, true);
         }
-        let point = self.commit_point();
+        if let Err(e) = self.commit_point() {
+            return Err(self.failed_commit(log, minted, e, batches, rocks));
+        }
+        // Committed and durable. The transaction's frees, after its writes:
+        // the ids its deletes left unreferenced in the committed state
+        // (RocksDB freed them in its journal batch above).
+        if !rocks {
+            let dead = self.committed_dead();
+            self.free_dead(dead, false);
+        }
+        drop(log);
+        drop(minted);
+        let redo = self.flush_redo();
         self.run_deferred_rebuild();
-        redo.and(journal).and(point)
+        redo.map_err(CommitFailure::CommittedWithError)
+    }
+
+    /// The commit point of a closing transaction failed with `e`: roll it
+    /// back when nothing of it can have reached the store, else keep it
+    /// applied and report it as not durable. `batches` is
+    /// [`wal_batches`](Self::wal_batches) before the commit; `journal_gone`
+    /// when a RocksDB journal was already deleted (committed there).
+    fn failed_commit(
+        &mut self,
+        log: Vec<UndoOp>,
+        minted: Vec<crate::dict::TermId>,
+        e: GStoreError,
+        batches: u64,
+        journal_gone: bool,
+    ) -> CommitFailure {
+        if journal_gone || self.wal_batches() != batches {
+            // Applied: its redo records stay unwritten (it is not known to
+            // be durable) and its frees are not made (nothing references
+            // them less than before the failure would justify).
+            self.redo_pending.clear();
+            self.reclaim.clear();
+            self.run_deferred_rebuild();
+            return CommitFailure::NotDurable(e);
+        }
+        self.undo_failed_commit(log, minted, e, RocksUndo::Rollback)
+    }
+
+    /// Undo a transaction whose commit failed with `e` (see
+    /// [`undo_transaction`](Self::undo_transaction)).
+    fn undo_failed_commit(
+        &mut self,
+        log: Vec<UndoOp>,
+        minted: Vec<crate::dict::TermId>,
+        e: GStoreError,
+        rocks: RocksUndo,
+    ) -> CommitFailure {
+        match self.undo_transaction(log, minted, true, rocks) {
+            Ok(()) => CommitFailure::RolledBack(e),
+            // Undone; only deleting the replayed RocksDB journal failed (the
+            // next write or open deletes it — replaying it again is a no-op).
+            Err((true, cleanup)) => CommitFailure::RolledBack(GStoreError::Database(format!(
+                "{e}; (the rolled-back transaction's journal is deleted later: {cleanup})"
+            ))),
+            Err((false, undo)) => CommitFailure::NotDurable(GStoreError::Database(format!(
+                "{e}; rolling the transaction back failed too: {undo} (its journal is replayed \
+                 by the next write or open, which undoes it)"
+            ))),
+        }
+    }
+
+    /// Flushes of the on-disk store's file that got as far as naming their
+    /// write-ahead log (both modes; `0` for the other layouts).
+    fn wal_batches(&self) -> u64 {
+        let sink = self
+            .disk_guard()
+            .as_ref()
+            .map_or(0, |s| s.store.wal_batches());
+        sink + self.store.as_disk().map_or(0, |dt| dt.wal_batches())
     }
 
     /// Roll back the active transaction, undoing every triple mutation made
-    /// since [`begin`](Self::begin) in reverse order.
+    /// since [`begin`](Self::begin) in reverse order. A transaction that
+    /// changed nothing (only reads, or writes that changed no triple) leaves
+    /// [`mutation_count`](Self::mutation_count), the cached query results
+    /// and the CSR as they were.
     pub fn rollback(&mut self) -> Result<()> {
         let Some(log) = self.txn.take() else {
             return Err(GStoreError::Database("no active transaction".into()));
         };
-        // Its deletes are undone (nothing to free); the terms it minted are
-        // freed once its inserts are gone.
         let minted = self.dict.take_allocations();
         self.dict.track_allocations(false);
+        // Stream mode: the default graph's changes live in the overlay, not
+        // in the undo log.
+        let overlay = self
+            .store
+            .as_disk()
+            .and_then(|dt| dt.transaction())
+            .is_some_and(|t| !t.is_empty());
+        self.undo_transaction(log, minted, overlay, RocksUndo::Rollback)
+            .map_err(|(_, e)| e)
+    }
+
+    /// Undo the transaction that just closed: its undo `log` in reverse
+    /// order, the terms it `minted` freed once its inserts are gone. `rocks`
+    /// names the journal step that undoes a RocksDB transaction's writes.
+    /// `changed`: whether it changed anything the log does not show (a
+    /// Stream-mode overlay, or a commit that got as far as applying it);
+    /// without that and with an empty log, nothing counts as a mutation. An
+    /// error says whether the writes were undone all the same (only the
+    /// deletion of a replayed RocksDB journal failed).
+    fn undo_transaction(
+        &mut self,
+        log: Vec<UndoOp>,
+        minted: Vec<crate::dict::TermId>,
+        changed: bool,
+        rocks: RocksUndo,
+    ) -> std::result::Result<(), (bool, GStoreError)> {
+        let changed = changed || !log.is_empty();
+        // Its deletes are undone (nothing to free); the terms it minted are
+        // freed once its inserts are gone.
         self.reclaim.clear();
         // The transaction's mutations are being undone, so its buffered redo
         // records must never reach the log, nor its queued write-through the
@@ -1702,7 +1920,10 @@ impl Database {
         // A RocksDB store is rolled back by replaying its undo journal (which
         // also covers the named-graph quads in RocksDB); only the in-memory
         // named-graph map is undone here.
-        let journaled = self.rocks_journaling();
+        let journaled = match rocks {
+            RocksUndo::Rollback => self.rocks_journaling(),
+            RocksUndo::FailedCommit => true,
+        };
         // Default-graph triples the rollback puts back: their edges are folded
         // into the tree once the store holds them again (below), O(height)
         // each.
@@ -1766,7 +1987,10 @@ impl Database {
                 }
             }
         }
-        let replayed = self.rocks_rollback_journal();
+        let replayed = match rocks {
+            RocksUndo::Rollback => self.rocks_rollback_journal(),
+            RocksUndo::FailedCommit => self.rocks_rollback_uncleared_journal(),
+        };
         if replayed.is_err() {
             // The store's state is not known: never filter through the tree.
             self.index_valid = false;
@@ -1780,7 +2004,12 @@ impl Database {
                 }
             }
         }
-        self.touched();
+        // Review db#7: a transaction that changed nothing invalidates no
+        // cached answer and no CSR (the ids it minted, if any, are freed
+        // below, which counts on its own).
+        if changed || replayed.is_err() {
+            self.touched();
+        }
         if replayed.is_ok() && self.id_reclaim == IdReclaim::Immediate {
             for t in minted {
                 self.reclaim.note(t);
@@ -1790,14 +2019,14 @@ impl Database {
         // one batch with the minted and replayed terms nothing references
         // any more, so a crash before that batch replays it again at the
         // next open (which frees them then) — never an orphan term.
-        let replayed = match replayed {
+        let undone = match replayed {
             Ok(()) if journaled => {
                 let dead = self.committed_dead();
                 let cleared = self.rocks_commit_journal_with(&dead);
                 if cleared.is_ok() {
                     self.free_dead(dead, true);
                 }
-                cleared
+                cleared.map_err(|e| (true, e))
             }
             Ok(()) => {
                 if self.id_reclaim == IdReclaim::Immediate {
@@ -1805,10 +2034,10 @@ impl Database {
                 }
                 Ok(())
             }
-            Err(e) => Err(e),
+            Err(e) => Err((false, e)),
         };
         self.run_deferred_rebuild();
-        replayed
+        undone
     }
 
     /// Whether a transaction is currently active.

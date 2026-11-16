@@ -1147,6 +1147,31 @@ impl RocksStore {
         if !self.journaling() {
             return Ok(());
         }
+        self.replay_kept_journal()
+    }
+
+    /// Roll back the transaction whose commit failed to delete its undo
+    /// journal ([`commit_journal_with`](Self::commit_journal_with) left it
+    /// stale for deletion): replay the journal instead, keeping it as
+    /// [`rollback_keeping_journal`](Self::rollback_keeping_journal) does
+    /// until `commit_journal_with` deletes it with the terms the replay
+    /// left unreferenced. Without this a later
+    /// [`heal_journal`](Self::heal_journal) would delete the journal —
+    /// committing the transaction — while a reopen before it would replay
+    /// it, undoing the transaction (review gap-rocksdb-exec#5). If the
+    /// replay fails, the journal stays stale for replay: the next write or
+    /// open finishes the rollback, so the transaction never becomes
+    /// durable. A no-op unless the journal is stale for deletion.
+    pub fn rollback_uncleared_journal(&mut self) -> Result<()> {
+        if !matches!(*self.journal_state(), Journal::Stale { replay: false, .. }) {
+            return Ok(());
+        }
+        self.replay_kept_journal()
+    }
+
+    /// Replay the journal on disk, keeping it (see
+    /// [`rollback_keeping_journal`](Self::rollback_keeping_journal)).
+    fn replay_kept_journal(&mut self) -> Result<()> {
         // No longer recording while it replays: the replay's own writes
         // must not append records to the journal they undo (a crash replays
         // that journal again from its start anyway).

@@ -1328,6 +1328,12 @@ impl DiskStore {
         self.pager.write().unwrap().flush()
     }
 
+    /// The pager's [`wal_batches`](Pager::wal_batches): flushes of this
+    /// file that got as far as naming their write-ahead log.
+    pub fn wal_batches(&self) -> u64 {
+        self.read_pager().wal_batches()
+    }
+
     /// Persist counters and flush all dirty pages (see [`commit`](Self::commit)).
     pub fn flush(&mut self) -> Result<()> {
         self.check_writable()?;
