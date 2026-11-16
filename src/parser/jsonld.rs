@@ -40,6 +40,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::rc::Rc;
 
 use crate::error::{GStoreError, Result};
 use crate::json::Json;
@@ -68,7 +69,7 @@ pub fn parse_str_with(content: &str, labels: &mut BlankLabeler) -> Result<Vec<Tr
         labels: std::mem::take(labels),
         budget: TermBudget::for_input(content.len()),
     };
-    let done = proc.process_top(&json, &Context::default());
+    let done = proc.process_top(&json, &Rc::new(Context::default()));
     *labels = proc.labels;
     done?;
     proc.budget.check()?;
@@ -98,7 +99,10 @@ struct TermDef {
     language: Option<String>,
 }
 
-/// The active JSON-LD context threaded through processing.
+/// The active JSON-LD context threaded through processing. It is shared
+/// (`Rc`) by every node object that does not carry its own `@context`, and
+/// copied only for one that does (review parser#7: each node object used to
+/// copy the whole context, O(nodes x terms)).
 #[derive(Debug, Clone, Default)]
 struct Context {
     base: Option<String>,
@@ -144,7 +148,7 @@ impl Processor {
 
     /// Entry point: a document is a node object, an array of them, or an object
     /// carrying `@graph`.
-    fn process_top(&mut self, json: &Json, base: &Context) -> Result<()> {
+    fn process_top(&mut self, json: &Json, base: &Rc<Context>) -> Result<()> {
         match json {
             Json::Arr(items) => {
                 for it in items {
@@ -161,11 +165,16 @@ impl Processor {
         }
     }
 
-    /// Build the active context by layering an object's `@context` on `parent`.
-    fn active_context(&self, parent: &Context, pairs: &[(String, Json)]) -> Result<Context> {
+    /// Build the active context by layering an object's `@context` on
+    /// `parent`; without one, `parent` itself (shared, not copied).
+    fn active_context(
+        &self,
+        parent: &Rc<Context>,
+        pairs: &[(String, Json)],
+    ) -> Result<Rc<Context>> {
         match get(pairs, "@context") {
-            Some(c) => self.build_context(parent, c),
-            None => Ok(parent.clone()),
+            Some(c) => self.build_context(parent, c).map(Rc::new),
+            None => Ok(Rc::clone(parent)),
         }
     }
 
@@ -244,7 +253,7 @@ impl Processor {
     }
 
     /// Process a node object, returning its subject term.
-    fn process_node(&mut self, pairs: &[(String, Json)], parent_ctx: &Context) -> Result<Term> {
+    fn process_node(&mut self, pairs: &[(String, Json)], parent_ctx: &Rc<Context>) -> Result<Term> {
         let ctx = self.active_context(parent_ctx, pairs)?;
 
         // Subject identity.
@@ -279,13 +288,14 @@ impl Processor {
                 continue; // drop keys that do not expand to an absolute IRI
             }
             let predicate = Term::Iri(pred_iri);
-            let def = ctx.terms.get(key).cloned().unwrap_or_default();
-            self.emit_values(&subject, &predicate, val, &ctx, &def)?;
+            let none = TermDef::default();
+            let def = ctx.terms.get(key).unwrap_or(&none);
+            self.emit_values(&subject, &predicate, val, &ctx, def)?;
         }
         Ok(subject)
     }
 
-    fn process_graph(&mut self, g: &Json, ctx: &Context) -> Result<()> {
+    fn process_graph(&mut self, g: &Json, ctx: &Rc<Context>) -> Result<()> {
         match g {
             Json::Arr(items) => {
                 for it in items {
@@ -307,7 +317,7 @@ impl Processor {
         subj: &Term,
         pred: &Term,
         val: &Json,
-        ctx: &Context,
+        ctx: &Rc<Context>,
         def: &TermDef,
     ) -> Result<()> {
         // A term with @container:@list turns an array/scalar into an RDF list.
@@ -336,7 +346,7 @@ impl Processor {
         subj: &Term,
         pred: &Term,
         val: &Json,
-        ctx: &Context,
+        ctx: &Rc<Context>,
         def: &TermDef,
     ) -> Result<()> {
         match val {
@@ -367,7 +377,7 @@ impl Processor {
 
     /// Expand a JSON array into an `rdf:first`/`rdf:rest`/`rdf:nil` chain,
     /// returning the head (`rdf:nil` for an empty list).
-    fn build_list(&mut self, items: &[&Json], ctx: &Context, def: &TermDef) -> Result<Term> {
+    fn build_list(&mut self, items: &[&Json], ctx: &Rc<Context>, def: &TermDef) -> Result<Term> {
         let nil = Term::iri(format!("{RDF_NS}nil"));
         if items.is_empty() {
             return Ok(nil);
@@ -391,7 +401,7 @@ impl Processor {
         Ok(head)
     }
 
-    fn list_item_term(&mut self, val: &Json, ctx: &Context, def: &TermDef) -> Result<Term> {
+    fn list_item_term(&mut self, val: &Json, ctx: &Rc<Context>, def: &TermDef) -> Result<Term> {
         match val {
             Json::Obj(pairs) => {
                 if let Some(v) = get(pairs, "@value") {

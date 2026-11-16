@@ -36,6 +36,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::rc::Rc;
 
 use crate::error::Result;
 use crate::model::{Term, Triple};
@@ -560,7 +561,9 @@ struct EvalContext {
     parent_subject: Term,
     parent_object: Option<Term>,
     vocab: Option<String>,
-    prefixes: HashMap<String, String>,
+    /// Shared by every element that declares no prefix of its own, copied
+    /// by one that does (review parser#7: each element used to copy it).
+    prefixes: Rc<HashMap<String, String>>,
     lang: Option<String>,
     /// Incomplete triples awaiting a child subject: `(predicate, direction)`.
     incomplete: Vec<(Term, Dir)>,
@@ -573,7 +576,7 @@ impl EvalContext {
             base,
             parent_object: None,
             vocab: None,
-            prefixes: initial_prefixes(),
+            prefixes: Rc::new(initial_prefixes()),
             lang: None,
             incomplete: Vec::new(),
         }
@@ -615,7 +618,7 @@ impl Extractor {
         let mut typed_resource: Option<Term> = None;
 
         // Local mutable context copies.
-        let mut prefixes = ctx.prefixes.clone();
+        let mut prefixes = Rc::clone(&ctx.prefixes);
         let mut vocab = ctx.vocab.clone();
         let mut lang = ctx.lang.clone();
         // `xml:base` (rare in RDFa) overrides the inherited base for this subtree.
@@ -636,11 +639,11 @@ impl Extractor {
 
         // Step 3: prefix mappings from @prefix and xmlns:*.
         if let Some(p) = el.attr("prefix") {
-            parse_prefix_attr(p, &mut prefixes);
+            parse_prefix_attr(p, Rc::make_mut(&mut prefixes));
         }
         for (k, v) in &el.attrs {
             if let Some(pfx) = k.strip_prefix("xmlns:") {
-                prefixes.insert(pfx.to_string(), v.clone());
+                Rc::make_mut(&mut prefixes).insert(pfx.to_string(), v.clone());
             }
         }
 

@@ -495,3 +495,118 @@ fn an_empty_rdfxml_property_element_describes_its_object() {
     want.sort_by_key(|t| format!("{t:?}"));
     assert_eq!(got, want);
 }
+
+// ---- JSON-LD contexts and RDFa prefix maps are shared (parser#7) -------------
+
+fn jsonld_with_terms(terms: usize, nodes: usize) -> String {
+    let defs: Vec<String> = (0..terms)
+        .map(|i| format!("\"t{i}\": \"http://ex/t{i}\""))
+        .collect();
+    let graph: Vec<String> = (0..nodes)
+        .map(|i| format!("{{\"@id\": \"http://ex/n{i}\", \"t0\": \"v\"}}"))
+        .collect();
+    format!(
+        "{{\"@context\": {{{}}}, \"@graph\": [{}]}}",
+        defs.join(", "),
+        graph.join(", ")
+    )
+}
+
+/// Review parser#7: every JSON-LD node object copied the whole active
+/// context (O(nodes x terms): 10.9 s for 20000 `{}` under a 4000-term
+/// context). With the context shared, 16 times the terms cost about the
+/// same, not 16 times as much (bound: 4).
+#[test]
+fn jsonld_node_objects_share_the_active_context() {
+    let nodes = 5000;
+    let small = jsonld_with_terms(250, nodes);
+    let large = jsonld_with_terms(4000, nodes);
+    assert_eq!(jsonld::parse_str(&large).unwrap().len(), nodes);
+    let t_small = fastest(|| {
+        jsonld::parse_str(&small).unwrap();
+    });
+    let t_large = fastest(|| {
+        jsonld::parse_str(&large).unwrap();
+    });
+    let ratio = t_large.as_secs_f64() / t_small.as_secs_f64().max(1e-6);
+    assert!(
+        ratio < 4.0 || t_large < Duration::from_millis(30),
+        "16x the context terms took {ratio:.1}x as long ({t_small:?} -> {t_large:?})"
+    );
+}
+
+/// A node object's own `@context` applies to it and to what it contains,
+/// not to its siblings (JSON-LD 1.1 §4.1: contexts are scoped to the object
+/// that carries them).
+#[test]
+fn a_jsonld_node_context_is_scoped_to_its_node() {
+    let doc = r#"{"@context": {"ex": "http://ex/", "name": "http://ex/name"},
+        "@graph": [
+          {"@id": "ex:a", "@context": {"name": "http://other/name"}, "name": "A",
+           "ex:child": {"@id": "ex:c", "name": "C"}},
+          {"@id": "ex:b", "name": "B"}
+        ]}"#;
+    let mut got = jsonld::parse_str(doc).unwrap();
+    got.sort_by_key(|t| format!("{t:?}"));
+    let mut want = vec![
+        Triple::new(iri("http://ex/a"), iri("http://other/name"), lit("A")),
+        Triple::new(iri("http://ex/a"), iri("http://ex/child"), iri("http://ex/c")),
+        Triple::new(iri("http://ex/c"), iri("http://other/name"), lit("C")),
+        Triple::new(iri("http://ex/b"), iri("http://ex/name"), lit("B")),
+    ];
+    want.sort_by_key(|t| format!("{t:?}"));
+    assert_eq!(got, want);
+}
+
+fn rdfa_with_prefixes(prefixes: usize, elements: usize) -> String {
+    let decl: Vec<String> = (0..prefixes)
+        .map(|i| format!("p{i}: http://ex/p{i}/"))
+        .collect();
+    let body: String = (0..elements)
+        .map(|i| format!("<div about=\"http://ex/s{i}\" property=\"p0:v\">x</div>"))
+        .collect();
+    format!(
+        "<html prefix=\"{}\"><body>{body}</body></html>",
+        decl.join(" ")
+    )
+}
+
+/// Review parser#7 (RDFa): every element copied the prefix map in scope
+/// (2000 elements: 6 ms with no prefix declared, 184 ms under 1000). Shared,
+/// 100 times the prefixes cost about the same (bound: 4).
+#[test]
+fn rdfa_elements_share_the_prefix_map() {
+    let elements = 2000;
+    let small = rdfa_with_prefixes(10, elements);
+    let large = rdfa_with_prefixes(1000, elements);
+    let ts = rdfa::parse_str(&large).unwrap();
+    assert_eq!(
+        ts.iter()
+            .filter(|t| t.predicate == iri("http://ex/p0/v"))
+            .count(),
+        elements
+    );
+    let t_small = fastest(|| {
+        rdfa::parse_str(&small).unwrap();
+    });
+    let t_large = fastest(|| {
+        rdfa::parse_str(&large).unwrap();
+    });
+    let ratio = t_large.as_secs_f64() / t_small.as_secs_f64().max(1e-6);
+    assert!(
+        ratio < 4.0 || t_large < Duration::from_millis(30),
+        "100x the prefixes took {ratio:.1}x as long ({t_small:?} -> {t_large:?})"
+    );
+}
+
+/// RDFa Core §7.5 step 3: a prefix mapping applies to the element that
+/// declares it and its descendants, not to its siblings.
+#[test]
+fn an_rdfa_prefix_is_scoped_to_its_element() {
+    let doc = "<html prefix=\"a: http://ex/a/\"><body>\
+               <div prefix=\"a: http://ex/inner/\" about=\"http://ex/s1\" property=\"a:p\">x</div>\
+               <div about=\"http://ex/s2\" property=\"a:p\">y</div></body></html>";
+    let ts = rdfa::parse_str(doc).unwrap();
+    assert!(ts.contains(&Triple::new(iri("http://ex/s1"), iri("http://ex/inner/p"), lit("x"))));
+    assert!(ts.contains(&Triple::new(iri("http://ex/s2"), iri("http://ex/a/p"), lit("y"))));
+}
