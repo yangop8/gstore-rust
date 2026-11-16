@@ -216,20 +216,27 @@ fn result_table(result: QueryResult) -> ResultSet {
 }
 
 /// The JSON scaffolding counted per cell of an answer on top of its
-/// variable name and value: `{"x":{"type":"literal","value":""}}`, its
-/// separators and the escapes a value may need.
-const CELL_OVERHEAD: u64 = 48;
+/// escaped variable name and escaped value: the largest binding object
+/// (`{"type":"typed-literal","datatype":"","value":""}`), the `:` after the
+/// variable name and the `,` after the cell, rounded up.
+const CELL_OVERHEAD: u64 = 56;
 
 /// Whether the first `shown` rows of `rs` (all of them for `None`) would serialize
-/// to more than `budget` bytes, by the size of their cells (each row's
-/// variable names and values plus [`CELL_OVERHEAD`]) — stopping at the
-/// first row past the budget.
+/// to more than `budget` bytes, by the size of their cells: each row's
+/// variable names and values as escaped JSON strings
+/// ([`json::escaped_len`](crate::json::escaped_len) — a control character
+/// takes six bytes, a quote two) plus [`CELL_OVERHEAD`] — stopping at the
+/// first row past the budget. An upper bound of the bindings' serialized
+/// size (a value's JSON form, decoded from the N-Triples cell and escaped
+/// again, is never longer than the escaped cell; round-2 review: the raw
+/// lengths let an escape-heavy answer pass at several times the budget).
 fn result_bytes_exceed(rs: &ResultSet, shown: Option<usize>, budget: u64) -> bool {
     let mut total: u64 = 0;
     for row in rs.rows.iter().take(shown.unwrap_or(usize::MAX)) {
         for (var, cell) in rs.vars.iter().zip(row) {
             if let Some(v) = cell {
-                total += (var.len() + v.len()) as u64 + CELL_OVERHEAD;
+                total += (crate::json::escaped_len(var) + crate::json::escaped_len(v)) as u64
+                    + CELL_OVERHEAD;
             }
         }
         total += 4;
@@ -267,8 +274,10 @@ fn read_response(
     let out_limit = output_limit(ans_num, limit, ctx.config.max_output_size);
     let shown = usize::try_from(out_limit).ok();
     // The result byte budget (`max_result_bytes`, review sec#10) of an
-    // answer carried in the response: its cells are summed up before the
-    // JSON document is built, which is never built past the budget.
+    // answer carried in the response: an upper bound of its bindings'
+    // serialized size is summed up before the JSON document is built, so
+    // the bindings are never built past the budget (the document's fixed
+    // envelope — head, status fields — comes on top).
     if matches!(format, OutFormat::Json | OutFormat::NTriple) {
         let budget = ctx.inner.config().max_result_bytes;
         if budget != 0 && result_bytes_exceed(rs, shown, budget) {

@@ -346,6 +346,19 @@ pub fn quote(s: &str) -> String {
     out
 }
 
+/// The length in bytes of `s` as a quoted, escaped JSON string literal —
+/// what [`write_str`] appends — without building it.
+pub fn escaped_len(s: &str) -> usize {
+    2 + s
+        .chars()
+        .map(|c| match c {
+            '"' | '\\' | '\n' | '\r' | '\t' | '\u{08}' | '\u{0C}' => 2,
+            c if (c as u32) < 0x20 => 6,
+            c => c.len_utf8(),
+        })
+        .sum::<usize>()
+}
+
 /// Append `s` as a quoted, escaped JSON string literal to `out`.
 pub fn write_str(s: &str, out: &mut String) {
     out.push('"');
@@ -677,6 +690,22 @@ impl Parser<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escaped_len_is_what_write_str_appends() {
+        for s in [
+            "",
+            "plain",
+            "quote \" and \\ backslash",
+            "\n\r\t\u{08}\u{0C}",
+            "\u{01}\u{1f} controls",
+            "caf\u{e9} \u{1F600}",
+        ] {
+            let mut out = String::new();
+            write_str(s, &mut out);
+            assert_eq!(escaped_len(s), out.len(), "{s:?}");
+        }
+    }
 
     #[test]
     fn parses_every_value_kind() {
