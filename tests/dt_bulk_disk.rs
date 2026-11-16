@@ -718,7 +718,9 @@ fn gbuild_disk_uses_the_bulk_build() {
         "d.nt",
     ]);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "{out:?}");
+    // review sparqlconf#12: a build that skipped a statement (`not rdf`)
+    // exits 3 (built, statements skipped); it used to exit 0.
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
     assert!(stdout.contains("bulk build"), "{stdout}");
     assert!(stdout.contains("triples=2"), "{stdout}");
     assert!(stdout.contains("spills:"), "{stdout}");
@@ -732,7 +734,8 @@ fn gbuild_disk_uses_the_bulk_build() {
     );
 
     let out = run(&["--disk", "--incremental", "i", "d.nt"]);
-    assert!(out.status.success(), "{out:?}");
+    // review sparqlconf#12: as above, exit 3 for the skipped statement.
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
     assert!(!String::from_utf8_lossy(&out.stdout).contains("bulk build"));
     assert_eq!(Database::open(base.join("i.db")).unwrap().triple_num(), 2);
     assert_eq!(Database::open(base.join("b.db")).unwrap().triple_num(), 2);

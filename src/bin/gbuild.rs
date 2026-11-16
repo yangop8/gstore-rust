@@ -81,7 +81,11 @@
 //! finish cleaning up (an old layout, the staging area) says so — "built,
 //! but …" — and exits with status 1; the new database is the one served.
 //!
-//! Exit status: 0 built, 1 failed, 2 invalid arguments; `-h`/`--help`.
+//! Exit status: 0 built, 1 failed, 2 invalid arguments, 3 built but
+//! statements were skipped (tolerant mode: the database holds every other
+//! statement, and `parse_error.log` names the skipped ones — so a script
+//! running `gexport` then `gbuild` notices a statement that did not load
+//! back); `-h`/`--help`.
 
 #[path = "common/cli.rs"]
 mod cli;
@@ -369,14 +373,14 @@ fn main() -> ExitCode {
         }
     };
     if rocksdb && (incremental || !cfg!(feature = "rocksdb")) {
-        let code = build_rocksdb(name, &dir, &sources, &opts, &mut log, started);
-        if code == ExitCode::SUCCESS {
-            created.keep();
-            if existed {
-                return drop_old_rules(&dir);
-            }
+        let Some(report) = build_rocksdb(name, &dir, &sources, &opts, &mut log, started) else {
+            return ExitCode::FAILURE;
+        };
+        created.keep();
+        if existed && drop_old_rules(&dir) != ExitCode::SUCCESS {
+            return ExitCode::FAILURE;
         }
-        return code;
+        return built_exit(&report, log.path());
     }
     let mut bulk_installed = false;
     let mut cleanup_incomplete = false;
@@ -455,11 +459,30 @@ fn main() -> ExitCode {
     }
     // The bulk install removed the replaced database's rules itself, right
     // after its commit point.
-    if existed && !bulk_installed {
-        return drop_old_rules(&dir);
+    if existed && !bulk_installed && drop_old_rules(&dir) != ExitCode::SUCCESS {
+        return ExitCode::FAILURE;
     }
-    ExitCode::SUCCESS
+    built_exit(&report, &log_path)
 }
+
+/// The exit status of a build that completed: 0, or [`SKIPPED`] when the
+/// tolerant import skipped statements (review sparqlconf#12: a skipped
+/// statement — a literal the loader refuses, say — must not pass for a
+/// complete build in a script; the database is built all the same).
+fn built_exit(report: &ImportReport, log: &Path) -> ExitCode {
+    if report.failed == 0 {
+        return ExitCode::SUCCESS;
+    }
+    eprintln!(
+        "gbuild: built, but {} statement(s) were skipped (listed in {}); exit status {SKIPPED}",
+        report.failed,
+        log.display()
+    );
+    ExitCode::from(SKIPPED)
+}
+
+/// The exit status of a build that skipped statements (see [`built_exit`]).
+const SKIPPED: u8 = 3;
 
 /// After a `--force` rebuild: remove the replaced database's reasoning rules
 /// (`reason_rule_files/`), as dropping it would — executed, their ledgers
@@ -501,7 +524,8 @@ impl Drop for CreatedDir {
 }
 
 /// Build a RocksDB-backed database (each file parsed by its extension). Gated on
-/// the `rocksdb` feature.
+/// the `rocksdb` feature. The import report of a build that completed;
+/// `None` (the error printed) when it failed.
 #[cfg(feature = "rocksdb")]
 fn build_rocksdb(
     name: &str,
@@ -510,7 +534,7 @@ fn build_rocksdb(
     opts: &ImportOptions,
     log: &mut ParseErrorLog,
     started: Instant,
-) -> ExitCode {
+) -> Option<ImportReport> {
     // Close the freshly built store before reopening it (RocksDB takes a lock).
     let report =
         match Database::build_rocksdb_from_sources(name.to_string(), dir, sources, opts, log) {
@@ -520,18 +544,18 @@ fn build_rocksdb(
             }
             Err(e) => {
                 eprintln!("rocksdb build failed: {e}");
-                return ExitCode::FAILURE;
+                return None;
             }
         };
     match Database::open(dir) {
         Ok(db) => print_stats(name, dir, &db, started, "RocksDB"),
         Err(e) => {
             eprintln!("built, but failed to reopen: {e}");
-            return ExitCode::FAILURE;
+            return None;
         }
     }
     print_report(&report, log.path());
-    ExitCode::SUCCESS
+    Some(report)
 }
 
 #[cfg(not(feature = "rocksdb"))]
@@ -542,9 +566,9 @@ fn build_rocksdb(
     _opts: &ImportOptions,
     _log: &mut ParseErrorLog,
     _started: Instant,
-) -> ExitCode {
+) -> Option<ImportReport> {
     eprintln!("gbuild: --rocksdb requires building with `--features rocksdb`");
-    ExitCode::FAILURE
+    None
 }
 
 /// Whether `path` exists as anything but an empty directory.

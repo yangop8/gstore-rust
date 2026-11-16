@@ -24,7 +24,8 @@
 //! test ends, also when it fails; servers run in-process on `127.0.0.1:0`.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use gstore::model::term::export_key;
@@ -473,4 +474,138 @@ fn redo_records_of_reader_terms_replay_after_a_load() {
         .replay_redo_log(tmp.join("logs").join("redo.log"))
         .unwrap();
     assert_eq!(all_keys(&mut replayed), want);
+}
+
+// ---- sparqlconf#12: UPDATE and the loader agree; gexport -> gbuild -----------
+
+const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
+
+#[test]
+fn update_refuses_the_literals_the_loader_refuses() {
+    let mut db = Database::new("lits");
+    for bad in [
+        format!("\"x\"^^<{XSD}integer>"),
+        format!("\"300\"^^<{XSD}byte>"),
+        format!("\"9223372036854775808\"^^<{XSD}integer>"),
+        format!("\"NaN\"^^<{XSD}double>"),
+    ] {
+        let q = format!("INSERT DATA {{ <http://ex/s> <http://ex/p> {bad} }}");
+        let err = db.query(&q).expect_err(&q).to_string();
+        assert!(err.contains("loader refuses"), "{q}: {err}");
+    }
+    // Built by the engine: arbitrary-precision arithmetic, STRDT.
+    for q in [
+        "INSERT { <http://ex/x> <http://ex/big> ?v } WHERE { BIND(9223372036854775807 + 1 AS ?v) }"
+            .to_string(),
+        format!(
+            "INSERT {{ <http://ex/x> <http://ex/t> ?v }} WHERE {{ BIND(STRDT(\"x\", <{XSD}int>) AS ?v) }}"
+        ),
+    ] {
+        assert!(db.query(&q).is_err(), "{q}");
+    }
+    // Nothing of a refused operation is applied.
+    let q = format!(
+        "INSERT DATA {{ <http://ex/s> <http://ex/ok> 1 . <http://ex/s> <http://ex/p> \"y\"^^<{XSD}int> }}"
+    );
+    assert!(db.query(&q).is_err());
+    assert!(all_keys(&mut db).is_empty());
+    // Valid literals, ill-typed literals of unchecked types and big
+    // decimals are stored as before.
+    let q = format!(
+        "INSERT DATA {{ <http://ex/s> <http://ex/p> 9223372036854775807, \"-12\"^^<{XSD}short>, \
+         1.5e3, \"x\"^^<{XSD}decimal>, 99999999999999999999.5 }}"
+    );
+    db.query(&q).unwrap();
+    assert_eq!(all_keys(&mut db).len(), 5);
+}
+
+fn run(bin: &str, args: &[&str], dir: &Path) -> std::process::Output {
+    Command::new(bin)
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn gexport_then_gbuild_loses_nothing() {
+    let tmp = TmpDir::new("export");
+    std::fs::write(tmp.join("a.rdf"), rdfxml_doc("zh_CN")).unwrap();
+    std::fs::write(
+        tmp.join("b.jsonld"),
+        "[{\"@id\": \"_:a b\", \"http://ex/p\": {\"@value\": \"v\", \"@language\": \"\"}}, \
+         {\"@id\": \"_:a b\", \"http://ex/q\": \"w\"}]",
+    )
+    .unwrap();
+    let mut db = Database::new("src");
+    for f in ["a.rdf", "b.jsonld"] {
+        db.query(&format!("LOAD <file://{}>", tmp.join(f).display()))
+            .unwrap();
+    }
+    db.query(&format!(
+        "INSERT DATA {{ <http://ex/s> <http://ex/n> 42, \"t\\u0001ab\\tx\" . \
+         <http://ex/s> <http://ex/m> \"9\"^^<{XSD}byte> }}"
+    ))
+    .unwrap();
+    // An IRI a lenient reader let in.
+    assert!(db.insert_triple(&Triple::new(
+        Term::iri("http://ex/a>b c"),
+        Term::iri("http://ex/p"),
+        Term::iri("http://ex/o"),
+    )));
+    let before = all_keys(&mut db);
+    db.save(tmp.join("src.db")).unwrap();
+
+    let out = run(env!("CARGO_BIN_EXE_gexport"), &["src", "out.nt"], &tmp.0);
+    assert!(out.status.success(), "{out:?}");
+    let out = run(env!("CARGO_BIN_EXE_gbuild"), &["dst", "out.nt"], &tmp.0);
+    assert!(out.status.success(), "gbuild skipped statements: {out:?}");
+    let mut rebuilt = Database::open(tmp.join("dst.db")).unwrap();
+    let after = all_keys(&mut rebuilt);
+    assert_eq!(after.len(), before.len(), "{before:?}\n{after:?}");
+    // Blank nodes are renamed per import; everything else is identical.
+    let no_blanks = |rows: &BTreeSet<Vec<String>>| -> BTreeSet<Vec<String>> {
+        rows.iter()
+            .map(|r| {
+                r.iter()
+                    .map(|k| {
+                        if k.starts_with("_:") {
+                            "_:".into()
+                        } else {
+                            k.clone()
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+    assert_eq!(no_blanks(&after), no_blanks(&before));
+}
+
+#[test]
+fn gbuild_exits_3_when_it_skipped_statements() {
+    let tmp = TmpDir::new("gbuild");
+    std::fs::write(
+        tmp.join("d.nt"),
+        format!(
+            "<http://ex/s> <http://ex/p> <http://ex/o> .\n\
+             <http://ex/s> <http://ex/p> \"x\"^^<{XSD}integer> .\n"
+        ),
+    )
+    .unwrap();
+    let out = run(env!("CARGO_BIN_EXE_gbuild"), &["d", "d.nt"], &tmp.0);
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("RDF parse error num 1"), "{stdout}");
+    // The build finished all the same.
+    let mut db = Database::open(tmp.join("d.db")).unwrap();
+    assert_eq!(all_keys(&mut db).len(), 1);
+    // A clean source exits 0.
+    std::fs::write(
+        tmp.join("e.nt"),
+        "<http://ex/s> <http://ex/p> <http://ex/o> .\n",
+    )
+    .unwrap();
+    let out = run(env!("CARGO_BIN_EXE_gbuild"), &["e", "e.nt"], &tmp.0);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
 }

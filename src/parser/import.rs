@@ -708,6 +708,28 @@ fn invalid_quad(q: &Quad, upstream_checks: bool) -> Option<String> {
     None
 }
 
+/// SPARQL UPDATE's literal rule, the same as the tolerant loader's
+/// ([`upstream_literal_check`]): an `INSERT DATA` triple or an instantiated
+/// `INSERT` template triple whose object the loader would refuse
+/// (`"x"^^xsd:integer`, `"300"^^xsd:byte`, an `xsd:integer` beyond 64 bits
+/// such as `9223372036854775807 + 1`, a `NaN` double, …) fails the
+/// operation before any of it is applied. Without it UPDATE stored literals
+/// that `gexport` writes and `gbuild` then skips (review sparqlconf#12). A
+/// strict import (the library default, `gbuild --strict`, SPARQL `LOAD`)
+/// still stores such a literal as written.
+pub fn check_update_literals<'a>(objects: impl IntoIterator<Item = &'a Term>) -> Result<()> {
+    for o in objects {
+        if let Some(msg) = upstream_literal_check(o) {
+            return Err(GStoreError::Query(format!(
+                "cannot insert the literal {}: {msg} (the loader refuses it, so it would not \
+                 load back from an export)",
+                o.to_ntriples()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Upstream `RDFParser::parseFile`'s object checks: `None` when the object
 /// passes, else its message.
 pub fn upstream_literal_check(object: &Term) -> Option<&'static str> {

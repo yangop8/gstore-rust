@@ -539,16 +539,19 @@ fn load_into_graph_targets_that_graph() {
 // ---------------------------------------------------------------------------
 
 fn typed_db() -> Database {
-    let mut db = Database::new("typed");
-    update(
-        &mut db,
-        "PREFIX : <http://ex/> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> INSERT DATA { \
+    // review sparqlconf#12: SPARQL UPDATE now refuses the numeric literals
+    // the tolerant loader refuses ("abc"^^xsd:integer, "300"^^xsd:byte), so
+    // the ill-typed data comes in through a strict import, which stores
+    // them as written.
+    Database::build_from_str(
+        "typed",
+        "@prefix : <http://ex/> . @prefix xsd: <http://www.w3.org/2001/XMLSchema#> . \
          :a :v \"abc\"^^xsd:integer . :b :v \"01\"^^xsd:integer . :c :v \"300\"^^xsd:byte . \
          :d :v \"1\"^^xsd:byte . :e :v \"2020-13-01T00:00:00Z\"^^xsd:dateTime . \
          :f :v \"2020-01-01T00:00:00Z\"^^xsd:dateTime . :g :v \"1e3\"^^xsd:decimal . \
-         :h :v \"-0\"^^xsd:nonPositiveInteger }",
-    );
-    db
+         :h :v \"-0\"^^xsd:nonPositiveInteger .",
+    )
+    .unwrap()
 }
 
 fn subjects(db: &mut Database, filter: &str) -> Vec<String> {
@@ -571,7 +574,7 @@ fn subjects(db: &mut Database, filter: &str) -> Vec<String> {
 #[test]
 fn ill_typed_literals_are_stored_but_never_numbers() {
     let mut db = typed_db();
-    // INSERT accepts ill-typed literals as they are.
+    // A strict import stores ill-typed literals as they are.
     assert_eq!(
         col(
             &mut db,

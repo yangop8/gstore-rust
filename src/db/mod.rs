@@ -2301,7 +2301,11 @@ impl Database {
         pfn: Option<&crate::pfn::PfnCaller>,
     ) -> Result<usize> {
         match op {
-            UpdateOp::InsertData(triples) => self.try_insert_data(&triples),
+            UpdateOp::InsertData(triples) => {
+                // The loader's literal rule (review sparqlconf#12).
+                import::check_update_literals(triples.iter().map(|g| &g.object))?;
+                self.try_insert_data(&triples)
+            }
             UpdateOp::DeleteData(triples) => Ok(self.delete_data(&triples)),
             UpdateOp::Modify {
                 with,
@@ -2327,6 +2331,9 @@ impl Database {
                     cancel,
                     pfn,
                 )?;
+                // The loader's literal rule, before anything is applied
+                // (review sparqlconf#12).
+                import::check_update_literals(ins.iter().map(|(_, t)| &t.object))?;
                 // A template triple outside `GRAPH { … }` targets the WITH
                 // graph, else the default graph.
                 let target = |g: &Option<String>| g.clone().or_else(|| with.clone());
