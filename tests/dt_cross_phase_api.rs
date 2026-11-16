@@ -120,7 +120,15 @@ fn every_write_path_invalidates_the_query_cache_and_the_csr() {
     assert_eq!(state(&srv, "cache"), with, "after commit");
     let tid = begin(&srv);
     tquery(&srv, &tid, DELETE);
-    assert!(cell(&tquery(&srv, &tid, COUNT)).contains('2'));
+    // review tests-a#2: compare the COUNT's lexical value, as `state` does —
+    // `contains('2')` held for every xsd:integer cell (its datatype IRI
+    // holds "2001"), so a stale or begin-time answer of 3 passed as well.
+    let n = cell(&tquery(&srv, &tid, COUNT));
+    assert_eq!(
+        n.trim_start_matches('"').split('"').next().unwrap(),
+        without.0,
+        "the transaction reads its own delete: {n}"
+    );
     assert!(!cell(&tquery(&srv, &tid, REACH)).contains("\"length\":3"));
     ok(&srv.op("rollback", &[("db_name", "cache"), ("tid", &tid)]));
     assert_eq!(state(&srv, "cache"), with, "after rollback");

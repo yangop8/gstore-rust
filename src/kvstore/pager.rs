@@ -288,6 +288,9 @@ pub struct Pager {
     /// this pager found itself out of step with it): every write and commit
     /// is refused from then on (see the module docs).
     failed: FailureFlag,
+    /// Flushes whose write-ahead log got its name (see
+    /// [`wal_batches`](Self::wal_batches)).
+    wal_batches: u64,
     /// Number of committed flushes (tests assert when commits happen).
     #[cfg(test)]
     flushes: u64,
@@ -330,6 +333,7 @@ impl Pager {
             op_failed: false,
             write_gen: 0,
             failed: Arc::new(OnceLock::new()),
+            wal_batches: 0,
             #[cfg(test)]
             flushes: 0,
         };
@@ -370,6 +374,18 @@ impl Pager {
     /// pager marked it failed (see the module docs). Reopen to recover.
     pub fn failure(&self) -> Option<&str> {
         self.failed.get().map(String::as_str)
+    }
+
+    /// How many flushes since the open got as far as naming their
+    /// write-ahead log — from that step on a batch may be durable (the next
+    /// open replays a complete log), whether or not the flush then
+    /// succeeded. A caller compares it before and after a commit to tell a
+    /// failed commit that left the file as it was (no new batch) from one
+    /// that may survive in part or whole: a later step of the failed flush,
+    /// or a flush the cache made in the middle of the work (the dirty pages
+    /// of a large operation outgrew it).
+    pub fn wal_batches(&self) -> u64 {
+        self.wal_batches
     }
 
     /// The flag behind [`failure`](Self::failure), for a store sharing this
@@ -681,6 +697,7 @@ impl Pager {
         // 1. Write-ahead: stage the log under a temporary name and fsync it,
         //    then give it its name. Nothing on disk changed if this fails.
         write_wal(&self.wal_path, &batch)?;
+        self.wal_batches += 1;
         // From here the log may be durable: an error leaves the file possibly
         // half-applied, which only a replay of the log can finish.
         if let Err(e) = self.apply_committed(&batch) {

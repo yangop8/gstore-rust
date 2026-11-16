@@ -1349,7 +1349,10 @@ fn every_privilege_class_maps_to_its_operations() {
                 "begin",
                 "tquery",
                 "commit",
-                "rollback",
+                // review gap-txn-lifecycle#5: "rollback" is open to every
+                // user (checked below) — the transaction handlers let only
+                // the owner or a superuser end a transaction, so an owner
+                // whose update privilege was revoked can still roll back.
                 "checkpoint",
             ],
         ),
@@ -1373,6 +1376,8 @@ fn every_privilege_class_maps_to_its_operations() {
         }
         users.clear_privileges("u").unwrap();
     }
+    assert!(sysdb::allowed(&users, "u", "rollback", Some("alpha")));
+    assert!(sysdb::allowed(&users, "u", "rollback", Some("beta")));
     for op in ["login", "show", "userpassword", "check", "funquery"] {
         assert!(sysdb::allowed(&users, "u", op, None), "{op}");
     }

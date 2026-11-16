@@ -1816,6 +1816,23 @@ impl Database {
         Ok(())
     }
 
+    /// Roll back a transaction whose commit could not delete its undo
+    /// journal (review gap-rocksdb-exec#5): replay the stale journal now —
+    /// it stays on disk until [`rocks_commit_journal_with`](Self::rocks_commit_journal_with)
+    /// deletes it with the terms the replay leaves unreferenced — so the
+    /// transaction is undone instead of being committed by the next write's
+    /// cleanup or undone by the next open, whichever comes first. If the
+    /// replay fails the journal stays stale for replay (writes are refused;
+    /// the next write or open finishes the rollback). No-op for the other
+    /// layouts.
+    pub(super) fn rocks_rollback_uncleared_journal(&mut self) -> Result<()> {
+        #[cfg(feature = "rocksdb")]
+        if let Some(rocks) = self.store.as_rocks_mut() {
+            return rocks.rollback_uncleared_journal();
+        }
+        Ok(())
+    }
+
     /// RocksDB, outside a transaction: journal the auto-commit statement
     /// about to run (a SPARQL UPDATE request, `insert_sources` /
     /// `remove_sources`), so that it is crash-atomic as a whole — a crash

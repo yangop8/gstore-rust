@@ -101,6 +101,27 @@ impl<'a> Txn<'a> {
     }
 }
 
+/// The `<begin>_<tid>` id the transaction log (`/api txnlog`) shows for
+/// transaction `tid` of `db` (its newest record), and its state.
+fn logged(srv: &Server, db: &str, tid: &str) -> (String, String) {
+    let j = srv.op("txnlog", &[("pageNo", "1"), ("pageSize", "100")]);
+    ok(&j);
+    let field = |r: &Json, k: &str| {
+        r.get(k)
+            .and_then(Json::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    // Newest first.
+    j.get("list")
+        .and_then(Json::as_array)
+        .unwrap_or_default()
+        .iter()
+        .find(|r| field(r, "db_name") == db && field(r, "TID").ends_with(&format!("_{tid}")))
+        .map(|r| (field(r, "TID"), field(r, "state")))
+        .unwrap_or_else(|| panic!("transaction {tid} of {db} in {j}"))
+}
+
 fn int_lit(v: &str) -> String {
     format!("\"{v}\"^^<{XSD_INTEGER}>")
 }
@@ -311,11 +332,24 @@ fn transaction_ids_are_numbered_per_loaded_database_in(layout: &str) {
     assert!(string(&j, "StatusMsg").contains("already committed"), "{j}");
 
     // Unloading and loading again restarts the numbering (upstream creates a
-    // new Txn_manager on load) — and forgets how the old ids ended.
+    // new Txn_manager on load). review gap-txn-lifecycle#6: this comment
+    // used to add "and forgets how the old ids ended" — the codified flaw of
+    // gap-txn-lifecycle#2, where a retried request for an earlier load's
+    // transaction ended the new one with the same number. How the old ids
+    // ended is kept across the reload: the transaction log's
+    // `<begin>_<tid>` form names the old transaction 1 (refused as already
+    // committed), never the new transaction 1, and the old id 2 is still
+    // known as committed.
+    let (old_1, _) = logged(&srv, "alpha", "1");
     srv.unload("alpha");
     srv.load("alpha");
     let mut a = Txn::begin(&srv, "alpha", "1");
     a.update("insert data { <a2> <p> <o> }", 1);
+    let j = srv.op("commit", &[("db_name", "alpha"), ("tid", &old_1)]);
+    assert_ne!(code(&j), 0, "{j}");
+    assert!(string(&j, "StatusMsg").contains("already committed"), "{j}");
+    let j = srv.op("commit", &[("db_name", "alpha"), ("tid", "2")]);
+    assert!(string(&j, "StatusMsg").contains("already committed"), "{j}");
     // One writer per database: a second begin is refused.
     let j = srv.op("begin", &[("db_name", "alpha"), ("isolevel", "1")]);
     assert_eq!(code(&j), 1008, "{j}");

@@ -236,9 +236,12 @@ mod rocks {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// If deleting a committed transaction's undo journal fails, the journal
-    /// must not be replayed later (that would undo the commit): writes are
-    /// refused until a retry deletes it, and then the commit stands.
+    /// A commit whose journal cannot be deleted leaves a stale journal that
+    /// must not decide the outcome later: writes are refused until a retry
+    /// deletes it. review gap-rocksdb-exec#5: this test used to assert that
+    /// the commit then stands (the next write's cleanup committed it, while
+    /// a reopen before any write would have undone it); the failed commit
+    /// is now rolled back through its journal, so it is gone either way.
     #[test]
     fn stale_journal_after_a_failed_commit_blocks_writes_until_cleared() {
         let (dir, mut db) = open_rocks("rocks_stale_journal", BASE);
@@ -264,9 +267,9 @@ mod rocks {
         drop(db);
 
         let mut db = Database::open(&dir).unwrap();
-        for (s, o) in [("t", "u"), ("v", "w")] {
+        for (s, o, there) in [("t", "u", false), ("v", "w", true)] {
             let q = format!("ASK {{ <http://ex/{s}> <http://ex/p> <http://ex/{o}> }}");
-            assert_eq!(db.query(&q).unwrap(), QueryResult::Ask(true), "{q}");
+            assert_eq!(db.query(&q).unwrap(), QueryResult::Ask(there), "{q}");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

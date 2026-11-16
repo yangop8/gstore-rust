@@ -139,6 +139,12 @@ root_password="123456"
 system_username="system"
 # auto check point, default on
 check_point=on
+# seconds after which an open transaction with no statement running is
+# rolled back (logged as ABORTED), so a client that vanishes after begin
+# cannot block its database's writes and maintenance; also frees a RocksDB
+# database's copy for it. A transaction of a deleted user is rolled back too.
+# 0 = never (upstream behaviour; gserver warns at startup) (Rust extension)
+txn_idle_timeout=600
 # build use multi thread increase efficiency
 build_multi_thread=off
 # gbuild --disk builds the indexes in bulk (sorted, bottom-up). Its sort

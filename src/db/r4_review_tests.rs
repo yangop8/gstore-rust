@@ -377,12 +377,15 @@ mod rocks {
         let fp = &db.store.as_rocks().unwrap().inject_failures().journal_clear;
         fp.store(false, Ordering::SeqCst);
         let live = quads(&mut db);
+        // review gap-rocksdb-exec#5: the commit that failed to delete its
+        // journal is rolled back now (it used to stay applied), so the log
+        // starts from BASE alone and the default graph kept BASE's triples.
         assert_eq!(
             live.len(),
-            3,
+            2,
             "the default graph kept its triples: {live:?}"
         );
-        assert_eq!(replayed(&log, &[setup]), live);
+        assert_eq!(replayed(&log, &[]), live);
     }
 
     /// Rolled-back transactions leave nothing in the RocksDB store's

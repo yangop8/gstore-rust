@@ -773,6 +773,13 @@ impl DiskTriples {
         self.unsynced.load(Ordering::SeqCst)
     }
 
+    /// Flushes of the store's file that got as far as naming their
+    /// write-ahead log ([`Pager::wal_batches`](super::Pager::wal_batches)):
+    /// unchanged across a failed commit means nothing of it can survive.
+    pub fn wal_batches(&self) -> u64 {
+        self.store.wal_batches()
+    }
+
     /// Count `n` applied changes towards [`unsynced_writes`](Self::unsynced_writes).
     fn applied(&self, n: u64) {
         self.unsynced.fetch_add(n, Ordering::SeqCst);

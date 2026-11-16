@@ -242,7 +242,13 @@ impl ApiLogs {
 
     /// Record that transaction `tid` of `user` began on `db`. Best effort.
     pub fn txn_begin(&self, root: &Path, db: &str, tid: u64, user: &str) {
-        let begun = clock::unix_millis();
+        self.txn_begin_at(root, db, tid, user, clock::unix_millis());
+    }
+
+    /// [`txn_begin`](Self::txn_begin) at `begun` (Unix milliseconds): the
+    /// begin time a server keeps with the transaction, so that the
+    /// `<begun>_<tid>` form of the record's `TID` names it exactly.
+    pub fn txn_begin_at(&self, root: &Path, db: &str, tid: u64, user: &str, begun: u128) {
         self.txn_begun
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -265,6 +271,36 @@ impl ApiLogs {
         let rec = txn_record(db, tid, user, state, begun, Some(ended));
         let _guard = self.io();
         let _ = append_line(&txnlog_path(root), &record_line(rec));
+    }
+
+    /// Mark every transaction the log still shows `RUNNING` as `ABORTED`
+    /// (review gap-txn-lifecycle#2): run once by a server as it starts, when
+    /// no transaction of its own is open, so these are the transactions a
+    /// previous process left behind (killed, crashed) — never committed,
+    /// and undone (RocksDB, Stream mode) or lost (in memory) with it. Their
+    /// records keep their `TID` and begin time; the end time is now. Best
+    /// effort. Returns how many were marked.
+    pub fn abort_stale_running(&self, root: &Path) -> usize {
+        let path = txnlog_path(root);
+        if !path.exists() {
+            return 0;
+        }
+        let ended = clock::unix_millis();
+        let mut lines = Vec::new();
+        for rec in txn_records(root) {
+            if rec.get("state").and_then(Json::as_str) != Some(TxnState::Running.as_str()) {
+                continue;
+            }
+            let mut rec = rec;
+            rec.set("state", TxnState::Aborted.as_str());
+            rec.set("end_time", ended.to_string());
+            lines.push(record_line(rec));
+        }
+        let _guard = self.io();
+        lines
+            .iter()
+            .filter(|line| append_line(&path, line).is_ok())
+            .count()
     }
 
     /// Append `line` to today's file in `dir`; when that file is new, delete
