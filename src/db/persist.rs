@@ -1060,7 +1060,10 @@ impl Database {
     }
 
     /// [`build_disk_incremental`](Self::build_disk_incremental) from
-    /// `sources` (the pre-Phase-6 body of the disk build).
+    /// `sources` (the pre-Phase-6 body of the disk build). The new store is
+    /// built in the bulk build's staging area and installed by the bulk
+    /// build's crash-safe install, so a build that fails or is interrupted
+    /// leaves the database `dir` held before as it was.
     #[doc(hidden)]
     pub fn build_disk_from_sources_incremental<P: AsRef<Path>>(
         dir: P,
@@ -1070,6 +1073,9 @@ impl Database {
     ) -> Result<import::ImportReport> {
         let dir = dir.as_ref();
         fs::create_dir_all(dir)?;
+        // Another build of this process rebuilding `dir` would share the
+        // staging area below: refused, as between bulk builds.
+        let _guard = super::dirlock::BuildGuard::enter(dir)?;
         // Replacing the files of a database another process serves (or one
         // of this process has open) would strand its later writes: refused,
         // as the bulk build refuses, and the directory held meanwhile.
@@ -1080,21 +1086,46 @@ impl Database {
             )));
         }
         let _lock = super::dirlock::DirLock::acquire(dir)?;
-        remove_other_layouts(dir, StorageKind::Disk)?;
-        // Fresh build: remove any prior store/VS-tree files *and* their WALs, so a
-        // leftover WAL from a crashed earlier build can't replay into the new file.
-        let kv = dir.join(KV_FILE);
-        super::remove_file_and_wal(&kv);
-        let mut ds = DiskStore::open(&kv, DISK_CACHE_PAGES)?;
-        let report = ds.import_sources(sources, opts, log)?;
-        ds.flush()?;
-        // Build the out-of-core VS-tree alongside the store, so a later
-        // `load_disk` filters through it on disk instead of materializing it.
-        let vskv = dir.join(VSTREE_KV_FILE);
-        super::remove_file_and_wal(&vskv);
-        drop(write_vstree_kv(&vskv, disk_vstree_entries(&ds)?)?);
-        ds.mark_vstree_fresh();
-        ds.flush()?;
+        crate::bulk::commit::refuse_open_store(dir)?;
+        // The new store and VS-tree are built in the bulk build's staging
+        // area, which no layout detection reads, and installed by its
+        // install (review durability#5): until the new `kvstore.kv` is
+        // renamed into place the old database — whatever its layout — is
+        // untouched, so a build that fails (a strict parse error, ENOSPC) or
+        // a crash leaves it as it was.
+        let staging = dir.join(crate::bulk::STAGING_DIR);
+        fsutil::remove_dir_if_exists(&staging)?;
+        fs::create_dir_all(&staging)?;
+        let built = (|| -> Result<import::ImportReport> {
+            let kv = staging.join(KV_FILE);
+            let mut ds = DiskStore::open(&kv, DISK_CACHE_PAGES)?;
+            let report = ds.import_sources(sources, opts, log)?;
+            ds.flush()?;
+            // The out-of-core VS-tree alongside the store, so a later
+            // `load_disk` filters through it on disk instead of
+            // materializing it.
+            drop(write_vstree_kv(
+                &staging.join(VSTREE_KV_FILE),
+                disk_vstree_entries(&ds)?,
+            )?);
+            ds.mark_vstree_fresh();
+            ds.flush()?;
+            Ok(report)
+        })();
+        let report = match built {
+            Ok(report) => report,
+            Err(e) => {
+                let _ = fsutil::remove_dir_if_exists(&staging);
+                return Err(e);
+            }
+        };
+        for w in crate::bulk::commit::install_staged_disk(dir, &staging)? {
+            crate::gs_warn!(
+                "incremental disk build of '{}': built (the new database is in place), but \
+                 its install did not finish: {w}",
+                dir.display()
+            );
+        }
         Ok(report)
     }
 
@@ -1304,7 +1335,9 @@ impl Database {
     }
 
     /// Write an encoded build (`db`'s dictionary, `acc`'s ids) into a fresh
-    /// RocksDB store in `dir`.
+    /// RocksDB store, staged as `dir/rocksdb.tmp` and swapped in for
+    /// `dir/rocksdb` once complete: a build that fails leaves the database
+    /// `dir` held as it was.
     #[cfg(feature = "rocksdb")]
     fn create_rocksdb(
         mut db: Database,
@@ -1329,30 +1362,64 @@ impl Database {
                 dir.display()
             )));
         }
+        // Another build of this process rebuilding `dir` would share the
+        // staging directory below: refused, as between bulk builds.
+        let _guard = super::dirlock::BuildGuard::enter(dir)?;
         let lock = super::dirlock::DirLock::acquire(dir)?;
-        // Fresh build: replace any previous database in `dir`.
-        remove_other_layouts(dir, StorageKind::RocksDb)?;
         let rocks_dir = dir.join(ROCKS_SUBDIR);
-        fsutil::discard_dir(&rocks_dir)?;
-
-        let mut rocks = RocksStore::open(&rocks_dir)?;
-        // Dictionary first: a term without a triple is harmless, the reverse not.
-        rocks.replace_dictionary(rocks_layout::dict_entries(&db.dict))?;
-        crate::store::MutableStore::bulk_load(&mut rocks, ids);
-        if let Some(e) = rocks.take_error() {
-            return Err(GStoreError::Database(e));
-        }
-        // Named graphs: the `gspo` CF and the in-memory map.
-        for (gid, quads) in named {
-            for &id in &quads {
-                rocks.insert_quad(gid, id)?;
+        // Finish a swap a crash interrupted (as every open does) before
+        // anything is staged: its `rocksdb.new` may be the database.
+        fsutil::recover_dir_swap(&rocks_dir)?;
+        // An older binary serving the store takes only `rocksdb/LOCK`.
+        crate::bulk::commit::refuse_open_store(dir)?;
+        // The new store is written into `rocksdb.tmp` and swapped in as a
+        // whole (review durability#5, #15): until the swap the database
+        // `dir` held — whatever its layout — is untouched, so a build that
+        // fails or is interrupted leaves it as it was.
+        let staged = fsutil::StagedDir::begin(&rocks_dir, &fsutil::STORE_SWAP)?;
+        {
+            let mut rocks = RocksStore::open(staged.path())?;
+            // Dictionary first: a term without a triple is harmless, the
+            // reverse not.
+            rocks.replace_dictionary(rocks_layout::dict_entries(&db.dict))?;
+            crate::store::MutableStore::bulk_load(&mut rocks, ids);
+            if let Some(e) = rocks.take_error() {
+                return Err(GStoreError::Database(e));
             }
-            db.named.bulk_load(gid, quads);
+            // Named graphs: the `gspo` CF and the in-memory map.
+            for (gid, quads) in named {
+                for &id in &quads {
+                    rocks.insert_quad(gid, id)?;
+                }
+                db.named.bulk_load(gid, quads);
+            }
+            rocks.put_meta(rocks_layout::NAME_KEY, db.name.as_bytes())?;
+            rocks.put_meta(rocks_layout::LAYOUT_KEY, rocks_layout::LAYOUT_VERSION)?;
+            rocks.flush()?;
+            // Closed before its directory is renamed.
         }
-        rocks.put_meta(rocks_layout::NAME_KEY, db.name.as_bytes())?;
-        rocks.put_meta(rocks_layout::LAYOUT_KEY, rocks_layout::LAYOUT_VERSION)?;
-        rocks.flush()?;
-        db.store = Backend::Rocks(rocks);
+        // Again, right before the swap (see `refuse_open_store`).
+        crate::bulk::commit::refuse_open_store(dir)?;
+        match staged.install() {
+            Ok(()) => {}
+            Err(e) if e.committed => crate::gs_warn!(
+                "RocksDB build of '{}': the new store is in place, but its swap did not \
+                 finish: {}",
+                dir.display(),
+                e.error
+            ),
+            Err(e) => return Err(e.error),
+        }
+        // `rocksdb/` takes precedence in layout detection: the new store is
+        // the database now, whatever else the directory still holds.
+        if let Err(e) = remove_other_layouts(dir, StorageKind::RocksDb) {
+            crate::gs_warn!(
+                "RocksDB build of '{}': built (the new store is in place), but the other \
+                 layouts could not be removed: {e}",
+                dir.display()
+            );
+        }
+        db.store = Backend::Rocks(RocksStore::open(&rocks_dir)?);
         db.home = Some(dir.to_path_buf());
         db.dir_lock = Some(lock);
         db.rebuild_index();
