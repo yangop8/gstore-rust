@@ -90,14 +90,19 @@ none
   both executors (`--features rocksdb` adds RocksDB); the case format is in
   `tests/w3c/README.md`. Mention that SPARQL behaviour changes should come
   with a case there, citing the spec section.
-- docs/REFACTOR_BACKLOG.md (parser#18, D3/D8): the W3C rdf-tests (Turtle /
+- docs/REFACTOR_BACKLOG.md (parser#18, D5): the W3C rdf-tests (Turtle /
   TriG / N-Triples / N-Quads / RDF/XML syntax suites) and the official
-  SPARQL 1.1 syntax manifests are not vendored (the machine had no reliable
-  access to w3.org / GitHub, and D5 asks for hand-authored cases); the
-  reader-side items of parser#18 — a term round-trip property test (reader
-  term → dict_key → N-Triples → reader) and a lexer complexity test — are
-  left to r3-parser (parser#4/#5/#8/#10 own those code paths) and
-  r2-terms' shared term validator. tests/w3c covers SPARQL only.
+  SPARQL 1.1 manifests are not vendored: D5 replaces them with
+  hand-authored cases (tests/w3c, SPARQL only), and the machine had no
+  reliable access to w3.org / GitHub. The other reader-side items of
+  parser#18 are covered by other packages' tests: the term round-trip
+  property (reader term -> dict_key -> N-Triples -> reader) by r2-terms'
+  tests/term_roundtrip.rs (this round), the lexer complexity test by
+  tests/crash_regressions.rs and the lexer's
+  prefix_lookahead_is_linear_in_the_run_length (round 1, H-14 / parser#2),
+  and relative-IRI resolution in RDF/XML / JSON-LD / RDFa beyond `#frag`
+  by r3-parser with parser#4. A reader-side spec-derived corpus (W3C-style
+  positive / negative syntax cases for the RDF readers) stays open.
 - docs/REFACTOR_BACKLOG.md (query#17 / design#10 context): the streaming
   and materializing executors are cross-checked case by case by
   tests/w3c_subset.rs (settings `full`, `stream`, `dpb`); the executor merge
@@ -147,6 +152,12 @@ rocksdb` 8-10 s.
   comparisons, which compare the cells as N-Triples strings). After the
   merge, re-run `cargo test --test w3c_subset`
   (convention 13e).
+- **parser#18 is partial:** its SPARQL half (an implementation-independent
+  oracle, the stream_tests doc) is done here, and its term round-trip and
+  lexer-complexity items are covered by r2-terms and round 1 (see Docs
+  notes); a spec-derived syntax corpus for the RDF readers is not written
+  (D5 scopes the hand-authored subset to SPARQL), recorded for
+  docs/REFACTOR_BACKLOG.md.
 - **Not covered by the subset, on purpose:** DESCRIBE (its answer is
   implementation-defined), `SERVICE` (needs a network endpoint), whether
   the default graph contains the named graphs (implementation-defined,
