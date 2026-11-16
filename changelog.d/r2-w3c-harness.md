@@ -46,21 +46,27 @@ New tests and tools:
   (a row, a count, a typed literal) fail on every layout and executor, a
   passing `xfail` case fails the run, malformed cases are rejected,
   blank-node isomorphism / tie groups / the query scanner have unit tests.
+  A guard test runs the deepest direct sub-SELECT nesting the parser
+  accepts (127 levels: `{ SELECT … }` costs one nesting level where
+  `{ { SELECT … } }` costs two, so twice as many sub-queries can now nest)
+  on every layout and executor setting on a worker-sized stack, and checks
+  that one level more is refused as too deep.
   `W3C_FILTER=<substring>` runs a subset. The format is documented in
   `tests/w3c/README.md`.
-- 119 cases: `basic/` 61 (BGP, literals, blank nodes, FILTER, OPTIONAL,
+- 120 cases: `basic/` 61 (BGP, literals, blank nodes, FILTER, OPTIONAL,
   UNION, (NOT) EXISTS, MINUS, paths, BIND, VALUES, aggregates, ORDER BY /
   LIMIT / OFFSET, DISTINCT, SELECT expressions, CONSTRUCT, ASK, GRAPH,
   functions, seven SPARQL Update forms; all pass), `subquery/` 16 (every
   sub-SELECT position; 14 fail before the parser fix, all pass after),
-  `tricky/` 42 (§8.3 MINUS vs NOT EXISTS, filter scope, error semantics of
+  `tricky/` 43 (§8.3 MINUS vs NOT EXISTS, filter scope, error semantics of
   `!`, `||`, `&&`, numeric promotion, `=` vs `sameTerm`, ORDER BY over term
   kinds, aggregates over no solutions, empty group, CONSTRUCT skipping
-  ill-formed triples, …; 25 pass, 17 are `xfail`). The xfail cases record
+  ill-formed triples, BNODE(str) per solution, …; 25 pass, 18 are
+  `xfail`). The xfail cases record
   confirmed engine bugs for their owners: query#2, sparqlconf#3, query#9,
   sparqlconf#4, sparqlconf#13 (r3-sparql-paths), query#3, sparqlconf#1,
   query#4, query#6 (r3-sparql-joins), query#7, query#8, sparqlconf#7,
-  query#11, sparqlconf#8, query#5 ×2 (r3-sparql-functions), query#14
+  query#11, sparqlconf#8, query#5 ×3 (r3-sparql-functions), query#14
   (r4-sparql-guard). Run time: about 3 s for the suite in a debug build, 10 s
   with RocksDB.
 - **`tests/dt_sparql11.rs` compares full typed terms** (sparqlconf#18,
@@ -105,7 +111,7 @@ No hot path changed (the parser change only moves where `SELECT` is
 recognised inside a group), so no bench smoke run was needed (convention 8).
 Suite run times on this machine (4 vCPU, other builds running at the same
 time): `cargo test --test w3c_subset` 3-4 s wall in the test profile
-(119 cases × 4 layouts × 3 settings, plus self-tests); with `--features
+(120 cases × 4 layouts × 3 settings, plus self-tests); with `--features
 rocksdb` 8-10 s.
 
 ## Requests/Not yet
@@ -121,7 +127,10 @@ rocksdb` 8-10 s.
   `tests/w3c/tricky/construct-labelled-blank-node-template` and
   `tests/w3c/tricky/update-insert-template-blank-node`, both `xfail`
   naming query#5 with a note; the fix for query#5 should cover both (and
-  delete both markers).
+  delete both markers, together with the marker of
+  `tests/w3c/tricky/bnode-of-a-string-is-fresh-per-solution`, query#5's own
+  in-request symptom: `BNODE(?v)` gives one node for every solution with
+  the same string).
 - **Round-2 ids deliberately without a w3c case:** sparqlconf#14 (simple
   literal vs `xsd:string`, r2-terms) and query#1 (substring index on
   non-canonical numerals, r2-index-cancel) are fixed in this same round by
@@ -134,11 +143,16 @@ rocksdb` 8-10 s.
   through `QueryResult::Select(ResultSet { vars, rows: Vec<Vec<Option<
   String>>> })` and `gstore::parser::ntriples::parse_term`; if r2-terms
   (query#15) changes the cell type, `answer_of()` / `T::from_cell()` adapt
-  in a line or two. After the merge, re-run `cargo test --test w3c_subset`
+  in a line or two (and so do `tests/dt_sparql11.rs`'s whole-cell
+  comparisons, which compare the cells as N-Triples strings). After the
+  merge, re-run `cargo test --test w3c_subset`
   (convention 13e).
 - **Not covered by the subset, on purpose:** DESCRIBE (its answer is
   implementation-defined), `SERVICE` (needs a network endpoint), whether
   the default graph contains the named graphs (implementation-defined,
-  §13), `RAND` / `NOW` / `UUID` / `BNODE` values, and negative syntax tests
+  §13), `RAND` / `NOW` / `UUID` / `BNODE()` values (only their structure:
+  `BNODE(str)` is one node per solution, case
+  `tricky/bnode-of-a-string-is-fresh-per-solution`, `xfail` query#5), and
+  negative syntax tests
   (the format has no "expect an error" file; the sub-SELECT negatives are
   Rust tests in w3c_subset.rs).

@@ -1,0 +1,2 @@
+query#5
+BNODE(str) hashes the string, so every solution with the same string gets the same blank node.

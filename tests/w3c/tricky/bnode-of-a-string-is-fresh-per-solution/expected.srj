@@ -1,0 +1,7 @@
+{
+  "head": {"vars": ["s", "b1", "b2"]},
+  "results": {"bindings": [
+    {"s": {"type": "uri", "value": "http://example.com/s1"}, "b1": {"type": "bnode", "value": "x"}, "b2": {"type": "bnode", "value": "x"}},
+    {"s": {"type": "uri", "value": "http://example.com/s2"}, "b1": {"type": "bnode", "value": "y"}, "b2": {"type": "bnode", "value": "y"}}
+  ]}
+}

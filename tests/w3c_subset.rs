@@ -1858,6 +1858,65 @@ fn a_sub_select_parses_as_a_whole_group_in_every_position() {
     }
 }
 
+/// The stack of the HTTP worker threads (`server::WORKER_STACK_SIZE`, which
+/// is crate-private): requests must evaluate on it.
+const WORKER_STACK: usize = if cfg!(debug_assertions) {
+    16 << 20
+} else {
+    8 << 20
+};
+
+/// review parser#3: a sub-SELECT written directly as a group body costs one
+/// nesting level where `{ { SELECT … } }` costs two, so twice as many
+/// sub-queries can now nest in one request. The deepest such request the
+/// parser accepts is parsed, evaluated (every layout, every executor
+/// setting) and dropped on a worker-sized stack — a stack overflow would
+/// abort the server — and one level more is refused as too deep.
+#[test]
+fn the_deepest_direct_sub_select_nesting_runs_on_a_worker_stack() {
+    use gstore::parser::sparql::MAX_NESTING_DEPTH;
+    let nest = |n: usize| {
+        format!(
+            "SELECT * WHERE {}{{ ?s ?p ?o }}{}",
+            "{ SELECT * WHERE ".repeat(n),
+            " }".repeat(n)
+        )
+    };
+    // The outer WHERE group is one level, each sub-query's group one more.
+    let deepest = MAX_NESTING_DEPTH - 1;
+    match gstore::parser::sparql::parse(&nest(deepest + 1)) {
+        Err(e) => assert!(e.to_string().contains("nested too deeply"), "{e}"),
+        Ok(_) => panic!("{} nested sub-queries were accepted", deepest + 1),
+    }
+    let query = nest(deepest);
+    std::thread::Builder::new()
+        .stack_size(WORKER_STACK)
+        .spawn(move || {
+            let scratch = TempDir::new("deep_sub_selects");
+            let data = scratch.path().join("data.ttl");
+            fs::write(
+                &data,
+                "<http://ex/a> <http://ex/p> <http://ex/b> , <http://ex/c> .\n",
+            )
+            .unwrap();
+            let shape = query_shape(&query).unwrap();
+            for layout in Layout::all() {
+                let mut db = open_layout(layout, &data, scratch.path()).unwrap();
+                for exec in [Exec::Full, Exec::Stream, Exec::Dpb] {
+                    db.set_topk_options(exec.options());
+                    let rows = match db.query(&exec.query_text(&query, &shape)) {
+                        Ok(QueryResult::Select(rs)) => rs.row_count(),
+                        other => panic!("[{} {}] {other:?}", layout.name(), exec.name()),
+                    };
+                    assert_eq!(rows, 2, "[{} {}]", layout.name(), exec.name());
+                }
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
 #[test]
 fn a_sub_select_is_the_whole_group() {
     // GroupGraphPattern ::= '{' ( SubSelect | GroupGraphPatternSub ) '}':

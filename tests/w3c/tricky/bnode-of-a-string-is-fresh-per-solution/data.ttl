@@ -1,0 +1,3 @@
+@prefix : <http://example.com/> .
+:s1 :str "foo" .
+:s2 :str "foo" .
