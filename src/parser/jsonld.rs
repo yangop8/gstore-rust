@@ -40,6 +40,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::rc::Rc;
 
 use crate::error::{GStoreError, Result};
 use crate::json::Json;
@@ -68,7 +69,7 @@ pub fn parse_str_with(content: &str, labels: &mut BlankLabeler) -> Result<Vec<Tr
         labels: std::mem::take(labels),
         budget: TermBudget::for_input(content.len()),
     };
-    let done = proc.process_top(&json, &Context::default());
+    let done = proc.process_top(&json, &Rc::new(Context::default()));
     *labels = proc.labels;
     done?;
     proc.budget.check()?;
@@ -98,13 +99,43 @@ struct TermDef {
     language: Option<String>,
 }
 
-/// The active JSON-LD context threaded through processing.
-#[derive(Debug, Clone, Default)]
+/// The active JSON-LD context threaded through processing. It is shared
+/// (`Rc`) by every node object that does not carry its own `@context`; one
+/// that does gets a new context whose term definitions are a layer of its
+/// own over the shared ones ([`Terms`]), so nothing is copied in
+/// proportion to the terms in scope (review parser#7: each node object
+/// used to copy the whole context, O(nodes x terms)).
+#[derive(Debug, Default)]
 struct Context {
     base: Option<String>,
     vocab: Option<String>,
     language: Option<String>,
-    terms: HashMap<String, TermDef>,
+    terms: Rc<Terms>,
+}
+
+/// Term definitions in layers: the definitions of one `@context` (an
+/// object, or every member of an array of them), over the layers of the
+/// contexts it extends, which are shared, not copied. A lookup walks the
+/// layers from the top, so a later definition hides an earlier one and
+/// `"term": null` (stored as `None`) removes it. A `@context` that defines
+/// no term adds no layer, so there are at most as many layers as nested
+/// objects carrying term definitions (bounded by the JSON nesting depth).
+#[derive(Debug, Default)]
+struct Terms {
+    own: HashMap<String, Option<TermDef>>,
+    below: Option<Rc<Terms>>,
+}
+
+impl Terms {
+    fn get(&self, key: &str) -> Option<&TermDef> {
+        let mut layer = self;
+        loop {
+            if let Some(def) = layer.own.get(key) {
+                return def.as_ref();
+            }
+            layer = layer.below.as_deref()?;
+        }
+    }
 }
 
 // ---- triple extraction ----------------------------------------------------
@@ -144,7 +175,7 @@ impl Processor {
 
     /// Entry point: a document is a node object, an array of them, or an object
     /// carrying `@graph`.
-    fn process_top(&mut self, json: &Json, base: &Context) -> Result<()> {
+    fn process_top(&mut self, json: &Json, base: &Rc<Context>) -> Result<()> {
         match json {
             Json::Arr(items) => {
                 for it in items {
@@ -161,30 +192,61 @@ impl Processor {
         }
     }
 
-    /// Build the active context by layering an object's `@context` on `parent`.
-    fn active_context(&self, parent: &Context, pairs: &[(String, Json)]) -> Result<Context> {
-        match get(pairs, "@context") {
-            Some(c) => self.build_context(parent, c),
-            None => Ok(parent.clone()),
+    /// Build the active context by layering an object's `@context` on
+    /// `parent`; without one, `parent` itself (shared, not copied).
+    fn active_context(
+        &self,
+        parent: &Rc<Context>,
+        pairs: &[(String, Json)],
+    ) -> Result<Rc<Context>> {
+        let Some(c) = get(pairs, "@context") else {
+            return Ok(Rc::clone(parent));
+        };
+        // A new layer of term definitions over the parent's (shared).
+        let mut ctx = Context {
+            base: parent.base.clone(),
+            vocab: parent.vocab.clone(),
+            language: parent.language.clone(),
+            terms: Rc::new(Terms {
+                own: HashMap::new(),
+                below: Some(Rc::clone(&parent.terms)),
+            }),
+        };
+        self.build_context(&mut ctx, c)?;
+        // A `@context` without term definitions adds no layer.
+        if ctx.terms.own.is_empty() {
+            if let Some(below) = ctx.terms.below.clone() {
+                ctx.terms = below;
+            }
         }
+        Ok(Rc::new(ctx))
     }
 
-    fn build_context(&self, parent: &Context, ctx_json: &Json) -> Result<Context> {
-        let mut ctx = parent.clone();
+    /// Apply the local context `ctx_json` to `ctx`, whose top term layer
+    /// is its own (not shared): an array's members in order, each on the
+    /// result of the ones before (the same layer, not a copy per member).
+    fn build_context(&self, ctx: &mut Context, ctx_json: &Json) -> Result<()> {
         match ctx_json {
             // Remote contexts are not fetched (documented limitation).
             Json::Str(_) => {}
             // A null context resets everything.
-            Json::Null => ctx = Context::default(),
+            Json::Null => *ctx = Context::default(),
             Json::Arr(items) => {
                 for it in items {
-                    ctx = self.build_context(&ctx, it)?;
+                    self.build_context(ctx, it)?;
                 }
             }
             Json::Obj(defs) => {
                 for (k, v) in defs {
                     match k.as_str() {
-                        "@base" => ctx.base = as_opt_string(v),
+                        // A relative `@base` is resolved against the base
+                        // in force (JSON-LD 1.1 §4.1.2; review parser#4).
+                        "@base" => {
+                            ctx.base = as_opt_string(v).map(|b| match &ctx.base {
+                                Some(outer) => crate::parser::iri::resolve(outer, &b),
+                                None => b,
+                            })
+                        }
                         "@vocab" => ctx.vocab = as_opt_string(v),
                         "@language" => {
                             ctx.language = match v {
@@ -196,17 +258,18 @@ impl Processor {
                         // `"term": null` explicitly removes the mapping (JSON-LD
                         // context term deletion) rather than defining a dead term.
                         _ if matches!(v, Json::Null) => {
-                            ctx.terms.remove(k);
+                            own_terms(ctx).insert(k.clone(), None);
                         }
                         _ => {
-                            ctx.terms.insert(k.clone(), self.build_term_def(&ctx, v)?);
+                            let def = self.build_term_def(ctx, v)?;
+                            own_terms(ctx).insert(k.clone(), Some(def));
                         }
                     }
                 }
             }
             _ => {}
         }
-        Ok(ctx)
+        Ok(())
     }
 
     fn build_term_def(&self, ctx: &Context, v: &Json) -> Result<TermDef> {
@@ -237,7 +300,7 @@ impl Processor {
     }
 
     /// Process a node object, returning its subject term.
-    fn process_node(&mut self, pairs: &[(String, Json)], parent_ctx: &Context) -> Result<Term> {
+    fn process_node(&mut self, pairs: &[(String, Json)], parent_ctx: &Rc<Context>) -> Result<Term> {
         let ctx = self.active_context(parent_ctx, pairs)?;
 
         // Subject identity.
@@ -251,7 +314,7 @@ impl Processor {
             for tv in item_refs(t) {
                 if let Json::Str(s) = tv {
                     let iri = expand_iri(&ctx, s, true, false);
-                    if is_absolute_iri(&iri) || iri.starts_with("_:") {
+                    if crate::parser::iri::is_absolute(&iri) || iri.starts_with("_:") {
                         let ty = self.term(&iri);
                         self.push(subject.clone(), rdf_type(), ty);
                     }
@@ -268,17 +331,18 @@ impl Processor {
                 continue;
             }
             let pred_iri = expand_iri(&ctx, key, true, false);
-            if !is_absolute_iri(&pred_iri) {
+            if !crate::parser::iri::is_absolute(&pred_iri) {
                 continue; // drop keys that do not expand to an absolute IRI
             }
             let predicate = Term::Iri(pred_iri);
-            let def = ctx.terms.get(key).cloned().unwrap_or_default();
-            self.emit_values(&subject, &predicate, val, &ctx, &def)?;
+            let none = TermDef::default();
+            let def = ctx.terms.get(key).unwrap_or(&none);
+            self.emit_values(&subject, &predicate, val, &ctx, def)?;
         }
         Ok(subject)
     }
 
-    fn process_graph(&mut self, g: &Json, ctx: &Context) -> Result<()> {
+    fn process_graph(&mut self, g: &Json, ctx: &Rc<Context>) -> Result<()> {
         match g {
             Json::Arr(items) => {
                 for it in items {
@@ -300,7 +364,7 @@ impl Processor {
         subj: &Term,
         pred: &Term,
         val: &Json,
-        ctx: &Context,
+        ctx: &Rc<Context>,
         def: &TermDef,
     ) -> Result<()> {
         // A term with @container:@list turns an array/scalar into an RDF list.
@@ -329,7 +393,7 @@ impl Processor {
         subj: &Term,
         pred: &Term,
         val: &Json,
-        ctx: &Context,
+        ctx: &Rc<Context>,
         def: &TermDef,
     ) -> Result<()> {
         match val {
@@ -360,7 +424,7 @@ impl Processor {
 
     /// Expand a JSON array into an `rdf:first`/`rdf:rest`/`rdf:nil` chain,
     /// returning the head (`rdf:nil` for an empty list).
-    fn build_list(&mut self, items: &[&Json], ctx: &Context, def: &TermDef) -> Result<Term> {
+    fn build_list(&mut self, items: &[&Json], ctx: &Rc<Context>, def: &TermDef) -> Result<Term> {
         let nil = Term::iri(format!("{RDF_NS}nil"));
         if items.is_empty() {
             return Ok(nil);
@@ -384,7 +448,7 @@ impl Processor {
         Ok(head)
     }
 
-    fn list_item_term(&mut self, val: &Json, ctx: &Context, def: &TermDef) -> Result<Term> {
+    fn list_item_term(&mut self, val: &Json, ctx: &Rc<Context>, def: &TermDef) -> Result<Term> {
         match val {
             Json::Obj(pairs) => {
                 if let Some(v) = get(pairs, "@value") {
@@ -449,6 +513,23 @@ impl Processor {
     }
 }
 
+/// The top term layer of a context being built, to add definitions to.
+/// It is the context's own ([`Processor::active_context`] or a `null`
+/// context made it); were it shared, a new layer over it is started rather
+/// than a copy made.
+fn own_terms(ctx: &mut Context) -> &mut HashMap<String, Option<TermDef>> {
+    if Rc::get_mut(&mut ctx.terms).is_none() {
+        let below = Rc::clone(&ctx.terms);
+        ctx.terms = Rc::new(Terms {
+            own: HashMap::new(),
+            below: Some(below),
+        });
+    }
+    &mut Rc::get_mut(&mut ctx.terms)
+        .expect("a new term layer is not shared")
+        .own
+}
+
 fn rdf_type() -> Term {
     Term::iri(RDF_TYPE)
 }
@@ -458,7 +539,8 @@ fn rdf_type() -> Term {
 fn expand_iri(ctx: &Context, value: &str, vocab: bool, document: bool) -> String {
     if value.is_empty() {
         return match &ctx.base {
-            Some(b) if document => b.clone(),
+            // The document itself: the base without its fragment.
+            Some(b) if document => crate::parser::iri::resolve(b, value),
             _ => value.to_string(),
         };
     }
@@ -493,7 +575,8 @@ fn expand_iri(ctx: &Context, value: &str, vocab: bool, document: bool) -> String
     }
     if document {
         if let Some(b) = &ctx.base {
-            return resolve_against_base(b, value);
+            // The shared RFC 3986 resolver (review parser#4).
+            return crate::parser::iri::resolve(b, value);
         }
     }
     value.to_string()
@@ -571,44 +654,6 @@ fn rdf_err(msg: impl Into<String>) -> GStoreError {
     GStoreError::RdfParse {
         line: 0,
         msg: msg.into(),
-    }
-}
-
-/// Does `s` carry an absolute-IRI scheme (`scheme:` where scheme starts alpha)?
-fn is_absolute_iri(s: &str) -> bool {
-    match s.find(':') {
-        Some(i) => {
-            let scheme = &s[..i];
-            !scheme.is_empty()
-                && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-                && scheme
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
-        }
-        None => false,
-    }
-}
-
-/// A practical relative-reference resolver (absolute pass-through; `#frag` and
-/// relative paths joined onto the base). Copied minimally to keep this module
-/// self-contained.
-fn resolve_against_base(base: &str, reference: &str) -> String {
-    if reference.is_empty() {
-        return base.to_string();
-    }
-    if is_absolute_iri(reference) {
-        return reference.to_string();
-    }
-    if base.is_empty() {
-        return reference.to_string();
-    }
-    if let Some(frag) = reference.strip_prefix('#') {
-        let stem = base.split('#').next().unwrap_or(base);
-        return format!("{stem}#{frag}");
-    }
-    match base.rfind('/') {
-        Some(i) => format!("{}{}", &base[..=i], reference),
-        None => reference.to_string(),
     }
 }
 

@@ -7,8 +7,50 @@
 //! fall back to the comparison operator.
 
 use std::ops::Range;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::error::{GStoreError, Result};
+
+/// The default of `[upload] sparql_max_size`, the limit `gserver` installs:
+/// 16 MiB.
+pub const DEFAULT_MAX_REQUEST_BYTES: usize = 16 << 20;
+
+/// The process value of [`max_request_bytes`].
+static MAX_REQUEST_BYTES: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// The longest SPARQL query or update text [`parse`](super::parse)
+/// accepts, in bytes; `usize::MAX` means no limit. A longer request is
+/// refused before it is tokenized (review parser#8): the tokens of a
+/// request take memory in proportion to their number.
+///
+/// A process has no limit until [`set_max_request_bytes`] sets one:
+/// `gserver` (and `gbuild`) install `[upload] sparql_max_size`, whose
+/// default is [`DEFAULT_MAX_REQUEST_BYTES`], through
+/// `GStoreConfig::install_storage_defaults`. The command-line tools that
+/// read no configuration (`gquery`, `gconsole`) and library callers keep
+/// running updates of any size from their own files.
+pub fn max_request_bytes() -> usize {
+    MAX_REQUEST_BYTES.load(Ordering::Relaxed)
+}
+
+/// Set [`max_request_bytes`] for this process (`0` = no limit).
+pub fn set_max_request_bytes(bytes: usize) {
+    let bytes = if bytes == 0 { usize::MAX } else { bytes };
+    MAX_REQUEST_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+/// `Err` when `input` is longer than [`max_request_bytes`].
+pub fn check_request_size(input: &str) -> Result<()> {
+    let max = max_request_bytes();
+    if input.len() > max {
+        return Err(GStoreError::SparqlParse(format!(
+            "the request is {} bytes long, more than the limit of {max} bytes \
+             ([upload] sparql_max_size)",
+            input.len()
+        )));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
@@ -81,21 +123,19 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>> {
 /// The parser needs the raw lexemes where a construct is passed through
 /// verbatim rather than interpreted, e.g. the `jsonVars` argument text of an
 /// upstream `PFN.name({…})` call.
+///
+/// The lexer reads `input` in place (byte offsets into the `&str`): besides
+/// the tokens and their spans it allocates nothing per input byte (review
+/// parser#8: it used to copy the input into a `Vec<char>` plus a byte-offset
+/// table, about 12 bytes per input byte, before parsing began).
 pub fn tokenize_with_spans(input: &str) -> Result<(Vec<Token>, Vec<Range<usize>>)> {
-    let chars: Vec<char> = input.chars().collect();
-    // byte_at[i] = byte offset of chars[i]; byte_at[chars.len()] = input.len().
-    let mut byte_at: Vec<usize> = input.char_indices().map(|(b, _)| b).collect();
-    byte_at.push(input.len());
-    let (tokens, char_spans) = Lexer::new(chars).run()?;
-    let spans = char_spans
-        .into_iter()
-        .map(|(a, b)| byte_at[a]..byte_at[b])
-        .collect();
-    Ok((tokens, spans))
+    Lexer::new(input).run()
 }
 
-struct Lexer {
-    chars: Vec<char>,
+struct Lexer<'a> {
+    src: &'a str,
+    /// Byte offset of the next character in `src` (always on a character
+    /// boundary).
     pos: usize,
     /// A run of `PN_CHARS` / `.` that [`lex_word_or_pname`](Self::lex_word_or_pname)
     /// scanned for a prefix-ending `:` without finding one. Every later
@@ -103,15 +143,15 @@ struct Lexer {
     /// is known there (review H-14: scanning again from each word of
     /// `a-a-a-…` was quadratic).
     no_prefix_run: Range<usize>,
-    /// Characters the prefix look-ahead has stepped over (a work counter
-    /// for the complexity tests).
+    /// Bytes the prefix look-ahead has stepped over (a work counter for the
+    /// complexity tests).
     lookahead_steps: usize,
 }
 
-impl Lexer {
-    fn new(chars: Vec<char>) -> Lexer {
+impl<'a> Lexer<'a> {
+    fn new(src: &'a str) -> Lexer<'a> {
         Lexer {
-            chars,
+            src,
             pos: 0,
             no_prefix_run: 0..0,
             lookahead_steps: 0,
@@ -122,23 +162,33 @@ impl Lexer {
         GStoreError::SparqlParse(msg.into())
     }
 
+    fn rest(&self) -> &'a str {
+        &self.src[self.pos..]
+    }
     fn peek(&self) -> Option<char> {
-        self.chars.get(self.pos).copied()
+        self.rest().chars().next()
     }
     fn peek2(&self) -> Option<char> {
-        self.chars.get(self.pos + 1).copied()
+        self.peek_at(1)
+    }
+    /// The character `k` positions ahead (`0` = the next one).
+    fn peek_at(&self, k: usize) -> Option<char> {
+        self.rest().chars().nth(k)
+    }
+    /// Step over `c`, the next character.
+    fn advance(&mut self, c: char) {
+        self.pos += c.len_utf8();
     }
     fn bump(&mut self) -> Option<char> {
         let c = self.peek();
-        if c.is_some() {
-            self.pos += 1;
+        if let Some(c) = c {
+            self.advance(c);
         }
         c
     }
 
-    /// Lex the whole input into tokens plus their `[start, end)` char spans.
-    #[allow(clippy::type_complexity)]
-    fn run(&mut self) -> Result<(Vec<Token>, Vec<(usize, usize)>)> {
+    /// Lex the whole input into tokens plus their byte spans.
+    fn run(&mut self) -> Result<(Vec<Token>, Vec<Range<usize>>)> {
         let mut out = Vec::new();
         let mut spans = Vec::new();
         loop {
@@ -146,7 +196,7 @@ impl Lexer {
             let start = self.pos;
             let Some(c) = self.peek() else {
                 out.push(Token::Eof);
-                spans.push((start, start));
+                spans.push(start..start);
                 return Ok((out, spans));
             };
             let tok = match c {
@@ -217,7 +267,7 @@ impl Lexer {
                 other => return Err(self.err(format!("unexpected character '{other}'"))),
             };
             out.push(tok);
-            spans.push((start, self.pos));
+            spans.push(start..self.pos);
         }
     }
 
@@ -229,15 +279,12 @@ impl Lexer {
     fn skip_ws_and_comments(&mut self) {
         loop {
             match self.peek() {
-                Some(c) if c.is_whitespace() => {
-                    self.pos += 1;
-                }
+                Some(c) if c.is_whitespace() => self.advance(c),
                 Some('#') => {
-                    while let Some(c) = self.peek() {
-                        self.pos += 1;
-                        if c == '\n' {
-                            break;
-                        }
+                    // To the end of the line, in one step.
+                    match self.rest().find('\n') {
+                        Some(i) => self.pos += i + 1,
+                        None => self.pos = self.src.len(),
                     }
                 }
                 _ => break,
@@ -274,7 +321,7 @@ impl Lexer {
                 }
                 Some(c) => {
                     iri.push(c);
-                    self.pos += 1;
+                    self.advance(c);
                 }
                 None => break,
             }
@@ -296,7 +343,7 @@ impl Lexer {
         while let Some(c) = self.peek() {
             if c.is_alphanumeric() || c == '_' {
                 name.push(c);
-                self.pos += 1;
+                self.advance(c);
             } else {
                 break;
             }
@@ -320,7 +367,7 @@ impl Lexer {
             while let Some(c) = self.peek() {
                 if crate::model::term::is_blank_label_char(c) || c == '.' {
                     label.push(c);
-                    self.pos += 1;
+                    self.advance(c);
                 } else {
                     break;
                 }
@@ -358,16 +405,14 @@ impl Lexer {
                 }
                 Some(c) if c == quote => {
                     if triple {
-                        if self.peek2() == Some(quote)
-                            && self.chars.get(self.pos + 2).copied() == Some(quote)
-                        {
+                        if self.peek2() == Some(quote) && self.peek_at(2) == Some(quote) {
                             self.bump();
                             self.bump();
                             self.bump();
                             break;
                         }
                         value.push(c);
-                        self.pos += 1;
+                        self.advance(c);
                     } else {
                         self.bump();
                         break;
@@ -375,7 +420,7 @@ impl Lexer {
                 }
                 Some(c) => {
                     value.push(c);
-                    self.pos += 1;
+                    self.advance(c);
                 }
             }
         }
@@ -386,7 +431,7 @@ impl Lexer {
             while let Some(c) = self.peek() {
                 if c.is_ascii_alphanumeric() || c == '-' {
                     tag.push(c);
-                    self.pos += 1;
+                    self.advance(c);
                 } else {
                     break;
                 }
@@ -457,29 +502,29 @@ impl Lexer {
         while let Some(c) = self.peek() {
             if c.is_ascii_digit() {
                 s.push(c);
-                self.pos += 1;
+                self.advance(c);
             } else if c == '.' {
                 // Only consume '.' as part of the number if a digit follows, so
                 // `3 .` (number then statement dot) is not mis-lexed.
                 if !is_decimal && self.peek2().is_some_and(|d| d.is_ascii_digit()) {
                     is_decimal = true;
                     s.push(c);
-                    self.pos += 1;
+                    self.advance(c);
                 } else {
                     break;
                 }
             } else if (c == 'e' || c == 'E') && !is_double {
                 // EXPONENT ::= [eE] [+-]? [0-9]+ — the digits are required.
                 let signed = matches!(self.peek2(), Some('+') | Some('-'));
-                let digit_at = self.pos + 1 + usize::from(signed);
-                if !self.chars.get(digit_at).is_some_and(|d| d.is_ascii_digit()) {
+                let digit_at = 1 + usize::from(signed);
+                if !self.peek_at(digit_at).is_some_and(|d| d.is_ascii_digit()) {
                     return Err(self.err(format!(
                         "malformed number '{s}{c}…': an exponent needs digits, e.g. {s}e3"
                     )));
                 }
                 is_double = true;
                 s.push(c);
-                self.pos += 1;
+                self.advance(c);
                 if signed {
                     s.push(self.bump().unwrap());
                 }
@@ -513,16 +558,15 @@ impl Lexer {
         let is_prefix = if self.no_prefix_run.contains(&self.pos) {
             None
         } else {
-            let mut end = self.pos;
-            while self
-                .chars
-                .get(end)
-                .is_some_and(|&c| is_pn_char(c) || c == '.')
+            let run = self
+                .rest()
+                .find(|c: char| !(is_pn_char(c) || c == '.'))
+                .unwrap_or(self.rest().len());
+            let end = self.pos + run;
+            self.lookahead_steps += run;
+            let run_text = &self.src[self.pos..end];
+            if !run_text.is_empty() && self.src[end..].starts_with(':') && !run_text.ends_with('.')
             {
-                end += 1;
-            }
-            self.lookahead_steps += end - self.pos;
-            if end > self.pos && self.chars.get(end) == Some(&':') && self.chars[end - 1] != '.' {
                 Some(end)
             } else {
                 self.no_prefix_run = self.pos..end;
@@ -530,13 +574,13 @@ impl Lexer {
             }
         };
         if let Some(end) = is_prefix {
-            head.extend(&self.chars[self.pos..end]);
+            head.push_str(&self.src[self.pos..end]);
             self.pos = end;
         } else {
             while let Some(c) = self.peek() {
                 if is_name_char(c) {
                     head.push(c);
-                    self.pos += 1;
+                    self.advance(c);
                 } else {
                     break;
                 }
@@ -544,21 +588,16 @@ impl Lexer {
         }
         if self.peek() == Some(':') {
             self.bump();
-            // (char, consumed source chars, came from an escape)
+            // (char, consumed source bytes, came from an escape)
             let mut local: Vec<(char, usize, bool)> = Vec::new();
             loop {
                 match self.peek() {
                     Some(c) if is_pn_char(c) || c == '.' || c == ':' => {
-                        local.push((c, 1, false));
-                        self.pos += 1;
+                        local.push((c, c.len_utf8(), false));
+                        self.advance(c);
                     }
                     Some('%') => {
-                        let hex = |i: usize| {
-                            self.chars
-                                .get(self.pos + i)
-                                .copied()
-                                .filter(char::is_ascii_hexdigit)
-                        };
+                        let hex = |i: usize| self.peek_at(i).filter(char::is_ascii_hexdigit);
                         let (Some(h1), Some(h2)) = (hex(1), hex(2)) else {
                             return Err(self.err(format!(
                                 "invalid percent-encoding in prefixed name '{head}:{}…': '%' \
@@ -657,7 +696,7 @@ mod tests {
         ] {
             for n in [1_000usize, 2_000, 4_000] {
                 let src = format!("ASK {{ FILTER(?x = {}a) }}", format!("a{sep}").repeat(n));
-                let mut lx = Lexer::new(src.chars().collect());
+                let mut lx = Lexer::new(&src);
                 let toks = lx.run().unwrap().0;
                 assert!(
                     lx.lookahead_steps <= src.len(),

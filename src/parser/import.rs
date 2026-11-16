@@ -204,6 +204,15 @@ pub struct ImportOptions {
     pub batch_bytes: usize,
     /// The read window: the buffer size of the reader over a file.
     pub window: usize,
+    /// The most bytes one token (a literal, IRI, name, number or language
+    /// tag) of a streaming format (N-Triples, N-Quads, Turtle, TriG) may
+    /// take, and one N-Triples / N-Quads line: a longer one fails its
+    /// statement, and only this much of it is held. `0` (or `usize::MAX`)
+    /// = no limit. Defaults to
+    /// [`default_max_token_bytes`](crate::parser::stream::default_max_token_bytes)
+    /// (`[upload] rdf_max_token_size` in `gserver` and `gbuild`; review
+    /// parser#5).
+    pub max_token_bytes: usize,
 }
 
 impl Default for ImportOptions {
@@ -223,6 +232,7 @@ impl ImportOptions {
             batch_size: DEFAULT_BATCH_SIZE,
             batch_bytes: DEFAULT_BATCH_BYTES,
             window: DEFAULT_WINDOW,
+            max_token_bytes: crate::parser::stream::default_max_token_bytes(),
         }
     }
 
@@ -538,45 +548,144 @@ struct Pipeline<'a> {
 /// `GRAPH ?g`. A label already used as a subject or object stays a blank node
 /// there, all through the document (its graph is apart from it, and a
 /// warning says so): what was read is not rewritten, and one node never
-/// splits in two. Whether a label was used earlier is tracked in a Bloom
-/// filter of [`BlankGraphs::FILTER_BITS`] bits, so memory stays bounded; a
-/// false positive only keeps a graph apart.
+/// splits in two. Whether a label was used earlier is tracked in a
+/// [`SeenLabels`] filter, whose memory grows with the labels but stays a
+/// few bytes per label; a false positive (under 1%, see there) only keeps
+/// a graph apart.
 #[derive(Default)]
 struct BlankGraphs {
     /// Graph labels: `true` = an IRI everywhere, `false` = kept apart.
     graphs: std::collections::HashMap<String, bool>,
-    /// The Bloom filter of the labels used as a subject or object
-    /// (allocated on first use).
-    seen: Vec<u64>,
+    /// The labels used as a subject or object.
+    seen: SeenLabels,
 }
 
-impl BlankGraphs {
-    /// Bits of the filter (1 MiB).
-    const FILTER_BITS: usize = 1 << 23;
+/// A scalable Bloom filter of blank-node labels (review parser#14: a fixed
+/// 2^23-bit filter with two hash bits saturated, about 51% false positives
+/// at 5 million labels).
+///
+/// Labels go into the newest of a series of filters. Filter `i` holds
+/// `FIRST_CAPACITY << i` labels at a false-positive rate of
+/// `TARGET_FP / 2^(i+1)` (its bits and hash count are sized for that), and a
+/// new one starts when it is full. A label is "maybe seen" if any filter
+/// holds it, so the false-positive rate is about the sum of the filters'
+/// rates, [`SeenLabels::TARGET_FP`] (0.5%; measured 0.51% at 5 million
+/// labels, a unit test holds it under 1%), however many labels a document
+/// has — up to [`SeenLabels::MAX_BYTES`] of filters (ten filters, 201 MB,
+/// for 67 million labels); past that the last filter takes the rest and its
+/// rate rises. Memory: about 4 bytes per label (21 MB for 5 million), allocated
+/// as the labels come.
+#[derive(Default)]
+struct SeenLabels {
+    filters: Vec<Bloom>,
+    /// Bytes of all filters.
+    bytes: usize,
+}
 
-    fn bits(label: &str) -> [usize; 2] {
+struct Bloom {
+    bits: Vec<u64>,
+    /// `bits.len() * 64`.
+    nbits: u64,
+    hashes: u32,
+    capacity: usize,
+    len: usize,
+}
+
+impl SeenLabels {
+    /// Labels of the first filter.
+    const FIRST_CAPACITY: usize = 1 << 16;
+    /// The bound of the false-positive rate (the sum of the filters' rates).
+    const TARGET_FP: f64 = 0.005;
+    /// Most bytes of filters (past it the last filter keeps filling).
+    const MAX_BYTES: usize = 256 << 20;
+
+    fn hashes(label: &str) -> (u64, u64) {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         label.hash(&mut h);
-        let v = h.finish();
-        let mask = (Self::FILTER_BITS - 1) as u64;
-        [(v & mask) as usize, ((v >> 32) & mask) as usize]
+        let a = h.finish();
+        0x9E37_79B9_7F4A_7C15u64.hash(&mut h);
+        // Odd, so the probe positions of a label are distinct.
+        (a, h.finish() | 1)
     }
 
     fn mark(&mut self, label: &str) {
-        if self.seen.is_empty() {
-            self.seen = vec![0; Self::FILTER_BITS / 64];
+        let (a, b) = Self::hashes(label);
+        if self.filters.iter().any(|f| f.contains(a, b)) {
+            return;
         }
-        for b in Self::bits(label) {
-            self.seen[b / 64] |= 1 << (b % 64);
+        let full = self.filters.last().is_none_or(|f| f.len >= f.capacity);
+        if full {
+            let i = self.filters.len() as i32;
+            let capacity = Self::FIRST_CAPACITY << i;
+            let fp = Self::TARGET_FP / 2f64.powi(i + 1);
+            let (words, hashes) = Bloom::size(capacity, fp);
+            if self.filters.is_empty() || self.bytes + words * 8 <= Self::MAX_BYTES {
+                self.bytes += words * 8;
+                self.filters.push(Bloom::new(capacity, words, hashes));
+            }
+        }
+        if let Some(f) = self.filters.last_mut() {
+            f.insert(a, b);
         }
     }
 
     fn maybe_seen(&self, label: &str) -> bool {
-        !self.seen.is_empty()
-            && Self::bits(label)
-                .iter()
-                .all(|&b| self.seen[b / 64] & (1 << (b % 64)) != 0)
+        let (a, b) = Self::hashes(label);
+        self.filters.iter().any(|f| f.contains(a, b))
+    }
+}
+
+impl Bloom {
+    /// The 64-bit words and hash functions of a filter for `capacity` items
+    /// at false-positive rate `fp` (`m = -n ln p / ln² 2`, `k = m/n ln 2`).
+    fn size(capacity: usize, fp: f64) -> (usize, u32) {
+        let ln2 = std::f64::consts::LN_2;
+        let bits = (capacity as f64 * -fp.ln() / (ln2 * ln2)).ceil();
+        let words = ((bits / 64.0).ceil() as usize).max(1);
+        let hashes = ((bits / capacity as f64) * ln2).round().max(1.0) as u32;
+        (words, hashes)
+    }
+
+    fn new(capacity: usize, words: usize, hashes: u32) -> Bloom {
+        Bloom {
+            bits: vec![0; words],
+            nbits: words as u64 * 64,
+            hashes,
+            capacity,
+            len: 0,
+        }
+    }
+
+    /// Probe position `i` of a label hashed to `(a, b)` (double hashing).
+    fn position(&self, a: u64, b: u64, i: u32) -> (usize, u64) {
+        let p = a.wrapping_add(u64::from(i).wrapping_mul(b)) % self.nbits;
+        ((p / 64) as usize, 1 << (p % 64))
+    }
+
+    fn insert(&mut self, a: u64, b: u64) {
+        for i in 0..self.hashes {
+            let (word, bit) = self.position(a, b, i);
+            self.bits[word] |= bit;
+        }
+        self.len += 1;
+    }
+
+    fn contains(&self, a: u64, b: u64) -> bool {
+        (0..self.hashes).all(|i| {
+            let (word, bit) = self.position(a, b, i);
+            self.bits[word] & bit != 0
+        })
+    }
+}
+
+impl BlankGraphs {
+    fn mark(&mut self, label: &str) {
+        self.seen.mark(label);
+    }
+
+    fn maybe_seen(&self, label: &str) -> bool {
+        self.seen.maybe_seen(label)
     }
 
     fn iri(label: &str) -> Term {
@@ -642,6 +751,13 @@ impl Pipeline<'_> {
 impl StatementSink for Pipeline<'_> {
     fn at_line(&mut self, line: usize) {
         self.line = line;
+    }
+
+    fn max_token_bytes(&self) -> usize {
+        match self.opts.max_token_bytes {
+            0 => usize::MAX,
+            n => n,
+        }
     }
 
     fn statement(&mut self, quads: &mut Vec<Quad>) -> Result<()> {
@@ -1218,5 +1334,40 @@ mod tests {
         assert_eq!(url_path("https://h"), "");
         assert!(is_url("HTTP://x"));
         assert!(!is_url("file:///x"));
+    }
+
+    /// Review parser#14: the filter of labels used as a subject or object
+    /// had a fixed 2^23 bits and two hash bits, about 51% false positives
+    /// at 5 million labels (so about half the blank graphs of such a
+    /// document were kept apart from their own descriptions). The scalable
+    /// filter stays under 1% (and has no false negatives).
+    #[test]
+    fn blank_graph_filter_false_positives_stay_under_one_percent_at_5m_labels() {
+        use std::fmt::Write;
+        let mut bg = BlankGraphs::default();
+        let n = 5 << 20;
+        let mut label = String::new();
+        for i in 0..n {
+            label.clear();
+            write!(label, "b{i}").unwrap();
+            bg.mark(&label);
+        }
+        let probes = 200_000;
+        let fp = (0..probes)
+            .filter(|i| bg.maybe_seen(&format!("g{i}")))
+            .count();
+        let rate = fp as f64 / probes as f64;
+        eprintln!(
+            "measured: {n} labels, false-positive rate {rate:.4}, filter bytes {}",
+            bg.seen.bytes
+        );
+        assert!(rate < 0.01, "false-positive rate {rate} at {n} labels");
+        assert!(
+            (0..n)
+                .step_by(4999)
+                .all(|i| bg.maybe_seen(&format!("b{i}"))),
+            "a marked label was not seen"
+        );
+        assert!(bg.seen.bytes < 32 << 20, "{} bytes", bg.seen.bytes);
     }
 }

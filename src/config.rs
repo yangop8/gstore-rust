@@ -46,7 +46,11 @@
 //! * `[upload]`: the request body caps before authentication and in all
 //!   (`preauth_max_body_size`, `request_body_budget`; see
 //!   [`crate::preauth`]), the limits a zip package must stay within —
-//!   `unzip_max_entries`, `unzip_max_size` (see [`crate::zipio`]) — and the
+//!   `unzip_max_entries`, `unzip_max_size` (see [`crate::zipio`]) — the
+//!   parser limits `rdf_max_token_size` (one token of the streaming RDF
+//!   readers, [`crate::parser::stream::default_max_token_bytes`]) and
+//!   `sparql_max_size` (one SPARQL request,
+//!   [`crate::parser::sparql::lexer::max_request_bytes`]), and the
 //!   download and file-retention policy of the `/api` layer
 //!   (`anonymous_download`, an upstream-compat switch;
 //!   `download_max_concurrent`, `file_retention_hours`,
@@ -270,6 +274,8 @@ pub const KNOWN_KEYS: &[(&str, &str)] = &[
     // Rust-only extensions.
     ("upload", "unzip_max_entries"),
     ("upload", "unzip_max_size"),
+    ("upload", "rdf_max_token_size"),
+    ("upload", "sparql_max_size"),
     ("upload", "anonymous_download"),
     ("upload", "download_max_concurrent"),
     ("upload", "file_retention_hours"),
@@ -581,6 +587,19 @@ pub struct GStoreConfig {
     /// *(Rust extension)* Bytes the files of a zip package may unpack to, in
     /// all (default 10 GiB) — the zip-bomb guard of `crate::zipio`.
     pub unzip_max_size: u64,
+    /// *(Rust extension)* Bytes one token (a literal, IRI, name, number or
+    /// language tag) of the streaming RDF readers — N-Triples, N-Quads,
+    /// Turtle, TriG — and one N-Triples / N-Quads line may take: a longer
+    /// one fails its statement, after the reader held only this much of it
+    /// (default 64 MiB; `0` = no limit; review parser#5). Installed as the
+    /// process default by [`GStoreConfig::install_storage_defaults`].
+    pub rdf_max_token_size: u64,
+    /// *(Rust extension)* Bytes a SPARQL query or update may have: a longer
+    /// one is refused before it is tokenized (default 16 MiB; `0` = no
+    /// limit; review parser#8). Installed as the process limit by
+    /// [`GStoreConfig::install_storage_defaults`] (`gserver`, `gbuild`); a
+    /// process that installs none has no limit.
+    pub sparql_max_size: u64,
     /// *(Rust extension; upstream-compat switch)* Serve `/file/download`
     /// without credentials, as upstream does: the export directory (exports
     /// and `format=file` query results) to anyone. Default **off**: a
@@ -769,6 +788,8 @@ impl Default for GStoreConfig {
             upload_allow_compress_packages: split_list("zip"),
             unzip_max_entries: crate::zipio::DEFAULT_MAX_ENTRIES,
             unzip_max_size: crate::zipio::DEFAULT_MAX_SIZE,
+            rdf_max_token_size: crate::parser::stream::DEFAULT_MAX_TOKEN_BYTES as u64,
+            sparql_max_size: crate::parser::sparql::lexer::DEFAULT_MAX_REQUEST_BYTES as u64,
             anonymous_download: false,
             download_max_concurrent: 8,
             file_retention_hours: 168,
@@ -1116,6 +1137,12 @@ impl GStoreConfig {
             "unzip_max_size" => {
                 self.unzip_max_size = parse_num(v).ok_or_else(|| bad("a size in bytes"))?
             }
+            "rdf_max_token_size" => {
+                self.rdf_max_token_size = parse_num(v).ok_or_else(|| bad("a size in bytes"))?
+            }
+            "sparql_max_size" => {
+                self.sparql_max_size = parse_num(v).ok_or_else(|| bad("a size in bytes"))?
+            }
             "anonymous_download" => {
                 self.anonymous_download = parse_switch(v).ok_or_else(|| bad("on or off"))?
             }
@@ -1296,6 +1323,8 @@ impl GStoreConfig {
             "upload_allow_compress_packages" => self.upload_allow_compress_packages.join("|"),
             "unzip_max_entries" => self.unzip_max_entries.to_string(),
             "unzip_max_size" => self.unzip_max_size.to_string(),
+            "rdf_max_token_size" => self.rdf_max_token_size.to_string(),
+            "sparql_max_size" => self.sparql_max_size.to_string(),
             "anonymous_download" => switch(self.anonymous_download),
             "download_max_concurrent" => self.download_max_concurrent.to_string(),
             "file_retention_hours" => self.file_retention_hours.to_string(),
@@ -1531,7 +1560,11 @@ impl GStoreConfig {
 
     /// Install this configuration's process-wide storage defaults that are
     /// not [`OpenOptions`]: the id-reclamation policy (`[system]
-    /// id_reclaim`, [`crate::db::set_default_id_reclaim`]) and, with the
+    /// id_reclaim`, [`crate::db::set_default_id_reclaim`]), the parser
+    /// limits (`[upload] rdf_max_token_size`,
+    /// [`crate::parser::stream::set_default_max_token_bytes`];
+    /// `sparql_max_size`,
+    /// [`crate::parser::sparql::lexer::set_max_request_bytes`]) and, with the
     /// `rocksdb` feature, the RocksDB tuning (`[storage]
     /// rocksdb_block_cache_mb` / `rocksdb_bloom` / `rocksdb_max_open_files`).
     /// The environment
@@ -1541,6 +1574,12 @@ impl GStoreConfig {
     /// them.
     pub fn install_storage_defaults(&self) {
         crate::db::set_default_id_reclaim(self.id_reclaim);
+        crate::parser::stream::set_default_max_token_bytes(
+            usize::try_from(self.rdf_max_token_size).unwrap_or(usize::MAX),
+        );
+        crate::parser::sparql::lexer::set_max_request_bytes(
+            usize::try_from(self.sparql_max_size).unwrap_or(usize::MAX),
+        );
         #[cfg(feature = "rocksdb")]
         crate::backend::rocks::set_default_rocks_tuning(self.rocks_tuning());
     }
@@ -2055,6 +2094,7 @@ upload_allow_compress_packages = "zip"
                     preauth_max_body_size=512\nrequest_body_budget=4096\n\
                     upload_allow_extensions=nt | ttl\nupload_allow_compress_packages=zip|tar\n\
                     unzip_max_entries=12\nunzip_max_size=4096\n\
+                    rdf_max_token_size=2048\nsparql_max_size=0\n\
                     anonymous_download=on\ndownload_max_concurrent=2\nfile_retention_hours=5\n\
                     upload_user_quota=77\n\
                     [query]\ninteger_division=truncate\nquery_cache_size=0\n\
@@ -2150,6 +2190,7 @@ upload_allow_compress_packages = "zip"
             "zip|tar"
         );
         assert_eq!((c.unzip_max_entries, c.unzip_max_size), (12, 4096));
+        assert_eq!((c.rdf_max_token_size, c.sparql_max_size), (2048, 0));
         assert!(c.anonymous_download);
         assert_eq!(c.value("anonymous_download").unwrap(), "on");
         assert_eq!(

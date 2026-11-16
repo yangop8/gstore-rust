@@ -19,14 +19,14 @@
 //! it skips blank lines and `#` comments.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader};
 use std::path::Path;
 
 use crate::error::{GStoreError, Result};
 use crate::model::{Term, Triple};
 use crate::parser::ntriples::Scanner;
 use crate::parser::stream::{
-    BlankLabeler, CollectQuads, StatementSink, SyntaxError, DEFAULT_WINDOW,
+    token_too_long, BlankLabeler, CollectQuads, StatementSink, SyntaxError, DEFAULT_WINDOW,
 };
 
 /// One N-Quads statement: a triple plus the graph it belongs to (`None` ⇒ the
@@ -100,7 +100,9 @@ pub fn parse_str_triples(content: &str) -> Result<Vec<Triple>> {
 
 /// Stream an N-Quads document from `reader` into `sink`, one line (one
 /// statement) at a time: memory holds the reader's buffer plus the current
-/// line. Blank-node labels go through `labels` (verbatim in keep mode).
+/// line, which may be at most [`StatementSink::max_token_bytes`] long (a
+/// longer one is an error of its statement, and only that much of it is
+/// held). Blank-node labels go through `labels` (verbatim in keep mode).
 pub fn parse_reader<R: BufRead>(
     reader: R,
     labels: &BlankLabeler,
@@ -110,23 +112,32 @@ pub fn parse_reader<R: BufRead>(
 }
 
 /// The line-at-a-time driver behind the N-Triples (`allow_graph == false`)
-/// and N-Quads readers. A line that does not parse (or is not UTF-8) is
-/// reported to `sink` as one failed statement; I/O errors end the parse.
+/// and N-Quads readers. A line that does not parse (or is not UTF-8, or is
+/// longer than [`StatementSink::max_token_bytes`]) is reported to `sink` as
+/// one failed statement; I/O errors end the parse.
 pub(crate) fn stream_lines<R: BufRead>(
     mut reader: R,
     labels: &BlankLabeler,
     allow_graph: bool,
     sink: &mut dyn StatementSink,
 ) -> Result<()> {
+    let max_line = sink.max_token_bytes();
     let mut buf: Vec<u8> = Vec::new();
     let mut out: Vec<Quad> = Vec::with_capacity(1);
     let mut line_no = 0usize;
     loop {
         buf.clear();
-        if reader.read_until(b'\n', &mut buf)? == 0 {
+        let Some(too_long) = read_line_capped(&mut reader, &mut buf, max_line)? else {
             return Ok(());
-        }
+        };
         line_no += 1;
+        if too_long {
+            let text = String::from_utf8_lossy(&buf[..buf.len().min(1024)]);
+            let e = token_too_long(line_no, "the line", max_line);
+            sink.error(SyntaxError::from_error(&e).with_context(snippet(text.trim())))?;
+            buf = Vec::new();
+            continue;
+        }
         let parsed = match std::str::from_utf8(&buf) {
             Ok(line) if allow_graph => parse_line(line, line_no),
             Ok(line) => crate::parser::ntriples::parse_line(line, line_no)
@@ -153,6 +164,49 @@ pub(crate) fn stream_lines<R: BufRead>(
         // One huge line must not pin its buffer for the rest of the file.
         if buf.capacity() > 4 * DEFAULT_WINDOW {
             buf = Vec::new();
+        }
+    }
+}
+
+/// Read one line, up to and including its `\n`, into `buf`, holding at
+/// most `max` bytes of it: `None` at the end of the input, `Some(true)` when
+/// the line was longer (the rest of it is read and dropped), `Some(false)`
+/// otherwise.
+fn read_line_capped<R: BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max: usize,
+) -> io::Result<Option<bool>> {
+    let mut read_any = false;
+    let mut over = false;
+    loop {
+        let avail = match reader.fill_buf() {
+            Ok(b) => b,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if avail.is_empty() {
+            return Ok(read_any.then_some(over));
+        }
+        read_any = true;
+        let (n, done) = match avail.iter().position(|&b| b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (avail.len(), false),
+        };
+        if !over && buf.len() + n > max {
+            // Too long: keep its start (for the error's context) only.
+            over = true;
+            buf.truncate(1024);
+        }
+        if !over {
+            buf.extend_from_slice(&avail[..n]);
+        } else if buf.len() < 1024 {
+            let room = 1024 - buf.len();
+            buf.extend_from_slice(&avail[..n.min(room)]);
+        }
+        reader.consume(n);
+        if done {
+            return Ok(Some(over));
         }
     }
 }

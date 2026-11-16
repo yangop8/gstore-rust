@@ -8,6 +8,7 @@
 //! blank-node scopes, named graphs).
 
 pub mod import;
+pub mod iri;
 pub mod jsonld;
 pub mod nquads;
 pub mod ntriples;

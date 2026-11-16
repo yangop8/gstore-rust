@@ -11,6 +11,9 @@
 //! * prefixed names `p:local`, the `a` keyword (= rdf:type)
 //! * predicate-object lists (`;`) and object lists (`,`)
 //! * IRIs, blank nodes, plain/typed/lang literals, numeric & boolean literals
+//!   (numbers are the grammar's `INTEGER` / `DECIMAL` / `DOUBLE` terminals,
+//!   longest match: `1.e5` is a double, `1e` or `1.5.5` a syntax error)
+//! * prefixes with inner dots (`ex.v2:`, `PN_PREFIX`)
 //! * `[ … ]` blank-node property lists and `( … )` collections (lowered to an
 //!   `rdf:first`/`rdf:rest`/`rdf:nil` chain), including nesting
 //! * with [`parse_reader_trig`], TriG graph blocks (see [`crate::parser::trig`])
@@ -22,7 +25,10 @@
 //! reader's buffer, a few characters of lookahead and the statement being
 //! parsed — never the document. Each completed statement's triples go to a
 //! [`StatementSink`] (inside a TriG block too, so one huge graph block is not
-//! buffered either).
+//! buffered either). One token — a string, IRI, name, number or language
+//! tag — may take at most [`StatementSink::max_token_bytes`] (64 MiB by
+//! default): a longer one fails its statement once the reader has read that
+//! much of it, and the reader moves past it without holding the rest.
 //!
 //! # Errors and recovery
 //!
@@ -32,6 +38,10 @@
 //! `TurtleParser::discardLine`): the statement's triples are dropped, the rest
 //! of the line the error was detected on is skipped, and parsing resumes at
 //! the next line (still inside the current TriG block, if any).
+//!
+//! Invalid UTF-8 fails the statement it is read in. Inside a comment, which
+//! is whitespace, it is an error of the comment's line of its own: the
+//! statements around the comment still load (a strict sink stops there).
 //!
 //! # Extension: line breaks in short strings
 //!
@@ -66,8 +76,8 @@ use crate::model::{Term, Triple};
 use crate::parser::nquads::Quad;
 use crate::parser::sparql::ast::{xsd, RDF_TYPE};
 use crate::parser::stream::{
-    expansion_budget, expansion_error, BlankLabeler, CharSource, CollectQuads, StatementSink,
-    SyntaxError, DEFAULT_WINDOW, MAX_LOOKAHEAD,
+    expansion_budget, expansion_error, token_too_long, BlankLabeler, CharSource, CollectQuads,
+    StatementSink, SyntaxError, DEFAULT_WINDOW, MAX_LOOKAHEAD,
 };
 
 /// Parse a Turtle document into triples.
@@ -147,6 +157,8 @@ fn run<R: BufRead>(
         ctx: [None, None, None],
         stmt_start: 0,
         held: 0,
+        max_token: sink.max_token_bytes(),
+        bad_comment: None,
     };
     p.run(sink)
 }
@@ -178,6 +190,13 @@ struct Parser<R> {
     /// Bytes of RDF terms the current statement holds (its quads, the items
     /// of its collections), bounded by [`expansion_budget`].
     held: usize,
+    /// The most bytes one token (a literal, IRI, name, number, language
+    /// tag) may take ([`StatementSink::max_token_bytes`]).
+    max_token: usize,
+    /// The line of a comment holding invalid UTF-8, found while skipping
+    /// whitespace: reported on its own, not charged to the statement around
+    /// or after it (review parser#12).
+    bad_comment: Option<usize>,
 }
 
 /// The `rdf:` namespace base (for collection `rdf:first`/`rest`/`nil`).
@@ -210,6 +229,26 @@ fn is_blank_label_char(c: char) -> bool {
     crate::model::term::is_blank_label_char(c)
 }
 
+/// A character that ends a prefixed name or keyword (besides whitespace).
+fn is_term_separator(c: char) -> bool {
+    c == '.' || is_term_separator_not_dot(c)
+}
+
+fn is_term_separator_not_dot(c: char) -> bool {
+    matches!(
+        c,
+        ';' | ',' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '"' | '\''
+    )
+}
+
+/// A character a prefix may continue with after a `.` (PN_CHARS, leniently:
+/// any non-ASCII character that is not whitespace or a control).
+fn is_prefix_char(c: char) -> bool {
+    c.is_alphanumeric()
+        || matches!(c, '_' | '-' | '\u{00B7}')
+        || (!c.is_ascii() && !c.is_whitespace() && !c.is_control())
+}
+
 /// Characters a `\`-escape may produce in a local name (`PN_LOCAL_ESC`).
 const LOCAL_ESCAPES: &str = "_~.-!$&'()*+,;=/?#@%";
 
@@ -226,6 +265,12 @@ impl<R: BufRead> Parser<R> {
             let item = self.next_item();
             if let Some(e) = self.src.take_io_error() {
                 return Err(e.into());
+            }
+            // A comment with invalid UTF-8 is an error of its own line; the
+            // statement around or after it still counts (review parser#12:
+            // the next statement used to fail in its place).
+            if let Some(line) = self.bad_comment.take() {
+                sink.error(SyntaxError::new(line, "invalid UTF-8 in a comment"))?;
             }
             let item = match item {
                 // Decoded as U+FFFD: the statement is not what the file says.
@@ -418,11 +463,22 @@ impl<R: BufRead> Parser<R> {
                     self.bump();
                 }
                 Some('#') => {
+                    // Checked on its own for invalid UTF-8 (see
+                    // `bad_comment`): what the statement read before keeps
+                    // its own flag.
+                    let before = self.src.take_bad_utf8();
+                    let line = self.src.line();
                     while let Some(c) = self.peek() {
                         if c == '\n' {
                             break;
                         }
                         self.bump();
+                    }
+                    if self.src.take_bad_utf8() {
+                        self.bad_comment.get_or_insert(line);
+                    }
+                    if before {
+                        self.src.flag_bad_utf8();
                     }
                 }
                 _ => break,
@@ -439,6 +495,17 @@ impl<R: BufRead> Parser<R> {
         let q = Quad::new(s, p, o, self.graph.clone());
         self.charge(q.heap_bytes())?;
         self.out.push(q);
+        Ok(())
+    }
+
+    /// `Err` when a token being read has grown to `len` bytes, past the
+    /// limit of one token ([`StatementSink::max_token_bytes`]; review
+    /// parser#5: an unterminated `"""` string or a newline-free IRI was
+    /// held whole, however long).
+    fn check_token(&self, len: usize, what: &str) -> Result<()> {
+        if len > self.max_token {
+            return Err(token_too_long(self.src.line(), what, self.max_token));
+        }
         Ok(())
     }
 
@@ -539,7 +606,7 @@ impl<R: BufRead> Parser<R> {
 
     fn parse_directive(&mut self) -> Result<()> {
         self.bump(); // '@'
-        let kw = self.read_bareword();
+        let kw = self.read_bareword()?;
         match kw.as_str() {
             "prefix" => {
                 self.skip_ws();
@@ -578,16 +645,29 @@ impl<R: BufRead> Parser<R> {
         Ok(())
     }
 
-    /// Read a prefix namespace token `p:` or `:`, returning the prefix (no colon).
+    /// Read a prefix namespace token `p:` or `:`, returning the prefix (no
+    /// colon). A prefix the names of the document could not use afterwards
+    /// is refused: one ending in `.` (PN_PREFIX) or holding a term
+    /// separator. Inner dots are fine (`ex.v2:`; review parser#11).
     fn read_prefix_ns(&mut self) -> Result<String> {
         let mut ns = String::new();
         while let Some(c) = self.peek() {
             if c == ':' {
+                if ns.ends_with('.')
+                    || ns.starts_with('.')
+                    || ns.chars().any(is_term_separator_not_dot)
+                {
+                    return Err(self.err(format!(
+                        "invalid prefix name '{ns}:' (a prefix cannot start or end with '.' or \
+                         hold any of ;,()[]{{}}<\"')"
+                    )));
+                }
                 self.bump();
                 return Ok(ns);
             } else if c.is_whitespace() {
                 break;
             } else {
+                self.check_token(ns.len(), "a prefix name")?;
                 ns.push(c);
                 self.bump();
             }
@@ -638,6 +718,7 @@ impl<R: BufRead> Parser<R> {
         }
         match self.peek() {
             Some('.') => {
+                self.no_number_after_dot()?;
                 self.bump();
                 Ok(())
             }
@@ -797,6 +878,11 @@ impl<R: BufRead> Parser<R> {
             if matches!(self.peek(), Some(c) if c <= ' ') {
                 return Err(self.err("invalid IRI (space or control character before '>')"));
             }
+            if let Err(e) = self.check_token(s.len(), "an IRI") {
+                // Stop after the IRI, not inside it (see `resync`).
+                self.skip_rest_of_iri();
+                return Err(e);
+            }
             match self.bump() {
                 Some('>') => return Ok(self.resolve_iri(&s)),
                 Some('\\') => {
@@ -814,20 +900,26 @@ impl<R: BufRead> Parser<R> {
                     };
                     if let Err(e) = escaped {
                         // Stop after the IRI, not inside it (see `resync`).
-                        while let Some(c) = self.peek() {
-                            if c <= ' ' {
-                                break;
-                            }
-                            self.bump();
-                            if c == '>' {
-                                break;
-                            }
-                        }
+                        self.skip_rest_of_iri();
                         return Err(e);
                     }
                 }
                 Some(c) => s.push(c),
                 None => return Err(self.err("unterminated IRI")),
+            }
+        }
+    }
+
+    /// After an error inside an IRI: move past its `>` (or to the space or
+    /// control character that ends it), without holding it.
+    fn skip_rest_of_iri(&mut self) {
+        while let Some(c) = self.peek() {
+            if c <= ' ' {
+                break;
+            }
+            self.bump();
+            if c == '>' {
+                break;
             }
         }
     }
@@ -852,6 +944,7 @@ impl<R: BufRead> Parser<R> {
                     self.bump();
                 }
             } else if is_blank_label_char(c) {
+                self.check_token(label.len(), "a blank node label")?;
                 label.push(c);
                 self.bump();
             } else {
@@ -868,16 +961,28 @@ impl<R: BufRead> Parser<R> {
         // Could be `prefix:local`, `:local`, or a boolean literal.
         let mut prefix = String::new();
         while let Some(c) = self.peek() {
+            if c == '.' {
+                // PN_PREFIX may hold '.', not at its end: the dots belong
+                // to the prefix when a prefix character follows them
+                // (`ex.v2:a`; review parser#11), else they end the
+                // statement (`true.`).
+                let dots = (0..MAX_LOOKAHEAD - 1)
+                    .take_while(|&k| self.src.peek_at(k) == Some('.'))
+                    .count();
+                if prefix.is_empty() || !self.src.peek_at(dots).is_some_and(is_prefix_char) {
+                    break;
+                }
+                for _ in 0..dots {
+                    prefix.push('.');
+                    self.bump();
+                }
+                continue;
+            }
             // Stop at the ':' that ends the prefix, or any term separator.
-            if c == ':'
-                || c.is_whitespace()
-                || matches!(
-                    c,
-                    '.' | ';' | ',' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '"' | '\''
-                )
-            {
+            if c == ':' || c.is_whitespace() || is_term_separator(c) {
                 break;
             }
+            self.check_token(prefix.len(), "a prefixed name")?;
             prefix.push(c);
             self.bump();
         }
@@ -902,6 +1007,7 @@ impl<R: BufRead> Parser<R> {
     fn read_pn_local(&mut self) -> Result<String> {
         let mut local = String::new();
         while let Some(c) = self.peek() {
+            self.check_token(local.len(), "a prefixed name")?;
             if c == '\\' {
                 match self.peek2() {
                     Some(e) if LOCAL_ESCAPES.contains(e) => {
@@ -938,6 +1044,10 @@ impl<R: BufRead> Parser<R> {
         }
         let mut value = String::new();
         loop {
+            if let Err(e) = self.check_token(value.len(), "a string literal") {
+                self.skip_rest_of_literal(quote, triple);
+                return Err(e);
+            }
             match self.peek() {
                 None => return Err(self.err("unterminated literal")),
                 // A raw line break in a short string: W3C Turtle forbids it
@@ -989,6 +1099,7 @@ impl<R: BufRead> Parser<R> {
                 let mut lang = String::new();
                 while let Some(c) = self.peek() {
                     if c.is_ascii_alphanumeric() || c == '-' {
+                        self.check_token(lang.len(), "a language tag")?;
                         lang.push(c);
                         self.bump();
                     } else {
@@ -1066,43 +1177,86 @@ impl<R: BufRead> Parser<R> {
         }
     }
 
+    /// A numeric literal, lexed as the Turtle grammar's longest match of
+    /// (§6.5):
+    ///
+    /// ```text
+    /// INTEGER  ::= [+-]? [0-9]+
+    /// DECIMAL  ::= [+-]? [0-9]* '.' [0-9]+
+    /// DOUBLE   ::= [+-]? ([0-9]+ '.' [0-9]* EXPONENT | '.' [0-9]+ EXPONENT | [0-9]+ EXPONENT)
+    /// EXPONENT ::= [eE] [+-]? [0-9]+
+    /// ```
+    ///
+    /// What follows the number is left to the statement: `1e` is the
+    /// integer `1` followed by `e` (an error there), `1.5.5` the decimal
+    /// `1.5` followed by the decimal `.5` (see [`Parser::expect_dot`]), and
+    /// `1.e5` a double (review parser#10: `1e`, `1E+`, `1.5.5` and `1e5e5`
+    /// were stored as numbers, and `1.e5` was refused).
     fn parse_numeric(&mut self) -> Result<Term> {
         let mut s = String::new();
-        let mut is_decimal = false;
-        let mut is_double = false;
         if matches!(self.peek(), Some('+') | Some('-')) {
             s.push(self.bump().unwrap());
         }
-        while let Some(c) = self.peek() {
-            if c.is_ascii_digit() {
-                s.push(c);
+        let int_digits = self.read_digits(&mut s)?;
+        let mut fraction = false;
+        if self.peek() == Some('.') {
+            if self.peek2().is_some_and(|c| c.is_ascii_digit()) {
+                // '.' [0-9]+ (DECIMAL, or a DOUBLE's mantissa).
+                s.push('.');
                 self.bump();
-            } else if c == '.' && self.peek2().is_some_and(|n| n.is_ascii_digit()) {
-                is_decimal = true;
-                s.push(c);
+                self.read_digits(&mut s)?;
+                fraction = true;
+            } else if int_digits > 0 && self.exponent_at(1) {
+                // [0-9]+ '.' EXPONENT: `1.e5`.
+                s.push('.');
                 self.bump();
-            } else if c == 'e' || c == 'E' {
-                is_double = true;
-                s.push(c);
-                self.bump();
-                if matches!(self.peek(), Some('+') | Some('-')) {
-                    s.push(self.bump().unwrap());
-                }
-            } else {
-                break;
             }
         }
-        if s.is_empty() || s.chars().all(|c| c == '+' || c == '-') {
+        if int_digits == 0 && !fraction {
             return Err(self.err("invalid numeric literal"));
         }
-        let dt = if is_double {
+        let mut double = false;
+        if self.exponent_at(0) {
+            s.push(self.bump().unwrap()); // e / E
+            if matches!(self.peek(), Some('+') | Some('-')) {
+                s.push(self.bump().unwrap());
+            }
+            self.read_digits(&mut s)?;
+            double = true;
+        }
+        let dt = if double {
             xsd::DOUBLE
-        } else if is_decimal {
+        } else if fraction {
             xsd::DECIMAL
         } else {
             xsd::INTEGER
         };
         Ok(Term::typed_literal(s, dt))
+    }
+
+    /// Append the run of ASCII digits that follows to `s`; how many.
+    fn read_digits(&mut self, s: &mut String) -> Result<usize> {
+        let mut n = 0;
+        while let Some(c) = self.peek().filter(char::is_ascii_digit) {
+            self.check_token(s.len(), "a number")?;
+            s.push(c);
+            self.bump();
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    /// Whether an EXPONENT (`[eE] [+-]? [0-9]+`) starts `k` characters ahead.
+    fn exponent_at(&mut self, k: usize) -> bool {
+        if !matches!(self.src.peek_at(k), Some('e' | 'E')) {
+            return false;
+        }
+        let digit = if matches!(self.src.peek_at(k + 1), Some('+' | '-')) {
+            k + 2
+        } else {
+            k + 1
+        };
+        self.src.peek_at(digit).is_some_and(|c| c.is_ascii_digit())
     }
 
     fn read_string_escape(&mut self, out: &mut String) -> Result<()> {
@@ -1143,17 +1297,18 @@ impl<R: BufRead> Parser<R> {
         Ok(())
     }
 
-    fn read_bareword(&mut self) -> String {
+    fn read_bareword(&mut self) -> Result<String> {
         let mut w = String::new();
         while let Some(c) = self.peek() {
             if c.is_ascii_alphabetic() {
+                self.check_token(w.len(), "a directive name")?;
                 w.push(c);
                 self.bump();
             } else {
                 break;
             }
         }
-        w
+        Ok(w)
     }
 
     fn expect(&mut self, c: char) -> Result<()> {
@@ -1166,15 +1321,33 @@ impl<R: BufRead> Parser<R> {
         }
     }
 
+    /// The `.` that ends a statement or directive. A `.` followed by a
+    /// digit is never one: it starts a DECIMAL / DOUBLE (`<s> <p> 1.5.5 .`
+    /// is the number `1.5` followed by the number `.5`, a syntax error; it
+    /// was read as `1.5`, then a stray statement `5 .`).
     fn expect_dot(&mut self) -> Result<()> {
         self.skip_ws();
+        self.no_number_after_dot()?;
         self.expect('.')
     }
 
+    /// `Err` when the next characters are `.` and a digit (a number, not a
+    /// statement terminator).
+    fn no_number_after_dot(&mut self) -> Result<()> {
+        if self.peek() == Some('.') && self.peek2().is_some_and(|c| c.is_ascii_digit()) {
+            return Err(
+                self.err("expected '.', found a number starting with '.' (malformed number?)")
+            );
+        }
+        Ok(())
+    }
+
+    /// Resolve a relative IRI against the `@base` / `BASE` in force (the
+    /// shared RFC 3986 resolver of every reader, [`crate::parser::iri`]).
     fn resolve_iri(&self, s: &str) -> String {
         match &self.base {
-            Some(base) if !is_absolute_iri(s) => resolve_reference(base, s),
-            _ => s.to_string(),
+            Some(base) => crate::parser::iri::resolve(base, s),
+            None => s.to_string(),
         }
     }
 }
@@ -1201,163 +1374,6 @@ fn literal_span_error(e: &GStoreError, line: usize, overflow: bool) -> GStoreErr
              closing quote missing?)"
         ),
     }
-}
-
-fn is_absolute_iri(s: &str) -> bool {
-    match s.find(':') {
-        Some(idx) => is_valid_scheme(&s[..idx]),
-        None => false,
-    }
-}
-
-/// `scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )` (RFC 3986 §3.1).
-/// The first character must be a letter; an empty scheme is invalid.
-fn is_valid_scheme(scheme: &str) -> bool {
-    let mut chars = scheme.chars();
-    match chars.next() {
-        Some(first) if first.is_ascii_alphabetic() => {
-            chars.all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
-        }
-        _ => false,
-    }
-}
-
-/// Resolve a relative IRI `reference` against an absolute `base` following the
-/// reference-resolution algorithm of RFC 3986 §5.2 (the relative branches; the
-/// caller guarantees `reference` has no scheme). This fixes the previous naive
-/// concatenation, which produced e.g. `http://ex.com/pathfile` for base
-/// `http://ex.com/path` + `file` instead of the correct `http://ex.com/file`.
-fn resolve_reference(base: &str, reference: &str) -> String {
-    let (b_scheme, b_authority, b_path, b_query, _) = split_iri(base);
-    let (_, r_authority, r_path, r_query, r_fragment) = split_iri(reference);
-
-    let (authority, path, query) = if r_authority.is_some() {
-        (r_authority, remove_dot_segments(r_path), r_query)
-    } else if r_path.is_empty() {
-        let query = if r_query.is_some() { r_query } else { b_query };
-        (b_authority, b_path.to_string(), query)
-    } else if r_path.starts_with('/') {
-        (b_authority, remove_dot_segments(r_path), r_query)
-    } else {
-        let merged = merge_paths(b_authority, b_path, r_path);
-        (b_authority, remove_dot_segments(&merged), r_query)
-    };
-
-    recompose(b_scheme, authority, &path, query, r_fragment)
-}
-
-/// Split an IRI reference into `(scheme, authority, path, query, fragment)`
-/// per RFC 3986 §3. `scheme` and `path` are always present (possibly empty);
-/// `authority`, `query` and `fragment` are present only when their delimiters
-/// (`//`, `?`, `#`) appear.
-#[allow(clippy::type_complexity)]
-fn split_iri(s: &str) -> (&str, Option<&str>, &str, Option<&str>, Option<&str>) {
-    let mut rest = s;
-    let mut fragment = None;
-    if let Some(i) = rest.find('#') {
-        fragment = Some(&rest[i + 1..]);
-        rest = &rest[..i];
-    }
-    let mut query = None;
-    if let Some(i) = rest.find('?') {
-        query = Some(&rest[i + 1..]);
-        rest = &rest[..i];
-    }
-    let mut scheme = "";
-    if let Some(i) = rest.find(':') {
-        if is_valid_scheme(&rest[..i]) {
-            scheme = &rest[..i];
-            rest = &rest[i + 1..];
-        }
-    }
-    let mut authority = None;
-    if let Some(after) = rest.strip_prefix("//") {
-        let end = after.find('/').unwrap_or(after.len());
-        authority = Some(&after[..end]);
-        rest = &after[end..];
-    }
-    (scheme, authority, rest, query, fragment)
-}
-
-/// Merge a relative-path reference onto the base path (RFC 3986 §5.3).
-fn merge_paths(base_authority: Option<&str>, base_path: &str, ref_path: &str) -> String {
-    if base_authority.is_some() && base_path.is_empty() {
-        format!("/{ref_path}")
-    } else if let Some(i) = base_path.rfind('/') {
-        format!("{}{}", &base_path[..=i], ref_path)
-    } else {
-        ref_path.to_string()
-    }
-}
-
-/// Remove `.` and `..` path segments (RFC 3986 §5.2.4).
-fn remove_dot_segments(path: &str) -> String {
-    let mut input = path.to_string();
-    let mut output = String::new();
-    while !input.is_empty() {
-        if input.starts_with("../") {
-            input.drain(..3);
-        } else if input.starts_with("./") {
-            input.drain(..2);
-        } else if input.starts_with("/./") {
-            input.replace_range(..3, "/");
-        } else if input == "/." {
-            input.replace_range(..2, "/");
-        } else if input.starts_with("/../") {
-            input.replace_range(..4, "/");
-            remove_last_segment(&mut output);
-        } else if input == "/.." {
-            input.replace_range(..3, "/");
-            remove_last_segment(&mut output);
-        } else if input == "." || input == ".." {
-            input.clear();
-        } else {
-            let start = usize::from(input.starts_with('/'));
-            let end = match input[start..].find('/') {
-                Some(i) => start + i,
-                None => input.len(),
-            };
-            output.push_str(&input[..end]);
-            input.drain(..end);
-        }
-    }
-    output
-}
-
-fn remove_last_segment(output: &mut String) {
-    match output.rfind('/') {
-        Some(i) => output.truncate(i),
-        None => output.clear(),
-    }
-}
-
-/// Recompose components into an IRI string (RFC 3986 §5.3).
-fn recompose(
-    scheme: &str,
-    authority: Option<&str>,
-    path: &str,
-    query: Option<&str>,
-    fragment: Option<&str>,
-) -> String {
-    let mut out = String::new();
-    if !scheme.is_empty() {
-        out.push_str(scheme);
-        out.push(':');
-    }
-    if let Some(a) = authority {
-        out.push_str("//");
-        out.push_str(a);
-    }
-    out.push_str(path);
-    if let Some(q) = query {
-        out.push('?');
-        out.push_str(q);
-    }
-    if let Some(f) = fragment {
-        out.push('#');
-        out.push_str(f);
-    }
-    out
 }
 
 #[cfg(test)]

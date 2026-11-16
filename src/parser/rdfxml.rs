@@ -9,9 +9,16 @@
 //!   `rdf:type` triple)
 //! * `rdf:about`, `rdf:ID` (resolved against `xml:base`), `rdf:nodeID`
 //! * property elements with `rdf:resource`, nested node elements (striped
-//!   syntax), or text content (with `rdf:datatype` / `xml:lang`)
-//! * property *attributes* (shorthand for literal-valued properties)
-//! * `rdf:parseType="Resource"` (anonymous blank node) and `="Literal"`
+//!   syntax), or text content (with `rdf:datatype` / `xml:lang`; the text
+//!   is the literal exactly, whitespace included)
+//! * property *attributes* (shorthand for literal-valued properties), also
+//!   on an empty property element, where they describe its object (its
+//!   `rdf:resource` / `rdf:nodeID`, else a fresh blank node)
+//! * `rdf:parseType="Resource"` (anonymous blank node) and `="Literal"` (an
+//!   `rdf:XMLLiteral` holding the content, markup included, as exclusive
+//!   canonical XML with comments)
+//! * relative IRIs resolved against `xml:base` per RFC 3986
+//!   ([`crate::parser::iri`])
 //! * `rdf:li` membership properties (lowered to `rdf:_1`, `rdf:_2`, …) and the
 //!   `rdf:Seq`/`rdf:Bag`/`rdf:Alt` container classes
 //! * `rdf:parseType="Collection"` (the node elements become an
@@ -37,13 +44,18 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::rc::Rc;
 
 use crate::error::{GStoreError, Result};
 use crate::model::{Term, Triple};
+use crate::parser::iri::resolve;
 use crate::parser::stream::{BlankLabeler, TermBudget};
 
 const RDF_NS: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
+/// The namespace the reserved prefix `xmlns` is bound to (XML Namespaces
+/// §3): `xmlns:p` attributes are namespace declarations, not data.
+const XMLNS_NS: &str = "http://www.w3.org/2000/xmlns/";
 
 /// Deepest element nesting accepted. The XML reader, the triple extractor and
 /// dropping the element tree all recurse once per level, so an unbounded depth
@@ -122,14 +134,18 @@ struct XmlElement {
 #[derive(Debug)]
 enum XmlChild {
     Element(XmlElement),
+    /// Character data (text, CDATA sections and expanded references).
     Text(String),
+    /// A comment inside an element (kept for `rdf:parseType="Literal"`,
+    /// whose value is the content as canonical XML with comments).
+    Comment(String),
 }
 
 impl XmlElement {
     fn elements(&self) -> impl Iterator<Item = &XmlElement> {
         self.children.iter().filter_map(|c| match c {
             XmlChild::Element(e) => Some(e),
-            XmlChild::Text(_) => None,
+            XmlChild::Text(_) | XmlChild::Comment(_) => None,
         })
     }
 
@@ -235,14 +251,21 @@ impl XmlParser {
     }
 
     fn skip_comment(&mut self) -> Result<()> {
+        self.read_comment().map(drop)
+    }
+
+    /// A comment `<!-- … -->`: its text.
+    fn read_comment(&mut self) -> Result<String> {
         self.pos += 4; // "<!--"
+        let mut text = String::new();
         while !self.starts_with("-->") {
-            if self.bump().is_none() {
-                return Err(self.err("unterminated comment"));
+            match self.bump() {
+                Some(c) => text.push(c),
+                None => return Err(self.err("unterminated comment")),
             }
         }
         self.pos += 3;
-        Ok(())
+        Ok(text)
     }
 
     /// `<!DOCTYPE name ExternalID? [ internal subset ]? >`: the internal
@@ -606,7 +629,7 @@ impl XmlParser {
                         }
                         return Ok(children);
                     } else if self.starts_with("<!--") {
-                        self.skip_comment()?;
+                        children.push(XmlChild::Comment(self.read_comment()?));
                     } else if self.starts_with("<![CDATA[") {
                         self.pos += 9;
                         let mut cdata = String::new();
@@ -739,23 +762,82 @@ struct Extractor {
     budget: TermBudget,
 }
 
-/// The inherited XML context threaded through the walk.
+/// The inherited XML context threaded through the walk. Cloning it for an
+/// element copies no namespace binding and no base: both are shared (review
+/// parser#7's pattern: every element copied every namespace declared above
+/// it, 3.8 s for 40000 elements under 1000 declarations).
 #[derive(Clone)]
 struct Ctx {
-    ns: HashMap<String, String>,
+    ns: Rc<Ns>,
     lang: Option<String>,
-    base: String,
+    base: Rc<str>,
 }
 
 impl Ctx {
     fn root() -> Ctx {
+        // The two reserved prefixes. Binding `xmlns` lets the attribute
+        // loops expand an `xmlns:p` declaration (and skip it as syntax): a
+        // declaration on any element but `rdf:RDF` used to fail the document
+        // with "undefined namespace prefix 'xmlns:'".
         let mut ns = HashMap::new();
         ns.insert("xml".to_string(), XML_NS.to_string());
+        ns.insert("xmlns".to_string(), XMLNS_NS.to_string());
         Ctx {
-            ns,
+            ns: Rc::new(Ns {
+                own: ns,
+                below: None,
+            }),
             lang: None,
-            base: String::new(),
+            base: Rc::from(""),
         }
+    }
+}
+
+/// The namespace bindings in scope, in layers: those an element declares
+/// (`xmlns`, `xmlns:p`) over the layers of its ancestors, which are shared,
+/// not copied. A lookup walks the layers from the innermost, so an inner
+/// declaration hides an outer one. Only elements that declare a namespace
+/// add a layer, so there are at most as many as the document is deep.
+#[derive(Default)]
+struct Ns {
+    own: HashMap<String, String>,
+    below: Option<Rc<Ns>>,
+}
+
+impl Ns {
+    fn get(&self, prefix: &str) -> Option<&String> {
+        let mut layer = self;
+        loop {
+            if let Some(uri) = layer.own.get(prefix) {
+                return Some(uri);
+            }
+            layer = layer.below.as_deref()?;
+        }
+    }
+
+    /// The bindings `own` over `below` (`below` itself when `own` is empty).
+    fn layer(below: &Rc<Ns>, own: HashMap<String, String>) -> Rc<Ns> {
+        if own.is_empty() {
+            Rc::clone(below)
+        } else {
+            Rc::new(Ns {
+                own,
+                below: Some(Rc::clone(below)),
+            })
+        }
+    }
+
+    /// The namespace declarations among `attrs` (`""` = the default one).
+    fn declared(attrs: &[(String, String)]) -> HashMap<String, String> {
+        let mut own = HashMap::new();
+        for (k, v) in attrs {
+            if k == "xmlns" {
+                own.insert(String::new(), v.clone());
+            } else if let Some(prefix) = k.strip_prefix("xmlns:") {
+                own.insert(prefix.to_string(), v.clone());
+            }
+        }
+        own
     }
 }
 
@@ -791,13 +873,12 @@ impl Extractor {
     /// tag fails the document (review parser#1).
     fn child_ctx(&self, parent: &Ctx, el: &XmlElement) -> Result<Ctx> {
         let mut ctx = parent.clone();
+        ctx.ns = Ns::layer(&parent.ns, Ns::declared(&el.attrs));
         for (k, v) in &el.attrs {
-            if k == "xmlns" {
-                ctx.ns.insert(String::new(), v.clone());
-            } else if let Some(prefix) = k.strip_prefix("xmlns:") {
-                ctx.ns.insert(prefix.to_string(), v.clone());
-            } else if k == "xml:base" {
-                ctx.base = v.clone();
+            if k == "xml:base" {
+                // XML Base: a relative `xml:base` is resolved against the
+                // base in scope (RFC 3986, review parser#4).
+                ctx.base = resolve(&parent.base, v).into();
             } else if k == "xml:lang" {
                 ctx.lang = crate::model::term::normalize_lang_tag(v).map_err(|msg| {
                     GStoreError::RdfParse {
@@ -885,19 +966,40 @@ impl Extractor {
             Term::Iri(format!("{ns}{local}"))
         };
 
-        // rdf:resource ⇒ IRI object.
-        if let Some(res) = attr_value(pe, RDF_NS, "resource", &ctx.ns)? {
-            self.push(
-                subject.clone(),
-                predicate,
-                Term::Iri(resolve(&ctx.base, &res)),
-            );
-            return Ok(());
-        }
-        // rdf:nodeID ⇒ blank-node object.
-        if let Some(nid) = attr_value(pe, RDF_NS, "nodeID", &ctx.ns)? {
-            let obj = self.node_id(&nid);
-            self.push(subject.clone(), predicate, obj);
+        // rdf:resource ⇒ IRI object, rdf:nodeID ⇒ blank-node object; and
+        // an empty property element with property attributes ⇒ a fresh
+        // blank node (emptyPropertyElt, RDF/XML §7.2.21). Property
+        // attributes (and `rdf:type`) describe that object (review
+        // parser#9: they were dropped, and an element with only property
+        // attributes became the literal "").
+        let resource = attr_value(pe, RDF_NS, "resource", &ctx.ns)?;
+        let node_id = attr_value(pe, RDF_NS, "nodeID", &ctx.ns)?;
+        let (prop_attrs, rdf_type) = property_attributes(pe, &ctx)?;
+        let empty = !pe.has_element_children() && pe.text().trim().is_empty();
+        let described = !prop_attrs.is_empty() || rdf_type.is_some();
+        let no_literal_syntax = attr_value(pe, RDF_NS, "parseType", &ctx.ns)?.is_none()
+            && attr_value(pe, RDF_NS, "datatype", &ctx.ns)?.is_none();
+        if resource.is_some() || node_id.is_some() || (described && empty && no_literal_syntax) {
+            let obj = match (resource, node_id) {
+                (Some(res), _) => Term::Iri(resolve(&ctx.base, &res)),
+                (None, Some(nid)) => self.node_id(&nid),
+                (None, None) => self.fresh_blank(),
+            };
+            self.push(subject.clone(), predicate, obj.clone());
+            if let Some(ty) = rdf_type {
+                self.push(obj.clone(), iri_type(), Term::Iri(ty));
+            }
+            for (p, value) in prop_attrs {
+                self.push(
+                    obj.clone(),
+                    Term::Iri(p),
+                    Term::Literal {
+                        value,
+                        datatype: None,
+                        lang: ctx.lang.clone(),
+                    },
+                );
+            }
             return Ok(());
         }
 
@@ -930,11 +1032,14 @@ impl Extractor {
                     return Ok(());
                 }
                 "Literal" => {
+                    // The content, markup included, as exclusive canonical
+                    // XML (review parser#9: only the text was kept).
+                    let value = xml_literal(pe, &ctx.ns)?;
                     self.push(
                         subject.clone(),
                         predicate,
                         Term::Literal {
-                            value: pe.text(),
+                            value,
                             datatype: Some(format!("{RDF_NS}XMLLiteral")),
                             lang: None,
                         },
@@ -984,17 +1089,22 @@ impl Extractor {
         }
 
         // Otherwise a literal from the text content.
-        let datatype = attr_value(pe, RDF_NS, "datatype", &ctx.ns)?;
+        // `rdf:datatype` is an IRI reference too (resolved like the others).
+        let datatype =
+            attr_value(pe, RDF_NS, "datatype", &ctx.ns)?.map(|dt| resolve(&ctx.base, &dt));
         let lang = if datatype.is_some() {
             None
         } else {
             ctx.lang.clone()
         };
+        // The text exactly as written: whitespace is part of the value
+        // (literalPropertyElt, RDF/XML §7.2.16; review parser#9 — it was
+        // trimmed).
         self.push(
             subject.clone(),
             predicate,
             Term::Literal {
-                value: pe.text().trim().to_string(),
+                value: pe.text(),
                 datatype,
                 lang,
             },
@@ -1015,8 +1125,185 @@ fn iri_type() -> Term {
     Term::Iri(format!("{RDF_NS}type"))
 }
 
+/// The property attributes of property element `pe` as `(predicate IRI,
+/// value)`, and its `rdf:type` attribute (resolved), for an
+/// emptyPropertyElt (RDF/XML §7.2.21).
+#[allow(clippy::type_complexity)]
+fn property_attributes(
+    pe: &XmlElement,
+    ctx: &Ctx,
+) -> Result<(Vec<(String, String)>, Option<String>)> {
+    let mut props = Vec::new();
+    let mut rdf_type = None;
+    for (raw, value) in &pe.attrs {
+        let (a_ns, a_local) = expand_attr_name(raw, &ctx.ns)?;
+        if a_ns == RDF_NS && a_local == "type" {
+            rdf_type = Some(resolve(&ctx.base, value));
+        } else if !is_syntax_attr(raw, &a_ns, &a_local) {
+            props.push((format!("{a_ns}{a_local}"), value.clone()));
+        }
+    }
+    Ok((props, rdf_type))
+}
+
+/// The value of an `rdf:parseType="Literal"` property element: its content
+/// as Exclusive XML Canonicalization with comments renders it (RDF 1.1 XML
+/// Syntax §7.2.17, parseTypeLiteralPropertyElt). Elements keep their
+/// markup; each element declares the namespaces it visibly uses (its own
+/// prefix and its attributes' prefixes) unless an enclosing element of the
+/// literal already declared them with the same value; namespace
+/// declarations come first, by prefix, then the attributes, by namespace
+/// IRI and local name; an empty element is written `<a></a>`; text escapes
+/// `&`, `<`, `>` and carriage returns, attribute values `&`, `<`, `"`,
+/// tabs, line feeds and carriage returns. CDATA sections are text, and DTD
+/// entity references are already expanded.
+fn xml_literal(pe: &XmlElement, ns: &Rc<Ns>) -> Result<String> {
+    let mut out = String::new();
+    write_c14n_content(&pe.children, ns, None, &mut out)?;
+    Ok(out)
+}
+
+/// The namespace declarations the canonical form has written on the
+/// enclosing elements of the literal, innermost first (a chain on the
+/// stack, so an element adds its own without copying its ancestors').
+struct Rendered<'a> {
+    own: HashMap<String, String>,
+    below: Option<&'a Rendered<'a>>,
+}
+
+/// The value the nearest enclosing element rendered for `prefix`.
+fn rendered_uri<'a>(mut layer: Option<&'a Rendered<'a>>, prefix: &str) -> Option<&'a str> {
+    while let Some(r) = layer {
+        if let Some(uri) = r.own.get(prefix) {
+            return Some(uri);
+        }
+        layer = r.below;
+    }
+    None
+}
+
+fn write_c14n_content(
+    children: &[XmlChild],
+    scope: &Rc<Ns>,
+    rendered: Option<&Rendered<'_>>,
+    out: &mut String,
+) -> Result<()> {
+    for child in children {
+        match child {
+            XmlChild::Text(t) => {
+                for c in t.chars() {
+                    match c {
+                        '&' => out.push_str("&amp;"),
+                        '<' => out.push_str("&lt;"),
+                        '>' => out.push_str("&gt;"),
+                        '\r' => out.push_str("&#xD;"),
+                        c => out.push(c),
+                    }
+                }
+            }
+            XmlChild::Comment(t) => {
+                out.push_str("<!--");
+                out.push_str(t);
+                out.push_str("-->");
+            }
+            XmlChild::Element(e) => write_c14n_element(e, scope, rendered, out)?,
+        }
+    }
+    Ok(())
+}
+
+fn write_c14n_element(
+    el: &XmlElement,
+    parent_scope: &Rc<Ns>,
+    rendered: Option<&Rendered<'_>>,
+    out: &mut String,
+) -> Result<()> {
+    let undefined = |prefix: &str| GStoreError::RdfParse {
+        line: 0,
+        msg: format!("undefined namespace prefix '{prefix}:' in an XML literal"),
+    };
+    let scope = Ns::layer(parent_scope, Ns::declared(&el.attrs));
+    // The prefixes the element visibly uses ("" = the default namespace).
+    let mut used: Vec<&str> = vec![el.name.split_once(':').map_or("", |(p, _)| p)];
+    let mut attrs: Vec<(&str, &str, &str, &str)> = Vec::new(); // (ns, local, qname, value)
+    for (k, v) in &el.attrs {
+        if k == "xmlns" || k.starts_with("xmlns:") {
+            continue;
+        }
+        match k.split_once(':') {
+            Some(("xml", local)) => attrs.push((XML_NS, local, k, v)),
+            Some((p, local)) => {
+                let uri = scope.get(p).ok_or_else(|| undefined(p))?;
+                used.push(p);
+                attrs.push((uri, local, k, v));
+            }
+            None => attrs.push(("", k, k, v)),
+        }
+    }
+    used.sort_unstable();
+    used.dedup();
+    attrs.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    let mut here = Rendered {
+        own: HashMap::new(),
+        below: rendered,
+    };
+    out.push('<');
+    out.push_str(&el.name);
+    for p in used {
+        let uri = scope.get(p).map_or("", String::as_str);
+        if !p.is_empty() && uri.is_empty() {
+            return Err(undefined(p));
+        }
+        let before = rendered_uri(rendered, p);
+        let declared = if p.is_empty() {
+            uri != before.unwrap_or("")
+        } else {
+            before != Some(uri)
+        };
+        if declared {
+            out.push_str(" xmlns");
+            if !p.is_empty() {
+                out.push(':');
+                out.push_str(p);
+            }
+            out.push_str("=\"");
+            push_c14n_attr(uri, out);
+            out.push('"');
+            here.own.insert(p.to_string(), uri.to_string());
+        }
+    }
+    for (_, _, qname, value) in attrs {
+        out.push(' ');
+        out.push_str(qname);
+        out.push_str("=\"");
+        push_c14n_attr(value, out);
+        out.push('"');
+    }
+    out.push('>');
+    write_c14n_content(&el.children, &scope, Some(&here), out)?;
+    out.push_str("</");
+    out.push_str(&el.name);
+    out.push('>');
+    Ok(())
+}
+
+/// An attribute value escaped as canonical XML writes it.
+fn push_c14n_attr(value: &str, out: &mut String) {
+    for c in value.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '"' => out.push_str("&quot;"),
+            '\t' => out.push_str("&#x9;"),
+            '\n' => out.push_str("&#xA;"),
+            '\r' => out.push_str("&#xD;"),
+            c => out.push(c),
+        }
+    }
+}
+
 /// Expand an element/datatype qualified name to `(namespace, local)`.
-fn expand_name(qname: &str, ns: &HashMap<String, String>) -> Result<(String, String)> {
+fn expand_name(qname: &str, ns: &Ns) -> Result<(String, String)> {
     match qname.split_once(':') {
         Some((prefix, local)) => {
             let iri = ns.get(prefix).ok_or_else(|| GStoreError::RdfParse {
@@ -1034,7 +1321,7 @@ fn expand_name(qname: &str, ns: &HashMap<String, String>) -> Result<(String, Str
 
 /// Expand an *attribute* qualified name. Unprefixed attributes are not in the
 /// default namespace (XML namespaces rule); they get an empty namespace.
-fn expand_attr_name(qname: &str, ns: &HashMap<String, String>) -> Result<(String, String)> {
+fn expand_attr_name(qname: &str, ns: &Ns) -> Result<(String, String)> {
     match qname.split_once(':') {
         Some((prefix, local)) => {
             let iri = ns.get(prefix).ok_or_else(|| GStoreError::RdfParse {
@@ -1049,12 +1336,7 @@ fn expand_attr_name(qname: &str, ns: &HashMap<String, String>) -> Result<(String
 
 /// Find an RDF-syntax attribute's value by namespace+local, tolerating the
 /// common unprefixed spelling (`about` when the writer omitted the `rdf:`).
-fn attr_value(
-    el: &XmlElement,
-    want_ns: &str,
-    want_local: &str,
-    ns: &HashMap<String, String>,
-) -> Result<Option<String>> {
+fn attr_value(el: &XmlElement, want_ns: &str, want_local: &str, ns: &Ns) -> Result<Option<String>> {
     for (raw, value) in &el.attrs {
         let (a_ns, a_local) = expand_attr_name(raw, ns)?;
         let matches = (a_ns == want_ns && a_local == want_local)
@@ -1089,46 +1371,6 @@ fn is_syntax_attr(raw: &str, a_ns: &str, a_local: &str) -> bool {
     }
     // Unprefixed spelling of the identity attributes.
     a_ns.is_empty() && matches!(a_local, "about" | "ID" | "nodeID" | "resource")
-}
-
-/// Resolve a (possibly relative) IRI reference against `base` — a practical
-/// subset: absolute references pass through; `#frag` and relative references are
-/// joined to the base.
-fn resolve(base: &str, reference: &str) -> String {
-    if reference.is_empty() {
-        return base.to_string();
-    }
-    if is_absolute(reference) {
-        return reference.to_string();
-    }
-    if base.is_empty() {
-        return reference.to_string();
-    }
-    if let Some(frag) = reference.strip_prefix('#') {
-        let stem = base.split('#').next().unwrap_or(base);
-        return format!("{stem}#{frag}");
-    }
-    // Relative path: replace the last segment of the base.
-    match base.rfind('/') {
-        Some(i) => format!("{}{}", &base[..=i], reference),
-        None => reference.to_string(),
-    }
-}
-
-/// Does `s` have an absolute-IRI scheme (`scheme:` where scheme starts with a
-/// letter)?
-fn is_absolute(s: &str) -> bool {
-    match s.find(':') {
-        Some(i) => {
-            let scheme = &s[..i];
-            !scheme.is_empty()
-                && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-                && scheme
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
-        }
-        None => false,
-    }
 }
 
 #[cfg(test)]

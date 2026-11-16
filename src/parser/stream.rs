@@ -24,7 +24,7 @@
 
 use std::collections::VecDeque;
 use std::io::{self, BufRead};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::error::{GStoreError, Result};
 use crate::model::Term;
@@ -43,6 +43,47 @@ pub const DEFAULT_WINDOW: usize = 64 * 1024;
 /// (and the rest of its statement after it), so that a failed statement can
 /// be [replayed](CharSource::replay) from that line break.
 pub const MAX_LITERAL_SPAN: usize = 256 * 1024;
+
+/// The built-in default of the longest single token the streaming readers
+/// hold (see [`default_max_token_bytes`]): 64 MiB.
+pub const DEFAULT_MAX_TOKEN_BYTES: usize = 64 << 20;
+
+/// The process default of [`StatementSink::max_token_bytes`].
+static MAX_TOKEN_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_TOKEN_BYTES);
+
+/// The most bytes one token may take in the streaming readers (N-Triples,
+/// N-Quads, Turtle, TriG): a literal's value, an IRI, a prefixed or
+/// blank-node name, a number, a language tag — and a whole N-Triples /
+/// N-Quads line. A longer one fails its statement (a tolerant import skips
+/// and logs it), after the readers held at most this much of it (review
+/// parser#5: an unterminated `"""` string, a newline-free string or IRI,
+/// or one long N-Quads line was buffered whole, the line six times over).
+/// [`DEFAULT_MAX_TOKEN_BYTES`] unless
+/// [`set_default_max_token_bytes`] changed it (`gserver` and `gbuild` set
+/// `[upload] rdf_max_token_size`); `usize::MAX` means no limit.
+pub fn default_max_token_bytes() -> usize {
+    MAX_TOKEN_BYTES.load(Ordering::Relaxed)
+}
+
+/// Set [`default_max_token_bytes`] for this process (`0` = no limit). It
+/// applies to the parses that start afterwards, through
+/// [`ImportOptions`](crate::parser::import::ImportOptions) created
+/// afterwards and the plain `parse_*` functions.
+pub fn set_default_max_token_bytes(bytes: usize) {
+    let bytes = if bytes == 0 { usize::MAX } else { bytes };
+    MAX_TOKEN_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+/// The error of a token longer than `max` bytes ([`default_max_token_bytes`]).
+pub fn token_too_long(line: usize, what: &str, max: usize) -> GStoreError {
+    GStoreError::RdfParse {
+        line,
+        msg: format!(
+            "{what} is longer than {max} bytes, the limit of one token \
+             ([upload] rdf_max_token_size)"
+        ),
+    }
+}
 
 /// Marks a lookahead entry decoded from an invalid UTF-8 sequence (the low
 /// bits hold its byte length).
@@ -85,6 +126,8 @@ pub struct CharSource<R> {
     line: usize,
     eof: bool,
     io_error: Option<io::Error>,
+    /// A character decoded from invalid UTF-8 was consumed (see
+    /// [`take_bad_utf8`](Self::take_bad_utf8)).
     bad_utf8: bool,
     /// Bytes of the characters consumed so far.
     consumed: u64,
@@ -127,10 +170,20 @@ impl<R: BufRead> CharSource<R> {
         self.io_error.take()
     }
 
-    /// Whether an invalid UTF-8 sequence was decoded (as U+FFFD) since the
-    /// last call; resets the flag.
+    /// Whether a character decoded from an invalid UTF-8 sequence (as
+    /// U+FFFD) was consumed ([`bump`](Self::bump)) since the last call;
+    /// resets the flag. Only consumed characters count, so a bad byte the
+    /// reader has merely looked ahead at is charged to the statement that
+    /// reads it, not to the one being finished (review parser#12).
     pub fn take_bad_utf8(&mut self) -> bool {
         std::mem::take(&mut self.bad_utf8)
+    }
+
+    /// Set the flag [`take_bad_utf8`](Self::take_bad_utf8) reports (to put
+    /// back one taken while a part of the input, a comment, was checked on
+    /// its own).
+    pub fn flag_bad_utf8(&mut self) {
+        self.bad_utf8 = true;
     }
 
     /// Decode one more character into the lookahead. `false` at the end of
@@ -162,7 +215,6 @@ impl<R: BufRead> CharSource<R> {
         let n = utf8_len(b0);
         if n == 0 {
             self.inner.consume(1);
-            self.bad_utf8 = true;
             self.look.push_back(('\u{FFFD}', 1 | BAD));
             return true;
         }
@@ -177,7 +229,6 @@ impl<R: BufRead> CharSource<R> {
                 }
                 None => {
                     self.inner.consume(1);
-                    self.bad_utf8 = true;
                     self.look.push_back(('\u{FFFD}', 1 | BAD));
                 }
             }
@@ -220,7 +271,6 @@ impl<R: BufRead> CharSource<R> {
         {
             Some(c) => self.look.push_back((c, n as u8)),
             None => {
-                self.bad_utf8 = true;
                 self.look.push_back(('\u{FFFD}', have.max(1) as u8 | BAD));
             }
         }
@@ -528,6 +578,14 @@ pub trait StatementSink {
     /// A statement that failed. `Err` stops the parse with that error
     /// (strict); `Ok` skips the statement and continues (tolerant).
     fn error(&mut self, err: SyntaxError) -> Result<()>;
+
+    /// The most bytes one token (and one N-Triples / N-Quads line) may take
+    /// (see [`default_max_token_bytes`]); readers ask once, when they
+    /// start. The bulk loaders' sink answers
+    /// [`ImportOptions::max_token_bytes`](crate::parser::import::ImportOptions).
+    fn max_token_bytes(&self) -> usize {
+        default_max_token_bytes()
+    }
 }
 
 /// A strict sink collecting every quad (the plain `parse_*` APIs).

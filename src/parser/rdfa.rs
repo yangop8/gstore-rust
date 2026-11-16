@@ -36,6 +36,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::rc::Rc;
 
 use crate::error::Result;
 use crate::model::{Term, Triple};
@@ -560,7 +561,10 @@ struct EvalContext {
     parent_subject: Term,
     parent_object: Option<Term>,
     vocab: Option<String>,
-    prefixes: HashMap<String, String>,
+    /// Shared by every element that declares no prefix of its own; one
+    /// that does adds a layer of its own over it ([`Prefixes`]; review
+    /// parser#7: each element used to copy the whole map).
+    prefixes: Rc<Prefixes>,
     lang: Option<String>,
     /// Incomplete triples awaiting a child subject: `(predicate, direction)`.
     incomplete: Vec<(Term, Dir)>,
@@ -573,7 +577,10 @@ impl EvalContext {
             base,
             parent_object: None,
             vocab: None,
-            prefixes: initial_prefixes(),
+            prefixes: Rc::new(Prefixes {
+                own: initial_prefixes(),
+                below: None,
+            }),
             lang: None,
             incomplete: Vec::new(),
         }
@@ -615,12 +622,12 @@ impl Extractor {
         let mut typed_resource: Option<Term> = None;
 
         // Local mutable context copies.
-        let mut prefixes = ctx.prefixes.clone();
         let mut vocab = ctx.vocab.clone();
         let mut lang = ctx.lang.clone();
         // `xml:base` (rare in RDFa) overrides the inherited base for this subtree.
+        // A relative one is resolved against the inherited base.
         let base = match el.attr("xml:base") {
-            Some(b) => b.to_string(),
+            Some(b) => resolve_iri(&ctx.base, b),
             None => ctx.base.clone(),
         };
 
@@ -633,15 +640,25 @@ impl Extractor {
             };
         }
 
-        // Step 3: prefix mappings from @prefix and xmlns:*.
+        // Step 3: prefix mappings from @prefix and xmlns:*, in a layer of
+        // this element's own over the inherited ones (shared, not copied).
+        let mut own_prefixes = HashMap::new();
         if let Some(p) = el.attr("prefix") {
-            parse_prefix_attr(p, &mut prefixes);
+            parse_prefix_attr(p, &mut own_prefixes);
         }
         for (k, v) in &el.attrs {
             if let Some(pfx) = k.strip_prefix("xmlns:") {
-                prefixes.insert(pfx.to_string(), v.clone());
+                own_prefixes.insert(pfx.to_string(), v.clone());
             }
         }
+        let prefixes = if own_prefixes.is_empty() {
+            Rc::clone(&ctx.prefixes)
+        } else {
+            Rc::new(Prefixes {
+                own: own_prefixes,
+                below: Some(Rc::clone(&ctx.prefixes)),
+            })
+        };
 
         // Step 4: language, through the shared language-tag rule
         // (`zh_CN` is `zh-CN`, `""` no language; anything else that is no
@@ -927,7 +944,31 @@ impl Extractor {
 struct LocalCtx<'a> {
     base: &'a str,
     vocab: &'a Option<String>,
-    prefixes: &'a HashMap<String, String>,
+    prefixes: &'a Prefixes,
+}
+
+/// The prefix mappings in scope, in layers: those an element declares
+/// (`prefix`, `xmlns:*`) over the layers of its ancestors, which are shared,
+/// not copied. A lookup walks the layers from the element's own, so an
+/// inner mapping hides an outer one. Only elements that declare a prefix
+/// add a layer, so there are at most as many as the tree is deep
+/// ([`MAX_TREE_DEPTH`]).
+#[derive(Default)]
+struct Prefixes {
+    own: HashMap<String, String>,
+    below: Option<Rc<Prefixes>>,
+}
+
+impl Prefixes {
+    fn get(&self, prefix: &str) -> Option<&String> {
+        let mut layer = self;
+        loop {
+            if let Some(ns) = layer.own.get(prefix) {
+                return Some(ns);
+            }
+            layer = layer.below.as_deref()?;
+        }
+    }
 }
 
 fn make_literal(value: &str, datatype: Option<String>, lang: &Option<String>) -> Term {
@@ -962,7 +1003,9 @@ fn parse_prefix_attr(s: &str, out: &mut HashMap<String, String>) {
 fn resolve_resource(value: &str, local: &LocalCtx) -> Option<Term> {
     let v = value.trim();
     if v.is_empty() {
-        return None;
+        // An empty IRI reference is the base itself (RFC 3986 §5.2: the
+        // document, without a fragment; review parser#4).
+        return Some(Term::Iri(resolve_iri(local.base, "")));
     }
     if let Some(inner) = v.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
         return resolve_curie(inner, local);
@@ -1050,51 +1093,14 @@ fn datatype_iri(value: &str, local: &LocalCtx) -> Option<String> {
 }
 
 fn is_absolute_iri(s: &str) -> bool {
-    match s.find(':') {
-        Some(i) => {
-            let scheme = &s[..i];
-            !scheme.is_empty()
-                && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-                && scheme
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
-        }
-        None => false,
-    }
+    crate::parser::iri::is_absolute(s)
 }
 
-/// Resolve a (possibly relative) IRI reference against `base` (practical subset).
+/// Resolve a (possibly relative) IRI reference against `base` with the
+/// shared RFC 3986 resolver of every reader ([`crate::parser::iri`]; review
+/// parser#4). Surrounding whitespace of the attribute value is ignored.
 fn resolve_iri(base: &str, reference: &str) -> String {
-    let reference = reference.trim();
-    if reference.is_empty() {
-        return base.to_string();
-    }
-    if is_absolute_iri(reference) {
-        return reference.to_string();
-    }
-    if base.is_empty() {
-        return reference.to_string();
-    }
-    if let Some(frag) = reference.strip_prefix('#') {
-        let stem = base.split('#').next().unwrap_or(base);
-        return format!("{stem}#{frag}");
-    }
-    if reference.starts_with('/') {
-        // Replace path from the authority onward (best-effort).
-        if let Some(scheme_end) = base.find("://") {
-            let after = &base[scheme_end + 3..];
-            let auth_end = after
-                .find('/')
-                .map(|i| scheme_end + 3 + i)
-                .unwrap_or(base.len());
-            return format!("{}{}", &base[..auth_end], reference);
-        }
-        return reference.to_string();
-    }
-    match base.rfind('/') {
-        Some(i) => format!("{}{}", &base[..=i], reference),
-        None => reference.to_string(),
-    }
+    crate::parser::iri::resolve(base, reference.trim())
 }
 
 /// The subset of RDFa 1.1 initial-context prefixes we predefine.
