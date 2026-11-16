@@ -1145,6 +1145,11 @@ pub(crate) fn run_accept_loop(
 /// connections waiting for its worker.
 const IDLE_POLL: Duration = Duration::from_millis(100);
 
+/// How long an idle kept-alive connection looks for a request on its way
+/// before it yields its worker to a waiting connection (see
+/// [`wait_for_request`]).
+const QUEUED_LOOK: Duration = Duration::from_millis(1);
+
 /// Longest accepted request line / header line, and most header lines.
 const MAX_HEADER_LINE: u64 = 64 * 1024;
 const MAX_HEADERS: usize = 256;
@@ -1605,11 +1610,17 @@ pub(crate) fn serve_connection<S: Read + Write>(
         if let Some(m) = hint_max {
             max_requests = max_requests.min(m.max(1));
         }
+        // While connections wait for a worker this response closes the
+        // connection — and says so — giving the worker up, instead of
+        // promising keep-alive and closing the idle connection a moment
+        // later, when the client may be sending its next request (review
+        // http#15). A next request already received is served first.
         let keep = ctl.is_some()
             && !idle.is_zero()
             && served < max_requests
             && wants_keep_alive(&req, info.http10)
-            && !life.stopping();
+            && !life.stopping()
+            && (env.waiting.load(Ordering::SeqCst) == 0 || !reader.buffer().is_empty());
         let meta = ConnMeta::new(
             keep,
             idle,
@@ -1722,10 +1733,15 @@ impl<S: Read> Read for Timed<'_, S> {
 
 /// Wait (at most `idle`) for the next request on a kept-alive connection.
 /// `false` — close the connection — on EOF, timeout, a shutdown, or when other
-/// connections are waiting for a worker (an idle connection yields its worker).
-/// `true` once the next request has begun: its first byte is readable, or —
-/// under TLS — bytes of the record carrying it have reached the socket (its
-/// head deadline then covers the rest of that record).
+/// connections are waiting for a worker (an idle connection yields its
+/// worker) — but only after a last short look ([`QUEUED_LOOK`]) finds
+/// nothing on its way: a request already in the socket, in the TLS layer's
+/// decrypted buffer or partly received is served, not reset by the close
+/// (review http#15; the response before promised keep-alive only while no
+/// connection waited, see `serve_connection`). `true` once the next request
+/// has begun: its first byte is readable, or — under TLS — bytes of the
+/// record carrying it have reached the socket (its head deadline then covers
+/// the rest of that record).
 fn wait_for_request<S: Read>(
     reader: &mut BufReader<S>,
     ctl: &TcpStream,
@@ -1739,14 +1755,15 @@ fn wait_for_request<S: Read>(
     let deadline = Instant::now() + idle;
     let arrived = socket_bytes();
     loop {
-        if life.stopping() || waiting.load(Ordering::SeqCst) > 0 {
+        if life.stopping() {
             return false;
         }
+        let queued = waiting.load(Ordering::SeqCst) > 0;
         let now = Instant::now();
         if now >= deadline {
             return false;
         }
-        let poll = (deadline - now).min(IDLE_POLL);
+        let poll = (deadline - now).min(if queued { QUEUED_LOOK } else { IDLE_POLL });
         let _ = ctl.set_read_timeout(Some(poll));
         // Bounds the whole poll, every socket read under TLS included, so a
         // record trickling in cannot keep this wait from its checks above.
@@ -1767,9 +1784,124 @@ fn wait_for_request<S: Read>(
                 if socket_bytes() != arrived {
                     return true; // part of a TLS record: the request has begun
                 }
+                if queued {
+                    return false; // nothing on its way: yield the worker
+                }
             }
             Err(_) => return false,
         }
+    }
+}
+
+#[cfg(test)]
+mod keep_alive_tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    /// A connected pair: (client, server side).
+    fn pair() -> (TcpStream, TcpStream) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let c = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let (s, _) = l.accept().unwrap();
+        (c, s)
+    }
+
+    /// review http#15: with a connection queued for a worker, an idle
+    /// kept-alive connection is yielded only if nothing is on its way — a
+    /// request already in the socket is served.
+    #[test]
+    fn a_queued_connection_does_not_drop_a_request_already_sent() {
+        let life = Lifecycle::new("127.0.0.1:9".parse().unwrap());
+        let waiting = AtomicUsize::new(1);
+        let (mut client, server) = pair();
+        client.write_all(b"GET /status HTTP/1.1\r\n\r\n").unwrap();
+        // The bytes are in the server's socket buffer (a blocking peek
+        // returns once they are).
+        let mut one = [0u8; 1];
+        assert_eq!(server.peek(&mut one).unwrap(), 1);
+        let ctl = server.try_clone().unwrap();
+        let mut reader = BufReader::new(server);
+        assert!(wait_for_request(
+            &mut reader,
+            &ctl,
+            &life,
+            Duration::from_secs(60),
+            &waiting
+        ));
+        assert!(reader.buffer().starts_with(b"GET /status"));
+
+        // Nothing on its way: yielded after the short look, not after the
+        // idle timeout (60 s here; the test's hang guard).
+        let (_quiet_client, quiet) = pair();
+        let ctl = quiet.try_clone().unwrap();
+        let mut reader = BufReader::new(quiet);
+        assert!(!wait_for_request(
+            &mut reader,
+            &ctl,
+            &life,
+            Duration::from_secs(60),
+            &waiting
+        ));
+    }
+
+    /// The response headers `serve_connection` writes for one request with
+    /// `waiting` connections queued for a worker.
+    fn response_with_waiting(waiting: usize) -> String {
+        let opts = HttpOptions::default();
+        let life = Lifecycle::new("127.0.0.1:9".parse().unwrap());
+        let env = ConnEnv {
+            life: Arc::clone(&life),
+            opts: Arc::new(opts.clone()),
+            ingest: Arc::new(crate::preauth::Ingest::new(&opts, None)),
+            waiting: Arc::new(AtomicUsize::new(waiting)),
+        };
+        let (mut client, server) = pair();
+        client
+            .write_all(b"GET /status HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(60)))
+            .unwrap();
+        let ctl = server.try_clone().unwrap();
+        let serving = thread::spawn(move || {
+            serve_connection(
+                &server,
+                Some(&ctl),
+                None,
+                life.enter(),
+                &env,
+                |s, _req, meta| {
+                    write_response_ext(s, 200, "text/plain", &meta.headers(&[]), b"ok")?;
+                    Ok(true)
+                },
+            );
+        });
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            assert_eq!(
+                client.read(&mut byte).unwrap(),
+                1,
+                "the response ended early"
+            );
+            head.push(byte[0]);
+        }
+        // Let the connection end (keep-alive: at its idle wait, by EOF).
+        drop(client);
+        serving.join().unwrap();
+        String::from_utf8(head).unwrap()
+    }
+
+    /// review http#15: while a connection waits for a worker, a response
+    /// does not promise keep-alive (the connection is closed after it, as
+    /// announced); otherwise it does.
+    #[test]
+    fn a_response_promises_keep_alive_only_while_no_connection_waits() {
+        let idle = response_with_waiting(0);
+        assert!(idle.contains("Connection: keep-alive"), "{idle}");
+        let busy = response_with_waiting(1);
+        assert!(busy.contains("Connection: close"), "{busy}");
+        assert!(!busy.contains("Keep-Alive"), "{busy}");
     }
 }
 
