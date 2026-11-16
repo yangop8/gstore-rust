@@ -6522,29 +6522,15 @@ fn unify(binding: &mut Binding, slot: &Slot, value: u32) -> bool {
 /// `rdf:langString`, the datatype of a language-tagged literal.
 const RDF_LANG_STRING: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString";
 
-/// RDF term equality, for `sameTerm`: a simple literal and the
-/// `xsd:string` literal of the same text are one term (RDF 1.1).
+/// RDF term equality, for `sameTerm`: the store's own term identity — the
+/// one BGP matching, joins, `DISTINCT` and `GROUP BY` use — so `sameTerm`
+/// never contradicts them. The store keeps a term as written: `"v"` and
+/// `"v"^^xsd:string` are two terms, and so are `"x"@en` and `"x"@EN`
+/// (language tags compare character by character, as RDF 1.1's term
+/// equality does; review sparqlconf#14). Folding them into one term would
+/// take a canonical encoding of stored keys (docs/REFACTOR_BACKLOG.md).
 fn same_term(a: &Term, b: &Term) -> bool {
-    match (a, b) {
-        (
-            Term::Literal {
-                value: va,
-                datatype: da,
-                lang: la,
-            },
-            Term::Literal {
-                value: vb,
-                datatype: db,
-                lang: lb,
-            },
-        ) => {
-            fn dt(d: &Option<String>) -> Option<&str> {
-                d.as_deref().filter(|d| *d != xsd::STRING)
-            }
-            va == vb && la == lb && dt(da) == dt(db)
-        }
-        _ => a == b,
-    }
+    a == b
 }
 
 /// Render a `SERVICE` inner pattern as a remote `SELECT * WHERE { … }` query

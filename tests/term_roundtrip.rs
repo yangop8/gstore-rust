@@ -824,3 +824,65 @@ fn result_serializers_render_cells_as_the_terms_they_are() {
     let cells = select_cells(&mut db, "SELECT ?s WHERE { ?s <http://ex/p> ?o }");
     assert_eq!(cells, vec![vec![Some("<http://ex/a>b>".to_string())]]);
 }
+
+// ---- sparqlconf#14: sameTerm agrees with the store's term identity -----------
+
+#[test]
+fn same_term_agrees_with_matching_joins_and_distinct() {
+    let mut db = Database::build_from_str(
+        "same",
+        "@prefix : <http://ex/> . @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\
+         :d :name \"Dave\"^^xsd:string . :e :name \"Dave\" . :e :label \"x\"@en . :f :label \"x\"@EN .",
+    )
+    .unwrap();
+    let rows = |db: &mut Database, q: &str| select_cells(db, q).len();
+    let ask = |db: &mut Database, q: &str| match db.query(q).unwrap() {
+        QueryResult::Ask(b) => b,
+        other => panic!("{other:?}"),
+    };
+    let x = "PREFIX : <http://ex/> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> ";
+    // The store keeps "Dave" and "Dave"^^xsd:string as two terms ...
+    assert_eq!(
+        rows(&mut db, &format!("{x} SELECT ?s {{ ?s :name \"Dave\" }}")),
+        1
+    );
+    assert_eq!(
+        rows(
+            &mut db,
+            &format!("{x} SELECT DISTINCT ?n {{ VALUES ?n {{ \"Dave\" \"Dave\"^^xsd:string }} }}")
+        ),
+        2
+    );
+    assert_eq!(
+        rows(
+            &mut db,
+            &format!("{x} SELECT ?a ?b {{ ?a :name ?n . ?b :name ?n }}")
+        ),
+        2
+    );
+    // ... and so does sameTerm, in a constant and over the joined data.
+    assert!(!ask(
+        &mut db,
+        &format!("{x} ASK {{ FILTER(sameTerm(\"abc\"^^xsd:string, \"abc\")) }}")
+    ));
+    assert_eq!(
+        rows(
+            &mut db,
+            &format!("{x} SELECT ?a ?b {{ ?a :name ?m . ?b :name ?n FILTER(sameTerm(?m, ?n)) }}")
+        ),
+        2
+    );
+    // Language tags: compared as written, as matching does.
+    assert_eq!(
+        rows(&mut db, &format!("{x} SELECT ?s {{ ?s :label \"x\"@en }}")),
+        1
+    );
+    assert!(!ask(
+        &mut db,
+        &format!("{x} ASK {{ FILTER(sameTerm(\"x\"@en, \"x\"@EN)) }}")
+    ));
+    assert!(ask(
+        &mut db,
+        &format!("{x} ASK {{ FILTER(sameTerm(\"x\"@en, \"x\"@en)) }}")
+    ));
+}
