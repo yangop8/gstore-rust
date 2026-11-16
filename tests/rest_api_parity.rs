@@ -155,11 +155,15 @@ struct Srv {
 
 impl Srv {
     fn start(tag: &str) -> Srv {
+        Srv::start_with(tag, |s| s)
+    }
+
+    fn start_with(tag: &str, f: impl FnOnce(ApiServer) -> ApiServer) -> Srv {
         let root = TmpDir::new(tag);
         let server = ApiServer::bind(&root.0, "root", "127.0.0.1:0")
             .expect("bind")
             .with_shutdown_grace(Duration::from_millis(100));
-        let server = Arc::new(server);
+        let server = Arc::new(f(server));
         let addr = server.local_addr().unwrap();
         let s2 = Arc::clone(&server);
         let serving = Some(thread::spawn(move || s2.serve_forever()));
@@ -404,7 +408,33 @@ fn export_writes_every_quad_on_both_surfaces() {
 fn export_in_a_transaction_writes_the_committed_state() {
     let srv = Srv::start("exptxn");
     with_named_graph(&srv, "txndb");
-    let begin = srv.ok("POST", "/begin?db_name=txndb", "");
+    export_in_a_transaction(&srv, "txndb");
+}
+
+/// The same for an on-disk database served in Stream mode, whose
+/// transaction reads a view of the store's committed pages
+/// (`SnapStore::Disk`) rather than an in-memory copy.
+#[test]
+fn export_in_a_transaction_of_a_stream_mode_disk_database_writes_the_committed_state() {
+    let srv = Srv::start_with("exptxndisk", |s| {
+        s.with_open_options(gstore::db::OpenOptions {
+            disk_query_mode: gstore::db::DiskQueryMode::Stream,
+            ..gstore::db::OpenOptions::default()
+        })
+    });
+    srv.ok("POST", "/build?db_name=dtxn&layout=disk", DATA);
+    srv.ok(
+        "POST",
+        "/update?db_name=dtxn",
+        "INSERT DATA { GRAPH <http://ex/g1> { <http://ex/x> <http://ex/p> <http://ex/y> } }",
+    );
+    export_in_a_transaction(&srv, "dtxn");
+}
+
+/// REST `/export` of `db` (two default-graph triples and [`NAMED`]) while a
+/// transaction that wrote to another graph is open, then after its commit.
+fn export_in_a_transaction(srv: &Srv, db: &str) {
+    let begin = srv.ok("POST", &format!("/begin?db_name={db}"), "");
     let tid = begin
         .json()
         .get("TID")
@@ -415,7 +445,7 @@ fn export_in_a_transaction_writes_the_committed_state() {
         &format!("/tquery?tid={tid}"),
         "INSERT DATA { GRAPH <http://ex/g2> { <http://ex/u> <http://ex/p> <http://ex/v> } }",
     );
-    let rest = srv.ok("GET", "/export?db_name=txndb", "");
+    let rest = srv.ok("GET", &format!("/export?db_name={db}"), "");
     let got = lines(&rest.body);
     assert!(got.contains(NAMED), "{}", rest.body);
     assert!(
@@ -425,10 +455,10 @@ fn export_in_a_transaction_writes_the_committed_state() {
     );
     assert_eq!(got.len(), 3, "{}", rest.body);
     // `/api` refuses while the transaction is open (upstream).
-    let j = srv.api(&[("operation", "export"), ("db_name", "txndb")]);
+    let j = srv.api(&[("operation", "export"), ("db_name", db)]);
     assert_eq!(code(&j), 1004, "{j}");
     srv.ok("POST", &format!("/commit?tid={tid}"), "");
-    let rest = srv.ok("GET", "/export?db_name=txndb", "");
+    let rest = srv.ok("GET", &format!("/export?db_name={db}"), "");
     assert!(rest.body.contains("<http://ex/g2> ."), "{}", rest.body);
 }
 
