@@ -1617,6 +1617,13 @@ pub(crate) enum OpErrorKind {
     /// failed part-way and whose applied part could not be saved) — REST
     /// `500`, `/api` `1005`; the message starts with [`NOT_DURABLE`].
     Persist,
+    /// The statement ran past `query_timeout` and was stopped (review
+    /// sec#10) — REST `503` (the SPARQL Protocol's refused query) with a
+    /// `{"error":…}` body, `/api` `1005`.
+    Timeout,
+    /// The serialized answer passed `max_result_bytes` (review sec#10) —
+    /// REST `503` with a `{"error":…}` body, `/api` `1005`.
+    ResultTooLarge,
 }
 
 impl OpError {
@@ -1634,6 +1641,7 @@ impl OpError {
             OpErrorKind::TxnEnded | OpErrorKind::Conflict => 409,
             OpErrorKind::NotOwner => 403,
             OpErrorKind::ShuttingDown => 503,
+            OpErrorKind::Timeout | OpErrorKind::ResultTooLarge => 503,
             OpErrorKind::Query => 400,
             OpErrorKind::Failed | OpErrorKind::Persist => 500,
         }
@@ -1643,10 +1651,24 @@ impl OpError {
     /// failed SPARQL statement the SPARQL endpoints' `{"error":…}` body.
     fn rest(&self) -> Resp {
         match self.kind {
-            OpErrorKind::Query => Resp::new(400, SPARQL_JSON, err_json(&self.msg)),
+            OpErrorKind::Query | OpErrorKind::Timeout | OpErrorKind::ResultTooLarge => {
+                Resp::new(self.http(), SPARQL_JSON, err_json(&self.msg))
+            }
             _ => Resp::fail(self.http(), &self.msg),
         }
     }
+}
+
+/// The [`OpErrorKind::Timeout`] error of a job whose deadline `d` stopped it
+/// (`e`: what the stopped job reported — for an UPDATE stopped part-way,
+/// which operations stayed applied).
+fn timed_out_err(e: OpError, d: &crate::deadline::Deadline) -> OpError {
+    let msg = if e.msg.contains("applied") {
+        format!("{} ({})", d.message(), e.msg)
+    } else {
+        d.message()
+    };
+    OpError::new(OpErrorKind::Timeout, msg)
 }
 
 /// What a [`QueryJob`] produced.
@@ -3145,19 +3167,32 @@ impl ApiInner {
             }) => Some(OpError::new(OpErrorKind::Persist, w.clone())),
             _ => None,
         };
+        // A read is rendered before it is logged: an answer over the result
+        // byte budget is logged as the failure it is answered as.
+        let rendered = match &out {
+            Ok(JobOutput::Read(result)) => Some(render_result_within(
+                fmt,
+                result,
+                self.config().max_result_bytes,
+            )),
+            _ => None,
+        };
         qlog.finish(
             self,
-            match (&out, &not_durable) {
-                (_, Some(e)) => Err(e),
-                (Ok(JobOutput::Read(result)), None) => Ok(answer_count(result)),
-                (Ok(JobOutput::Updated { changed, .. }), None) => Ok(*changed),
-                (Err(e), None) => Err(e),
+            match (&out, &not_durable, &rendered) {
+                (_, Some(e), _) => Err(e),
+                (_, None, Some(Err(e))) => Err(e),
+                (Ok(JobOutput::Read(result)), None, _) => Ok(answer_count(result)),
+                (Ok(JobOutput::Updated { changed, .. }), None, _) => Ok(*changed),
+                (Err(e), None, _) => Err(e),
             },
         );
-        match out {
-            Ok(JobOutput::Read(result)) => render_result(fmt, &result),
-            Ok(JobOutput::Updated { changed, warning }) => update_resp(changed, &warning),
-            Err(e) => e.rest(),
+        match (out, rendered) {
+            (_, Some(Ok(resp))) => resp,
+            (_, Some(Err(e))) => e.rest(),
+            (Ok(JobOutput::Updated { changed, warning }), None) => update_resp(changed, &warning),
+            (Ok(JobOutput::Read(result)), None) => render_result(fmt, &result),
+            (Err(e), None) => e.rest(),
         }
     }
 
@@ -3171,11 +3206,25 @@ impl ApiInner {
     /// (released from the db lock first, so it does not stall the owner's
     /// `/tquery`s). A write that changed data marks the database dirty and is
     /// saved before the lock is released under the check_point policy.
+    ///
+    /// The statement runs under `query_timeout` (review sec#10, robust#5): a
+    /// deadline raises the job's cancel flag — the one `/cancel` raises —
+    /// once its time is up, the evaluator stops at its next cancellation
+    /// check and releases the database (a writer queued behind a runaway
+    /// read is no longer blocked for good), and the job fails as
+    /// [`OpErrorKind::Timeout`].
     pub(crate) fn run_query_job(&self, job: QueryJob) -> Result<JobOutput, OpError> {
         // Ends the task (also on a panic) once the job — and so its db lock —
         // is done.
         let mut task = TaskGuard::new(self, job.task_id);
+        let deadline = crate::deadline::arm(&job.cancel, self.config().query_timeout);
         let out = self.run_query_job_locked(job);
+        let out = match (out, &deadline) {
+            (Err(e), Some(d)) if d.fired() && e.kind != OpErrorKind::Persist => {
+                Err(timed_out_err(e, d))
+            }
+            (out, _) => out,
+        };
         task.set_ok(out.is_ok());
         out
     }
@@ -6259,22 +6308,111 @@ fn lockout_refused(wait: Duration) -> Resp {
     r
 }
 
+/// The message of an answer larger than `max_result_bytes` (`limit`).
+pub(crate) fn result_too_large_msg(limit: u64) -> String {
+    format!(
+        "result too large: the answer exceeds max_result_bytes ({limit} bytes); ask for less \
+         (project fewer variables, add a LIMIT and page with OFFSET) or raise max_result_bytes"
+    )
+}
+
+/// A [`Write`] adapter that counts the bytes it passes on and fails the
+/// write that would take them past `limit` (`0`: no limit) — the result
+/// byte budget (`max_result_bytes`, review sec#10). Serialization stops at
+/// that write, so no more than `limit` bytes of an oversized answer are
+/// ever produced; [`exceeded`](Self::exceeded) tells the failure from an
+/// I/O error of `inner`. Used around every result serializer of both
+/// servers (REST answers here, the single-database server's buffered and
+/// streamed ones).
+pub(crate) struct CountingWriter<W> {
+    inner: W,
+    written: u64,
+    limit: u64,
+    exceeded: bool,
+}
+
+impl<W: Write> CountingWriter<W> {
+    /// Count what goes to `inner`, at most `limit` bytes (`0`: no limit).
+    pub(crate) fn new(inner: W, limit: u64) -> CountingWriter<W> {
+        CountingWriter {
+            inner,
+            written: 0,
+            limit,
+            exceeded: false,
+        }
+    }
+
+    /// Whether a write was refused for passing the limit.
+    pub(crate) fn exceeded(&self) -> bool {
+        self.exceeded
+    }
+
+    /// The wrapped writer.
+    pub(crate) fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.limit != 0 && self.written.saturating_add(buf.len() as u64) > self.limit {
+            self.exceeded = true;
+            return Err(std::io::Error::other(result_too_large_msg(self.limit)));
+        }
+        let n = self.inner.write(buf)?;
+        self.written += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Write `triples` as N-Triples ([`ntriples_body`], a slice at a time) to
+/// `out`, stopping at the first failed write (a [`CountingWriter`]'s budget).
+pub(crate) fn write_ntriples<W: Write>(
+    triples: &[crate::model::Triple],
+    out: &mut W,
+) -> std::io::Result<()> {
+    for chunk in triples.chunks(256) {
+        out.write_all(&ntriples_body(chunk))?;
+    }
+    Ok(())
+}
+
 /// Render a [`QueryResult`] into an HTTP response using the negotiated format.
 fn render_result(fmt: ResultFormat, result: &QueryResult) -> Resp {
-    match result {
-        QueryResult::Select(rs) => {
-            let mut buf = Vec::new();
-            let _ = sparql_results::write_select(fmt, rs, &mut buf);
-            Resp::new(200, fmt.content_type(), buf)
-        }
-        QueryResult::Ask(b) => {
-            let mut buf = Vec::new();
-            let _ = sparql_results::write_ask(fmt, *b, &mut buf);
-            Resp::new(200, fmt.content_type(), buf)
-        }
-        QueryResult::Construct(ts) => Resp::new(200, "application/n-triples", ntriples_body(ts)),
-        QueryResult::Update { changed } => update_resp(*changed, &None),
+    render_result_within(fmt, result, 0).unwrap_or_else(|e| e.rest())
+}
+
+/// [`render_result`] within the result byte budget `limit`
+/// (`max_result_bytes`; `0`: none): an answer that would pass it is
+/// [`OpErrorKind::ResultTooLarge`], found as soon as its serialization
+/// passes the budget (a [`CountingWriter`]), never after the whole of it.
+fn render_result_within(
+    fmt: ResultFormat,
+    result: &QueryResult,
+    limit: u64,
+) -> Result<Resp, OpError> {
+    let too_large = || OpError::new(OpErrorKind::ResultTooLarge, result_too_large_msg(limit));
+    let mut out = CountingWriter::new(Vec::new(), limit);
+    let (ctype, written) = match result {
+        QueryResult::Select(rs) => (
+            fmt.content_type(),
+            sparql_results::write_select(fmt, rs, &mut out),
+        ),
+        QueryResult::Ask(b) => (
+            fmt.content_type(),
+            sparql_results::write_ask(fmt, *b, &mut out),
+        ),
+        QueryResult::Construct(ts) => ("application/n-triples", write_ntriples(ts, &mut out)),
+        QueryResult::Update { changed } => return Ok(update_resp(*changed, &None)),
+    };
+    if written.is_err() && out.exceeded() {
+        return Err(too_large());
     }
+    Ok(Resp::new(200, ctype, out.into_inner()))
 }
 
 /// The error message of an UPDATE that failed after applying part of its
@@ -6502,6 +6640,41 @@ fn new_system_password() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// review sec#10: the result byte budget stops a serializer at the
+    /// write that passes it — an oversized answer is never produced whole.
+    #[test]
+    fn the_counting_writer_stops_an_oversized_answer_at_the_budget() {
+        let mut rs = crate::query::ResultSet::new(vec!["s".to_string()]);
+        for i in 0..10_000 {
+            rs.rows.push(vec![Some(format!("<http://ex/{i}>"))]);
+        }
+        let mut whole = Vec::new();
+        sparql_results::write_select(ResultFormat::Json, &rs, &mut whole).unwrap();
+        assert!(whole.len() > 200_000);
+        let mut out = CountingWriter::new(Vec::new(), 4096);
+        let r = sparql_results::write_select(ResultFormat::Json, &rs, &mut out);
+        assert!(r.is_err() && out.exceeded());
+        assert!(out.into_inner().len() <= 4096, "no more than the budget");
+        // Within the budget (or with none) the bytes are those of the answer.
+        let mut out = CountingWriter::new(Vec::new(), 0);
+        sparql_results::write_select(ResultFormat::Json, &rs, &mut out).unwrap();
+        assert!(!out.exceeded());
+        assert_eq!(out.into_inner(), whole);
+        let small = QueryResult::Ask(true);
+        assert_eq!(
+            render_result_within(ResultFormat::Json, &small, 4096)
+                .unwrap()
+                .status,
+            200
+        );
+        let big = QueryResult::Select(rs);
+        let Err(e) = render_result_within(ResultFormat::Json, &big, 4096) else {
+            panic!("an oversized answer was rendered");
+        };
+        assert_eq!(e.kind, OpErrorKind::ResultTooLarge);
+        assert_eq!(e.rest().status, 503);
+    }
 
     #[test]
     fn detects_update_statements() {

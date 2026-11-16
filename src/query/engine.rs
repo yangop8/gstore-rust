@@ -2174,6 +2174,12 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         reverse: bool,
     ) -> std::collections::HashSet<u32> {
         let mut out = std::collections::HashSet::new();
+        // Cooperative cancellation (a deadline or `/cancel`): a path over
+        // every node, or a closure, can run long (review robust#5); the
+        // Result-returning caller turns the cut-short set into Cancelled.
+        if self.cancelled() {
+            return out;
+        }
         match path {
             PathExpr::Pred(iri) => {
                 if let Some(pid) = self.path_pred_id(iri) {
@@ -2189,6 +2195,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 // forward: a then b; reverse: b then a (with reverse traversal).
                 let (first, second) = if reverse { (b, a) } else { (a, b) };
                 for mid in self.path_reach(first, start, reverse) {
+                    if self.cancelled() {
+                        break;
+                    }
                     out.extend(self.path_reach(second, mid, reverse));
                 }
             }
@@ -2247,6 +2256,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             visited.insert(start);
         }
         while let Some(n) = frontier.pop() {
+            // One cancellation check per frontier step (review robust#5).
+            if self.cancelled() {
+                return;
+            }
             for next in self.path_reach(inner, n, reverse) {
                 if visited.insert(next) {
                     out.insert(next);
@@ -2638,6 +2651,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             .and_then(|i| parts[i].take())
             .unwrap_or_default();
         for pick in order {
+            // Cooperative cancellation between the joins (review robust#5).
+            if self.cancelled() {
+                return Vec::new();
+            }
             let (rb, rv) = parts[pick].take().unwrap_or_default();
             acc = join_sets(&acc, &acc_vars, &rb, &rv);
             for v in rv {
@@ -2698,7 +2715,12 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             }
             let plan = &plans[pi];
             let mut next = Vec::new();
-            for binding in &solutions {
+            for (i, binding) in solutions.iter().enumerate() {
+                // ... and once per batch of bindings within one pattern, so
+                // one huge step (a cross product) stops too (review robust#5).
+                if i % 64 == 63 && self.cancelled() {
+                    return Vec::new();
+                }
                 self.extend(binding, plan, &candidates, &mut next);
             }
             solutions = next;
@@ -3310,7 +3332,16 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         // The subject's / object's candidate sets, looked up once per call.
         let s_cands = slot_candidates(&plan.s, cands);
         let o_cands = slot_candidates(&plan.o, cands);
-        for (s, p, o) in self.candidate_triples_in(binding, plan, s_cands, o_cands) {
+        for (i, (s, p, o)) in self
+            .candidate_triples_in(binding, plan, s_cands, o_cands)
+            .into_iter()
+            .enumerate()
+        {
+            // Cooperative cancellation once per batch of candidates (review
+            // robust#5): the caller turns the cut-short output into Cancelled.
+            if i % 1024 == 1023 && self.cancelled() {
+                break;
+            }
             // VS-tree filter: an entity variable's value must be a candidate.
             if !in_candidates(s_cands, s) || !in_candidates(o_cands, o) {
                 continue;

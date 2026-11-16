@@ -30,6 +30,8 @@ pub mod concurrent;
 pub mod config;
 // `gconsole`: the interactive console, a client of gserver's `/api`.
 pub mod console;
+// Query deadlines: the timer behind `query_timeout`.
+pub mod deadline;
 pub mod dict;
 pub mod error;
 // The upstream-compatible gStore `/api` operation layer (see `docs/GAP_PLAN.md` §2).

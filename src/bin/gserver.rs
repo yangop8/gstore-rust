@@ -1242,6 +1242,8 @@ fn serve(cli: &Cli, cfg: &GStoreConfig, target: &Target, supervisor: u32) -> u8 
                     .with_load_policy(load_policy)
                     .with_query_settings(cfg.query_settings())
                     .with_http_options(cfg.http_options())
+                    .with_query_timeout(cfg.query_timeout)
+                    .with_max_result_bytes(cfg.max_result_bytes)
                     .with_db_dir(dir),
                 Err(e) => {
                     gs_error!("failed to bind {}:{}: {e}", cfg.listen_addr, cfg.port);
