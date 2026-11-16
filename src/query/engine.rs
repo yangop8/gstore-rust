@@ -218,6 +218,12 @@ mod topk;
 use topk::PreparedBgp;
 pub use topk::{DpbMode, EvalStats, TopKOptions};
 
+// The hash index of OPTIONAL, MINUS and the joins over maybe-unbound
+// variables, shared by both executors (review sparqlconf#2 / query#10).
+#[path = "probe.rs"]
+mod probe;
+use probe::RowIndex;
+
 /// `xsd:dateTime`, the datatype produced by `NOW()`.
 const XSD_DATETIME: &str = "http://www.w3.org/2001/XMLSchema#dateTime";
 /// `xsd:dayTimeDuration`, the datatype produced by `TIMEZONE()`.
@@ -1385,38 +1391,48 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                         }
                     }
                 }
-                // SPARQL evaluates ORDER BY over the *pre-projection* solution
-                // sequence, so it may sort by a pattern variable that is not selected
-                // (e.g. `SELECT ?x … ORDER BY DESC(?sal)`), or by a SELECT-clause
-                // alias. Extend the layout + bindings with the aliases, sort, then
-                // project — a stable sort preserves the resulting order.
-                if !q.order_by.is_empty() {
-                    if let Projection::Items(items) = &q.projection {
-                        for it in items {
-                            if let SelectItem::Expr(e, alias) = it {
-                                if !layout.index.contains_key(alias) {
-                                    let idx = layout.names.len();
-                                    layout.index.insert(alias.clone(), idx);
-                                    layout.names.push(alias.clone());
-                                    layout.is_pred.push(false);
-                                    for b in solutions.iter_mut() {
-                                        // The column exists (unbound) while its
-                                        // expression is evaluated, so a reference
-                                        // to the alias itself reads unbound
-                                        // instead of indexing past the end — as
-                                        // the Top-K path (`order_extend`) does.
-                                        b.push(None);
-                                        b[idx] = self.eval_id(e, b, &layout);
-                                    }
+                // The SELECT expressions extend the solutions left to right
+                // (SPARQL 1.1 §18.2.4.4): each becomes a column under its
+                // alias, evaluated once, seeing the aliases before it and
+                // only those — with or without ORDER BY (review query#6 /
+                // sparqlconf#6: without ORDER BY an expression could not see
+                // an earlier alias, with it every expression was evaluated
+                // again at projection, seeing later aliases too). An alias
+                // that is already a WHERE variable gets no column and is
+                // evaluated at projection, as before.
+                let where_len = layout.names.len();
+                if let Projection::Items(items) = &q.projection {
+                    for it in items {
+                        if let SelectItem::Expr(e, alias) = it {
+                            if !layout.index.contains_key(alias) {
+                                let idx = layout.names.len();
+                                layout.index.insert(alias.clone(), idx);
+                                layout.names.push(alias.clone());
+                                layout.is_pred.push(false);
+                                for b in solutions.iter_mut() {
+                                    // The column exists (unbound) while its
+                                    // expression is evaluated, so a reference
+                                    // to the alias itself reads unbound
+                                    // instead of indexing past the end — as
+                                    // the Top-K path (`order_extend`) does.
+                                    b.push(None);
+                                    b[idx] = self.eval_id(e, b, &layout);
                                 }
                             }
                         }
                     }
+                }
+                // SPARQL evaluates ORDER BY over the *pre-projection* solution
+                // sequence, so it may sort by a pattern variable that is not selected
+                // (e.g. `SELECT ?x … ORDER BY DESC(?sal)`), or by a SELECT-clause
+                // alias: sort the extended solutions, then project — a stable
+                // sort preserves the resulting order.
+                if !q.order_by.is_empty() {
                     self.sort_solutions(&mut solutions, &q.order_by, &layout);
                 }
                 solutions
                     .iter()
-                    .map(|b| self.project_items(b, &layout, q, &result_vars))
+                    .map(|b| self.project_items(b, &layout, where_len, q, &result_vars))
                     .collect::<Result<Vec<_>>>()?
             };
 
@@ -1534,10 +1550,19 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     }
 
     /// Project a single solution into result-variable order (no aggregation).
+    ///
+    /// `b` / `layout` hold the WHERE variables in their first `where_len`
+    /// columns, then the SELECT-expression columns the caller added (see
+    /// `eval_select_solutions`, and `OrderCtx` / `order_extend` in the
+    /// streaming executor): an expression item reads its column — so each
+    /// expression is evaluated once per solution, left to right — and only
+    /// one whose alias is a WHERE variable (no column of its own) is
+    /// evaluated here.
     fn project_items(
         &self,
         b: &Binding,
         layout: &VarLayout,
+        where_len: usize,
         q: &SelectQuery,
         result_vars: &[String],
     ) -> Result<Vec<Option<u32>>> {
@@ -1555,7 +1580,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     SelectItem::Expr(Expr::GraphFn { .. } | Expr::Pfn { .. }, alias) => {
                         Ok(layout.index.get(alias).and_then(|&i| b[i]))
                     }
-                    SelectItem::Expr(e, _) => Ok(self.eval_id(e, b, layout)),
+                    SelectItem::Expr(e, alias) => match layout.index.get(alias) {
+                        Some(&i) if i >= where_len && i < b.len() => Ok(b[i]),
+                        _ => Ok(self.eval_id(e, b, layout)),
+                    },
                 })
                 .collect(),
         }
@@ -2540,10 +2568,13 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// decoded into bindings over this query's [`VarLayout`] (each returned term
     /// interned via the shared dictionary/extras so it joins with outer
     /// solutions). On any failure (variable endpoint, unserializable inner
-    /// pattern, connection or parse error) a non-`SILENT` service yields no
-    /// solutions, while a `SILENT` one yields the single identity solution so the
+    /// pattern, connection, HTTP or parse error) a non-`SILENT` service is
+    /// the query's error, naming the endpoint and the cause (SPARQL 1.1
+    /// Federated Query §4; review robust#6 / tests-b#2 / sec#17: it used to
+    /// yield no solutions, so the query answered as if the endpoint had no
+    /// data), while a `SILENT` one yields the single identity solution so the
     /// outer query still returns. A refusal by policy is the query's error
-    /// instead, `SILENT` or not: `SERVICE` denied altogether, or an endpoint
+    /// too, `SILENT` or not: `SERVICE` denied altogether, or an endpoint
     /// at a host-local address under [`ServicePolicy::RemoteHosts`](crate::db::ServicePolicy::RemoteHosts).
     fn eval_service(
         &self,
@@ -2552,16 +2583,28 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         inner: &GraphPattern,
         layout: &VarLayout,
     ) -> Vec<Binding> {
-        // The identity solution: one all-unbound row (preserves outer bindings
-        // under a join). Returned for SILENT failures.
-        let identity = || vec![vec![None; layout.len()]];
-        let fail = |silent: bool| -> Vec<Binding> {
+        // A failure: under SILENT the identity solution, one all-unbound row
+        // (preserves outer bindings under a join); otherwise the query's
+        // error (see `failed`, reported by `check_cancel`), carrying `why`.
+        let fail = |silent: bool, why: String| -> Vec<Binding> {
             if silent {
-                identity()
-            } else {
-                Vec::new()
+                return vec![vec![None; layout.len()]];
             }
+            let mut failed = self.failed.borrow_mut();
+            if failed.is_none() {
+                *failed = Some(GStoreError::Query(why));
+            }
+            Vec::new()
         };
+
+        // A query that an earlier failure (or a cancel) already doomed
+        // contacts no further endpoint: an `EXISTS` evaluated per solution
+        // (in a projection, BIND or ORDER BY, where no FILTER loop polls the
+        // failure) would otherwise repeat a request already known to fail
+        // once per solution, each up to the client's timeouts.
+        if self.cancelled() {
+            return Vec::new();
+        }
 
         // Refused outright when this evaluator may not contact remote
         // endpoints (reported as an error by `check_cancel`).
@@ -2578,12 +2621,26 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         // be resolved without per-solution evaluation (uncommon — see backlog).
         let url = match endpoint {
             ServiceRef::Iri(iri) => iri.as_str(),
-            ServiceRef::Var(_) => return fail(silent),
+            ServiceRef::Var(v) => {
+                return fail(
+                    silent,
+                    format!(
+                        "SERVICE ?{v}: a variable endpoint is not supported (name the endpoint's \
+                         IRI, or use SERVICE SILENT to skip it)"
+                    ),
+                )
+            }
         };
 
         // Serialize the inner pattern to a remote SELECT query.
         let Some(query) = serialize_service_query(inner) else {
-            return fail(silent);
+            return fail(
+                silent,
+                format!(
+                    "SERVICE <{url}>: the pattern cannot be sent to the endpoint (only triple \
+                     patterns, groups and UNION can; use SERVICE SILENT to skip it)"
+                ),
+            );
         };
 
         // Fetch + parse the remote SPARQL-results JSON (depth-limited: a
@@ -2609,7 +2666,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 }
                 return Vec::new();
             }
-            Err(_) => return fail(silent),
+            Err(e) => return fail(silent, format!("SERVICE <{url}>: {e}")),
         };
 
         // Map each returned solution into this query's layout. Variables the
@@ -2696,8 +2753,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 for (&gid, gstore) in named {
                     let sub = self.graph_sub_evaluator(gstore, named);
                     for mut b in sub.eval_pattern(inner, layout) {
-                        b[vi] = Some(gid);
-                        out.push(b);
+                        if self.graph_name_agrees(b[vi], gid, layout.is_pred[vi]) {
+                            b[vi] = Some(gid);
+                            out.push(b);
+                        }
                     }
                 }
                 out
@@ -2705,9 +2764,37 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         }
     }
 
+    /// `Graph(?g, P)` joins the graph name with P's solutions (SPARQL 1.1
+    /// §18.5): a solution of P that binds `?g` itself — `?g` used inside the
+    /// graph pattern — is kept only when it binds it to this graph, `gid`
+    /// (review query#3 / sparqlconf#1: the binding was overwritten, so
+    /// `GRAPH ?g { ?g :created ?t }` returned every subject's row and an
+    /// `INSERT … WHERE` wrote them). Compared in the entity space: equal
+    /// dictionary ids are the same term; a computed (synthetic) id or a
+    /// predicate-space slot is compared by its term.
+    fn graph_name_agrees(&self, bound: Option<u32>, gid: u32, is_pred: bool) -> bool {
+        match bound {
+            None => true,
+            Some(id) if id == gid && !is_pred => true,
+            Some(id) if is_pred || is_synth(id) => match self.id_to_term(id, is_pred) {
+                Some(t) => self.id_to_term(gid, false).as_ref() == Some(&t),
+                None => false,
+            },
+            Some(_) => false,
+        }
+    }
+
     /// OPTIONAL (left outer join). For each left solution, keep all compatible
     /// right solutions (after applying the OPTIONAL's inner FILTERs to the
     /// merged binding); if none, keep the left solution unextended.
+    ///
+    /// A hash join: the right solutions are indexed on the variables the
+    /// right pattern shares with what the left solutions bind ([`RowIndex`],
+    /// also when some solutions leave them unbound), so each left solution
+    /// meets only its compatible right solutions — not every one of them
+    /// (review sparqlconf#2: quadratic, 12-16 s for 20,000 x 10,000 rows).
+    /// Cancellation is polled between left solutions. The output order is
+    /// unchanged: left-major, right-minor.
     fn eval_left_join(
         &self,
         left: Vec<Binding>,
@@ -2716,14 +2803,22 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         filters: &[Expr],
         layout: &VarLayout,
     ) -> Vec<Binding> {
-        let lvars: Vec<usize> = (0..layout.len()).collect();
-        let rvars = pattern_vars(b_pat, layout);
-        let _ = &lvars; // left may bind anything; merge handles compatibility
+        // The right pattern's variables some left solution binds (any other
+        // one is compatible with every left solution).
+        let shared: Vec<usize> = pattern_vars(b_pat, layout)
+            .into_iter()
+            .filter(|&v| left.iter().any(|l| l[v].is_some()))
+            .collect();
+        let index = RowIndex::new(&right, &shared);
         let mut out = Vec::new();
         for l in &left {
+            if self.cancelled() {
+                // Reported by the caller's `check_cancel`.
+                return Vec::new();
+            }
             let mut matched = false;
-            for r in &right {
-                if let Some(m) = merge_bindings(l, r) {
+            let _ = index.for_each_candidate(&right, l, |ri| {
+                if let Some(m) = merge_bindings(l, &right[ri]) {
                     if filters
                         .iter()
                         .all(|f| self.eval_ebv(f, &m, layout) == Some(true))
@@ -2732,12 +2827,12 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                         matched = true;
                     }
                 }
-            }
+                ControlFlow::<()>::Continue(())
+            });
             if !matched {
                 out.push(l.clone());
             }
         }
-        let _ = rvars;
         out
     }
 
@@ -4016,9 +4111,16 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     }
 
     /// `EXISTS { pat }` / `NOT EXISTS { pat }`: true iff `pat` has at least one
-    /// solution compatible with the current binding `b`. We substitute `b`'s
-    /// bound variables into `pat` as constants (so inner FILTER/BIND that
-    /// reference outer variables see their values), then test non-emptiness.
+    /// solution compatible with the current binding `b` (SPARQL 1.1 §18.6).
+    /// `b`'s bound variables are substituted into `pat` as constants, so
+    /// inner triple patterns, paths, FILTERs and BINDs see their values. A
+    /// variable the substituted pattern still binds — a `VALUES` block's, a
+    /// sub-SELECT's projected one, a BIND target, a graph name bound to a
+    /// blank node — is joined with `b` instead: only a solution that binds it
+    /// to `b`'s value (or leaves it unbound) counts (review query#4: such
+    /// solutions counted whatever they bound, so `FILTER EXISTS { VALUES ?s
+    /// { :a } }` held for every ?s). A sub-SELECT's own variables stay its
+    /// own; only its projection meets `b`.
     fn eval_exists(
         &self,
         negated: bool,
@@ -4028,8 +4130,51 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     ) -> bool {
         let bound = self.subst_pattern(pat, b, outer);
         let layout = VarLayout::build(&bound);
-        let found = self.pattern_has_solution(&bound, &layout);
+        // (inner slot, outer slot) of each variable `b` binds that the
+        // substituted pattern can still bind.
+        let shared: Vec<(usize, usize)> = layout
+            .names
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| !name.starts_with(PRED_ALIAS_PREFIX))
+            .filter_map(|(i, name)| {
+                let &o = outer.index.get(name)?;
+                b[o].map(|_| (i, o))
+            })
+            .collect();
+        let found = if shared.is_empty() {
+            self.pattern_has_solution(&bound, &layout)
+        } else {
+            self.pattern_has_solution_where(&bound, &layout, &|sol: &Binding| {
+                shared.iter().all(|&(i, o)| {
+                    self.same_term_or_unbound(sol[i], layout.is_pred[i], b[o], outer.is_pred[o])
+                })
+            })
+        };
         found ^ negated
+    }
+
+    /// Whether two slots are compatible: either unbound, or the same RDF
+    /// term — equal ids in one id space are (the dictionary is a bijection,
+    /// a computed term has one synthetic id per query); otherwise the terms
+    /// are compared.
+    fn same_term_or_unbound(
+        &self,
+        a: Option<u32>,
+        a_pred: bool,
+        b: Option<u32>,
+        b_pred: bool,
+    ) -> bool {
+        let (Some(x), Some(y)) = (a, b) else {
+            return true;
+        };
+        if a_pred == b_pred && (x == y || (!is_synth(x) && !is_synth(y))) {
+            return x == y;
+        }
+        match self.id_to_term(x, a_pred) {
+            Some(t) => self.id_to_term(y, b_pred).as_ref() == Some(&t),
+            None => false,
+        }
     }
 
     /// An id resolved back to its RDF term (synthetic, predicate, or
@@ -4126,6 +4271,14 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                         .and_then(|(id, p)| self.id_to_term(id, p))
                     {
                         Some(Term::Iri(s)) => GraphTerm::Iri(s),
+                        // A literal names no graph: no solution (review
+                        // sparqlconf#1 — the variable was left free, so the
+                        // pattern ranged over every named graph).
+                        Some(Term::Literal { .. }) => {
+                            return GraphPattern::Values(Vec::new(), Vec::new())
+                        }
+                        // A blank node stays a variable; `eval_exists`
+                        // requires the solutions to agree with its value.
                         _ => g.clone(),
                     },
                     GraphTerm::Iri(_) => g.clone(),
@@ -6422,6 +6575,10 @@ fn bind_node(b: &mut Binding, pt: &PatternTerm, id: u32, layout: &VarLayout) -> 
 
 /// MINUS: drop left solutions that have a compatible right solution sharing at
 /// least one bound variable (SPARQL `MINUS` semantics).
+///
+/// The right solutions are indexed on the shared variables ([`RowIndex`]), so
+/// each left solution costs a few hash lookups, not a scan of the right side
+/// (review sparqlconf#2: MINUS was a nested loop in both executors).
 fn eval_minus(
     left: Vec<Binding>,
     lvars: &[usize],
@@ -6436,28 +6593,10 @@ fn eval_minus(
     if shared.is_empty() {
         return left; // no shared variables ⇒ MINUS removes nothing
     }
+    let index = RowIndex::new(&right, &shared);
     left.into_iter()
-        .filter(|l| !minus_removes(l, &right, &shared))
+        .filter(|l| !index.removes(&right, l))
         .collect()
-}
-
-/// Whether MINUS drops `l`: some right solution is compatible with it on the
-/// `shared` variables and they share at least one bound one.
-fn minus_removes(l: &Binding, right: &[Binding], shared: &[usize]) -> bool {
-    right.iter().any(|r| {
-        let mut compatible = true;
-        let mut any_shared = false;
-        for &v in shared {
-            if let (Some(a), Some(b)) = (l[v], r[v]) {
-                any_shared = true;
-                if a != b {
-                    compatible = false;
-                    break;
-                }
-            }
-        }
-        compatible && any_shared
-    })
 }
 
 /// DISTINCT, OFFSET and LIMIT over a SELECT's projected rows, in that order.
@@ -6885,17 +7024,8 @@ fn join_sets(
         .filter(|v| right_vars.contains(v))
         .collect();
 
-    // Cross product when there is no shared variable, OR when a shared variable
-    // is left *unbound* (None) on some row: SPARQL compatibility treats an
-    // unbound value as a wildcard that matches anything, which the hash key
-    // (keyed on `Option<u32>`, where `None` is a distinct key) cannot express.
-    // This arises with OPTIONAL results re-joined later and with a SILENT
-    // SERVICE's identity solution. `merge_bindings` does the correct per-pair
-    // compatible-merge (None acts as a wildcard).
-    let unbound_shared = shared
-        .iter()
-        .any(|&i| left.iter().chain(right.iter()).any(|b| b[i].is_none()));
-    if shared.is_empty() || unbound_shared {
+    // Cross product when there is no shared variable.
+    if shared.is_empty() {
         let mut out = Vec::new();
         for l in left {
             for r in right {
@@ -6903,6 +7033,31 @@ fn join_sets(
                     out.push(m);
                 }
             }
+        }
+        return out;
+    }
+    // A shared variable *unbound* (None) on some row: SPARQL compatibility
+    // treats an unbound value as a wildcard that matches anything, which the
+    // hash key below (keyed on `Option<u32>`, where `None` is a distinct key)
+    // cannot express. This arises with OPTIONAL results re-joined later and
+    // with a SILENT SERVICE's identity solution. The [`RowIndex`] hashes the
+    // right rows on the shared variables each one binds, so a left row meets
+    // only the rows compatible with it — in the same left-major, right-minor
+    // order the cross product had (review query#10: this used to be the
+    // whole cross product, quadratic).
+    let unbound_shared = shared
+        .iter()
+        .any(|&i| left.iter().chain(right.iter()).any(|b| b[i].is_none()));
+    if unbound_shared {
+        let index = RowIndex::new(right, &shared);
+        let mut out = Vec::new();
+        for l in left {
+            let _ = index.for_each_candidate(right, l, |ri| {
+                if let Some(m) = merge_bindings(l, &right[ri]) {
+                    out.push(m);
+                }
+                ControlFlow::<()>::Continue(())
+            });
         }
         return out;
     }

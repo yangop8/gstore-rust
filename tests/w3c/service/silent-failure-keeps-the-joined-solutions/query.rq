@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Federated Query §4 and SPARQL 1.1 Query §18.5 Join: the failed SILENT SERVICE
+# is the join identity, so every :knows solution survives with ?n unbound
+PREFIX : <http://example.org/>
+SELECT ?f ?n WHERE { :alice :knows ?f . SERVICE SILENT ?endpoint { ?f :name ?n } }

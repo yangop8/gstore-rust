@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §18.6 exists and §18.5 Graph: ?g is the literal "lit", which names no
+# graph, so NOT EXISTS holds
+PREFIX : <http://example.org/>
+SELECT ?x WHERE { BIND("lit" AS ?g) FILTER NOT EXISTS { GRAPH ?g { ?s ?p ?o } } BIND(1 AS ?x) }

@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §16.3 ASK and §18.5 Graph(var, P): no named graph holds a
+# triple whose object is that graph's own name, so there is no solution
+PREFIX : <http://example.org/>
+ASK { GRAPH ?g { ?s :p ?g } }

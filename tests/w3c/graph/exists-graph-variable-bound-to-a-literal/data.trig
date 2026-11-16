@@ -1,0 +1,2 @@
+@prefix : <http://example.org/> .
+:g1 { :a :p :b . }

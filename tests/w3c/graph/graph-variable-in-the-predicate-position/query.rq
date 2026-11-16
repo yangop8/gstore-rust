@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §18.5 Graph(var, P): ?g is joined with the predicate P binds it to,
+# so only the triple whose predicate is the graph's own name matches
+PREFIX : <http://example.org/>
+SELECT ?g ?s ?o WHERE { GRAPH ?g { ?s ?g ?o } }

@@ -1,0 +1,8 @@
+{
+  "head": {"vars": ["s", "v"]},
+  "results": {"bindings": [
+    {"s": {"type": "uri", "value": "http://example.org/a"}, "v": {"type": "literal", "value": "x"}},
+    {"s": {"type": "uri", "value": "http://example.org/a"}, "v": {"type": "literal", "value": "y"}},
+    {"s": {"type": "uri", "value": "http://example.org/b"}, "v": {"type": "literal", "value": "z"}}
+  ]}
+}

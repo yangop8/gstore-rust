@@ -152,19 +152,26 @@ fn service_silent_join_dead_endpoint_preserves_outer_rows() {
     );
 }
 
+// review tests-b#2: this test pinned the wrong behaviour — a failed
+// non-SILENT SERVICE answered Ok with no rows, indistinguishable from an
+// endpoint without data. SPARQL 1.1 Federated Query §4 makes it the query's
+// error (robust#6, sec#17); the test now asserts that, with the endpoint in
+// the message.
 #[test]
-fn service_non_silent_dead_endpoint_returns_no_rows() {
+fn service_non_silent_dead_endpoint_fails_the_query() {
     let dead = dead_addr();
     let mut local = Database::build_from_str("svc_hard", LOCAL).expect("build local db");
 
-    // Without SILENT a failed service contributes no solutions (the query
-    // degrades to empty rather than panicking).
+    // Without SILENT a failed service is the query's error (not a panic, not
+    // an empty answer).
     let query = format!(
         "SELECT ?name WHERE {{ \
             <http://ex/alice> <http://ex/knows> ?friend . \
             SERVICE <http://{dead}/sparql> {{ ?friend <http://ex/name> ?name }} \
          }}"
     );
-    let rs = local.select(&query).expect("query returns Ok");
-    assert!(rs.rows.is_empty());
+    let err = local
+        .select(&query)
+        .expect_err("a failed non-SILENT SERVICE fails the query");
+    assert!(err.to_string().contains(&dead.to_string()), "{err}");
 }

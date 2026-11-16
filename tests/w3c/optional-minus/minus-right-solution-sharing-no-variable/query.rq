@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §18.5 Minus: the second UNION branch binds neither ?s nor ?o, so it
+# removes nothing; the first removes :s1
+PREFIX : <http://example.org/>
+SELECT ?s WHERE { ?s :p ?o MINUS { { ?s :q ?x } UNION { ?y :r ?x } } }

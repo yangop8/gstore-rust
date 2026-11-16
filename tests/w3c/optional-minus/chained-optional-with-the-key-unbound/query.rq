@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §18.5 LeftJoin: the second OPTIONAL meets the solutions of the first;
+# :s3 leaves ?n unbound, so every :nick solution is compatible with it
+PREFIX : <http://example.org/>
+SELECT ?s ?n ?k WHERE { ?s :p ?o OPTIONAL { ?s :name ?n } OPTIONAL { ?k :nick ?n } }

@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Federated Query §4 and SPARQL 1.1 Query §18.5 LeftJoin: the failed SILENT
+# SERVICE yields one empty solution, compatible with every left solution
+PREFIX : <http://example.org/>
+SELECT ?f ?n WHERE { :alice :knows ?f OPTIONAL { SERVICE SILENT ?endpoint { ?f :name ?n } } }

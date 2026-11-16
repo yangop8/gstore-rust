@@ -285,6 +285,32 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         found
     }
 
+    /// Whether `gp` has a solution that `accept` takes — as
+    /// [`pattern_has_solution`](Self::pattern_has_solution), stopping at the
+    /// first one taken (`EXISTS` whose pattern still binds a variable the
+    /// current solution binds, see [`eval_exists`](Self::eval_exists)).
+    pub(super) fn pattern_has_solution_where(
+        &self,
+        gp: &GraphPattern,
+        layout: &VarLayout,
+        accept: &dyn Fn(&Binding) -> bool,
+    ) -> bool {
+        if !self.topk.early_termination {
+            return self.eval_pattern(gp, layout).iter().any(accept);
+        }
+        self.bump(|s| s.streamed += 1);
+        let mut found = false;
+        let _ = self.stream_pattern(gp, layout, &mut |b| {
+            if accept(&b) {
+                found = true;
+                STOP
+            } else {
+                GO
+            }
+        });
+        found
+    }
+
     /// The first `n` solutions of `gp`, in the full evaluation's order. With
     /// early termination off, all of them (the caller cuts).
     pub(super) fn first_solutions(
@@ -396,10 +422,16 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     // No shared variable: MINUS removes nothing.
                     return self.stream_pattern(a, layout, sink);
                 }
-                let mut right: Option<Vec<Binding>> = None;
+                // The right side, hashed on the shared variables (review
+                // sparqlconf#2: this was a scan of it per left solution).
+                let mut right: Option<(Vec<Binding>, RowIndex)> = None;
                 self.stream_pattern(a, layout, &mut |l| {
-                    let right = right.get_or_insert_with(|| self.eval_pattern(b, layout));
-                    if minus_removes(&l, right, &shared) {
+                    let (rows, index) = right.get_or_insert_with(|| {
+                        let rows = self.eval_pattern(b, layout);
+                        let index = RowIndex::new(&rows, &shared);
+                        (rows, index)
+                    });
+                    if index.removes(rows, &l) {
                         GO
                     } else {
                         sink(l)
@@ -457,6 +489,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 for (&gid, gstore) in named {
                     let sub = self.graph_sub_evaluator(gstore, named);
                     sub.stream_pattern(inner, layout, &mut |mut b| {
+                        // A solution binding ?g itself must bind it to this
+                        // graph (review query#3 / sparqlconf#1).
+                        if !self.graph_name_agrees(b[vi], gid, layout.is_pred[vi]) {
+                            return GO;
+                        }
                         b[vi] = Some(gid);
                         sink(b)
                     })?;
@@ -784,26 +821,27 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             let mut rows = Vec::new();
             let mut seen = HashSet::new();
             let mut failed = None;
+            // The SELECT expressions extend each solution left to right, as
+            // in the full path (review query#6 / sparqlconf#6).
+            let exprs = OrderCtx::new(layout, &q.order_by, Some(&q.projection));
             if k > 0 {
-                let _ = self.stream_pattern(pattern, layout, &mut |b| match self.project_items(
-                    &b,
-                    layout,
-                    q,
-                    result_vars,
-                ) {
-                    Ok(row) => {
-                        if !q.distinct || seen.insert(row.clone()) {
-                            rows.push(row);
+                let _ = self.stream_pattern(pattern, layout, &mut |mut b| {
+                    self.order_extend(&exprs, &mut b);
+                    match self.project_items(&b, &exprs.full, layout.len(), q, result_vars) {
+                        Ok(row) => {
+                            if !q.distinct || seen.insert(row.clone()) {
+                                rows.push(row);
+                            }
+                            if rows.len() >= k {
+                                STOP
+                            } else {
+                                GO
+                            }
                         }
-                        if rows.len() >= k {
+                        Err(e) => {
+                            failed = Some(e);
                             STOP
-                        } else {
-                            GO
                         }
-                    }
-                    Err(e) => {
-                        failed = Some(e);
-                        STOP
                     }
                 });
             }
@@ -825,7 +863,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 self.bump(|s| s.dpb_topk += 1);
                 return sols
                     .iter()
-                    .map(|b| self.project_items(b, &ctx.full, q, result_vars))
+                    .map(|b| self.project_items(b, &ctx.full, layout.len(), q, result_vars))
                     .collect::<Result<Vec<_>>>()
                     .map(Some);
             }
@@ -840,7 +878,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             let best = self.heap_top_k(pattern, layout, &ctx, k);
             self.check_cancel()?;
             best.iter()
-                .map(|b| self.project_items(b, &ctx.full, q, result_vars))
+                .map(|b| self.project_items(b, &ctx.full, layout.len(), q, result_vars))
                 .collect::<Result<Vec<_>>>()?
         };
         Ok(Some(rows))
@@ -964,7 +1002,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         let _ = self.stream_pattern(pattern, layout, &mut |mut b| {
             self.order_extend(ctx, &mut b);
             let key = std::rc::Rc::new(self.sort_key(ctx.order_by, &b, &ctx.full));
-            let row = match self.project_items(&b, &ctx.full, q, result_vars) {
+            let row = match self.project_items(&b, &ctx.full, layout.len(), q, result_vars) {
                 Ok(row) => row,
                 Err(e) => {
                     failed = Some(e);
@@ -1091,7 +1129,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             }
             self.order_extend(ctx, &mut b);
             if q.distinct {
-                if seen.insert(self.project_items(&b, &ctx.full, q, result_vars)?) {
+                if seen.insert(self.project_items(&b, &ctx.full, layout.len(), q, result_vars)?) {
                     counted += 1;
                 }
             } else {
@@ -1652,52 +1690,31 @@ fn tree_leaves(tree: &JoinTree, out: &mut Vec<usize>) {
 
 /// One materialized join operand, indexed for probing: yields, for a left
 /// solution, every compatible right solution merged with it, in the right
-/// operand's order — what [`join_sets`] pairs it with.
+/// operand's order — what [`join_sets`] pairs it with. The index is the
+/// shared [`RowIndex`]: hashed on the shared variables each row binds, so a
+/// left solution or right rows that leave a shared variable unbound cost no
+/// scan of the operand (review query#10).
 struct Probe {
     rows: Vec<Binding>,
-    /// Shared variables bound in every row (the hash key).
-    key: Vec<usize>,
-    index: HashMap<Vec<u32>, Vec<usize>>,
+    index: RowIndex,
 }
 
 impl Probe {
-    /// Index `rows` on the variables of `hint` (the shared variables) that
-    /// every row binds. Which variables are used only affects speed: a left
-    /// solution that leaves one of them unbound is matched by a scan.
+    /// Index `rows` on the variables of `hint` (the shared variables).
+    /// Which variables are used only affects speed: every candidate is
+    /// still checked by the full compatible-merge.
     fn new(rows: Vec<Binding>, hint: &[usize]) -> Probe {
-        let key: Vec<usize> = hint
-            .iter()
-            .copied()
-            .filter(|&i| rows.iter().all(|r| r[i].is_some()))
-            .collect();
-        let mut index: HashMap<Vec<u32>, Vec<usize>> = HashMap::new();
-        if !key.is_empty() {
-            for (ri, r) in rows.iter().enumerate() {
-                let k = key.iter().map(|&i| r[i].unwrap_or(u32::MAX)).collect();
-                index.entry(k).or_default().push(ri);
-            }
-        }
-        Probe { rows, key, index }
+        let index = RowIndex::new(&rows, hint);
+        Probe { rows, index }
     }
 
     fn for_each_compatible(&self, l: &Binding, f: &mut Sink<'_>) -> Flow {
-        if !self.key.is_empty() {
-            let k: Option<Vec<u32>> = self.key.iter().map(|&i| l[i]).collect();
-            if let Some(k) = k {
-                for &ri in self.index.get(&k).map(Vec::as_slice).unwrap_or(&[]) {
-                    if let Some(m) = merge_bindings(l, &self.rows[ri]) {
-                        f(m)?;
-                    }
-                }
-                return GO;
+        self.index.for_each_candidate(&self.rows, l, |ri| {
+            match merge_bindings(l, &self.rows[ri]) {
+                Some(m) => f(m),
+                None => GO,
             }
-        }
-        for r in &self.rows {
-            if let Some(m) = merge_bindings(l, r) {
-                f(m)?;
-            }
-        }
-        GO
+        })
     }
 }
 

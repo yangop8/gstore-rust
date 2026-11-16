@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §8.1 and §18.6: under the current solution the group needs a VALUES row
+# with its ?o, so (:x, :o2) fails
+PREFIX : <http://example.org/>
+SELECT ?s ?o WHERE { ?s :p ?o FILTER EXISTS { VALUES ?o { :o1 :o3 } ?s :p ?o } }

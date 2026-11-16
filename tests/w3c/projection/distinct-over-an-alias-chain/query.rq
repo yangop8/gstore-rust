@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §18.2.4.4 SELECT Expressions and §18.2.5 (DISTINCT after the
+# projection): ?m from the ?l of each solution, then duplicates removed
+PREFIX : <http://example.org/>
+SELECT DISTINCT (STRLEN(?n) AS ?l) (?l * 10 AS ?m) WHERE { ?s :name ?n }
