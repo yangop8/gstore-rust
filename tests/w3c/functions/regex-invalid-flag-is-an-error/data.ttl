@@ -1,0 +1,3 @@
+@prefix : <http://example.org/> .
+:a :name "Alice" .
+:b :name "Bob" .

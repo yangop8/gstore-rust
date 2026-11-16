@@ -172,8 +172,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use regex::Regex;
-
 use crate::analytics::csr::CsrGraph;
 use crate::analytics::gfun::{self, GCall, GFnKind, GFunCtx, GFunValue, GNode};
 use crate::analytics::{GraphView, Interrupt};
@@ -444,6 +442,180 @@ impl Extras {
     }
 }
 
+/// What identifies one `BNODE(str)` node: the solution mapping (see
+/// [`QueryCtx::solution_key`]) and the string.
+type BnodeKey = (Box<[Option<u32>]>, String);
+
+/// Per-query state of the built-ins whose answer belongs to the query
+/// execution rather than to their arguments — `NOW`, `BNODE`, `RAND`,
+/// `UUID` / `STRUUID` (SPARQL 1.1 §17.4) — and the compiled patterns of
+/// `REGEX` / `REPLACE`. One value per evaluator, shared (`Rc`) with its
+/// `GRAPH` sub-evaluators, so a `GRAPH` block sees the same `NOW()`, the
+/// same `BNODE(str)` nodes and the same pattern cache as the rest of the
+/// query. The execution-bound part (`NOW()`'s instant, the `BNODE` nodes)
+/// starts afresh with every [`Evaluator::evaluate`] /
+/// [`Evaluator::eval_update_modify`] call (see
+/// [`begin_execution`](Self::begin_execution)), so an evaluator a caller
+/// reuses for another query does not hand that query the first one's
+/// instant or nodes.
+#[derive(Default)]
+struct QueryCtx {
+    /// `NOW()`: the instant of the first call (Unix seconds), returned by
+    /// every later call of the query (§17.4.5.1; review query#16).
+    now: std::cell::Cell<Option<i64>>,
+    /// `BNODE(str)`: the blank node minted for a string within one solution
+    /// mapping, keyed by the solution (see [`QueryCtx::solution_key`]) and
+    /// the string (§17.4.2.9; review query#5).
+    bnode_by_str: std::cell::RefCell<HashMap<BnodeKey, String>>,
+    /// The (synthetic) ids of the blank nodes `BNODE` minted in this query.
+    /// They are left out of a solution's key, so `BIND(BNODE("x") AS ?a)
+    /// BIND(BNODE("x") AS ?b)` — where the second call sees `?a` bound —
+    /// still gives one node per solution.
+    minted: std::cell::RefCell<HashSet<u32>>,
+    /// `RAND()`: xoshiro256** state, seeded from OS randomness at the first
+    /// call. Per query, so concurrent queries never share (and race on) a
+    /// generator (review conc#1).
+    rng: std::cell::Cell<Option<[u64; 4]>>,
+    /// `UUID()` / `STRUUID()`: OS randomness read ahead in blocks (see
+    /// [`QueryCtx::uuid_bytes`]); the bytes not yet used and where they start.
+    entropy: std::cell::RefCell<(Vec<u8>, usize)>,
+    /// `REGEX` / `REPLACE` patterns compiled for this query, so a pattern
+    /// is compiled once per query rather than once per solution (review
+    /// query#11).
+    regex: std::cell::RefCell<super::xpath_regex::RegexCache>,
+}
+
+impl QueryCtx {
+    /// How many random bytes [`uuid_bytes`](Self::uuid_bytes) reads at once.
+    const ENTROPY_BLOCK: usize = 512;
+
+    /// A new query execution starts: forget the previous one's `NOW()`
+    /// instant and `BNODE` nodes. The generators and the pattern cache
+    /// carry over (they hold no answer of the previous query).
+    fn begin_execution(&self) {
+        self.now.set(None);
+        self.bnode_by_str.borrow_mut().clear();
+        self.minted.borrow_mut().clear();
+    }
+
+    /// `NOW()`'s instant for this query.
+    fn now(&self) -> i64 {
+        match self.now.get() {
+            Some(t) => t,
+            None => {
+                let t = now_unix_secs();
+                self.now.set(Some(t));
+                t
+            }
+        }
+    }
+
+    /// The next `RAND()` draw: 64 bits of the query's generator.
+    fn next_u64(&self) -> u64 {
+        let mut s = self.rng.get().unwrap_or_else(|| {
+            let mut s = [0u64; 4];
+            for w in &mut s {
+                let mut bytes = [0u8; 8];
+                os_random(&mut bytes);
+                *w = u64::from_le_bytes(bytes);
+            }
+            if s == [0; 4] {
+                s[0] = 0x9E37_79B9_7F4A_7C15; // xoshiro's state must not be all zero
+            }
+            s
+        });
+        let out = xoshiro256starstar(&mut s);
+        self.rng.set(Some(s));
+        out
+    }
+
+    /// 16 bytes of OS randomness for a `UUID()` / `STRUUID()`: every call
+    /// gets bytes no other call got. Read [`ENTROPY_BLOCK`](Self::ENTROPY_BLOCK)
+    /// bytes at a time so a query minting many UUIDs does not pay a system
+    /// call for each.
+    fn uuid_bytes(&self) -> [u8; 16] {
+        let mut pool = self.entropy.borrow_mut();
+        let (buf, at) = &mut *pool;
+        if buf.len() < *at + 16 {
+            buf.resize(Self::ENTROPY_BLOCK, 0);
+            os_random(buf);
+            *at = 0;
+        }
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&buf[*at..*at + 16]);
+        // Used bytes are wiped, so they cannot be handed out twice.
+        buf[*at..*at + 16].fill(0);
+        *at += 16;
+        out
+    }
+
+    /// `pattern` compiled under the XPath `flags` (from the query's cache);
+    /// `None` for an invalid pattern or flags.
+    fn regex(&self, pattern: &str, flags: &str) -> Option<Rc<super::xpath_regex::Compiled>> {
+        self.regex.borrow_mut().get(pattern, flags)
+    }
+
+    /// The key identifying the solution mapping `b` for `BNODE(str)`: its
+    /// bindings, without the blank nodes `BNODE` itself minted (see
+    /// [`minted`](Self::minted)).
+    fn solution_key(&self, b: &Binding) -> Box<[Option<u32>]> {
+        let minted = self.minted.borrow();
+        if minted.is_empty() {
+            return b.as_slice().into();
+        }
+        b.iter()
+            .map(|slot| slot.filter(|id| !minted.contains(id)))
+            .collect()
+    }
+}
+
+/// One step of xoshiro256** (Blackman and Vigna): a fast, statistically
+/// strong non-cryptographic generator, for `RAND()`.
+fn xoshiro256starstar(s: &mut [u64; 4]) -> u64 {
+    let result = s[1].wrapping_mul(5).rotate_left(7).wrapping_mul(9);
+    let t = s[1] << 17;
+    s[2] ^= s[0];
+    s[3] ^= s[1];
+    s[1] ^= s[2];
+    s[0] ^= s[3];
+    s[2] ^= t;
+    s[3] = s[3].rotate_left(45);
+    result
+}
+
+/// Fill `buf` with randomness from the operating system: `/dev/urandom`
+/// (one handle for the process) where it exists; elsewhere, or if it cannot
+/// be read, the standard library's hasher keys, which it draws from the
+/// operating system's generator once per thread, run over a process-wide
+/// counter (SipHash keyed with secret random keys, a pseudo-random function).
+fn os_random(buf: &mut [u8]) {
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        static URANDOM: std::sync::OnceLock<Option<std::fs::File>> = std::sync::OnceLock::new();
+        if let Some(mut f) = URANDOM
+            .get_or_init(|| std::fs::File::open("/dev/urandom").ok())
+            .as_ref()
+        {
+            if f.read_exact(buf).is_ok() {
+                return;
+            }
+        }
+    }
+    use std::hash::{BuildHasher, Hasher};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    for chunk in buf.chunks_mut(8) {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(COUNTER.fetch_add(1, AtomicOrdering::Relaxed));
+        h.write_u128(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos()),
+        );
+        chunk.copy_from_slice(&h.finish().to_le_bytes()[..chunk.len()]);
+    }
+}
+
 /// The query evaluator binds a dictionary and a store for the duration of a
 /// query. It is generic over the [`TripleSource`] so the same optimizer and
 /// executor run against the in-memory [`TripleStore`] or the on-disk store,
@@ -550,6 +722,10 @@ pub struct Evaluator<'a, S: TripleSource = TripleStore> {
     /// Who calls `PFN.name(…)` functions, from which registry
     /// ([`with_pfn`](Self::with_pfn)); `None` = PFN calls fail.
     pfn: Option<crate::pfn::PfnCaller>,
+    /// The query's `NOW()` instant, `BNODE` nodes, `RAND()` generator,
+    /// `UUID()` randomness and compiled `REGEX` patterns (see [`QueryCtx`]).
+    /// Shared with `GRAPH` sub-evaluators: one query, one state.
+    ctx: Rc<QueryCtx>,
 }
 
 /// A source of the per-predicate CSR the advanced graph functions run on
@@ -611,6 +787,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             gfun_max_output: crate::analytics::gfun::paths::MAX_OUTPUT_BYTES,
             gfun_spent: Rc::default(),
             pfn: None,
+            ctx: Rc::default(),
         }
     }
 
@@ -643,6 +820,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             gfun_max_output: crate::analytics::gfun::paths::MAX_OUTPUT_BYTES,
             gfun_spent: Rc::default(),
             pfn: None,
+            ctx: Rc::default(),
         }
     }
 
@@ -778,6 +956,13 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         self
     }
 
+    /// How many `REGEX` / `REPLACE` patterns this evaluator compiled so far:
+    /// each distinct (pattern, flags) of the query once, however many
+    /// solutions call it (a work counter, like [`stats`](Self::stats)).
+    pub fn regex_compilations(&self) -> u64 {
+        self.ctx.regex.borrow().compiled()
+    }
+
     /// The CSR for the advanced graph functions of this query (see
     /// [`with_csr_provider`](Self::with_csr_provider)).
     fn gfun_csr(&self) -> Result<Arc<CsrGraph>> {
@@ -868,6 +1053,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// Evaluate a read query (SELECT / ASK / CONSTRUCT). Updates are handled in
     /// the db layer.
     pub fn evaluate(&self, query: &Query) -> Result<QueryResult> {
+        self.ctx.begin_execution();
         self.check_cancel()?;
         self.check_calls(query)?;
         let result = match query {
@@ -928,7 +1114,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 // A triple with a literal subject or a non-IRI predicate is
                 // not RDF and is left out (§16.2).
                 if let Some(t) = self
-                    .instantiate_template(tp, b, &layout, &mut fresh)
+                    .instantiate_template(tp, b, &layout, &mut fresh, true)
                     .filter(|t| !t.subject.is_literal() && matches!(t.predicate, Term::Iri(_)))
                 {
                     if seen.insert(t.to_string()) {
@@ -944,9 +1130,13 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// targets bound by the WHERE pattern) and return every triple having one of
     /// them as subject (the outgoing description), de-duplicated.
     fn eval_describe(&self, d: &DescribeQuery) -> Result<Vec<Triple>> {
+        // The resources in first-seen order, de-duplicated through a hash
+        // set (a linear `contains` per solution was quadratic in the number
+        // of resources — review sparqlconf#10 / query#12).
         let mut ids: Vec<u32> = Vec::new();
-        let add = |id: u32, ids: &mut Vec<u32>| {
-            if !ids.contains(&id) {
+        let mut seen_ids: HashSet<u32> = HashSet::new();
+        let mut add = |id: u32, ids: &mut Vec<u32>| {
+            if seen_ids.insert(id) {
                 ids.push(id);
             }
         };
@@ -1046,6 +1236,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         insert: &[QuadPattern],
         pattern: &GraphPattern,
     ) -> Result<(Vec<(Option<String>, Triple)>, Vec<(Option<String>, Triple)>)> {
+        self.ctx.begin_execution();
         self.check_pattern_calls(pattern)?;
         let layout = VarLayout::build(pattern);
         let sols = self.eval_pattern(pattern, &layout);
@@ -1057,14 +1248,19 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         for b in &sols {
             // One map per solution: a `[ … ]` / `( … )` node of the
             // templates is the same fresh blank node across this solution's
-            // quads, and a new one for the next solution.
+            // quads, and a new one for the next solution. A labelled `_:v`
+            // is fresh in the INSERT template only: in the DELETE template
+            // (where SPARQL forbids blank nodes) it names the stored node,
+            // as in the WHERE pattern and `DELETE DATA`, so `DELETE WHERE
+            // { … _:v }` deletes what it matched.
             let mut fresh = HashMap::new();
-            for (templates, out, seen) in [
-                (delete, &mut dels, &mut seen_d),
-                (insert, &mut ins, &mut seen_i),
+            for (templates, out, seen, fresh_labels) in [
+                (delete, &mut dels, &mut seen_d, false),
+                (insert, &mut ins, &mut seen_i, true),
             ] {
                 for q in templates {
-                    let Some(quad) = self.instantiate_quad(q, b, &layout, &mut fresh) else {
+                    let Some(quad) = self.instantiate_quad(q, b, &layout, &mut fresh, fresh_labels)
+                    else {
                         continue;
                     };
                     if seen.insert((quad.0.clone(), quad.1.to_string())) {
@@ -1078,14 +1274,16 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
 
     /// Fill a quad template from a solution (see
     /// [`eval_update_modify`](Self::eval_update_modify)); `None` if a
-    /// variable is unbound or the result is not a legal quad. `fresh` is as
-    /// for [`instantiate_template`](Self::instantiate_template).
+    /// variable is unbound or the result is not a legal quad. `fresh` and
+    /// `fresh_labels` are as for
+    /// [`instantiate_template`](Self::instantiate_template).
     fn instantiate_quad(
         &self,
         q: &QuadPattern,
         b: &Binding,
         layout: &VarLayout,
         fresh: &mut HashMap<String, Term>,
+        fresh_labels: bool,
     ) -> Option<(Option<String>, Triple)> {
         let graph = match &q.graph {
             None => None,
@@ -1095,7 +1293,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 _ => return None,
             },
         };
-        let t = self.instantiate_template(&q.triple, b, layout, fresh)?;
+        let t = self.instantiate_template(&q.triple, b, layout, fresh, fresh_labels)?;
         if t.subject.is_literal() || !matches!(t.predicate, Term::Iri(_)) {
             return None;
         }
@@ -1112,19 +1310,32 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
 
     /// Fill a template triple from a solution; `None` if any position is
     /// unbound. A hidden blank-node variable (`[ … ]` / `( … )` in the
-    /// template, see [`ANON_VAR_PREFIX`]) the solution does not bind becomes
-    /// a fresh blank node, the same one for every template triple of this
-    /// solution: `fresh` holds them, and the caller starts a new map per
-    /// solution.
+    /// template, see [`ANON_VAR_PREFIX`]) the solution does not bind, and —
+    /// with `fresh_labels`, in a CONSTRUCT or INSERT template — a labelled
+    /// blank node `_:v` of the template, become a fresh blank node, the
+    /// same one for every template triple of this solution (SPARQL 1.1
+    /// Query §16.2.1, Update §3.1.3; a labelled node was copied verbatim,
+    /// so every solution and every request wrote the same stored node —
+    /// review query#5): `fresh` holds them, and the caller starts a new map
+    /// per solution. Without `fresh_labels` (a DELETE template) `_:v` is
+    /// the stored node of that label.
     fn instantiate_template(
         &self,
         tp: &TriplePattern,
         b: &Binding,
         layout: &VarLayout,
         fresh: &mut HashMap<String, Term>,
+        fresh_labels: bool,
     ) -> Option<Triple> {
         let mut resolve = |pt: &PatternTerm| -> Option<Term> {
             match pt {
+                // Keyed apart from the hidden variables (named `_:…`).
+                PatternTerm::Term(Term::Blank(label)) if fresh_labels => Some(
+                    fresh
+                        .entry(format!("label {label}"))
+                        .or_insert_with(|| Term::Blank(fresh_bnode_label()))
+                        .clone(),
+                ),
                 PatternTerm::Term(t) => Some(t.clone()),
                 PatternTerm::Var(v) => match self.binding_term(v, b, layout) {
                     None if is_anon_var(v) => Some(
@@ -2072,16 +2283,14 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 sep,
             } = a
             {
-                gb[layout.len() + i] = self
-                    .eval_aggregate(
-                        *func,
-                        *distinct,
-                        arg.as_deref(),
-                        sep.as_deref(),
-                        sols,
-                        layout,
-                    )
-                    .map(|v| self.value_to_id(&v));
+                gb[layout.len() + i] = self.eval_aggregate(
+                    *func,
+                    *distinct,
+                    arg.as_deref(),
+                    sep.as_deref(),
+                    sols,
+                    layout,
+                );
             }
         }
         gb
@@ -2106,7 +2315,19 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             .all(|h| self.eval_ebv(h, &gb, &glayout) == Some(true))
     }
 
-    /// Compute one aggregate over a group's solutions.
+    /// Compute one aggregate over a group's solutions, as the id of its
+    /// value (`None`: an error, which leaves the column unbound).
+    ///
+    /// `DISTINCT` drops repeated RDF terms (hash-based; it compared values
+    /// pairwise, which was quadratic and counted `"01"` and `"1"` as one —
+    /// review query#12, sparqlconf#10). `MIN` / `MAX` pick by the `ORDER BY`
+    /// order (§18.5.1.7 / §18.5.1.8: blank nodes < IRIs < literals, then
+    /// by value, ties by the term), so the answer no longer depends on the
+    /// order of the input (review query#8, sparqlconf#7); they, `SAMPLE` and
+    /// `GROUP_CONCAT` keep the terms as stored (`"5"^^xsd:int` stays an
+    /// `xsd:int`, `"01"` stays `"01"`). `SUM` / `AVG` skip non-numeric
+    /// values — an extension: SPARQL makes the aggregate an error there —
+    /// and `AVG` divides by the number of values it summed (review query#7).
     fn eval_aggregate(
         &self,
         func: AggFunc,
@@ -2115,7 +2336,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         sep: Option<&str>,
         sols: &[&Binding],
         layout: &VarLayout,
-    ) -> Option<Value> {
+    ) -> Option<u32> {
         // COUNT(*) counts solutions; COUNT(DISTINCT *) counts the distinct
         // solution mappings (SPARQL 1.1 §18.5.1.1), so dedup bindings before
         // counting when the DISTINCT modifier is present. A mapping holds
@@ -2143,67 +2364,144 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                         )
                     })
                     .count();
-                return Some(Value::Int(n as i64));
+                return Some(self.value_to_id(&Value::Int(n as i64)));
             }
-            return Some(Value::Int(sols.len() as i64));
+            return Some(self.value_to_id(&Value::Int(sols.len() as i64)));
         }
         let arg = arg?;
-        let mut vals: Vec<Value> = sols
-            .iter()
-            .filter_map(|b| self.eval_value(arg, b, layout))
-            .collect();
-        if distinct {
-            let mut seen: Vec<Value> = Vec::new();
-            vals.retain(|v| {
-                if seen.contains(v) {
-                    false
-                } else {
-                    seen.push(v.clone());
-                    true
-                }
-            });
+        // COUNT / SUM / AVG over every value need only the values.
+        if !distinct && matches!(func, AggFunc::Count | AggFunc::Sum | AggFunc::Avg) {
+            let vals: Vec<Value> = sols
+                .iter()
+                .filter_map(|b| self.eval_value(arg, b, layout))
+                .collect();
+            return self
+                .numeric_aggregate(func, &vals)
+                .map(|v| self.value_to_id(&v));
         }
-        Some(match func {
-            AggFunc::Count => Value::Int(vals.len() as i64),
-            AggFunc::Sum => sum_values(&vals),
-            // Avg(S) = Sum(S) / Count(S) with the query's division (so an
-            // integer average is a decimal, or truncated in upstream mode);
-            // 0 for an empty group (§18.5.1.4).
-            AggFunc::Avg => {
-                if vals.is_empty() {
-                    Value::Int(0)
-                } else {
-                    sum_values(&vals).arith_with(
-                        ArithOp::Div,
-                        &Value::Int(vals.len() as i64),
-                        self.integer_division,
-                    )?
-                }
+        let items = self.aggregate_terms(arg, sols, layout);
+        let items: Vec<&AggTerm> = if distinct {
+            let mut seen: HashSet<&AggTerm> = HashSet::with_capacity(items.len());
+            items.iter().filter(|it| seen.insert(*it)).collect()
+        } else {
+            items.iter().collect()
+        };
+        match func {
+            AggFunc::Count | AggFunc::Sum | AggFunc::Avg => {
+                let vals: Vec<Value> = items.iter().filter_map(|it| self.agg_value(it)).collect();
+                self.numeric_aggregate(func, &vals)
+                    .map(|v| self.value_to_id(&v))
             }
-            AggFunc::Min => vals.into_iter().reduce(|a, b| {
-                if b.sparql_cmp(&a) == Some(std::cmp::Ordering::Less) {
-                    b
+            AggFunc::Min | AggFunc::Max => {
+                let want = if func == AggFunc::Min {
+                    std::cmp::Ordering::Less
                 } else {
-                    a
+                    std::cmp::Ordering::Greater
+                };
+                let mut best: Option<(_, &AggTerm)> = None;
+                for it in items {
+                    let Some(v) = self.agg_value(it) else {
+                        continue;
+                    };
+                    let key = order_key(&Some(v));
+                    let replace = match &best {
+                        None => true,
+                        Some((best_key, best_it)) => {
+                            key.cmp(best_key).then_with(|| {
+                                if it == *best_it {
+                                    std::cmp::Ordering::Equal
+                                } else {
+                                    self.agg_term(it).cmp(&self.agg_term(best_it))
+                                }
+                            }) == want
+                        }
+                    };
+                    if replace {
+                        best = Some((key, it));
+                    }
                 }
-            })?,
-            AggFunc::Max => vals.into_iter().reduce(|a, b| {
-                if b.sparql_cmp(&a) == Some(std::cmp::Ordering::Greater) {
-                    b
-                } else {
-                    a
-                }
-            })?,
-            AggFunc::Sample => vals.into_iter().next()?,
+                best.map(|(_, it)| self.agg_id(it))
+            }
+            AggFunc::Sample => items.first().map(|it| self.agg_id(it)),
+            // The lexical forms (`STR`) of the terms, as a simple literal.
             AggFunc::GroupConcat => {
-                let s = sep.unwrap_or(" ");
-                let joined = vals.iter().map(Value::lexical).collect::<Vec<_>>().join(s);
-                Value::Str {
-                    value: joined,
+                let parts: Vec<String> = items
+                    .iter()
+                    .filter_map(|it| self.agg_term(it))
+                    .map(|t| match t {
+                        Term::Literal { value, .. } => value,
+                        Term::Iri(s) | Term::Blank(s) => s,
+                    })
+                    .collect();
+                Some(self.value_to_id(&Value::Str {
+                    value: parts.join(sep.unwrap_or(" ")),
                     lang: None,
+                }))
+            }
+        }
+    }
+
+    /// `COUNT` / `SUM` / `AVG` of `vals` (`None` for another function, or
+    /// an arithmetic error). `AVG` is the sum of the numeric values divided
+    /// by how many there are, with the query's division (so an integer
+    /// average is a decimal, or truncated in upstream mode); 0 when there
+    /// are none (§18.5.1.4).
+    fn numeric_aggregate(&self, func: AggFunc, vals: &[Value]) -> Option<Value> {
+        match func {
+            AggFunc::Count => Some(Value::Int(vals.len() as i64)),
+            AggFunc::Sum => Some(sum_values(vals)),
+            AggFunc::Avg => {
+                let (sum, n) = sum_numeric(vals);
+                if n == 0 {
+                    Some(Value::Int(0))
+                } else {
+                    sum.arith_with(ArithOp::Div, &Value::Int(n as i64), self.integer_division)
                 }
             }
-        })
+            _ => None,
+        }
+    }
+
+    /// What an aggregate collects from each solution (errors skipped): the
+    /// ids a variable is bound to, or the terms an expression evaluates to.
+    fn aggregate_terms(&self, arg: &Expr, sols: &[&Binding], layout: &VarLayout) -> Vec<AggTerm> {
+        let column = match arg {
+            Expr::Var(v) => layout.index.get(v).copied().filter(|&i| !layout.is_pred[i]),
+            _ => None,
+        };
+        match column {
+            Some(i) => sols
+                .iter()
+                .filter_map(|b| b.get(i).copied().flatten())
+                .map(AggTerm::Id)
+                .collect(),
+            None => sols
+                .iter()
+                .filter_map(|b| self.eval_term(arg, b, layout))
+                .map(AggTerm::Term)
+                .collect(),
+        }
+    }
+
+    fn agg_value(&self, it: &AggTerm) -> Option<Value> {
+        match it {
+            AggTerm::Id(id) => self.id_to_value(*id, false),
+            AggTerm::Term(t) => Some(Value::from_term(t)),
+        }
+    }
+
+    fn agg_term(&self, it: &AggTerm) -> Option<Term> {
+        match it {
+            AggTerm::Id(id) => self.id_to_term(*id, false),
+            AggTerm::Term(t) => Some(t.clone()),
+        }
+    }
+
+    fn agg_id(&self, it: &AggTerm) -> u32 {
+        match it {
+            AggTerm::Id(id) => *id,
+            AggTerm::Term(t) => self.term_to_id(t),
+        }
     }
 
     // ---- property paths --------------------------------------------------
@@ -2724,6 +3022,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             gfun_max_output: self.gfun_max_output,
             gfun_spent: Rc::clone(&self.gfun_spent),
             pfn: self.pfn.clone(),
+            // Same NOW(), BNODE(str) nodes and pattern cache as the outer query.
+            ctx: Rc::clone(&self.ctx),
         }
     }
 
@@ -4519,6 +4819,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 Some(Value::Bool(same_term(&a, &c)))
             }
             "COALESCE" => args.iter().find_map(|a| self.eval_value(a, b, l)),
+            // XPath fn:matches: the s / m / i / x / q flags, any other flag
+            // an error; the pattern compiled once per query (review
+            // query#11, sparqlconf#8; see `xpath_regex`).
             "REGEX" => {
                 let text = self.eval_value(args.first()?, b, l)?.lexical();
                 let pat = self.eval_value(args.get(1)?, b, l)?.lexical();
@@ -4526,13 +4829,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     Some(a) => self.eval_value(a, b, l)?.lexical(),
                     None => String::new(),
                 };
-                let pat = if flags.contains('i') {
-                    format!("(?i){pat}")
-                } else {
-                    pat
-                };
-                let re = Regex::new(&pat).ok()?;
-                Some(Value::Bool(re.is_match(&text)))
+                let re = self.ctx.regex(&pat, &flags)?;
+                Some(Value::Bool(re.re.is_match(&text)))
             }
 
             // ---- strings (SPARQL 1.1) ------------------------------------
@@ -4561,6 +4859,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 };
                 Some(Value::Str { value, lang })
             }
+            // XPath fn:replace: the REGEX flags, the replacement string's
+            // `$N` / `\$` / `\\` syntax (`$1x` is group 1 then "x"), and a
+            // pattern matching the empty string is an error (review
+            // query#11, sparqlconf#8; see `xpath_regex`).
             "REPLACE" => {
                 let src = self.eval_value(args.first()?, b, l)?;
                 let (text, lang) = str_and_lang(&src);
@@ -4570,14 +4872,17 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     Some(a) => self.eval_value(a, b, l)?.lexical(),
                     None => String::new(),
                 };
-                let pat = if flags.contains('i') {
-                    format!("(?i){pat}")
-                } else {
-                    pat
-                };
-                let re = Regex::new(&pat).ok()?;
+                let re = self.ctx.regex(&pat, &flags)?;
+                if re.matches_empty {
+                    return None; // FORX0003
+                }
+                let rep = super::xpath_regex::Replacement::parse(
+                    &rep,
+                    re.re.captures_len() - 1,
+                    re.literal,
+                )?;
                 Some(Value::Str {
-                    value: re.replace_all(&text, rep.as_str()).into_owned(),
+                    value: rep.replace_all(&re.re, &text),
                     lang,
                 })
             }
@@ -4645,11 +4950,12 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             }
 
             // ---- numeric -------------------------------------------------
-            "RAND" => Some(Value::Double(next_rand())),
+            "RAND" => Some(Value::Double(unit_interval(self.ctx.next_u64()))),
 
             // ---- date / time ---------------------------------------------
+            // One instant per query (§17.4.5.1), GRAPH blocks included.
             "NOW" => Some(Value::Typed {
-                value: format_xsd_datetime_utc(now_unix_secs()),
+                value: format_xsd_datetime_utc(self.ctx.now()),
                 datatype: XSD_DATETIME.to_string(),
             }),
             "YEAR" => self.datetime_field(args, b, l, |p| p.year),
@@ -4696,16 +5002,39 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     .filter(|t| crate::model::term::is_valid_iriref(t))
                     .map(Value::Iri),
             },
+            // A blank node distinct from every node of the store and of
+            // other queries (§17.4.2.9): `BNODE()` a fresh one per call;
+            // `BNODE(str)` one per string within a solution mapping, the
+            // same for every call there and a different one in the next
+            // solution (review query#5).
             "BNODE" => {
                 let label = match args.first() {
-                    Some(a) => format!("b{:016x}", fnv1a(&self.eval_value(a, b, l)?.lexical())),
-                    None => format!("b{}", next_bnode_id()),
+                    None => fresh_bnode_label(),
+                    Some(a) => {
+                        let s = self.eval_value(a, b, l)?.lexical();
+                        let key = (self.ctx.solution_key(b), s);
+                        self.ctx
+                            .bnode_by_str
+                            .borrow_mut()
+                            .entry(key)
+                            .or_insert_with(fresh_bnode_label)
+                            .clone()
+                    }
                 };
+                // Interned now, so a later call of this query can tell the
+                // node is BNODE's own (see `QueryCtx::minted`).
+                let id = self.term_to_id(&Term::Blank(label.clone()));
+                self.ctx.minted.borrow_mut().insert(id);
                 Some(Value::Blank(label))
             }
-            "UUID" => Some(Value::Iri(format!("urn:uuid:{}", gen_uuid()))),
+            // Version-4 UUIDs from OS randomness: unique across threads,
+            // queries and processes (review conc#1).
+            "UUID" => Some(Value::Iri(format!(
+                "urn:uuid:{}",
+                format_uuid(self.ctx.uuid_bytes())
+            ))),
             "STRUUID" => Some(Value::Str {
-                value: gen_uuid(),
+                value: format_uuid(self.ctx.uuid_bytes()),
                 lang: None,
             }),
             "CONTAINALL" | "CONTAINANY" => self.eval_contain(name == "CONTAINANY", args, b, l),
@@ -5785,78 +6114,25 @@ fn now_unix_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// 64-bit FNV-1a hash — a stable label source for `BNODE("x")`.
-fn fnv1a(s: &str) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &byte in s.as_bytes() {
-        h ^= byte as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
+/// A double in `[0, 1)` from 64 random bits, for `RAND()`: the top 53 bits
+/// as the significand, so every value is equally likely.
+fn unit_interval(bits: u64) -> f64 {
+    (bits >> 11) as f64 / ((1u64 << 53) as f64)
 }
 
-/// Monotonic counter for argument-less `BNODE()` labels.
-static BNODE_COUNTER: AtomicU64 = AtomicU64::new(0);
-fn next_bnode_id() -> u64 {
-    BNODE_COUNTER.fetch_add(1, AtomicOrdering::Relaxed)
-}
-
-/// State for a tiny non-cryptographic PRNG (xorshift64*) backing `RAND`, `UUID`,
-/// and `STRUUID`. Seeded lazily from the system clock. NOT suitable for any
-/// security purpose — it exists only so these built-ins return varied values.
-static RNG_STATE: AtomicU64 = AtomicU64::new(0);
-
-fn rng_next_u64() -> u64 {
-    let mut s = RNG_STATE.load(AtomicOrdering::Relaxed);
-    if s == 0 {
-        let seed = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0x9E3779B97F4A7C15);
-        s = seed | 1; // never zero
-    }
-    s ^= s >> 12;
-    s ^= s << 25;
-    s ^= s >> 27;
-    RNG_STATE.store(s, AtomicOrdering::Relaxed);
-    s.wrapping_mul(0x2545F4914F6CDD1D)
-}
-
-/// A pseudo-random double in `[0, 1)` for `RAND` (non-cryptographic).
-fn next_rand() -> f64 {
-    // 53 significant bits → uniform in [0, 1).
-    (rng_next_u64() >> 11) as f64 / ((1u64 << 53) as f64)
-}
-
-/// Generate a random (version-4-shaped) UUID string for `UUID`/`STRUUID`. The
-/// randomness is the non-cryptographic PRNG above, so this is a convenience
-/// identifier, not a guaranteed-unique or secure UUID.
-fn gen_uuid() -> String {
-    let mut bytes = [0u8; 16];
-    bytes[..8].copy_from_slice(&rng_next_u64().to_le_bytes());
-    bytes[8..].copy_from_slice(&rng_next_u64().to_le_bytes());
+/// A version-4 UUID (RFC 9562 §5.4) from 16 random bytes, in its canonical
+/// lower-case text form, for `UUID()` / `STRUUID()`.
+fn format_uuid(mut bytes: [u8; 16]) -> String {
     bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
     bytes[8] = (bytes[8] & 0x3f) | 0x80; // RFC 4122 variant
-    let h = |b: u8| format!("{b:02x}");
-    format!(
-        "{}{}{}{}-{}{}-{}{}-{}{}-{}{}{}{}{}{}",
-        h(bytes[0]),
-        h(bytes[1]),
-        h(bytes[2]),
-        h(bytes[3]),
-        h(bytes[4]),
-        h(bytes[5]),
-        h(bytes[6]),
-        h(bytes[7]),
-        h(bytes[8]),
-        h(bytes[9]),
-        h(bytes[10]),
-        h(bytes[11]),
-        h(bytes[12]),
-        h(bytes[13]),
-        h(bytes[14]),
-        h(bytes[15]),
-    )
+    let mut out = String::with_capacity(36);
+    for (i, b) in bytes.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            out.push('-');
+        }
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
 }
 
 /// Jaro string similarity in `[0, 1]` over Unicode scalar values, with
@@ -5998,18 +6274,37 @@ fn eval_in(
 
 /// Sum numeric values (integer-preserving until a double appears).
 fn sum_values(vals: &[Value]) -> Value {
-    // Accumulate through the numeric tower so decimals and big integers are
-    // summed exactly (not silently skipped) and any double promotes the result.
-    // Non-numeric values are not summable and are skipped (as before).
+    sum_numeric(vals).0
+}
+
+/// The sum of the numeric values of `vals` and how many were added.
+/// Accumulates through the numeric tower so decimals and big integers are
+/// summed exactly (not silently skipped) and any double promotes the result.
+/// Non-numeric values are not summable and are skipped (an extension:
+/// SPARQL makes `SUM` / `AVG` an error there), and so is a value whose
+/// addition fails; `AVG` divides by the count (review query#7: it divided
+/// by the number of all values, skipped ones included).
+fn sum_numeric(vals: &[Value]) -> (Value, usize) {
     let mut acc = Value::Int(0);
+    let mut n = 0;
     for v in vals {
         if v.is_numeric() {
             if let Some(next) = acc.arith(ArithOp::Add, v) {
                 acc = next;
+                n += 1;
             }
         }
     }
-    acc
+    (acc, n)
+}
+
+/// One value an aggregate collects (see [`Evaluator::eval_aggregate`]): the
+/// id a variable is bound to, or the term an expression evaluates to. Two
+/// are equal when they are the same RDF term (`DISTINCT`).
+#[derive(Debug, PartialEq, Eq, Hash)]
+enum AggTerm {
+    Id(u32),
+    Term(Term),
 }
 
 /// How a variable of a trailing `VALUES` block meets an aggregate query's
@@ -7811,7 +8106,8 @@ mod builtin_tests {
             .expect("eval_custom_function follows eval_builtin");
         let body = &src[start..end];
         let re =
-            Regex::new(r#""([A-Z][A-Z0-9_]*)"\s*(?:=>|\|)|name == "([A-Z][A-Z0-9_]*)""#).unwrap();
+            regex::Regex::new(r#""([A-Z][A-Z0-9_]*)"\s*(?:=>|\|)|name == "([A-Z][A-Z0-9_]*)""#)
+                .unwrap();
         let handled: HashSet<&str> = re
             .captures_iter(body)
             .filter_map(|c| c.get(1).or_else(|| c.get(2)).map(|m| m.as_str()))
@@ -8168,7 +8464,9 @@ mod builtin_tests {
     #[test]
     fn bnode_uuid_struuid_shapes() {
         assert!(scalar("BNODE()").starts_with("_:"));
-        assert!(scalar(r#"BNODE("seed")"#).starts_with("_:b"));
+        // review query#5: BNODE(str) is a fresh node per solution now, not
+        // "b" followed by a hash of the string, so only the kind is fixed.
+        assert!(scalar(r#"BNODE("seed")"#).starts_with("_:"));
         let uuid = scalar("UUID()");
         assert!(
             uuid.starts_with("<urn:uuid:") && uuid.ends_with('>'),

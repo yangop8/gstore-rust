@@ -1,0 +1,7 @@
+{
+  "head": {"vars": ["g", "min", "max"]},
+  "results": {"bindings": [
+    {"g": {"type": "uri", "value": "http://example.org/g1"}, "min": {"type": "bnode", "value": "b"}, "max": {"type": "literal", "value": "5", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}},
+    {"g": {"type": "uri", "value": "http://example.org/g2"}, "min": {"type": "uri", "value": "http://example.org/z"}, "max": {"type": "literal", "value": "text"}}
+  ]}
+}

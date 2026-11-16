@@ -1,0 +1,5 @@
+# spec: SPARQL 1.1 Query §18.5.1.7 Min / §18.5.1.8 Max: numeric literals of different types
+# compare by value (§17.3 operator mapping, numeric type promotion), and the minimum and
+# maximum are the terms themselves, lexical form and datatype unchanged
+PREFIX : <http://example.org/>
+SELECT (MIN(?v) AS ?min) (MAX(?v) AS ?max) WHERE { :a :v ?v }

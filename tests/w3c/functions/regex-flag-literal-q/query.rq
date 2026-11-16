@@ -1,0 +1,5 @@
+# spec: SPARQL 1.1 Query §17.4.3.14 / §17.4.3.15 with XPath fn:matches / fn:replace flag q:
+# the pattern (and the replacement) are literal strings; q combines with i
+SELECT (REGEX("abc", "a.c", "q") AS ?dot) (REGEX("xa.cx", "a.c", "q") AS ?lit)
+       (REGEX("XA.CX", "a.c", "iq") AS ?ci) (REPLACE("1+1=2", "+", "$", "q") AS ?rep)
+WHERE {}

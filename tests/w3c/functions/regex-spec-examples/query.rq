@@ -1,0 +1,6 @@
+# spec: SPARQL 1.1 Query §17.4.3.14 REGEX (the section's examples: regex("Alice", "^ali", "i")
+# is true, regex("Bob", "^ali", "i") is false) and XPath fn:matches flags s and m
+SELECT (REGEX("Alice", "^ali", "i") AS ?alice) (REGEX("Bob", "^ali", "i") AS ?bob)
+       (REGEX("Alice", "^ali") AS ?case) (REGEX("a\nb", "a.b", "s") AS ?dotall)
+       (REGEX("a\nb", "a.b") AS ?dot) (REGEX("a\nb", "^b$", "m") AS ?multiline)
+WHERE {}

@@ -1,0 +1,6 @@
+# spec: SPARQL 1.1 Query §18.5.1.7 Min, §18.5.1.8 Max, §18.5.1.9 Sample (the result is an
+# element of the multiset, i.e. the RDF term as it is) and §18.5.1.6 GroupConcat (the
+# lexical forms, as by STR)
+PREFIX : <http://example.org/>
+SELECT ?s (MIN(?v) AS ?min) (MAX(?v) AS ?max) (SAMPLE(?v) AS ?sample) (GROUP_CONCAT(?v) AS ?concat)
+WHERE { ?s :v ?v } GROUP BY ?s

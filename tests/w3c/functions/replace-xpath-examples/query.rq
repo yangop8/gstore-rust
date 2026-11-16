@@ -1,0 +1,10 @@
+# spec: SPARQL 1.1 Query §17.4.3.15 REPLACE = XPath fn:replace (F&O §5.6.3 and its examples):
+# $N is capture group N (here followed by literal text), \$ a literal dollar, \\ a literal
+# backslash, a group above the pattern's count up to 9 the empty string
+SELECT (REPLACE("abracadabra", "bra", "*") AS ?a) (REPLACE("abracadabra", "a.*a", "*") AS ?b)
+       (REPLACE("abracadabra", "a.*?a", "*") AS ?c) (REPLACE("abracadabra", "a", "") AS ?d)
+       (REPLACE("abracadabra", "a(.)", "a$1$1") AS ?e) (REPLACE("AAAA", "A+", "b") AS ?f)
+       (REPLACE("AAAA", "A+?", "b") AS ?g) (REPLACE("darted", "^(.*?)d(.*)$", "$1c$2") AS ?h)
+       (REPLACE("abc", "(b)", "$1x") AS ?i) (REPLACE("a-b", "-", "\\$") AS ?j)
+       (REPLACE("a-b", "-", "\\\\") AS ?k) (REPLACE("abc", "(b)", "$2") AS ?l)
+WHERE {}

@@ -14,6 +14,7 @@ pub mod planner;
 pub mod results;
 pub mod value;
 pub mod vs_policy;
+mod xpath_regex;
 
 pub use engine::{DpbMode, EvalStats, Evaluator, TopKOptions};
 pub use functions::{CustomFn, FunctionRegistry};

@@ -1,0 +1,6 @@
+{
+  "head": {"vars": ["dot", "lit", "ci", "rep"]},
+  "results": {"bindings": [
+    {"dot": {"type": "literal", "value": "false", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"}, "lit": {"type": "literal", "value": "true", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"}, "ci": {"type": "literal", "value": "true", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"}, "rep": {"type": "literal", "value": "1$1=2"}}
+  ]}
+}

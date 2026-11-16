@@ -1,0 +1,6 @@
+{
+  "head": {"vars": ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"]},
+  "results": {"bindings": [
+    {"a": {"type": "literal", "value": "a*cada*"}, "b": {"type": "literal", "value": "*"}, "c": {"type": "literal", "value": "*c*bra"}, "d": {"type": "literal", "value": "brcdbr"}, "e": {"type": "literal", "value": "abbraccaddabbra"}, "f": {"type": "literal", "value": "b"}, "g": {"type": "literal", "value": "bbbb"}, "h": {"type": "literal", "value": "carted"}, "i": {"type": "literal", "value": "abxc"}, "j": {"type": "literal", "value": "a$b"}, "k": {"type": "literal", "value": "a\\b"}, "l": {"type": "literal", "value": "ac"}}
+  ]}
+}

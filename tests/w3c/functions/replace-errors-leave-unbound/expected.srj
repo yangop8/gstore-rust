@@ -1,0 +1,6 @@
+{
+  "head": {"vars": ["empty", "star", "dollar", "backslash", "flag", "ok"]},
+  "results": {"bindings": [
+    {"ok": {"type": "literal", "value": "azc"}}
+  ]}
+}

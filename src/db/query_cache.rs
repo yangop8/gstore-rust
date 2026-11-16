@@ -258,15 +258,18 @@ pub(crate) fn is_cacheable(q: &Query) -> bool {
     match q {
         Query::Select(s) => select_ok(s),
         Query::Ask(a) => pattern_ok(&a.pattern),
-        // A `[ … ]` / `( … )` node in the template is a fresh blank node per
-        // solution and per run, like BNODE().
+        // A `[ … ]` / `( … )` or labelled `_:v` node in the template is a
+        // fresh blank node per solution and per run, like BNODE().
         Query::Construct(c) => {
             pattern_ok(&c.pattern)
                 && c.order_by.iter().all(|o| expr_ok(&o.expr))
                 && !c.template.iter().any(|tp| {
                     [&tp.subject, &tp.predicate, &tp.object]
                         .into_iter()
-                        .any(|t| matches!(t, PatternTerm::Var(v) if is_anon_var(v)))
+                        .any(|t| match t {
+                            PatternTerm::Var(v) => is_anon_var(v),
+                            PatternTerm::Term(t) => matches!(t, Term::Blank(_)),
+                        })
                 })
         }
         Query::Describe(d) => d.pattern.as_ref().is_none_or(pattern_ok),
