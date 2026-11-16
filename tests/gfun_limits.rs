@@ -128,6 +128,16 @@ fn chain(n: u32) -> CsrGraph {
     graph((0..n - 1).map(|i| (i, i + 1)))
 }
 
+/// A clique, `a → b` for every `a < b < n`: few vertices with large
+/// neighbourhoods. A function's per-vertex steps stay below one poll
+/// interval (4096 work units) for `n = 200`, so every poll it makes comes
+/// from inside a vertex's neighbourhood — a component's BFS, a hub's
+/// edges — which is what analytics#8 asks for; a loop polling only per
+/// vertex (or per 1024 vertices, as before) never polls here.
+fn clique(n: u32) -> CsrGraph {
+    graph((0..n).flat_map(|a| (a + 1..n).map(move |b| (a, b))))
+}
+
 fn src(g: &CsrGraph, e: u32) -> Vec<GNode> {
     vec![GNode::from_node(g, g.node_of(e).unwrap())]
 }
@@ -224,8 +234,11 @@ fn stops_at_the_next_poll(kind: GFnKind, g: &CsrGraph, a: &GArgs, site: &'static
 #[test]
 fn wcc_stops_inside_a_giant_component() {
     let _s = serial();
-    // One component: every poll after the first outer step is inside its BFS.
     let g = chain(20_000);
+    stops_at_the_next_poll(GFnKind::Wcc, &g, &args(&g, |_| {}), "wcc");
+    // One dense component of 200 vertices: the outer loop alone never
+    // reaches a poll, so the polls are inside the component's BFS.
+    let g = clique(200);
     stops_at_the_next_poll(GFnKind::Wcc, &g, &args(&g, |_| {}), "wcc");
 }
 
@@ -241,6 +254,9 @@ fn pr_stops_inside_a_sweep() {
         a.ret_num = Some(1);
     });
     stops_at_the_next_poll(GFnKind::Pr, &g, &a, "pr");
+    // a vertex counts its edges: 200 hubs poll within a sweep
+    let g = clique(200);
+    stops_at_the_next_poll(GFnKind::Pr, &g, &a, "pr");
 }
 
 #[test]
@@ -248,6 +264,8 @@ fn label_prop_stops_inside_an_iteration() {
     let _s = serial();
     let g = chain(20_000);
     let a = args(&g, |a| a.max_iter = Some(2.0));
+    stops_at_the_next_poll(GFnKind::LabelProp, &g, &a, "labelProp");
+    let g = clique(200);
     stops_at_the_next_poll(GFnKind::LabelProp, &g, &a, "labelProp");
 }
 
@@ -273,6 +291,15 @@ fn triangle_counting_stops_inside_its_vertex_loop() {
         &args(&g, |_| {}),
         "triangleCounting",
     );
+    let g = clique(200);
+    for directed in [false, true] {
+        stops_at_the_next_poll(
+            GFnKind::TriangleCounting,
+            &g,
+            &args(&g, |a| a.directed = directed),
+            "triangleCounting",
+        );
+    }
 }
 
 #[test]
@@ -307,6 +334,9 @@ fn cluster_coeff_stops_inside_its_vertex_loop() {
     stops_at_the_next_poll(GFnKind::ClusterCoeff, &g, &args(&g, |_| {}), "clusterCoeff");
     let a = args(&g, |a| a.srcs = src(&g, 0));
     stops_at_the_next_poll(GFnKind::ClusterCoeff, &g, &a, "clusterCoeff");
+    // the global form over 200 vertices polls inside their neighbourhoods
+    let g = clique(200);
+    stops_at_the_next_poll(GFnKind::ClusterCoeff, &g, &args(&g, |_| {}), "clusterCoeff");
 }
 
 #[test]
@@ -1243,7 +1273,14 @@ fn rest_cancel_stops_a_parked_graph_function() {
     let addr = server.local_addr().unwrap();
     let s2 = Arc::clone(&server);
     let serving = std::thread::spawn(move || s2.serve_forever());
-    let r = rest::send(&addr, "POST", "/build?db_name=big", &chain_nt(20_000));
+    // One dense component of 150 vertices: WCC's first poll is inside its
+    // BFS (the outer loop alone never reaches a poll).
+    let clique_nt: String = (0..150)
+        .flat_map(|a| {
+            (a + 1..150).map(move |b| format!("<http://x/s{a}> <http://x/p> <http://x/s{b}> .\n"))
+        })
+        .collect();
+    let r = rest::send(&addr, "POST", "/build?db_name=big", &clique_nt);
     assert_eq!(r.status, 200, "{}", r.body);
 
     // Park at the first WCC poll; count the polls after the release.
