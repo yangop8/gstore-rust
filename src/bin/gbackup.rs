@@ -23,7 +23,11 @@
 //!
 //! The database directory's lock is held for the whole backup: a database
 //! another process has open (a `gserver` serving it — back it up through the
-//! server's `backup` instead — or a `gbuild` writing it) is refused.
+//! server's `backup` instead — or a `gbuild` writing it) is refused. So is a
+//! destination (or archive) that is the database directory itself or lies
+//! inside it: such a "backup" is no copy at all, and replacing the files
+//! there would delete the database's own pending write-ahead logs — it is
+//! refused before anything is touched.
 //!
 //! `-z` / `--zip` (upstream's `gbackup -z 1`), or a destination ending in
 //! `.zip`, packs the backup into a zip archive instead (feature `zip`):
@@ -35,7 +39,7 @@
 #[path = "common/cli.rs"]
 mod cli;
 
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
 use gstore::db::dirlock::DirLock;
@@ -128,6 +132,45 @@ fn command_line() -> Result<(Vec<String>, bool), ExitCode> {
     Ok((out, zip))
 }
 
+/// `path` with its longest existing leading part resolved (symbolic links,
+/// `.` and `..`) and the parts that do not exist yet appended as they are.
+fn resolve_leniently(path: &Path) -> PathBuf {
+    let absolute = match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path),
+        Err(_) => path.to_path_buf(),
+    };
+    let mut existing = absolute.clone();
+    let mut rest = Vec::new();
+    loop {
+        if let Ok(mut out) = std::fs::canonicalize(&existing) {
+            for part in rest.iter().rev() {
+                match Path::new(part).components().next() {
+                    Some(Component::ParentDir) => {
+                        out.pop();
+                    }
+                    Some(Component::CurDir) | None => {}
+                    _ => out.push(part),
+                }
+            }
+            return out;
+        }
+        let Some(last) = existing.components().next_back() else {
+            return absolute;
+        };
+        rest.push(last.as_os_str().to_owned());
+        if !existing.pop() {
+            return absolute;
+        }
+    }
+}
+
+/// Whether `path` is the directory `dir` or lies inside it (review
+/// bulkcli#4: `gbackup x x.db` reported a backup, made none, and deleted
+/// the database's pending write-ahead logs).
+fn is_within(path: &Path, dir: &Path) -> bool {
+    std::fs::canonicalize(dir).is_ok_and(|dir| resolve_leniently(path).starts_with(dir))
+}
+
 fn main() -> ExitCode {
     let (args, zip) = match command_line() {
         Ok(a) => a,
@@ -158,6 +201,19 @@ fn main() -> ExitCode {
     if !std::path::Path::new(&dir).is_dir() {
         eprintln!("database '{dir}' does not exist");
         return ExitCode::FAILURE;
+    }
+    for dest in [Some(Path::new(&target)), archive.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if is_within(dest, Path::new(&dir)) {
+            eprintln!(
+                "backup of '{dir}' refused: the destination '{}' is the database directory \
+                 or lies inside it",
+                dest.display()
+            );
+            return ExitCode::FAILURE;
+        }
     }
     // The database is held for the whole backup, as the `/api` backup holds
     // an unloaded one: the files of a database another process writes (a

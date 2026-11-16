@@ -536,6 +536,61 @@ fn a_server_killed_during_a_drop_leaves_no_half_deleted_database() {
     }
 }
 
+// ---- bulkcli#4: no backup into the database's own directory -------------------
+
+/// `gbackup` into the database directory itself (however it is spelled:
+/// relative, with a trailing slash, through a symbolic link) or into a
+/// directory inside it is refused before anything is touched — the
+/// database's pending write-ahead log survives byte for byte. It used to
+/// report "Backed up", make no backup and delete the log. The library's
+/// `backup_dir` refuses the same.
+#[test]
+fn gbackup_refuses_a_destination_inside_the_database() {
+    let root = TmpDir::new("gbackup_self");
+    let dir = disk_db(root.path(), "selfbk");
+    let wal = dir.join("kvstore.kv.wal");
+    // A placeholder log (its bytes are what must survive).
+    let bytes: Vec<u8> = (0..4096u32).map(|i| (i * 7 % 251) as u8).collect();
+    fs::write(&wal, &bytes).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&dir, root.path().join("link")).unwrap();
+    let mut dests = vec![
+        "selfbk.db",
+        "./selfbk.db/",
+        "selfbk.db/inner",
+        "selfbk.db/a/../b",
+    ];
+    if cfg!(unix) {
+        dests.push("link");
+    }
+    for dest in dests {
+        let out = tool("gbackup", root.path(), &["selfbk", dest]);
+        assert!(!out.status.success(), "{dest}: {}", text(&out));
+        assert!(text(&out).contains("refused"), "{dest}: {}", text(&out));
+        assert_eq!(
+            fs::read(&wal).unwrap(),
+            bytes,
+            "{dest}: the log is untouched"
+        );
+        for created in ["inner", "a", "b"] {
+            assert!(!dir.join(created).exists(), "{dest}");
+        }
+    }
+    let e = Database::backup_dir(&dir, dir.join("sub"))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("lies inside"), "{e}");
+    assert!(!dir.join("sub").exists());
+    assert_eq!(fs::read(&wal).unwrap(), bytes);
+    // A real destination works, and carries the log.
+    let out = tool("gbackup", root.path(), &["selfbk", "bk"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(
+        fs::read(root.path().join("bk/kvstore.kv.wal")).unwrap(),
+        bytes
+    );
+    assert_eq!(fs::read(&wal).unwrap(), bytes);
+}
 
 // ---- durability#14: /api rename reports registry and grant failures ----------
 
@@ -674,5 +729,65 @@ fn api_rename_reports_registry_and_grant_failures_and_undoes_the_rename() {
     ok(srv.api_as("bob", &[("operation", "load"), ("db_name", "newlubm")]));
     let j = srv.api_as("bob", &[("operation", "load"), ("db_name", "lubm")]);
     assert_ne!(status_code(&j), 0, "{j}");
+}
+
+// ---- durability#4: a backup never pairs a new kvstore.kv with an old vstree.kv -
+
+/// A backup refreshed over an older one, whose copy fails after the new
+/// `kvstore.kv` (here: the `vstree.kv` copy cannot create its temp file),
+/// used to leave the new store — whose header says its VS-tree is fresh —
+/// beside the previous backup's `vstree.kv`: the tree policy then pruned
+/// every entity added since. Now the old tree is removed durably before the
+/// new store lands, so the failed backup holds no stale tree (an open
+/// rebuilds or skips it). Both copy paths: `gbackup` of an on-disk database
+/// (file copy) and `Database::backup` of an open one (a save elsewhere).
+#[test]
+fn a_failed_backup_never_pairs_a_new_store_with_an_old_vstree() {
+    let root = TmpDir::new("backup_vstree");
+    fs::write(root.path().join("old.nt"), triples("a", 0..5)).unwrap();
+    let all = format!("{}{}", triples("a", 0..5), triples("n", 0..5));
+    fs::write(root.path().join("all.nt"), all).unwrap();
+    for via_open_database in [false, true] {
+        let bk = root.path().join(format!("bk{via_open_database}"));
+        let out = tool(
+            "gbuild",
+            root.path(),
+            &["--disk", "--force", "e3", "old.nt"],
+        );
+        assert!(out.status.success(), "{}", text(&out));
+        let out = tool("gbackup", root.path(), &["e3", bk.to_str().unwrap()]);
+        assert!(out.status.success(), "{}", text(&out));
+        assert!(bk.join("vstree.kv").is_file());
+        // The database grows (entities the old tree does not have), with a
+        // fresh VS-tree of its own.
+        let out = tool(
+            "gbuild",
+            root.path(),
+            &["--disk", "--force", "e3", "all.nt"],
+        );
+        assert!(out.status.success(), "{}", text(&out));
+        let blocker = bk.join("vstree.kv.tmp");
+        fs::create_dir_all(blocker.join("x")).unwrap();
+        if via_open_database {
+            let db = Database::open(root.path().join("e3.db")).unwrap();
+            assert!(db.backup(&bk).is_err());
+        } else {
+            let out = tool("gbackup", root.path(), &["e3", bk.to_str().unwrap()]);
+            assert!(!out.status.success(), "{}", text(&out));
+        }
+        fs::remove_dir_all(&blocker).unwrap();
+        assert!(
+            !bk.join("vstree.kv").exists(),
+            "via_open_database={via_open_database}: the old tree is gone"
+        );
+        let mut db = Database::open(&bk).unwrap();
+        assert_eq!(db.triple_num(), 10, "the new store is there");
+        assert_eq!(
+            subjects(&mut db, VsPolicy::Tree),
+            subjects(&mut db, VsPolicy::Off),
+            "via_open_database={via_open_database}"
+        );
+        assert_eq!(subjects(&mut db, VsPolicy::Tree).len(), 10);
+    }
 }
 

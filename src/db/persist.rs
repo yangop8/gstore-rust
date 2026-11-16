@@ -82,7 +82,15 @@
 //! way before it is deleted, so a crash mid-deletion never leaves a partial
 //! store that layout detection would prefer over the newly committed layout.
 //! [`Database::restore_into`] stages and validates the copy beside the target
-//! and swaps it in as a whole directory.
+//! and swaps it in as a whole directory. Builds never write over the
+//! database they replace: the bulk builds and the incremental disk build
+//! stage the new files in `.bulk-tmp/` and install them crash-safely
+//! ([`crate::bulk::commit`]); the incremental RocksDB build writes
+//! `rocksdb.tmp/` and swaps it in. A dropped database directory is renamed
+//! aside (`<dir>.drop-old`) durably before it is deleted
+//! ([`Database::drop_dir`]). A backup copy removes the destination's
+//! VS-tree and write-ahead logs durably before the new store lands, and
+//! copies `meta.bin` last.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
@@ -833,18 +841,24 @@ impl Database {
                 .is_none_or(|s| s.store.vstree_stale()),
         };
         let kv_dst = dir.join(KV_FILE);
-        // A stale WAL beside the destination would replay into the new copy.
-        fsutil::remove_file_if_exists(&wal_of(&kv_dst))?;
-        fsutil::copy_file_atomic(&home.join(KV_FILE), &kv_dst)?;
         let vs_src = home.join(VSTREE_KV_FILE);
         let vs_dst = dir.join(VSTREE_KV_FILE);
-        fsutil::remove_file_if_exists(&wal_of(&vs_dst))?;
+        // Removed durably before the new store lands: a stale WAL beside the
+        // destination (it would replay into the new copy) and the
+        // destination's VS-tree — an old tree must never pair with the new
+        // `kvstore.kv`, whose header may say "fresh" (review durability#4).
+        // A copy that stops after the store and before the tree leaves a
+        // store without a VS-tree, which an open rebuilds.
+        for path in [wal_of(&kv_dst), wal_of(&vs_dst), vs_dst.clone()] {
+            fsutil::remove_file_if_exists(&path)?;
+        }
+        fsutil::sync_dir(dir)?;
+        fsutil::copy_file_atomic(&home.join(KV_FILE), &kv_dst)?;
         if !stale && vs_src.is_file() {
             fsutil::copy_file_atomic(&vs_src, &vs_dst)?;
-        } else {
-            // The copy's header says the VS-tree is stale; it is rebuilt on open.
-            fsutil::remove_file_if_exists(&vs_dst)?;
         }
+        // (Otherwise the copy's header says the VS-tree is stale; it is
+        // rebuilt on open.)
         remove_other_layouts(dir, StorageKind::Disk)
     }
 
@@ -1522,11 +1536,30 @@ impl Database {
     /// (a `gbuild --force`, a bulk install, which hold the lock), whose staged
     /// files the repair would delete. Fails, touching nothing, while another
     /// process holds it.
+    ///
+    /// Refused, touching nothing, when `dst` is `src` or lies inside it (a
+    /// "backup" that would delete the source's own write-ahead logs, review
+    /// bulkcli#4), and while another process has a database in `dst` open.
+    /// The copy never pairs files of two states (review durability#4): what
+    /// must not meet the new files — `dst`'s write-ahead logs, its
+    /// `vstree.kv` (an old VS-tree beside a new `kvstore.kv` whose header
+    /// says "fresh" would prune the entities added since), a snapshot commit
+    /// record, and every database file `src` lacks — is removed durably
+    /// first, and `meta.bin`, the file the snapshot layout is detected by,
+    /// is copied last; so a copy that fails part-way leaves no stale
+    /// VS-tree and no mixed snapshot.
     pub fn backup_dir<P: AsRef<Path>, Q: AsRef<Path>>(src: P, dst: Q) -> Result<()> {
         let (src, dst) = (src.as_ref(), dst.as_ref());
         if !src.is_dir() {
             return Err(GStoreError::Database(format!(
                 "backup source '{}' is not a directory",
+                src.display()
+            )));
+        }
+        if fsutil::is_within(dst, src) {
+            return Err(GStoreError::Database(format!(
+                "backup destination '{}' is the database directory '{}' or lies inside it",
+                dst.display(),
                 src.display()
             )));
         }
@@ -1542,31 +1575,58 @@ impl Database {
             None
         };
         fs::create_dir_all(dst)?;
+        // A database another process has open in `dst` is not rewritten
+        // under it (as a save into another directory refuses).
+        let _dst_lock = if Database::storage_kind(dst).is_some() {
+            Some(super::dirlock::DirLock::acquire(dst)?)
+        } else {
+            None
+        };
 
         let kv = Path::new(KV_FILE);
         let vs = Path::new(VSTREE_KV_FILE);
-        let mut names: Vec<PathBuf> = SNAPSHOT_FILES.iter().map(PathBuf::from).collect();
-        // Each paged file before its WAL, so a stale destination WAL is gone
-        // before the new main file lands (see `wal_of`).
+        // The copy order: the snapshot members with `meta.bin` (the file the
+        // layout is detected by) last of all; each paged file before its WAL
+        // and `kvstore.kv` before `vstree.kv` (a store without its VS-tree
+        // just rebuilds it).
+        let mut names: Vec<PathBuf> = SNAPSHOT_FILES
+            .iter()
+            .filter(|n| **n != META_FILE)
+            .map(PathBuf::from)
+            .collect();
         for paged in [kv, vs] {
             names.push(paged.to_path_buf());
             names.push(wal_of(paged));
         }
-        for extra in [UPDATE_LOG_FILE, REDO_LOG_FILE, BACKUP_OFFSET_FILE] {
+        for extra in [
+            UPDATE_LOG_FILE,
+            REDO_LOG_FILE,
+            BACKUP_OFFSET_FILE,
+            META_FILE,
+        ] {
             names.push(PathBuf::from(extra));
         }
-        // A destination WAL must never meet a newly copied main file: drop them
-        // all first; the source's own WALs (if any) are copied after their file.
-        for paged in [kv, vs] {
-            fsutil::remove_file_if_exists(&dst.join(wal_of(paged)))?;
+        // Removed durably before anything is copied: a destination WAL (it
+        // would replay into the new main file), the destination VS-tree (it
+        // must never pair with the new store), a snapshot commit record (it
+        // would roll stale temp files forward over the copies), `meta.bin`
+        // (copied last), and every file the source lacks.
+        let mut stale: Vec<PathBuf> = vec![
+            wal_of(kv),
+            wal_of(vs),
+            vs.to_path_buf(),
+            PathBuf::from(fsutil::SNAPSHOT_COMMIT_FILE),
+            PathBuf::from(META_FILE),
+        ];
+        stale.extend(names.iter().filter(|n| !src.join(n).is_file()).cloned());
+        for name in &stale {
+            fsutil::remove_file_if_exists(&dst.join(name))?;
         }
         fsutil::sync_dir(dst)?;
         for name in &names {
-            let (from, to) = (src.join(name), dst.join(name));
+            let from = src.join(name);
             if from.is_file() {
-                fsutil::copy_file_atomic(&from, &to)?;
-            } else {
-                fsutil::remove_file_if_exists(&to)?;
+                fsutil::copy_file_atomic(&from, &dst.join(name))?;
             }
         }
         let (rocks_src, rocks_dst) = (src.join(ROCKS_SUBDIR), dst.join(ROCKS_SUBDIR));
