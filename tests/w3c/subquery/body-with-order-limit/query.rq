@@ -1,0 +1,5 @@
+# spec: SPARQL 1.1 Query §12 Subqueries, §15.1 ORDER BY, §15.5 LIMIT and §19.8 Grammar rule [53] GroupGraphPattern ::= '{' ( SubSelect | GroupGraphPatternSub ) '}':
+# the two oldest people, chosen inside the sub-query
+PREFIX : <http://example.org/>
+SELECT ?p ?a
+WHERE { SELECT ?p ?a WHERE { ?p :age ?a } ORDER BY DESC(?a) LIMIT 2 }

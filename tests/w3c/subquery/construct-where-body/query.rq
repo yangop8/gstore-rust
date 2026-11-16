@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §12 Subqueries, §16.2 CONSTRUCT and §19.8 Grammar rule [53] GroupGraphPattern ::= '{' ( SubSelect | GroupGraphPatternSub ) '}': … WHERE { SELECT … }
+PREFIX : <http://example.org/>
+CONSTRUCT { ?p :friendCount ?n }
+WHERE { SELECT ?p (COUNT(?f) AS ?n) WHERE { ?p :knows ?f } GROUP BY ?p }

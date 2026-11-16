@@ -707,16 +707,26 @@ impl<'s> Parser<'s> {
 
     /// Parse `{ … }`, returning the graph-pattern algebra for its contents.
     ///
-    /// Triple patterns accumulate into BGPs; group-level constructs
-    /// (`OPTIONAL`, `MINUS`, `BIND`, sub-groups, `UNION`, sub-`SELECT`,
-    /// `VALUES`) fold into the running conjunction in textual order. All
-    /// `FILTER`s in the group apply to the whole group (wrapped at the end).
+    /// `GroupGraphPattern ::= '{' ( SubSelect | GroupGraphPatternSub ) '}'`
+    /// (SPARQL 1.1 §19.8, rule 53): a group whose body starts with `SELECT`
+    /// is a sub-query and nothing else — `WHERE { SELECT … }`,
+    /// `OPTIONAL { SELECT … }`, `MINUS { SELECT … }`, `GRAPH ?g { SELECT … }`,
+    /// `FILTER EXISTS { SELECT … }`, a `UNION` operand `{ SELECT … }` and the
+    /// nested `{ { SELECT … } }` all parse through here (review parser#3 /
+    /// sparqlconf#5). Otherwise triple patterns accumulate into BGPs;
+    /// group-level constructs (`OPTIONAL`, `MINUS`, `BIND`, sub-groups,
+    /// `UNION`, `VALUES`) fold into the running conjunction in textual
+    /// order. All `FILTER`s in the group apply to the whole group (wrapped
+    /// at the end).
     fn parse_group_graph_pattern(&mut self) -> Result<GraphPattern> {
         self.nested(Self::parse_group_graph_pattern_inner)
     }
 
     fn parse_group_graph_pattern_inner(&mut self) -> Result<GraphPattern> {
         self.expect(&Token::LBrace, "'{'")?;
+        if self.keyword().as_deref() == Some("SELECT") {
+            return self.parse_subselect_body();
+        }
         // Every construct folded into `current` wraps it in one more node.
         let mut chain = self.chain_begin();
         let mut current = GraphPattern::Empty;
@@ -820,12 +830,9 @@ impl<'s> Parser<'s> {
                 }
                 Token::LBrace => {
                     flush!();
-                    // `{ SELECT … }` is a sub-query; otherwise a group/UNION.
-                    let node = if self.brace_starts_subselect() {
-                        self.parse_subselect_group()?
-                    } else {
-                        self.parse_group_or_union()?
-                    };
+                    // A group (a sub-query `{ SELECT … }` among them),
+                    // optionally the first operand of a UNION.
+                    let node = self.parse_group_or_union()?;
                     current = join_opt(current, node);
                     self.chain_link(&mut chain)?;
                 }
@@ -858,20 +865,24 @@ impl<'s> Parser<'s> {
         Ok(left)
     }
 
-    /// Does the upcoming `{` open a sub-`SELECT`? (peek past the brace.)
-    fn brace_starts_subselect(&self) -> bool {
-        matches!(self.peek(), Token::LBrace)
-            && matches!(self.peek_at(1), Token::Word(w) if w.eq_ignore_ascii_case("SELECT"))
-    }
-
-    /// Parse `{ SELECT … }` into a [`GraphPattern::SubSelect`].
-    fn parse_subselect_group(&mut self) -> Result<GraphPattern> {
-        self.nested(|p| {
-            p.expect(&Token::LBrace, "'{'")?;
-            let sq = p.parse_select()?;
-            p.expect(&Token::RBrace, "'}'")?;
-            Ok(GraphPattern::SubSelect(Box::new(sq)))
-        })
+    /// The rest of a group whose body is a sub-query, the cursor at its
+    /// `SELECT`: `SubSelect '}'`, as a [`GraphPattern::SubSelect`]. The
+    /// sub-query is the whole group; to join it with other patterns, nest
+    /// it as a group of its own (`{ { SELECT … } ?s ?p ?o }`).
+    fn parse_subselect_body(&mut self) -> Result<GraphPattern> {
+        let mut chain = self.chain_begin();
+        let sq = self.parse_select()?;
+        if !matches!(self.peek(), Token::RBrace) {
+            return Err(self.err(format!(
+                "expected '}}' closing the group after its sub-SELECT, found {} (a sub-SELECT \
+                 is a whole group: write {{ {{ SELECT … }} … }} to join it with other patterns)",
+                describe_token(self.peek())
+            )));
+        }
+        self.bump();
+        self.chain_link(&mut chain)?;
+        self.chain_end(chain);
+        Ok(GraphPattern::SubSelect(Box::new(sq)))
     }
 
     /// Parse an inline `VALUES` block: `VALUES ?v { … }` or

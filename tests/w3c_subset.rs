@@ -81,6 +81,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use gstore::json::Json;
+use gstore::parser::sparql::ast::{GraphPattern, Query};
 use gstore::query::{DpbMode, EvalStats, Evaluator, TopKOptions};
 use gstore::zipio::{write_export, ExportFormat};
 use gstore::{Database, DiskQueryMode, OpenOptions, QueryResult, Term};
@@ -1793,4 +1794,86 @@ fn streaming_settings_take_the_streaming_paths() {
     assert!(stats_of(data, ordered, Exec::Stream).heap_topk > 0);
     let dpb = stats_of(data, ordered, Exec::Dpb);
     assert!(dpb.dpb_topk + dpb.heap_topk > 0, "{dpb:?}");
+}
+
+// ---- review parser#3 / sparqlconf#5: the standard sub-SELECT forms -----------
+
+/// The pattern of a SELECT / ASK.
+fn where_pattern(q: &str) -> GraphPattern {
+    match gstore::parser::sparql::parse(q).unwrap_or_else(|e| panic!("{q}: {e}")) {
+        Query::Select(s) => s.pattern,
+        Query::Ask(a) => a.pattern,
+        other => panic!("{q}: {other:?}"),
+    }
+}
+
+#[test]
+fn a_sub_select_parses_as_a_whole_group_in_every_position() {
+    let sub = "SELECT ?s WHERE { ?s ?p ?o } LIMIT 1";
+    let parse = |q: String| {
+        gstore::parser::sparql::parse(&q).unwrap_or_else(|e| panic!("{q}\n  -> {e}"));
+    };
+    for q in [
+        format!("SELECT * WHERE {{ {sub} }}"),
+        format!("SELECT * WHERE {{ {{ {sub} }} }}"),
+        format!("SELECT * WHERE {{ ?a ?b ?c OPTIONAL {{ {sub} }} }}"),
+        format!("SELECT * WHERE {{ ?a ?b ?c MINUS {{ {sub} }} }}"),
+        format!("SELECT * WHERE {{ GRAPH ?g {{ {sub} }} }}"),
+        format!("SELECT * WHERE {{ ?a ?b ?c FILTER EXISTS {{ {sub} }} }}"),
+        format!("SELECT * WHERE {{ ?a ?b ?c FILTER NOT EXISTS {{ {sub} }} }}"),
+        format!("SELECT * WHERE {{ {{ {sub} }} UNION {{ {sub} }} }}"),
+        format!("SELECT * WHERE {{ {{ ?s ?p ?o }} UNION {{ {sub} }} }}"),
+        format!("SELECT * WHERE {{ {{ {sub} }} UNION {{ ?s ?p ?o }} UNION {{ {sub} }} }}"),
+        format!("SELECT * WHERE {{ SERVICE <http://ex/sparql> {{ {sub} }} }}"),
+        "SELECT ?x ?n WHERE { SELECT ?x (COUNT(*) AS ?n) WHERE { ?x ?p ?o } GROUP BY ?x }"
+            .to_string(),
+        format!("SELECT * WHERE {{ {sub} VALUES ?s {{ <http://ex/a> }} }}"),
+        format!("ASK {{ {sub} }}"),
+        format!("ASK WHERE {{ {sub} }}"),
+        format!("CONSTRUCT {{ ?s <http://ex/p> 1 }} WHERE {{ {sub} }}"),
+        format!("DESCRIBE ?s WHERE {{ {sub} }}"),
+        format!("INSERT {{ ?s <http://ex/p> 1 }} WHERE {{ {sub} }}"),
+        format!("DELETE {{ ?s ?p ?o }} WHERE {{ {sub} }}"),
+        "SELECT * WHERE { select ?s where { ?s ?p ?o } }".to_string(),
+    ] {
+        parse(q);
+    }
+    // `{ SELECT … }` and `{ { SELECT … } }` are the same pattern.
+    let direct = where_pattern(&format!("SELECT * WHERE {{ {sub} }}"));
+    assert!(matches!(direct, GraphPattern::SubSelect(_)), "{direct:?}");
+    assert_eq!(
+        direct,
+        where_pattern(&format!("SELECT * WHERE {{ {{ {sub} }} }}"))
+    );
+    // A UNION of two sub-queries.
+    let union = where_pattern(&format!(
+        "SELECT * WHERE {{ {{ {sub} }} UNION {{ {sub} }} }}"
+    ));
+    match union {
+        GraphPattern::Union(l, r) => {
+            assert!(matches!(*l, GraphPattern::SubSelect(_)));
+            assert!(matches!(*r, GraphPattern::SubSelect(_)));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_sub_select_is_the_whole_group() {
+    // GroupGraphPattern ::= '{' ( SubSelect | GroupGraphPatternSub ) '}':
+    // nothing may follow the sub-query inside its group.
+    for q in [
+        "SELECT * WHERE { SELECT ?s WHERE { ?s ?p ?o } ?s ?p ?o }",
+        "SELECT * WHERE { SELECT ?s WHERE { ?s ?p ?o } . ?s ?p ?o }",
+        "SELECT * WHERE { SELECT ?s WHERE { ?s ?p ?o } FILTER(true) }",
+        "SELECT * WHERE { ?s ?p ?o SELECT ?s WHERE { ?s ?p ?o } }",
+    ] {
+        let e = gstore::parser::sparql::parse(q).unwrap_err().to_string();
+        assert!(!e.is_empty(), "{q}");
+    }
+    let e =
+        gstore::parser::sparql::parse("SELECT * WHERE { SELECT ?s WHERE { ?s ?p ?o } ?x ?y ?z }")
+            .unwrap_err()
+            .to_string();
+    assert!(e.contains("sub-SELECT"), "{e}");
 }

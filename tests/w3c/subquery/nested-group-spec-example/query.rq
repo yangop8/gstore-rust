@@ -1,0 +1,13 @@
+# spec: SPARQL 1.1 Query §12 Subqueries (the section's example; the sub-query is a
+# group nested in the WHERE group, the form that always parsed)
+PREFIX : <http://people.example/>
+SELECT ?y ?minName
+WHERE {
+  :alice :knows ?y .
+  {
+    SELECT ?y (MIN(?name) AS ?minName)
+    WHERE {
+      ?y :name ?name .
+    } GROUP BY ?y
+  }
+}

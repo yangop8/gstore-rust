@@ -1,0 +1,7 @@
+{
+  "head": {"vars": ["p", "a"]},
+  "results": {"bindings": [
+    {"p": {"type": "uri", "value": "http://example.org/carol"}, "a": {"type": "literal", "value": "35", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}},
+    {"p": {"type": "uri", "value": "http://example.org/alice"}, "a": {"type": "literal", "value": "30", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}}
+  ]}
+}
