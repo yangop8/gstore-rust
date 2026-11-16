@@ -62,6 +62,8 @@ pub use persist::StorageKind;
 
 #[cfg(test)]
 mod hardening_tests;
+#[cfg(test)]
+mod layout_matrix_tests;
 mod load_policy;
 pub mod named;
 #[cfg(test)]
