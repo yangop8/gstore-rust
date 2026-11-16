@@ -6402,7 +6402,7 @@ const STRING_INDEX_MIN_ENTRIES: usize = 64;
 /// The index is keyed by the strings a substring `FILTER` compares — NOT the
 /// raw N-Triples dict key, whose escaped/quoted form would miss a needle
 /// holding an escaped character (`"`, `\`, a newline). A filter compares one
-/// of two strings (see [`substr_target_var`]): through `STR(?v)` the term's
+/// of two strings: through `STR(?v)` the term's
 /// own lexical form (`"0012"^^xsd:integer` is `"0012"`, an IRI its text), and
 /// through a bare `?v` its value's canonical form (`12`). The two differ for
 /// numbers and booleans with a non-canonical lexical form (leading zeros, a
@@ -6422,7 +6422,7 @@ pub fn dictionary_string_index(dict: &Dictionary) -> Option<Arc<StringIndex>> {
 const STRING_INDEX_POLL: usize = 1024;
 
 /// [`dictionary_string_index`] for a request with a cancel flag: a raised
-/// `cancel` stops the build — checked every [`STRING_INDEX_POLL`] terms —
+/// `cancel` stops the build — checked every 1,024 terms —
 /// with [`GStoreError::Cancelled`] (review conc#5). `Ok(None)` when no index
 /// would help (see there).
 pub fn dictionary_string_index_cancellable(

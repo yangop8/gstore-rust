@@ -759,7 +759,7 @@ impl Database {
     /// changed (one identity check per term, trigram work only for what
     /// changed) instead of being rebuilt from scratch; a full rebuild comes
     /// only once more than a quarter of the dictionary (at least
-    /// [`STRING_INDEX_STALE_MIN`]) was posted that way (review db#5).
+    /// 4,096 terms) was posted that way (review db#5).
     pub fn string_index_cancellable(
         &self,
         cancel: Option<&AtomicBool>,
