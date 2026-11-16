@@ -2899,7 +2899,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         l: &Binding,
         layout: &VarLayout,
         cache: &mut BoundPathCache,
-    ) -> Rc<Vec<(u32, u32)>> {
+    ) -> PathPairs {
         let bound = |t: &PatternTerm| match t {
             PatternTerm::Var(v) => l[layout.index[v]],
             PatternTerm::Term(_) => None,
@@ -6597,12 +6597,16 @@ impl<'g> PathJoin<'g> {
     }
 }
 
+/// The `(start, end)` pairs of a path pattern, shared by a memo's users.
+type PathPairs = Rc<Vec<(u32, u32)>>;
+
 /// The memo of one bind-joined path ([`Evaluator::bound_path_pairs`]): its
-/// `(start, end)` pairs per bound value and side, and with both ends free.
+/// `(start, end)` pairs per bound value and side (walked backwards from the
+/// object?, value), and with both ends free.
 #[derive(Default)]
 struct BoundPathCache {
-    from: HashMap<(bool, u32), Rc<Vec<(u32, u32)>>, FxBuildHasher>,
-    free: Option<Rc<Vec<(u32, u32)>>>,
+    from: HashMap<(bool, u32), PathPairs, FxBuildHasher>,
+    free: Option<PathPairs>,
 }
 
 /// The solution `l` extended by the path solution `(s, o)`; `None` when
