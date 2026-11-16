@@ -11,18 +11,24 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::error::{GStoreError, Result};
 
-/// The built-in default of [`max_request_bytes`]: 16 MiB.
+/// The default of `[upload] sparql_max_size`, the limit `gserver` installs:
+/// 16 MiB.
 pub const DEFAULT_MAX_REQUEST_BYTES: usize = 16 << 20;
 
 /// The process value of [`max_request_bytes`].
-static MAX_REQUEST_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_REQUEST_BYTES);
+static MAX_REQUEST_BYTES: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 /// The longest SPARQL query or update text [`parse`](super::parse)
-/// accepts, in bytes: [`DEFAULT_MAX_REQUEST_BYTES`] unless
-/// [`set_max_request_bytes`] changed it (`gserver` and `gbuild` set
-/// `[upload] sparql_max_size`); `usize::MAX` means no limit. A longer
-/// request is refused before it is tokenized (review parser#8): the
-/// tokens of a request take memory in proportion to their number.
+/// accepts, in bytes; `usize::MAX` means no limit. A longer request is
+/// refused before it is tokenized (review parser#8): the tokens of a
+/// request take memory in proportion to their number.
+///
+/// A process has no limit until [`set_max_request_bytes`] sets one:
+/// `gserver` (and `gbuild`) install `[upload] sparql_max_size`, whose
+/// default is [`DEFAULT_MAX_REQUEST_BYTES`], through
+/// `GStoreConfig::install_storage_defaults`. The command-line tools that
+/// read no configuration (`gquery`, `gconsole`) and library callers keep
+/// running updates of any size from their own files.
 pub fn max_request_bytes() -> usize {
     MAX_REQUEST_BYTES.load(Ordering::Relaxed)
 }

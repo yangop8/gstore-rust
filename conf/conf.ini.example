@@ -294,9 +294,10 @@ unzip_max_size = 10737418240
 # the memory an unterminated string or a gzip-compressed input can take.
 # 64 MB; 0 = no limit (upstream has none)
 rdf_max_token_size = 67108864
-# (gstore-rust extension) the longest SPARQL query or update, in bytes: a
-# longer one is refused before it is parsed. 16 MB; 0 = no limit (upstream has
-# none). Large loads belong in build / batchInsert, not in INSERT DATA.
+# (gstore-rust extension) the longest SPARQL query or update gserver accepts,
+# in bytes: a longer one is refused before it is parsed. 16 MB; 0 = no limit
+# (upstream has none; so do gquery and gconsole, which read no configuration).
+# Large loads belong in build / batchInsert, not in INSERT DATA.
 sparql_max_size = 16777216
 # (gstore-rust extension) /file/download. By default a download needs a valid
 # username / password, and a user reads a file only with the matching

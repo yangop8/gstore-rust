@@ -597,7 +597,8 @@ pub struct GStoreConfig {
     /// *(Rust extension)* Bytes a SPARQL query or update may have: a longer
     /// one is refused before it is tokenized (default 16 MiB; `0` = no
     /// limit; review parser#8). Installed as the process limit by
-    /// [`GStoreConfig::install_storage_defaults`].
+    /// [`GStoreConfig::install_storage_defaults`] (`gserver`, `gbuild`); a
+    /// process that installs none has no limit.
     pub sparql_max_size: u64,
     /// *(Rust extension; upstream-compat switch)* Serve `/file/download`
     /// without credentials, as upstream does: the export directory (exports

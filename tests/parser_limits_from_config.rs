@@ -13,9 +13,10 @@ use gstore::parser::{stream, turtle};
 
 #[test]
 fn the_upload_section_sets_the_token_and_request_limits() {
-    // The built-in defaults, and the shipped configuration's.
+    // The built-in defaults (no SPARQL limit until a configuration
+    // installs one), and the shipped configuration's.
     assert_eq!(stream::default_max_token_bytes(), 64 << 20);
-    assert_eq!(lexer::max_request_bytes(), 16 << 20);
+    assert_eq!(lexer::max_request_bytes(), usize::MAX);
     let shipped = GStoreConfig::default();
     assert_eq!(
         (shipped.rdf_max_token_size, shipped.sparql_max_size),
