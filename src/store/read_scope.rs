@@ -49,8 +49,8 @@ thread_local! {
     static SCOPES: RefCell<Vec<Slot>> = const { RefCell::new(Vec::new()) };
 }
 
-/// How the error of a statement that recorded a read error starts: "a read
-/// from the store failed while <what>: <first error>". Every site that turns
+/// How the error of a statement that recorded a read error starts: `"a read
+/// from the store failed while <what>: <first error>"`. Every site that turns
 /// a scope's [`take_error`](ReadScope::take_error) into an error builds this
 /// text (or calls [`read_failure`]), and
 /// [`GStoreError::kind`](crate::error::GStoreError::kind) classifies a

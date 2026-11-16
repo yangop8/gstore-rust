@@ -464,3 +464,40 @@ fn syntax_errors_stay_400_and_api_codes_are_unchanged() {
     );
     assert_eq!(code(&j), 1005, "{j}");
 }
+
+/// The lock primitives type their failures (review design#3): a lock held
+/// elsewhere is `Locked` (a conflict), a lock that cannot be taken at all is
+/// an I/O error (a storage failure).
+#[test]
+fn the_directory_locks_type_their_errors() {
+    use gstore::db::dirlock::{BuildGuard, DirLock};
+    use gstore::error::ErrorKind;
+    let root = TmpDir::new("lockkinds");
+    let dir = root.0.join("k.db");
+    fs::create_dir_all(&dir).unwrap();
+    // Held by "another process" (a description of its own).
+    let held = ForeignLock::take(&dir);
+    let e = DirLock::acquire(&dir).unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Locked, "{e}");
+    assert!(e.to_string().contains("locked by another process"), "{e}");
+    drop(held);
+    drop(DirLock::acquire(&dir).unwrap());
+    // The lock file cannot be opened: an I/O error.
+    fs::remove_file(dir.join("LOCK")).unwrap();
+    fs::create_dir(dir.join("LOCK")).unwrap();
+    let e = DirLock::acquire(&dir).unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Storage, "{e}");
+    assert!(
+        e.to_string().contains("cannot lock database directory"),
+        "{e}"
+    );
+    // A directory that is not there cannot be locked either.
+    let e = DirLock::acquire(&root.0.join("missing.db")).unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Storage, "{e}");
+    // A second bulk build of the same directory in this process.
+    let guard = BuildGuard::enter(&dir).unwrap();
+    let e = BuildGuard::enter(&dir).unwrap_err();
+    assert_eq!(e.kind(), ErrorKind::Locked, "{e}");
+    drop(guard);
+    drop(BuildGuard::enter(&dir).unwrap());
+}

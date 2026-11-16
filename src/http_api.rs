@@ -9601,7 +9601,9 @@ mod tests {
         let (s, body) = post(&format!("/cancel?id={task}"), "");
         assert_eq!(s, 200, "{body}");
         let (s, body) = query.join().unwrap();
-        assert_eq!(s, 400, "a cancelled /tquery fails: {body}");
+        // review design#3: a cancelled statement is a refused request (503),
+        // no longer a 400 query error.
+        assert_eq!(s, 503, "a cancelled /tquery fails: {body}");
         assert!(body.to_lowercase().contains("cancel"), "{body}");
         // The task is gone and the transaction is still usable.
         let (_, body) = split_status_body(&raw_request(&addr, "GET", "/tasklist", Some(&root), ""));
@@ -9746,9 +9748,10 @@ mod tests {
         );
 
         // The query, whose cancel flag was flipped while it ran, returns the
-        // cancellation error (HTTP 400 + "query cancelled").
+        // cancellation error (HTTP 503 + "query cancelled"; review design#3:
+        // it was a 400 query error).
         let (qstatus, qbody) = split_status_body(&query_thread.join().unwrap());
-        assert_eq!(qstatus, 400, "a cancelled query returns 400: {qbody}");
+        assert_eq!(qstatus, 503, "a cancelled query returns 503: {qbody}");
         assert!(
             qbody.to_lowercase().contains("cancel"),
             "expected a cancellation error, got: {qbody}"
@@ -11275,7 +11278,21 @@ mod tests {
             "INSERT DATA { <http://ex/c> <http://ex/p> <http://ex/d> }",
         );
         assert_eq!(s, 200, "{b}");
-        // A file where the rule directory belongs cannot be removed as one.
+        // review http#10: the rebuild's save fails (a directory stands where
+        // its staging file goes) — the fault used to be a rule directory
+        // that cannot be removed, which no longer precedes the save: the
+        // replaced rules go only once the new database is saved.
+        let blocker = server.root_dir().join("x.db").join("dict.bin.tmp");
+        fs::create_dir_all(blocker.join("blocker")).unwrap();
+        let (s, b) = post("/build?db_name=x&layout=snapshot", data);
+        assert_eq!(s, 500, "{b}");
+        let (s, b) = post("/sparql?db_name=x", ask);
+        assert_eq!(s, 200, "served again: {b}");
+        assert!(b.contains("true"), "the acknowledged insert survived: {b}");
+        fs::remove_dir_all(&blocker).unwrap();
+        // A rebuild saved over a rule directory it cannot remove (a file
+        // there) is in place, but not served — as a bulk build whose
+        // install did not finish — and the old rules are reported.
         fs::write(
             server.root_dir().join("x.db").join(RULE_DIR),
             "not a directory",
@@ -11283,9 +11300,9 @@ mod tests {
         .unwrap();
         let (s, b) = post("/build?db_name=x&layout=snapshot", data);
         assert_eq!(s, 500, "{b}");
+        assert!(b.contains(RULE_DIR), "{b}");
         let (s, b) = post("/sparql?db_name=x", ask);
-        assert_eq!(s, 200, "served again: {b}");
-        assert!(b.contains("true"), "the acknowledged insert survived: {b}");
+        assert_eq!(s, 404, "not served: {b}");
         stop_cp(&server, serving);
     }
 
@@ -11375,7 +11392,9 @@ mod tests {
             "/build?db_name=race&layout=disk",
             "<http://ex/a> <http://ex/p> <http://ex/b> .",
         );
-        assert_eq!(s, 400, "{b}");
+        // review design#3: a lock another process holds is a conflict (409)
+        // on every endpoint, no longer a 400.
+        assert_eq!(s, 409, "{b}");
         assert!(b.contains("locked by another process"), "{b}");
         assert!(
             dir.join("other-process-work").is_file(),
