@@ -532,76 +532,164 @@ fn an_open_rocksdb_database_is_not_replaced() {
     let _ = fs::remove_dir_all(&base);
 }
 
+/// The CRC-32 the pager's log frames carry (IEEE 802.3, reflected).
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+/// A complete, committed write-ahead log of `pages` (`(page id, bytes)`).
+fn committed_wal(pages: &[(u32, &[u8])]) -> Vec<u8> {
+    let mut wal = b"GSTOREWL".to_vec();
+    wal.extend_from_slice(&(pages.len() as u32).to_le_bytes());
+    for (id, page) in pages {
+        assert_eq!(page.len(), 4096);
+        wal.extend_from_slice(&id.to_le_bytes());
+        wal.extend_from_slice(page);
+    }
+    let crc = crc32(&wal[8..]);
+    wal.extend_from_slice(&crc.to_le_bytes());
+    wal.extend_from_slice(b"GSTORECM");
+    wal
+}
+
 /// A committed `kvstore.kv.wal` of the store being replaced is replayed
-/// before it is removed; a replay that fails part-way stops the build with
-/// the log in place (it alone can finish the half-applied batch), never
-/// removing it to go on.
+/// into it before it is removed. Review tests-a#5: the former test's log
+/// changed nothing visible (page 1 as it was, plus a page at the largest
+/// page id), so on a file system that takes a 16 TiB offset (tmpfs, xfs,
+/// btrfs) an install that removed the log without replaying it passed. Here
+/// the log writes a marked page past the old store's end, and a hard link
+/// keeps the old store's file after the install renames the new one over
+/// its name: the marked page is there only if the log was replayed — on any
+/// file system.
+#[test]
+fn the_old_wal_is_replayed_before_the_store_is_replaced() {
+    let base = tmp("wal_replayed");
+    let dir = base.join("w.db");
+    fs::create_dir_all(&dir).unwrap();
+    make_prior(&dir, Prior::Disk);
+    let kv = dir.join("kvstore.kv");
+    let old_store = base.join("old_store.kv");
+    fs::hard_link(&kv, &old_store).unwrap();
+    let len = fs::metadata(&kv).unwrap().len();
+    assert_eq!(len % 4096, 0);
+    let past_end = (len / 4096) as u32;
+    let marker = [0x5Au8; 4096];
+    let wal_path = dir.join("kvstore.kv.wal");
+    fs::write(&wal_path, committed_wal(&[(past_end, &marker)])).unwrap();
+    build_new(&dir).unwrap();
+    assert!(!wal_path.exists(), "the log is removed after its replay");
+    assert_eq!(which(&dir, Prior::Disk), Some(true));
+    let old = fs::read(&old_store).unwrap();
+    let at = past_end as usize * 4096;
+    assert!(
+        old.len() >= at + 4096 && old[at..at + 4096] == marker,
+        "the old store's committed log was removed without being replayed"
+    );
+    let _ = fs::remove_dir_all(&base);
+}
+
+/// The helper process of [`a_failed_replay_of_the_old_wal_keeps_the_log`]:
+/// runs the build with `RLIMIT_FSIZE` set (by the parent, before exec) and
+/// prints its outcome (does nothing in a normal run).
+#[test]
+fn limited_build_helper() {
+    let Ok(dir) = std::env::var("GSTORE_TEST_LIMITED_BUILD") else {
+        return;
+    };
+    match build_new(Path::new(&dir)) {
+        Ok(_) => println!("BUILD-OK"),
+        Err(e) => println!("BUILD-ERR {e}"),
+    }
+}
+
+/// A replay that fails part-way stops the build with the log in place (it
+/// alone can finish the half-applied batch), never removing it to go on.
+/// Review tests-a#5: the failure came from a page at a 16 TiB offset, which
+/// only some file systems refuse, so the test checked a different branch
+/// per file system. The build now runs in a child process whose file-size
+/// limit (`RLIMIT_FSIZE`, `SIGXFSZ` ignored) refuses that write with `EFBIG`
+/// everywhere.
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 #[test]
 fn a_failed_replay_of_the_old_wal_keeps_the_log() {
-    fn crc32(data: &[u8]) -> u32 {
-        let mut crc = 0xFFFF_FFFFu32;
-        for &b in data {
-            crc ^= u32::from(b);
-            for _ in 0..8 {
-                let mask = (crc & 1).wrapping_neg();
-                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-            }
-        }
-        !crc
+    use std::os::unix::process::CommandExt;
+
+    #[repr(C)]
+    struct RLimit {
+        cur: u64,
+        max: u64,
     }
+    extern "C" {
+        fn setrlimit(resource: i32, rlim: *const RLimit) -> i32;
+        fn getrlimit(resource: i32, rlim: *mut RLimit) -> i32;
+        fn signal(sig: i32, handler: usize) -> usize;
+    }
+    const RLIMIT_FSIZE: i32 = 1;
+    const SIGXFSZ: i32 = 25;
+    const SIG_IGN: usize = 1;
+    /// Far above everything the build writes, far below the log's page.
+    const LIMIT: u64 = 256 << 20;
+
     let base = tmp("wal_replay");
     let dir = base.join("w.db");
     fs::create_dir_all(&dir).unwrap();
     make_prior(&dir, Prior::Disk);
     let kv = dir.join("kvstore.kv");
     let before = fs::read(&kv).unwrap();
-    // A committed batch: page 1 as it is (harmless), then a page at the
-    // largest page id, past what the file system can hold (ext4: EFBIG).
-    let mut wal = b"GSTOREWL".to_vec();
-    wal.extend_from_slice(&2u32.to_le_bytes());
-    wal.extend_from_slice(&1u32.to_le_bytes());
-    wal.extend_from_slice(&before[4096..8192]);
-    wal.extend_from_slice(&u32::MAX.to_le_bytes());
-    wal.extend_from_slice(&[0u8; 4096]);
-    let crc = crc32(&wal[8..]);
-    wal.extend_from_slice(&crc.to_le_bytes());
-    wal.extend_from_slice(b"GSTORECM");
+    // A committed batch: page 1 as it is, then a page at the largest page
+    // id — a write past the child's file-size limit.
+    let wal = committed_wal(&[(1, &before[4096..8192]), (u32::MAX, &[0u8; 4096])]);
     let wal_path = dir.join("kvstore.kv.wal");
     fs::write(&wal_path, &wal).unwrap();
-    // Can this file system hold a page at that offset at all?
-    let fits = {
-        use std::io::{Seek, SeekFrom, Write};
-        let probe = base.join("probe");
-        let mut f = fs::File::create(&probe).unwrap();
-        let ok = f.seek(SeekFrom::Start(u64::from(u32::MAX) * 4096)).is_ok()
-            && f.write_all(&[0u8; 4096]).is_ok();
-        drop(f);
-        fs::remove_file(&probe).unwrap();
-        ok
-    };
-    match build_new(&dir) {
-        Ok(_) => {
-            // The replay succeeded, and the log was rightly removed.
-            assert!(fits, "a replay that failed was ignored");
-            assert!(!wal_path.exists());
-            assert_eq!(which(&dir, Prior::Disk), Some(true));
-        }
-        Err(e) => {
-            assert!(!fits, "{e}");
-            let e = e.to_string();
-            assert!(e.contains("write-ahead log"), "{e}");
-            assert!(wal_path.is_file(), "the log is kept for the next open");
-            assert_eq!(fs::read(&wal_path).unwrap(), wal);
-            assert!(!dir.join(bulk::STAGING_DIR).exists());
-            assert_eq!(fs::read(&kv).unwrap(), before, "the old store is in place");
-            // Once the log is dealt with, the old database is there and a
-            // rebuild succeeds.
-            fs::remove_file(&wal_path).unwrap();
-            assert_eq!(which(&dir, Prior::Disk), Some(false));
-            build_new(&dir).unwrap();
-            assert_eq!(which(&dir, Prior::Disk), Some(true));
-        }
+    let mut cmd = Command::new(std::env::current_exe().unwrap());
+    cmd.args(["--exact", "limited_build_helper", "--nocapture", "--test-threads=1"])
+        .env("GSTORE_TEST_LIMITED_BUILD", &dir);
+    // SAFETY: only async-signal-safe calls between fork and exec.
+    unsafe {
+        cmd.pre_exec(|| {
+            if signal(SIGXFSZ, SIG_IGN) == usize::MAX {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut cur = RLimit { cur: 0, max: 0 };
+            if getrlimit(RLIMIT_FSIZE, &mut cur) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let new = RLimit {
+                cur: LIMIT.min(cur.max),
+                max: cur.max,
+            };
+            if setrlimit(RLIMIT_FSIZE, &new) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
     }
+    let out = cmd.output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+    let e = stdout
+        .lines()
+        .find_map(|l| l.split_once("BUILD-ERR ").map(|(_, e)| e.to_string()))
+        .unwrap_or_else(|| panic!("a replay that failed was ignored: {stdout}"));
+    assert!(e.contains("write-ahead log"), "{e}");
+    assert!(wal_path.is_file(), "the log is kept for the next open");
+    assert_eq!(fs::read(&wal_path).unwrap(), wal);
+    assert!(!dir.join(bulk::STAGING_DIR).exists());
+    assert_eq!(fs::read(&kv).unwrap(), before, "the old store is in place");
+    // Once the log is dealt with, the old database is there and a rebuild
+    // succeeds.
+    fs::remove_file(&wal_path).unwrap();
+    assert_eq!(which(&dir, Prior::Disk), Some(false));
+    build_new(&dir).unwrap();
+    assert_eq!(which(&dir, Prior::Disk), Some(true));
     let _ = fs::remove_dir_all(&base);
 }
 
