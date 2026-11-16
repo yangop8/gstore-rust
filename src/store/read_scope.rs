@@ -49,6 +49,23 @@ thread_local! {
     static SCOPES: RefCell<Vec<Slot>> = const { RefCell::new(Vec::new()) };
 }
 
+/// How the error of a statement that recorded a read error starts: "a read
+/// from the store failed while <what>: <first error>". Every site that turns
+/// a scope's [`take_error`](ReadScope::take_error) into an error builds this
+/// text (or calls [`read_failure`]), and
+/// [`GStoreError::kind`](crate::error::GStoreError::kind) classifies a
+/// message that starts with it as a storage failure (review design#3): a
+/// server answers it as its own fault (HTTP 500), never as a bad request.
+pub const READ_FAILURE: &str = "a read from the store failed while ";
+
+/// The error of a statement (`what`: "evaluating the query", "exporting",
+/// …) whose read scope recorded the read error `msg`: it fails, and nothing
+/// of it is answered (contract C2). A
+/// [storage](crate::error::ErrorKind::Storage) failure.
+pub fn read_failure(what: &str, msg: impl std::fmt::Display) -> crate::error::GStoreError {
+    crate::error::GStoreError::Database(format!("{READ_FAILURE}{what}: {msg}"))
+}
+
 /// Read errors noted while no scope was active on the noting thread.
 static UNSCOPED: AtomicU64 = AtomicU64::new(0);
 

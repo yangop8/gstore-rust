@@ -627,7 +627,12 @@ fn tquery(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
             body.set("AnsNum", rs.rows.len());
             GResp::json(body)
         }
-        Err(e) if e.kind == OpErrorKind::Query => GResp::error(Status::OperationFailed, e.msg),
+        // A statement error — also a cancelled one, which the REST
+        // endpoints answer as a refusal (`503`, review design#3) — is
+        // upstream's `1005` with the message as it was.
+        Err(e) if matches!(e.kind, OpErrorKind::Query | OpErrorKind::Cancelled) => {
+            GResp::error(Status::OperationFailed, e.msg)
+        }
         Err(e) => txn_error("Transaction query fail", e),
     }
 }
@@ -759,7 +764,9 @@ fn query_error(e: OpError) -> GResp {
         OpErrorKind::Conflict | OpErrorKind::NotOwner => {
             GResp::error(Status::OperationConditionsAreNotSatisfied, e.msg)
         }
-        OpErrorKind::Query => {
+        // A cancelled statement (REST `503` since review design#3) is the
+        // `1005 "Query fail: …"` it was.
+        OpErrorKind::Query | OpErrorKind::Cancelled => {
             GResp::error(Status::OperationFailed, format!("Query fail: {}", e.msg))
         }
         // An update that failed part-way and whose applied part could not be

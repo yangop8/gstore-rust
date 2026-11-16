@@ -9,8 +9,12 @@
 //! it is released by the kernel even when the holder crashes) for every
 //! layout, and holds it for as long as the [`Database`](super::Database)
 //! lives. A second process opening the same directory gets a clear error
-//! naming the holder's pid ([`GStoreError::Database`], "… is locked by
-//! another process …"). A RocksDB database holds both this lock and the
+//! naming the holder's pid ([`GStoreError::Locked`], "… is locked by
+//! another process …"); a failure to take the lock at all — the lock file
+//! cannot be opened, the file system refuses the lock call — is an I/O
+//! error ([`GStoreError::Io`]), so a server answers the conflict as one
+//! (HTTP `409`) and the I/O failure as its own fault (`500`) (review
+//! design#3). A RocksDB database holds both this lock and the
 //! store's own `rocksdb/LOCK` (which RocksDB takes; older binaries take only
 //! that one, which is why a bulk build also checks it).
 //!
@@ -51,6 +55,19 @@ use crate::error::{GStoreError, Result};
 
 /// The lock file inside a database directory.
 pub const LOCK_FILE: &str = "LOCK";
+
+/// A failure to take a lock at all (`what`: the attempt, with its path): an
+/// I/O error of that kind ([`GStoreError::Io`], a storage failure), never
+/// a lock conflict (review design#3).
+fn lock_io_error(what: String, e: &dyn std::fmt::Display, kind: io::ErrorKind) -> GStoreError {
+    GStoreError::Io(io::Error::new(kind, format!("{what}: {e}")))
+}
+
+/// The lock is held by another process (or by another build of this one):
+/// a conflict, [`GStoreError::Locked`] (review design#3).
+fn lock_conflict(msg: String) -> GStoreError {
+    GStoreError::Locked(msg)
+}
 
 /// A lock this process holds, shared by every [`SideLock`] on the file.
 struct Held {
@@ -137,15 +154,19 @@ impl DirLock {
     /// lock when this process already holds the file `<dir>/LOCK` names (not
     /// merely a lock taken under the same path: see the module docs), else
     /// takes `<dir>/LOCK` exclusively — failing with a
-    /// [`GStoreError::Database`] that names the holder when another process
-    /// has it.
+    /// [`GStoreError::Locked`] that names the holder when another process
+    /// has it, or with a [`GStoreError::Io`] when the lock cannot be taken
+    /// at all (the directory or its lock file cannot be opened, the lock
+    /// call fails).
     pub fn acquire(dir: &Path) -> Result<DirLock> {
-        let canonical = fs::canonicalize(dir).map_err(|e| {
-            GStoreError::Database(format!(
-                "cannot lock database directory '{}': {e}",
-                dir.display()
-            ))
-        })?;
+        let cannot = |e: &io::Error| {
+            lock_io_error(
+                format!("cannot lock database directory '{}'", dir.display()),
+                e,
+                e.kind(),
+            )
+        };
+        let canonical = fs::canonicalize(dir).map_err(|e| cannot(&e))?;
         let path = canonical.join(LOCK_FILE);
         let mut reg = registry().lock().unwrap_or_else(PoisonError::into_inner);
         // A few rounds: another process's restore or rename may move the
@@ -156,8 +177,9 @@ impl DirLock {
                 .write(true)
                 .create(true)
                 .truncate(false)
-                .open(&path)?;
-            let key = key_of(&file, &canonical)?;
+                .open(&path)
+                .map_err(|e| cannot(&e))?;
+            let key = key_of(&file, &canonical).map_err(|e| cannot(&e))?;
             if let Some(held) = reg.get_mut(&key) {
                 // This process holds the very file `<dir>/LOCK` names: share
                 // it. (Dropping the probe descriptor keeps the lock: an
@@ -184,7 +206,7 @@ impl DirLock {
                     let holder = read_pid(&mut file)
                         .map(|pid| format!(" (pid {pid})"))
                         .unwrap_or_default();
-                    return Err(GStoreError::Database(format!(
+                    return Err(lock_conflict(format!(
                         "database directory '{}' is locked by another process{holder}: a gserver or \
                          another gStore tool has it open; stop it (or unload the database there) \
                          and retry",
@@ -193,12 +215,7 @@ impl DirLock {
                 }
                 // No advisory locks on this file system: open without one.
                 Err(TryLockError::Error(e)) if e.kind() == io::ErrorKind::Unsupported => false,
-                Err(TryLockError::Error(e)) => {
-                    return Err(GStoreError::Database(format!(
-                        "cannot lock database directory '{}': {e}",
-                        dir.display()
-                    )))
-                }
+                Err(TryLockError::Error(e)) => return Err(cannot(&e)),
             };
             let writer = Arc::new(Mutex::new(()));
             reg.insert(
@@ -216,7 +233,9 @@ impl DirLock {
                 writer,
             });
         }
-        Err(GStoreError::Database(format!(
+        // Another process keeps moving the directory (a restore, a
+        // rename): contention, to retry once it is done.
+        Err(lock_conflict(format!(
             "cannot lock database directory '{}': its lock file keeps being replaced",
             dir.display()
         )))
@@ -377,20 +396,19 @@ pub(crate) struct SideLock {
 
 impl SideLock {
     /// Lock `<dir><suffix>` (`dir`'s parent must exist), failing with a
-    /// [`GStoreError::Database`] naming the holder when another process has
-    /// it.
+    /// [`GStoreError::Locked`] naming the holder when another process has
+    /// it, or with a [`GStoreError::Io`] when the lock cannot be taken at
+    /// all.
     pub(crate) fn acquire(dir: &Path, suffix: &str) -> Result<SideLock> {
-        let cannot = |e: &dyn std::fmt::Display| {
-            GStoreError::Database(format!(
-                "cannot take the lock beside '{}': {e}",
-                dir.display()
-            ))
-        };
+        let what = || format!("cannot take the lock beside '{}'", dir.display());
+        let cannot = |e: &io::Error| lock_io_error(what(), e, e.kind());
         let parent = dir
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
-        let name = dir.file_name().ok_or_else(|| cannot(&"no file name"))?;
+        let name = dir
+            .file_name()
+            .ok_or_else(|| lock_io_error(what(), &"no file name", io::ErrorKind::InvalidInput))?;
         let mut file_name = name.to_os_string();
         file_name.push(suffix);
         let path = fs::canonicalize(parent)
@@ -423,7 +441,7 @@ impl SideLock {
                     let holder = read_pid(&mut file)
                         .map(|pid| format!(" (pid {pid})"))
                         .unwrap_or_default();
-                    return Err(GStoreError::Database(format!(
+                    return Err(lock_conflict(format!(
                         "'{}' is locked by another process{holder}: another gStore tool is \
                          creating or restoring the database there; retry when it is done",
                         dir.display()
@@ -436,7 +454,10 @@ impl SideLock {
             reg.insert(path.clone(), Held { file, holders: 1 });
             return Ok(SideLock { path });
         }
-        Err(cannot(&"its lock file keeps being replaced"))
+        Err(lock_conflict(format!(
+            "{}: its lock file keeps being replaced",
+            what()
+        )))
     }
 
     /// The lock file.
@@ -507,18 +528,20 @@ pub struct BuildGuard {
 }
 
 impl BuildGuard {
-    /// Claim directory `dir` (which must exist); fails if a build of this
-    /// process already rebuilds it.
+    /// Claim directory `dir` (which must exist); fails with a
+    /// [`GStoreError::Locked`] if a build of this process already rebuilds
+    /// it (an [`GStoreError::Io`] if `dir` cannot be resolved).
     pub fn enter(dir: &Path) -> Result<BuildGuard> {
         let canonical = fs::canonicalize(dir).map_err(|e| {
-            GStoreError::Database(format!(
-                "cannot lock database directory '{}': {e}",
-                dir.display()
-            ))
+            lock_io_error(
+                format!("cannot lock database directory '{}'", dir.display()),
+                &e,
+                e.kind(),
+            )
         })?;
         let mut set = building().lock().unwrap_or_else(PoisonError::into_inner);
         if !set.insert(canonical.clone()) {
-            return Err(GStoreError::Database(format!(
+            return Err(lock_conflict(format!(
                 "database directory '{}' is being rebuilt by another bulk build of this process",
                 dir.display()
             )));

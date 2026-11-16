@@ -2157,7 +2157,10 @@ fn txn_conflict_err(name: &str, tid: u64) -> OpError {
 /// Why a database / transaction operation shared by the REST endpoints and
 /// the upstream `/api` layer ([`crate::gapi`]) was refused or failed. Each
 /// front end renders it its own way: REST as an HTTP status ([`OpError::rest`]),
-/// `/api` as an upstream `StatusCode` (see `crate::gapi::ops_query`).
+/// `/api` as an upstream `StatusCode` (see `crate::gapi::ops_query`). An
+/// operation that failed with a [`GStoreError`] gets its kind from
+/// [`OpErrorKind::of`], the one place the protocol layers classify one
+/// (review design#3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OpError {
     pub(crate) kind: OpErrorKind,
@@ -2180,10 +2183,11 @@ pub(crate) enum OpErrorKind {
     Conflict,
     /// The server is shutting down — REST `503`.
     ShuttingDown,
-    /// The SPARQL statement failed (syntax, evaluation, cancellation) — REST
-    /// `400` with a `{"error":…}` body.
+    /// The SPARQL statement failed (syntax, evaluation) — REST `400` with a
+    /// `{"error":…}` body.
     Query,
-    /// An internal failure (I/O, save, begin/commit) — REST `500`.
+    /// An internal failure (I/O, a failed read, corrupt data, save,
+    /// begin/commit) — REST `500`.
     Failed,
     /// A write was applied in memory but persisting it failed (an UPDATE that
     /// failed part-way and whose applied part could not be saved) — REST
@@ -2196,6 +2200,52 @@ pub(crate) enum OpErrorKind {
     /// The serialized answer passed `max_result_bytes` (review sec#10) —
     /// REST `503` with a `{"error":…}` body, `/api` `1005`.
     ResultTooLarge,
+    /// The statement or export was stopped by a cancellation request
+    /// (`/cancel`, `operationTaskCancel`, a shutdown) — REST `503` with a
+    /// `{"error":…}` body (it was a `400` query error: review design#3),
+    /// `/api` `1005` as before.
+    Cancelled,
+}
+
+impl OpErrorKind {
+    /// The kind of an operation that failed with `e` — the one place the
+    /// protocol layers classify a [`GStoreError`] (review design#3), by its
+    /// [`kind`](GStoreError::kind): a syntax or evaluation error is
+    /// [`Query`](Self::Query) (REST `400`); a lock another process holds
+    /// (or a transaction conflict) [`Conflict`](Self::Conflict), `409` on
+    /// every endpoint; a cancellation [`Cancelled`](Self::Cancelled) and a
+    /// time limit [`Timeout`](Self::Timeout), `503`; a storage failure — an
+    /// I/O error, a failed read, a broken store, corrupt data —
+    /// [`Failed`](Self::Failed), `500` (as is a write applied but not made
+    /// durable, [`Persist`](Self::Persist), which the callers that save
+    /// report themselves). An untyped error
+    /// ([`ErrorKind::Other`](crate::error::ErrorKind::Other)) is `untyped`:
+    /// what the endpoint answered such an error as before errors were typed.
+    pub(crate) fn of(e: &GStoreError, untyped: OpErrorKind) -> OpErrorKind {
+        use crate::error::ErrorKind;
+        match e.kind() {
+            ErrorKind::Parse | ErrorKind::Query => OpErrorKind::Query,
+            ErrorKind::Locked | ErrorKind::Conflict => OpErrorKind::Conflict,
+            ErrorKind::Cancelled => OpErrorKind::Cancelled,
+            ErrorKind::Timeout => OpErrorKind::Timeout,
+            ErrorKind::Storage | ErrorKind::Corrupt => OpErrorKind::Failed,
+            _ => untyped,
+        }
+    }
+
+    /// The REST endpoints' (and the single-database server's) HTTP status
+    /// for this kind.
+    pub(crate) fn http(self) -> u16 {
+        match self {
+            OpErrorKind::NotLoaded | OpErrorKind::TxnUnknown => 404,
+            OpErrorKind::TxnEnded | OpErrorKind::Conflict => 409,
+            OpErrorKind::NotOwner => 403,
+            OpErrorKind::ShuttingDown => 503,
+            OpErrorKind::Timeout | OpErrorKind::ResultTooLarge | OpErrorKind::Cancelled => 503,
+            OpErrorKind::Query => 400,
+            OpErrorKind::Failed | OpErrorKind::Persist => 500,
+        }
+    }
 }
 
 impl OpError {
@@ -2206,29 +2256,46 @@ impl OpError {
         }
     }
 
+    /// The error `msg` of an operation that failed with `e`, of the kind
+    /// [`OpErrorKind::of`] gives it (`untyped`: the kind of an unclassified
+    /// error).
+    pub(crate) fn of(e: &GStoreError, untyped: OpErrorKind, msg: impl Into<String>) -> OpError {
+        OpError::new(OpErrorKind::of(e, untyped), msg)
+    }
+
+    /// A failed SPARQL statement: `e`, as its message, of the kind
+    /// [`OpErrorKind::of`] gives it — an unclassified error is a
+    /// [`Query`](OpErrorKind::Query) error, as every statement error was
+    /// before errors were typed.
+    pub(crate) fn statement(e: &GStoreError) -> OpError {
+        OpError::of(e, OpErrorKind::Query, e.to_string())
+    }
+
     /// The REST endpoints' HTTP status for this error.
-    fn http(&self) -> u16 {
-        match self.kind {
-            OpErrorKind::NotLoaded | OpErrorKind::TxnUnknown => 404,
-            OpErrorKind::TxnEnded | OpErrorKind::Conflict => 409,
-            OpErrorKind::NotOwner => 403,
-            OpErrorKind::ShuttingDown => 503,
-            OpErrorKind::Timeout | OpErrorKind::ResultTooLarge => 503,
-            OpErrorKind::Query => 400,
-            OpErrorKind::Failed | OpErrorKind::Persist => 500,
-        }
+    pub(crate) fn http(&self) -> u16 {
+        self.kind.http()
     }
 
     /// The REST rendering: `{"StatusCode":<http>,"StatusMsg":…}`, or for a
     /// failed SPARQL statement the SPARQL endpoints' `{"error":…}` body.
     fn rest(&self) -> Resp {
         match self.kind {
-            OpErrorKind::Query | OpErrorKind::Timeout | OpErrorKind::ResultTooLarge => {
-                Resp::new(self.http(), SPARQL_JSON, err_json(&self.msg))
-            }
+            OpErrorKind::Query
+            | OpErrorKind::Timeout
+            | OpErrorKind::ResultTooLarge
+            | OpErrorKind::Cancelled => Resp::new(self.http(), SPARQL_JSON, err_json(&self.msg)),
             _ => Resp::fail(self.http(), &self.msg),
         }
     }
+}
+
+/// The REST failure `msg` of a lifecycle operation that failed with `e`:
+/// `{"StatusCode":<http>,"StatusMsg":msg}` at the status of
+/// [`OpErrorKind::of`] — `409` for a lock another process holds, `500` for
+/// a storage failure, … — or of `untyped` for an unclassified error (the
+/// endpoint's status for it before errors were typed). Review design#3.
+fn fail_with(e: &GStoreError, untyped: OpErrorKind, msg: &str) -> Resp {
+    Resp::fail(OpErrorKind::of(e, untyped).http(), msg)
 }
 
 /// The [`OpErrorKind::Timeout`] error of a job whose `query_timeout` stopped
@@ -4058,7 +4125,7 @@ impl ApiInner {
                 ),
             )
         };
-        let query_err = |e: GStoreError| OpError::new(OpErrorKind::Query, e.to_string());
+        let query_err = |e: GStoreError| OpError::statement(&e);
         let caller = self.pfn_caller(&job.user);
         let Some(stmt) = job.stmt else {
             // A syntax error: answered once the database is known to be
@@ -4117,10 +4184,12 @@ impl ApiInner {
                 };
                 // A failed save of the applied part is a persistence failure
                 // (REST 500), not a query error (400): review durability#2.
+                // Otherwise the statement's own error decides (design#3): a
+                // read or storage failure is a 500, a cancellation a 503.
                 let kind = if warning.is_some() {
                     OpErrorKind::Persist
                 } else {
-                    OpErrorKind::Query
+                    OpErrorKind::of(&e, OpErrorKind::Query)
                 };
                 let msg = if wrote {
                     partial_update_msg(&e, warning)
@@ -4163,7 +4232,7 @@ impl ApiInner {
                 format!("database '{name}' was unloaded while this request waited"),
             )
         };
-        let query_err = |e: GStoreError| OpError::new(OpErrorKind::Query, e.to_string());
+        let query_err = |e: GStoreError| OpError::statement(&e);
         for attempt in 1..=SNAPSHOT_READ_ATTEMPTS {
             txn_park(name, TxnParkPoint::StatementQueued);
             let slot = self.read_synced(dbh)?;
@@ -4766,13 +4835,15 @@ impl ApiInner {
             };
             let db = match built {
                 Ok(db) => db,
-                Err(e) => return Resp::fail(400, &format!("build failed: {e}")),
+                Err(e) => return fail_with(&e, OpErrorKind::Query, &format!("build failed: {e}")),
             };
             // No other process may have the directory open while it is
             // rewritten (shares the lock a loaded copy holds in this process).
             let _dir_lock = match DirLock::acquire_existing(&dir) {
                 Ok(lock) => lock,
-                Err(e) => return Resp::fail(409, &format!("build failed: {e}")),
+                Err(e) => {
+                    return fail_with(&e, OpErrorKind::Conflict, &format!("build failed: {e}"))
+                }
             };
             // A rebuilt database replaces the loaded one: retire it (closing
             // its files and releasing its handle on the directory) before its
@@ -4878,7 +4949,7 @@ impl ApiInner {
             RestBuildSource::File(file) => match crate::parser::import::sources_from_paths(&[file])
             {
                 Ok(s) => s,
-                Err(e) => return Resp::fail(400, &format!("build failed: {e}")),
+                Err(e) => return fail_with(&e, OpErrorKind::Query, &format!("build failed: {e}")),
             },
             RestBuildSource::Text(_) => Vec::new(),
         };
@@ -4903,7 +4974,7 @@ impl ApiInner {
         };
         match DirLock::acquire_existing(dir) {
             Ok(probe) => drop(probe),
-            Err(e) => return Resp::fail(409, &format!("build failed: {e}")),
+            Err(e) => return fail_with(&e, OpErrorKind::Conflict, &format!("build failed: {e}")),
         }
         let existed = dir.exists();
         let was_loaded = match self.retire_loaded_saved(name) {
@@ -4941,7 +5012,7 @@ impl ApiInner {
                         }
                     }
                 }
-                return Resp::fail(400, &format!("build failed: {e}"));
+                return fail_with(&e, OpErrorKind::Query, &format!("build failed: {e}"));
             }
         };
         if !report.warnings.is_empty() {
@@ -4965,7 +5036,11 @@ impl ApiInner {
             Ok(db) => self.serve_built(name, db, dir.to_path_buf(), vanished, creator),
             Err(e) => {
                 register_built(&mut locked(&self.state), name, vanished, creator);
-                Resp::fail(500, &format!("built, but opening it failed: {e}"))
+                fail_with(
+                    &e,
+                    OpErrorKind::Failed,
+                    &format!("built, but opening it failed: {e}"),
+                )
             }
         }
     }
@@ -5046,8 +5121,9 @@ impl ApiInner {
                         st.dbs.insert(name.clone(), slot);
                         Resp::ok_with_warning(&format!("database '{name}' reopened"), &warning)
                     }
-                    Err(e) => Resp::fail(
-                        500,
+                    Err(e) => fail_with(
+                        &e,
+                        OpErrorKind::Failed,
                         &format!("load failed: {e} ({warning}; it is unloaded now)"),
                     ),
                 }
@@ -5078,7 +5154,7 @@ impl ApiInner {
                     st.dbs.insert(name.clone(), slot);
                     Resp::ok(&format!("database '{name}' loaded"))
                 }
-                Err(e) => Resp::fail(500, &format!("load failed: {e}")),
+                Err(e) => fail_with(&e, OpErrorKind::Failed, &format!("load failed: {e}")),
             }
         }))
     }
@@ -5132,7 +5208,13 @@ impl ApiInner {
             });
             let triples = match parse_rdf(&format, &content) {
                 Ok(ts) => ts,
-                Err(e) => return Resp::fail(400, &format!("upload parse failed ({format}): {e}")),
+                Err(e) => {
+                    return fail_with(
+                        &e,
+                        OpErrorKind::Query,
+                        &format!("upload parse failed ({format}): {e}"),
+                    )
+                }
             };
             let parsed = triples.len();
             let dbh = match loaded {
@@ -5158,7 +5240,11 @@ impl ApiInner {
                             h
                         }
                         Err(e) => {
-                            return Resp::fail(500, &format!("upload failed to open database: {e}"))
+                            return fail_with(
+                                &e,
+                                OpErrorKind::Failed,
+                                &format!("upload failed to open database: {e}"),
+                            )
                         }
                     }
                 }
@@ -5333,7 +5419,9 @@ impl ApiInner {
             // holds in this process, so it stays locked once that is retired).
             let _dir_lock = match DirLock::acquire_existing(&dir) {
                 Ok(lock) => lock,
-                Err(e) => return Resp::fail(409, &format!("drop failed: {e}")),
+                Err(e) => {
+                    return fail_with(&e, OpErrorKind::Conflict, &format!("drop failed: {e}"))
+                }
             };
             // Retire (closing its store files) before the directory is deleted.
             let was_loaded = match inner.retire_loaded(&name) {
@@ -5350,7 +5438,7 @@ impl ApiInner {
                 // part-way never leaves a half-deleted database under its
                 // name (review durability#10).
                 if let Err(e) = crate::db::fsutil::discard_db_dir(&dir) {
-                    return Resp::fail(500, &format!("drop failed: {e}"));
+                    return fail_with(&e, OpErrorKind::Failed, &format!("drop failed: {e}"));
                 }
             } else {
                 // What an interrupted drop of this name left behind (no
@@ -6001,7 +6089,7 @@ impl ApiInner {
         };
         let open_here =
             |slot: &DbSlot| !slot.retired && slot.txn.as_ref().map(|t| t.tid) == Some(tid);
-        let query_err = |e: GStoreError| OpError::new(OpErrorKind::Query, e.to_string());
+        let query_err = |e: GStoreError| OpError::statement(&e);
         let caller = self.pfn_caller(user);
         let stmt = match stmt {
             Ok(stmt) => stmt,
@@ -6059,7 +6147,7 @@ impl ApiInner {
         drop(slot);
         result.map_err(|e| {
             if wrote {
-                OpError::new(OpErrorKind::Query, partial_update_msg(&e, None))
+                OpError::of(&e, OpErrorKind::Query, partial_update_msg(&e, None))
             } else {
                 query_err(e)
             }
@@ -6582,7 +6670,7 @@ impl ApiInner {
                     crate::db::fsutil::atomic_write(&path.join(BACKUP_OWNER_FILE), name.as_bytes())
                 });
             if let Err(e) = claimed {
-                return Resp::fail(500, &format!("backup failed: {e}"));
+                return fail_with(&e, OpErrorKind::Failed, &format!("backup failed: {e}"));
             }
             match slot.db.backup(&path) {
                 Ok(()) => {
@@ -6592,7 +6680,7 @@ impl ApiInner {
                     );
                     Resp::new(200, JSON, body.into_bytes())
                 }
-                Err(e) => Resp::fail(500, &format!("backup failed: {e}")),
+                Err(e) => fail_with(&e, OpErrorKind::Failed, &format!("backup failed: {e}")),
             }
         }))
     }
@@ -6677,14 +6765,18 @@ impl ApiInner {
             // the swap (as the `/api` restore; shares a loaded copy's lock).
             let probe = match Database::lock_restore_target(&dir) {
                 Ok(lock) => lock,
-                Err(e) => return Resp::fail(409, &format!("restore failed: {e}")),
+                Err(e) => {
+                    return fail_with(&e, OpErrorKind::Conflict, &format!("restore failed: {e}"))
+                }
             };
             // Copy the backup beside the database's own directory and validate
             // the copy — never open the backup in place, or later writes would
             // land in the backup. The loaded database is untouched so far.
             let staged = match Database::stage_restore(&path, &dir) {
                 Ok(staged) => staged,
-                Err(e) => return Resp::fail(500, &format!("restore failed: {e}")),
+                Err(e) => {
+                    return fail_with(&e, OpErrorKind::Failed, &format!("restore failed: {e}"))
+                }
             };
             let loaded = locked(&inner.state).dbs.get(&name).map(Arc::clone);
             if let Some(h) = &loaded {
@@ -6744,8 +6836,9 @@ impl ApiInner {
                     }
                     Resp::ok(&format!("database '{name}' restored"))
                 }
-                (Ok(()), Err(e)) => Resp::fail(
-                    500,
+                (Ok(()), Err(e)) => fail_with(
+                    &e,
+                    OpErrorKind::Failed,
                     &format!("restore failed to open the restored copy: {e}"),
                 ),
                 (Err(e), reopened) => {
@@ -6756,7 +6849,7 @@ impl ApiInner {
                             DbSlot::handle(db, dir, false, &st.load_policy, &st.query_settings);
                         st.dbs.insert(name.clone(), slot);
                     }
-                    Resp::fail(500, &format!("restore failed: {e}"))
+                    fail_with(&e, OpErrorKind::Failed, &format!("restore failed: {e}"))
                 }
             }
         }))
@@ -8042,6 +8135,62 @@ fn new_system_password() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// review design#3: the status-mapping table — one classification for
+    /// every protocol layer. A statement error and a lifecycle failure get
+    /// the status of their kind; an unclassified one keeps the endpoint's
+    /// own (`untyped`).
+    #[test]
+    fn errors_map_to_the_status_of_their_kind() {
+        let io = |kind| GStoreError::Io(std::io::Error::new(kind, "x"));
+        let read = crate::store::read_scope::read_failure("evaluating the query", "page 7");
+        let table: Vec<(GStoreError, u16, u16, u16)> = vec![
+            // (error, as a statement, as a lifecycle step whose unclassified
+            // errors were 409, … whose unclassified errors were 500)
+            (GStoreError::SparqlParse("x".into()), 400, 400, 400),
+            (
+                GStoreError::RdfParse {
+                    line: 1,
+                    msg: "x".into(),
+                },
+                400,
+                400,
+                400,
+            ),
+            (GStoreError::Query("x".into()), 400, 400, 400),
+            (GStoreError::Locked("x".into()), 409, 409, 409),
+            (GStoreError::Conflict("x".into()), 409, 409, 409),
+            (io(std::io::ErrorKind::PermissionDenied), 500, 500, 500),
+            (io(std::io::ErrorKind::Other), 500, 500, 500),
+            (read.duplicate(), 500, 500, 500),
+            (GStoreError::StorageFailed("x".into()), 500, 500, 500),
+            (GStoreError::Serialize("x".into()), 500, 500, 500),
+            (GStoreError::Cancelled, 503, 503, 503),
+            (GStoreError::Timeout(Duration::from_secs(1)), 503, 503, 503),
+            (GStoreError::Database("x".into()), 400, 409, 500),
+        ];
+        for (e, statement, conflict, failed) in table {
+            assert_eq!(OpError::statement(&e).http(), statement, "{e}");
+            assert_eq!(
+                fail_with(&e, OpErrorKind::Conflict, "m").status,
+                conflict,
+                "{e}"
+            );
+            assert_eq!(
+                fail_with(&e, OpErrorKind::Failed, "m").status,
+                failed,
+                "{e}"
+            );
+        }
+        // A statement's refusals keep the SPARQL endpoints' body.
+        let cancelled = OpError::statement(&GStoreError::Cancelled).rest();
+        assert_eq!(
+            (cancelled.status, cancelled.ctype.as_str()),
+            (503, SPARQL_JSON)
+        );
+        let failed = OpError::statement(&read).rest();
+        assert_eq!(failed.status, 500);
+    }
 
     /// review sec#10: the result byte budget stops a serializer at the
     /// write that passes it — an oversized answer is never produced whole.

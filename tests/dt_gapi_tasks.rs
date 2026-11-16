@@ -827,7 +827,9 @@ fn queries_are_cancelled_across_the_rest_and_upstream_apis() {
     );
     assert_eq!(code(&j), 0, "{j}");
     let r = query.join().unwrap();
-    assert_eq!(r.status, 400, "{}", r.body);
+    // review design#3: a cancelled statement is a refused request (503),
+    // no longer a 400 query error.
+    assert_eq!(r.status, 503, "{}", r.body);
     assert!(r.body.to_lowercase().contains("cancel"), "{}", r.body);
 
     // An asynchronous query: one task, cancelled by its opt_id.
@@ -922,7 +924,9 @@ fn graph_function_queries_are_cancelled_like_any_query() {
     let r = rest(&addr, "POST", &format!("/cancel?id={opt_id}"), "");
     assert_eq!(r.status, 200, "{}", r.body);
     let r = query.join().unwrap();
-    assert_eq!(r.status, 400, "{}", r.body);
+    // review design#3: a cancelled statement is a refused request (503),
+    // no longer a 400 query error.
+    assert_eq!(r.status, 503, "{}", r.body);
     assert!(r.body.to_lowercase().contains("cancel"), "{}", r.body);
 
     // The database still answers graph-function queries afterwards.
@@ -1030,7 +1034,9 @@ fn an_update_running_a_graph_function_is_cancelled_like_a_query() {
     let r = rest(&addr, "POST", &format!("/cancel?id={opt_id}"), "");
     assert_eq!(r.status, 200, "{}", r.body);
     let r = query.join().unwrap();
-    assert_eq!(r.status, 400, "{}", r.body);
+    // review design#3: a cancelled statement is a refused request (503),
+    // no longer a 400 query error.
+    assert_eq!(r.status, 503, "{}", r.body);
     assert!(r.body.to_lowercase().contains("cancel"), "{}", r.body);
     assert!(!inserted(&addr));
 
