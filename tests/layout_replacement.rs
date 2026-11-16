@@ -791,3 +791,128 @@ fn a_failed_backup_never_pairs_a_new_store_with_an_old_vstree() {
     }
 }
 
+// ---- durability#9: a legacy-shadow reconcile killed part-way is finished -----
+
+const PARK_SHADOW: &str = "GSTORE_SHADOW_PARK";
+
+/// Set the modification time of `path` to `secs_ago` seconds ago.
+fn set_mtime(path: &Path, secs_ago: u64) {
+    let t = std::time::SystemTime::now() - std::time::Duration::from_secs(secs_ago);
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(t)
+        .unwrap();
+}
+
+/// The helper process of the reconcile crash test: opens
+/// `$GSTORE_TEST_RECONCILE_DIR` (a reconcile parks it, see the test). Does
+/// nothing in a normal run.
+#[test]
+fn reconcile_helper() {
+    let Ok(dir) = std::env::var("GSTORE_TEST_RECONCILE_DIR") else {
+        return;
+    };
+    let _db = Database::open(&dir);
+}
+
+/// A snapshot saved over an on-disk database whose save crashed before the
+/// old `kvstore.kv` was removed leaves the snapshot as a "legacy shadow"
+/// beside it; the next open reconciles it into `kvstore.kv`, in several
+/// page commits. That open is killed (SIGKILL) after a few changes were
+/// committed: the commits made `kvstore.kv` newer than the shadow, so the
+/// open after it used to skip the shadow (mtime order) and serve a mix of
+/// the two states. The reconcile's durable marker makes the next open
+/// apply the shadow again, which ends at exactly the snapshot's state.
+#[test]
+fn a_reconcile_killed_part_way_is_finished_by_the_next_open() {
+    let root = TmpDir::new("shadow_kill");
+    let dir = root.path().join("x.db");
+    let old = root.path().join("old.nt");
+    fs::write(&old, triples("o", 0..10)).unwrap();
+    Database::build_disk(&dir, &[&old]).unwrap();
+    let snap = root.path().join("snap");
+    let new = format!("{}{}", triples("o", 5..10), triples("n", 0..5));
+    Database::build_from_str("x", &new)
+        .unwrap()
+        .save(&snap)
+        .unwrap();
+    let mut want: Vec<String> = (5..10)
+        .map(|i| format!("<http://e/os{i}>"))
+        .chain((0..5).map(|i| format!("<http://e/ns{i}>")))
+        .collect();
+    want.sort();
+    for f in [
+        "dict.bin",
+        "store.bin",
+        "named.bin",
+        "meta.bin",
+        "vstree.bin",
+    ] {
+        fs::copy(snap.join(f), dir.join(f)).unwrap();
+        // The snapshot was saved after the store's last write.
+        set_mtime(&dir.join(f), 60);
+    }
+    set_mtime(&dir.join("kvstore.kv"), 120);
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "reconcile_helper",
+            "--nocapture",
+            "--test-threads",
+            "1",
+        ])
+        .current_dir(root.path())
+        .env("GSTORE_TEST_RECONCILE_DIR", &dir)
+        .env(PARK_SHADOW, "3")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child = Killed(child);
+    assert!(
+        wait_for_line(&mut child.0, PARK_SHADOW),
+        "the open did not park part-way through the reconcile"
+    );
+    drop(child); // SIGKILL, with 3 of the 10 changes committed
+    assert!(dir.join("store.bin").is_file(), "the shadow is still there");
+    let mut db = Database::open(&dir).unwrap();
+    assert_eq!(
+        subjects(&mut db, VsPolicy::Off),
+        want,
+        "the snapshot's state"
+    );
+    assert_eq!(db.triple_num(), 10);
+    drop(db);
+    assert!(!dir.join("store.bin").exists());
+    assert!(
+        dir.join("store.bin.legacy").is_file(),
+        "kept for manual recovery"
+    );
+    assert!(!dir.join("SHADOW.apply").exists(), "the marker is retired");
+    // A marker that names another store file (the store was replaced since
+    // it was written) decides nothing: an older shadow is still ignored.
+    let stale = Database::build_from_str("x", &triples("stale", 0..3)).unwrap();
+    let snap2 = root.path().join("snap2");
+    stale.save(&snap2).unwrap();
+    for f in [
+        "dict.bin",
+        "store.bin",
+        "named.bin",
+        "meta.bin",
+        "vstree.bin",
+    ] {
+        fs::copy(snap2.join(f), dir.join(f)).unwrap();
+        set_mtime(&dir.join(f), 3600);
+    }
+    fs::write(dir.join("SHADOW.apply"), "kvstore.kv dev=1 ino=1\n").unwrap();
+    let mut db = Database::open(&dir).unwrap();
+    assert_eq!(
+        subjects(&mut db, VsPolicy::Off),
+        want,
+        "the older shadow is ignored"
+    );
+    drop(db);
+    assert!(!dir.join("SHADOW.apply").exists());
+}

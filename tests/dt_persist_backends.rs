@@ -513,7 +513,6 @@ fn older_shadow_snapshot_is_ignored() {
         fs::copy(snap_dir.join(f), dir.join(f)).unwrap();
     }
     // A disk build written *after* the shadow — the shadow is older.
-    std::thread::sleep(std::time::Duration::from_millis(20));
     let nt = dir.with_extension("nt");
     write(&nt, BASE_NT);
     // Build the store files directly so the (older) shadow is left in place.
@@ -521,6 +520,25 @@ fn older_shadow_snapshot_is_ignored() {
         let kv = dir.join("kvstore.kv");
         let ds = gstore::kvstore::DiskStore::build_files(&kv, 64, &[&nt]).unwrap();
         drop(ds);
+    }
+    // review tests-b#15: the order is set explicitly — a minute older — not
+    // by sleeping 20 ms between the writes: the reconcile compares mtimes
+    // with `>=`, so on a file system with whole-second timestamps the two
+    // writes nearly always tied and the older shadow was applied.
+    let older = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    for f in [
+        "dict.bin",
+        "store.bin",
+        "named.bin",
+        "meta.bin",
+        "vstree.bin",
+    ] {
+        fs::File::options()
+            .write(true)
+            .open(dir.join(f))
+            .unwrap()
+            .set_modified(older)
+            .unwrap();
     }
     let mut db = Database::open(&dir).unwrap();
     assert_eq!(db.triple_num(), 3, "older shadow content is not applied");

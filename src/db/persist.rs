@@ -26,6 +26,10 @@
 //! `kvstore.kv`** (the triple/quad difference is applied) on open; an older
 //! shadow is ignored. Either way the shadow files are then renamed to
 //! `<file>.legacy` so the decision is made once and the data is never deleted.
+//! The reconcile patches `kvstore.kv` in place in several page commits; the
+//! decision to apply a shadow is recorded first (`SHADOW.apply`, bound to
+//! that store file), so an open after a crash part-way finishes it instead
+//! of comparing mtimes the partial commits changed.
 //!
 //! ## On-disk databases: Stream and Materialize mode, commit points
 //!
@@ -122,6 +126,16 @@ const SNAPSHOT_FILES: &[&str] = &[DICT_FILE, STORE_FILE, NAMED_FILE, VSTREE_FILE
 
 /// Suffix legacy shadow-snapshot files are renamed to (see the module docs).
 const LEGACY_SUFFIX: &str = ".legacy";
+
+/// The marker a legacy-shadow reconcile writes before it changes
+/// `kvstore.kv` (see [`reconcile_legacy_shadow`]): the decision to apply the
+/// shadow, bound to the store file it was taken for.
+const SHADOW_APPLY_FILE: &str = "SHADOW.apply";
+
+/// Test hook of the reconcile crash test: with this environment variable
+/// set to `n`, a legacy-shadow reconcile commits after its first `n`
+/// changes and parks for good (see [`fsutil::park_for_crash_test`]).
+const SHADOW_PARK_ENV: &str = "GSTORE_SHADOW_PARK";
 
 /// The lock file beside a database directory that a restore creating the
 /// database holds ([`Database::lock_restore_target`]).
@@ -417,23 +431,34 @@ fn key_triple(dict: &Dictionary, t: IdTriple) -> Option<KeyTriple> {
 
 /// Remove the artifacts of every layout other than `keep` from `dir`.
 pub(crate) fn remove_other_layouts(dir: &Path, keep: StorageKind) -> Result<()> {
+    // A legacy-shadow reconcile's marker (see `reconcile_legacy_shadow`)
+    // concerns the store and the snapshot of the layouts being replaced.
+    fsutil::remove_file_if_exists(&dir.join(SHADOW_APPLY_FILE))?;
     if keep != StorageKind::Snapshot {
-        for name in SNAPSHOT_FILES {
+        // The commit record first (it would roll leftover temp files
+        // forward), then `store.bin` (the file a legacy-shadow reconcile is
+        // triggered by), then the rest.
+        fsutil::remove_file_if_exists(&dir.join(fsutil::SNAPSHOT_COMMIT_FILE))?;
+        for name in std::iter::once(STORE_FILE)
+            .chain(SNAPSHOT_FILES.iter().copied().filter(|n| *n != STORE_FILE))
+        {
             let path = dir.join(name);
             fsutil::remove_file_if_exists(&path)?;
             fsutil::remove_file_if_exists(&fsutil::tmp_path(&path))?;
         }
-        fsutil::remove_file_if_exists(&dir.join(fsutil::SNAPSHOT_COMMIT_FILE))?;
     }
     if keep != StorageKind::Disk {
         let kv = dir.join(KV_FILE);
         if kv.exists() || wal_of(&kv).exists() {
             // The out-of-core VS-tree file belongs to the disk layout; leave a
             // `vstree.kv` alone otherwise (it may be a memory database's
-            // opted-in streaming index).
+            // opted-in streaming index). Each file before its WAL: a crash
+            // between the two leaves a log beside no store (removed by the
+            // next build or save here), never a store whose committed log
+            // is gone — a torn file a legacy-shadow reconcile would patch.
             for path in [kv, dir.join(VSTREE_KV_FILE)] {
-                fsutil::remove_file_if_exists(&wal_of(&path))?;
                 fsutil::remove_file_if_exists(&path)?;
+                fsutil::remove_file_if_exists(&wal_of(&path))?;
             }
         }
     }
@@ -2615,35 +2640,107 @@ fn read_whole_disk_store(db: &Database) -> Result<()> {
     Ok(())
 }
 
+/// What identifies the store file `kv` in a [`SHADOW_APPLY_FILE`] marker:
+/// its device and inode (a store replaced by a build, a copy or a restore —
+/// renamed into place — is another file; one the reconcile patches in place
+/// is the same). Off unix, where there is no such identity, every marker
+/// counts.
+fn store_identity(kv: &Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let m = fs::metadata(kv).ok()?;
+        Some(format!("{KV_FILE} dev={} ino={}\n", m.dev(), m.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        fs::metadata(kv).ok().map(|_| format!("{KV_FILE}\n"))
+    }
+}
+
 /// Reconcile a legacy shadow snapshot found next to `kvstore.kv` (see the
 /// module docs), then retire the shadow files.
+///
+/// Crash-atomic (review durability#9): the store is patched in place, in as
+/// many page commits as the difference needs, which changes its mtime — so
+/// once the decision to apply the shadow is taken (by mtime, for a shadow a
+/// legacy build wrote), it is first recorded durably in
+/// [`SHADOW_APPLY_FILE`], bound to this store file. An open after a crash
+/// part-way finds the marker and applies the shadow again (the difference
+/// is recomputed: applying it is idempotent) instead of comparing mtimes
+/// the partial commits have changed — which used to serve a mix of the two
+/// states. The shadow files are retired once the store equals the shadow,
+/// `store.bin` last, and the marker after them.
 fn reconcile_legacy_shadow(dir: &Path, ds: &mut DiskStore) -> Result<()> {
     let shadow = dir.join(STORE_FILE);
+    let marker = dir.join(SHADOW_APPLY_FILE);
+    let kv = dir.join(KV_FILE);
     if !shadow.is_file() {
+        // The marker of a reconcile that retired its shadow but crashed
+        // before removing it.
+        if marker.exists() {
+            fsutil::remove_file_if_exists(&marker)?;
+            fsutil::sync_dir(dir)?;
+        }
         return Ok(());
     }
-    let newer = match (mtime(&shadow), mtime(&dir.join(KV_FILE))) {
-        (Some(s), Some(k)) => s >= k,
-        _ => false,
-    };
-    if newer {
-        // An unreadable / inconsistent shadow cannot be trusted: keep the store.
+    let identity = store_identity(&kv);
+    let pending =
+        identity.is_some() && fs::read_to_string(&marker).ok().as_deref() == identity.as_deref();
+    let apply = pending
+        || match (mtime(&shadow), mtime(&kv)) {
+            (Some(s), Some(k)) => s >= k,
+            _ => false,
+        };
+    if apply {
+        // An unreadable / inconsistent shadow cannot be trusted: keep the
+        // store. (With a marker, the store already holds a part of it —
+        // which only happens once the shadow was read whole before.)
         if let Ok(snap) = Database::load_snapshot(dir) {
+            if !pending {
+                if let Some(identity) = &identity {
+                    fsutil::atomic_write(&marker, identity.as_bytes())?;
+                }
+            }
             apply_snapshot_to_disk(&snap, ds)?;
             ds.flush()?;
         }
     }
-    for name in SNAPSHOT_FILES {
+    for name in SNAPSHOT_FILES
+        .iter()
+        .copied()
+        .filter(|n| *n != STORE_FILE)
+        .chain(std::iter::once(STORE_FILE))
+    {
         let path = dir.join(name);
         if path.is_file() {
             let _ = fs::rename(&path, fsutil::with_suffix(&path, LEGACY_SUFFIX));
         }
     }
+    fsutil::sync_dir(dir)?;
+    fsutil::remove_file_if_exists(&marker)?;
     fsutil::sync_dir(dir)
 }
 
 /// Make the disk store's default and named graphs equal those of `snap`.
+/// Idempotent: the difference is computed from what the store holds now.
 fn apply_snapshot_to_disk(snap: &Database, ds: &mut DiskStore) -> Result<()> {
+    // The reconcile crash test's hook (read once per reconcile).
+    let park_after: Option<usize> = std::env::var(SHADOW_PARK_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse().ok());
+    let mut changes = 0usize;
+    let mut changed = |ds: &mut DiskStore| -> Result<()> {
+        changes += 1;
+        if park_after == Some(changes) {
+            ds.flush()?;
+            fsutil::park_for_crash_test(
+                SHADOW_PARK_ENV,
+                &format!("after {changes} changes of a legacy-shadow reconcile"),
+            );
+        }
+        Ok(())
+    };
     let disk_dict = ds.dictionary()?;
     let disk_triples: HashSet<KeyTriple> = ds
         .iter_all()?
@@ -2658,9 +2755,11 @@ fn apply_snapshot_to_disk(snap: &Database, ds: &mut DiskStore) -> Result<()> {
         .collect();
     for (s, p, o, lit) in disk_triples.difference(&snap_triples) {
         ds.delete_keys(s, p, o, *lit)?;
+        changed(ds)?;
     }
     for (s, p, o, lit) in snap_triples.difference(&disk_triples) {
         ds.insert_keys(s, p, o, *lit)?;
+        changed(ds)?;
     }
 
     let quad = |dict: &Dictionary, g: u32, t: IdTriple| -> Option<KeyQuad> {
@@ -2680,9 +2779,11 @@ fn apply_snapshot_to_disk(snap: &Database, ds: &mut DiskStore) -> Result<()> {
         .collect();
     for (g, s, p, o, lit) in disk_quads.difference(&snap_quads) {
         ds.delete_quad_keys(g, s, p, o, *lit)?;
+        changed(ds)?;
     }
     for (g, s, p, o, lit) in snap_quads.difference(&disk_quads) {
         ds.insert_quad_keys(g, s, p, o, *lit)?;
+        changed(ds)?;
     }
     Ok(())
 }
