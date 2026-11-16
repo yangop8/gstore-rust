@@ -628,9 +628,16 @@ fn tquery(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
             GResp::json(body)
         }
         // A statement error — also a cancelled one, which the REST
-        // endpoints answer as a refusal (`503`, review design#3) — is
-        // upstream's `1005` with the message as it was.
-        Err(e) if matches!(e.kind, OpErrorKind::Query | OpErrorKind::Cancelled) => {
+        // endpoints answer as a refusal (`503`, review design#3), and a
+        // read or storage failure of the statement, which they answer as
+        // their own fault (`500`; the statement's other `Failed` errors are
+        // internal ones) — is upstream's `1005` with the message as it was.
+        Err(e)
+            if matches!(
+                e.kind,
+                OpErrorKind::Query | OpErrorKind::Cancelled | OpErrorKind::Failed
+            ) =>
+        {
             GResp::error(Status::OperationFailed, e.msg)
         }
         Err(e) => txn_error("Transaction query fail", e),
@@ -764,9 +771,11 @@ fn query_error(e: OpError) -> GResp {
         OpErrorKind::Conflict | OpErrorKind::NotOwner => {
             GResp::error(Status::OperationConditionsAreNotSatisfied, e.msg)
         }
-        // A cancelled statement (REST `503` since review design#3) is the
-        // `1005 "Query fail: …"` it was.
-        OpErrorKind::Query | OpErrorKind::Cancelled => {
+        // A cancelled statement (REST `503` since review design#3) and a
+        // read or storage failure of the statement (REST `500`; the job's
+        // other `Failed` errors are internal ones) are the
+        // `1005 "Query fail: …"` they were.
+        OpErrorKind::Query | OpErrorKind::Cancelled | OpErrorKind::Failed => {
             GResp::error(Status::OperationFailed, format!("Query fail: {}", e.msg))
         }
         // An update that failed part-way and whose applied part could not be

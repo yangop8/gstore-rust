@@ -103,6 +103,12 @@ fn code(j: &Json) -> i64 {
     j.get("StatusCode").and_then(Json::as_i64).unwrap()
 }
 
+fn msg(j: &Json) -> &str {
+    j.get("StatusMsg")
+        .and_then(Json::as_str)
+        .unwrap_or_default()
+}
+
 fn enc(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
@@ -355,7 +361,8 @@ fn a_store_read_error_is_500_not_400() {
         "a store read error is the server's fault, not a bad request: {body}"
     );
     assert!(body.contains("read from the store failed"), "{body}");
-    // `/api` answers it as before: 1005, HTTP 200.
+    // `/api` answers it as before: 1005, HTTP 200, the message as it was
+    // ("Query fail: …").
     let j = api(
         srv.addr,
         &[
@@ -366,6 +373,38 @@ fn a_store_read_error_is_500_not_400() {
         ],
     );
     assert_eq!(code(&j), 1005, "{j}");
+    assert!(
+        msg(&j).starts_with("Query fail: database error: a read from the store failed"),
+        "{j}"
+    );
+    // REST `/tquery` in a transaction: 500 as well; `/api` `tquery`: 1005
+    // with the statement's own message, as before.
+    let (st, body) = srv.req("POST", "/begin?db_name=readfail", "");
+    assert_eq!(st, 200, "{body}");
+    let tid = json::parse(&body)
+        .unwrap()
+        .get("TID")
+        .map(|t| t.as_str().map_or_else(|| t.to_string(), str::to_string))
+        .unwrap();
+    let (st, body) = srv.req("POST", &format!("/tquery?tid={tid}"), BY_PREDICATE);
+    assert_eq!(st, 500, "{body}");
+    assert!(body.contains("read from the store failed"), "{body}");
+    let j = api(
+        srv.addr,
+        &[
+            ("operation", "tquery"),
+            ("db_name", "readfail"),
+            ("tid", &tid),
+            ("sparql", BY_PREDICATE),
+        ],
+    );
+    assert_eq!(code(&j), 1005, "{j}");
+    assert!(
+        msg(&j).starts_with("database error: a read from the store failed"),
+        "{j}"
+    );
+    let (st, body) = srv.req("POST", &format!("/rollback?tid={tid}"), "");
+    assert_eq!(st, 200, "{body}");
 }
 
 #[test]

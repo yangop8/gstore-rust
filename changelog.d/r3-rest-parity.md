@@ -29,8 +29,10 @@ Behaviour changes first:
     message names the applied part; it was a `400`), as REST answers it;
   - syntax and evaluation errors stay `400`; an error that is not
     classified keeps the status its endpoint gave it before.
-  The upstream `/api` keeps HTTP 200 and its `StatusCode`s (a cancelled
-  query is still `1005 "Query fail: …"`). Library: `GStoreError::kind()`
+  The upstream `/api` keeps HTTP 200, its `StatusCode`s and its messages
+  (a cancelled query or one that hit a store read error is still
+  `1005 "Query fail: …"`; in a transaction, `tquery` still answers `1005`
+  with the statement's message). Library: `GStoreError::kind()`
   and `gstore::error::ErrorKind` (`#[non_exhaustive]`: `Parse`, `Query`,
   `Locked`, `Conflict`, `Corrupt`, `Storage`, `Cancelled`, `Timeout`,
   `Other`); **new variant `GStoreError::Locked`** (no variant removed; it
@@ -102,7 +104,9 @@ Behaviour changes first:
   there; a store read error is `500` on REST and on the single-database
   server; a cancelled statement is `503`; syntax errors stay `400`; `/api`
   codes unchanged), `tests/rest_api_parity.rs` (the parity suite: export,
-  export inside a transaction, export cancelled, upload registration,
+  export inside a transaction — also of a Stream-mode on-disk database,
+  whose transaction reads a view of the committed pages — export
+  cancelled, upload registration,
   failed rebuild, build/load/unload/drop, load after an interrupted
   restore, failed backups — over an earlier backup (kept and retried), and
   into a fresh and an empty directory under `RLIMIT_FSIZE` — restore
@@ -220,6 +224,13 @@ building an N-Triples string.
   whose first half pinned the dropped record) and the empty-directory case
   of `a_backup_that_fails_part_way_leaves_no_directory_on_either_surface`
   fail on the first fix.
+- Review correction: once a statement's store read error was classified
+  as a storage failure (`OpErrorKind::Failed`), `/api` rendered it through
+  the arms of other failures — `query` lost its `"Query fail: "` prefix and
+  `tquery` gained `"Transaction query fail: "` — so the `/api` messages of
+  existing cases changed. Both render it as before again; pinned by
+  `tests/error_status_mapping.rs::a_store_read_error_is_500_not_400`
+  (which now also checks REST `/tquery` answers it `500`).
 - Seen once, unrelated: `tests/no_background_thread_outlives_serve_forever.rs`
   `the_asynchronous_operation_runner_is_joined` failed in the stream-mode
   workspace run while a `--features zip` run built in the same target
