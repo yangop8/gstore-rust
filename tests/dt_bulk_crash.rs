@@ -4,7 +4,10 @@
 //! `gbuild --disk` killed with SIGKILL at random moments or aborted at each
 //! step does the same; a directory another process holds is refused, as is
 //! a second build of the same directory in one process; a stale staging
-//! area is cleaned up by the next build.
+//! area is cleaned up by the next build. After every crash the VS-tree the
+//! directory opens with is checked against its store under the tree policy
+//! (review durability#17: the default policy never reads an out-of-core
+//! tree, so a stale `vstree.kv` beside a new store went unnoticed).
 
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -14,13 +17,58 @@ use std::time::{Duration, Instant};
 
 use gstore::bulk::{self, BulkInput, BulkOptions, BulkTarget, CRASH_ENV, CRASH_POINTS};
 use gstore::parser::import::{ImportOptions, Source};
-use gstore::{Database, StorageKind};
+use gstore::query::{scoped_vs_policy, VsPolicy};
+use gstore::{Database, QueryResult, StorageKind};
 
 const OLD: &str =
     "<http://e/s> <http://e/p> <http://e/old> .\n<http://e/s> <http://e/q> \"old\" .\n";
+// review durability#17: `new1` is also a subject, an entity the old
+// database's VS-tree has no out-edges for — a tree walk for `?x <p> ?y` on
+// an old tree paired with the new store misses it.
 const NEW: &str = "<http://e/s> <http://e/p> <http://e/new1> .\n\
                    <http://e/s> <http://e/p> <http://e/new2> .\n\
-                   <http://e/s> <http://e/q> \"new\" .\n";
+                   <http://e/s> <http://e/q> \"new\" .\n\
+                   <http://e/new1> <http://e/p> <http://e/new2> .\n";
+
+/// Queries whose subject variable's candidates come from a VS-tree walk
+/// under [`VsPolicy::Tree`] (a variable with a constant neighbour or an
+/// object variable would be answered from the store), for the test data
+/// and for LUBM.
+const VSTREE_QUERIES: [&str; 3] = [
+    "SELECT ?x WHERE { ?x <http://e/p> ?y }",
+    "SELECT ?x WHERE { ?x <http://e/p> <http://e/new2> }",
+    "SELECT ?x WHERE { ?x <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ?y }",
+];
+
+/// The sorted rows of `q` under `policy` (a unique comment bypasses the
+/// query cache).
+fn rows_under(db: &mut Database, q: &str, policy: VsPolicy) -> Vec<Vec<Option<String>>> {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _policy = scoped_vs_policy(policy);
+    let mut rows = match db.query(&format!("# dt_bulk_crash {n}\n{q}")).unwrap() {
+        QueryResult::Select(rs) => rs.rows,
+        other => panic!("{q}: {other:?}"),
+    };
+    rows.sort();
+    rows
+}
+
+/// Review durability#17: the VS-tree `db` opened with agrees with its store
+/// — a `vstree.kv` that is used (fresh by the store's header) gives the
+/// store's answers under the tree policy; a stale or missing one is not
+/// used (or is rebuilt), which gives them too. A new store paired with an
+/// old tree marked fresh fails here.
+fn assert_vstree_agrees(db: &mut Database, ctx: &str) {
+    for q in VSTREE_QUERIES {
+        let tree = rows_under(db, q, VsPolicy::Tree);
+        let store = rows_under(db, q, VsPolicy::Off);
+        assert_eq!(
+            tree, store,
+            "{ctx}: the VS-tree disagrees with the store: {q}"
+        );
+    }
+}
 
 /// The temp directories the current test thread made, removed when the
 /// thread ends — also when the test fails (a thread-local's destructor runs
@@ -109,8 +157,9 @@ fn which(dir: &Path, prior: Prior) -> Option<bool> {
         .unwrap()
         .rows;
     let objs: Vec<String> = rows.into_iter().map(|r| r[0].clone().unwrap()).collect();
+    assert_vstree_agrees(&mut db, &format!("{prior:?}"));
     if objs == ["<http://e/new1>", "<http://e/new2>"] {
-        assert_eq!(db.triple_num(), 3);
+        assert_eq!(db.triple_num(), 4);
         assert_eq!(kind, StorageKind::Disk);
         Some(true)
     } else {
@@ -118,6 +167,37 @@ fn which(dir: &Path, prior: Prior) -> Option<bool> {
         assert_eq!(db.triple_num(), 2);
         Some(false)
     }
+}
+
+/// The check of [`which`] sees what its old/new oracle alone cannot: a new
+/// `kvstore.kv` beside the old database's `vstree.kv` (what a copy stopped
+/// between the two files would leave; review durability#17). The oracle
+/// query `<s> <p> ?o` answers the same under every policy, so only the
+/// tree-walk queries catch it.
+#[test]
+fn the_vstree_check_sees_an_old_tree_beside_a_new_store() {
+    let base = tmp("vstree_check");
+    let (old_dir, new_dir) = (base.join("old.db"), base.join("new.db"));
+    fs::create_dir_all(&old_dir).unwrap();
+    make_prior(&old_dir, Prior::Disk);
+    build_new(&new_dir).unwrap();
+    fs::copy(new_dir.join("kvstore.kv"), old_dir.join("kvstore.kv")).unwrap();
+    let mut db = Database::open(&old_dir).unwrap();
+    let objs = rows_under(
+        &mut db,
+        "SELECT ?o WHERE { <http://e/s> <http://e/p> ?o }",
+        VsPolicy::Tree,
+    );
+    assert_eq!(objs.len(), 2, "the oracle query does not notice: {objs:?}");
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_vstree_agrees(&mut db, "planted")
+    }));
+    assert!(
+        caught.is_err(),
+        "the old tree beside the new store went unnoticed"
+    );
+    drop(db);
+    let _ = fs::remove_dir_all(&base);
 }
 
 fn build_new(dir: &Path) -> gstore::Result<bulk::BulkReport> {
@@ -195,10 +275,16 @@ fn killed_gbuild_leaves_the_old_or_the_new_database() {
     };
     let classify = |n: u64| match n {
         2 => false,
-        3 | 100_543 => true,
+        4 | 100_543 => true,
         other => panic!("neither old nor new: {other} triples"),
     };
-    let count = || Database::open(&dir).unwrap().triple_num();
+    // The triple count — and the VS-tree it opens with agrees with the
+    // store (review durability#17).
+    let count = || {
+        let mut db = Database::open(&dir).unwrap();
+        assert_vstree_agrees(&mut db, "after a killed gbuild");
+        db.triple_num()
+    };
     // 1. Abort at every step.
     for (k, point) in CRASH_POINTS.iter().enumerate() {
         rebuild_old();

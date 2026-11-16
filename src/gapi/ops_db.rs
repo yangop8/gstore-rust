@@ -1871,6 +1871,10 @@ fn drop_db(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         let dir = st.db_dir(&db);
         let loaded = st.dbs.get(&db).map(Arc::clone);
         if loaded.is_none() && !dir.is_dir() {
+            drop(st);
+            // What an interrupted drop of this name left behind (no
+            // database scan reads it) goes now.
+            let _ = crate::db::fsutil::remove_drop_leftover(&dir);
             return GResp::error(
                 Status::OperationFailed,
                 format!("database[{db}] does not exist"),
@@ -1921,10 +1925,14 @@ fn drop_db(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         // A `reasonManage` file operation (which does not wait for the
         // database) is never half-way through its rule directory meanwhile.
         let _rules = RuleStore::dir(&dir).lock();
+        // Durably either way (review durability#10): the logical deletion
+        // is a rename made durable; a deletion renames the directory aside
+        // durably before it deletes it, so a crash or an error part-way
+        // never leaves a half-deleted database under its name.
         let moved = if is_backup {
-            fs::rename(&dir, bak_path(&dir))
+            crate::db::fsutil::rename_dir_durably(&dir, &bak_path(&dir))
         } else {
-            fs::remove_dir_all(&dir)
+            crate::db::fsutil::discard_db_dir(&dir).map(drop)
         };
         if let Err(e) = moved {
             return GResp::error(Status::OperationFailed, format!("Drop fail: {e}"));
@@ -1994,24 +2002,79 @@ fn rename(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         Ok(l) => l,
         Err(e) => return failed(format!("Rename fail: {e}")),
     };
+    // Put the directory back under its old name (durably) after a failed
+    // registry or grant update: an error answer means nothing was renamed.
+    let undo = |why: String| -> GResp {
+        let _rules = RuleStore::dir(&to).lock();
+        match crate::db::fsutil::rename_dir_durably(&to, &from) {
+            Ok(()) => failed(format!("Rename fail: {why}; nothing was renamed")),
+            Err(e) => failed(format!(
+                "Rename fail: {why}; the directory stays at {} (moving it back failed: {e}) and \
+                 the registry is reconciled with it at the next start",
+                to.display()
+            )),
+        }
+    };
     {
         // As in drop: no `reasonManage` file operation is half-way through
         // the rule directory moved.
         let _rules = RuleStore::dir(&from).lock();
+        // Durable before the registry and the grants name the new
+        // directory (review durability#14).
         if let Err(e) = fs::rename(&from, &to) {
             return failed(format!("Rename fail: {e}"));
         }
     }
-    drop(lock);
-    let mut st = ctx.state();
-    match st.sysdb.rename(&db, &new_name) {
-        Ok(true) => {}
-        _ => {
-            let _ = st.sysdb.register(&new_name, ROOT_USER);
-        }
+    if let Err(e) = crate::db::fsutil::sync_dir(to.parent().unwrap_or(Path::new("."))) {
+        return undo(format!("the rename could not be made durable ({e})"));
     }
-    let _ = st.users.copy_database_privileges(&db, &new_name);
-    let _ = st.users.forget_database(&db);
+    // Each update below leaves memory and its file as they were when it
+    // fails; the earlier ones are undone and the failure is answered
+    // (review durability#14: it used to be ignored, and the grants on the
+    // renamed database were silently lost).
+    let mut st = ctx.state();
+    let registered = match st.sysdb.rename(&db, &new_name) {
+        Ok(true) => true,
+        // Not registered: registered now, under root.
+        Ok(false) => match st.sysdb.register(&new_name, ROOT_USER) {
+            Ok(()) => false,
+            Err(e) => {
+                drop(st);
+                return undo(format!("cannot update the database registry ({e})"));
+            }
+        },
+        Err(e) => {
+            drop(st);
+            return undo(format!("cannot update the database registry ({e})"));
+        }
+    };
+    if let Err(e) = st.users.copy_database_privileges(&db, &new_name) {
+        let back = if registered {
+            st.sysdb.rename(&new_name, &db).map(drop)
+        } else {
+            st.sysdb.unregister(&new_name).map(drop)
+        };
+        drop(st);
+        if let Err(b) = back {
+            crate::gs_warn!(
+                "rename of database '{db}' to '{new_name}' failed and its registry entry \
+                 could not be restored ({b}); the registry is reconciled with the database \
+                 directories at the next start"
+            );
+        }
+        return undo(format!("cannot copy the grants to the new name ({e})"));
+    }
+    if let Err(e) = st.users.forget_database(&db) {
+        // Renamed, registered and granted under the new name: only the old
+        // name's grants are left behind (they would apply to a later
+        // database of that name until the next start forgets them).
+        return failed(format!(
+            "Rename fail: database {db} was renamed to {new_name}, but the grants on the old \
+             name could not be removed ({e}); they are removed at the next start"
+        ));
+    }
+    drop(st);
+    drop(lock);
     GResp::success("Database rename successfully.")
 }
 

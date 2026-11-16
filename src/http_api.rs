@@ -5169,9 +5169,16 @@ impl ApiInner {
                 // the database) is never half-way through its rule directory
                 // meanwhile, as for the `/api` drop.
                 let _rules = RuleStore::dir(&dir).lock();
-                if let Err(e) = fs::remove_dir_all(&dir) {
+                // Renamed aside durably, then deleted: a crash or an error
+                // part-way never leaves a half-deleted database under its
+                // name (review durability#10).
+                if let Err(e) = crate::db::fsutil::discard_db_dir(&dir) {
                     return Resp::fail(500, &format!("drop failed: {e}"));
                 }
+            } else {
+                // What an interrupted drop of this name left behind (no
+                // database scan reads it) goes now.
+                let _ = crate::db::fsutil::remove_drop_leftover(&dir);
             }
             if !was_loaded && !existed_on_disk {
                 return Resp::fail(404, &format!("database '{name}' does not exist"));

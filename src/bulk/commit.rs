@@ -274,6 +274,23 @@ pub(crate) fn build_disk(
     })
 }
 
+/// Install a disk database another builder staged in `staging`
+/// (`<dir>/`[`STAGING_DIR`], holding a complete `kvstore.kv` and
+/// `vstree.kv`) with this module's install steps — how the incremental
+/// disk build replaces a database (review durability#5), so a failed or
+/// interrupted rebuild leaves the old database as a bulk build does. The
+/// caller holds `dir`'s [`DirLock`] and [`BuildGuard`]. An error before the
+/// commit point is returned with the old database in place (the staging
+/// area removed); errors after it come back as warnings.
+pub(crate) fn install_staged_disk(dir: &Path, staging: &Path) -> Result<Vec<String>> {
+    let mut fp = Failpoints::load(dir);
+    install(dir, staging, &mut fp).inspect_err(|_| {
+        if !fp.crashed {
+            let _ = fs::remove_dir_all(staging);
+        }
+    })
+}
+
 /// Who holds the lock of a RocksDB store in `dir` (`rocksdb/LOCK`, or that of
 /// a staged `rocksdb.new/`), if anyone does: RocksDB holds it — a POSIX
 /// record lock — for as long as the store is open, in any process. Read from

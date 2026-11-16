@@ -437,8 +437,9 @@ pub(crate) fn recover_snapshot(dir: &Path, members: &[&str]) -> Result<()> {
 
 // ---- directory staging ------------------------------------------------------
 
-/// Recursively copy directory `src` into the (new) directory `dst`, syncing
-/// every copied file.
+/// Recursively copy directory `src` into the (new) directory `dst`. Nothing
+/// is synced: the copy is published through [`StagedDir::install`], which
+/// fsyncs the whole staged tree before the swap.
 fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
@@ -449,10 +450,9 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
             copy_dir_all(&from, &to)?;
         } else {
             fs::copy(&from, &to)?;
-            File::open(&to)?.sync_all()?;
         }
     }
-    sync_dir(dst)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -466,6 +466,7 @@ thread_local! {
 /// The sibling names a directory swap uses for `target`: where the replacement
 /// is staged, where a complete replacement waits to be swapped in, and where
 /// the replaced directory goes before it is deleted.
+#[derive(Debug)]
 pub(crate) struct DirSwap {
     tmp: &'static str,
     new: &'static str,
@@ -516,6 +517,8 @@ impl DirSwap {
 /// Install a fully-populated staging directory `staged` as `target`, replacing
 /// any existing `target`: `staged` → `target.new` → (`target` → `target.old`)
 /// → `target`. Interrupted swaps are completed by [`recover_dir_swap`].
+// (Without the `rocksdb` feature nothing swaps a store this way.)
+#[cfg_attr(not(feature = "rocksdb"), allow(dead_code))]
 pub(crate) fn install_staged_dir(staged: &Path, target: &Path) -> Result<()> {
     install_staged_dir_as(staged, target, &STORE_SWAP)
 }
@@ -565,13 +568,24 @@ pub(crate) fn discard_dir(target: &Path) -> Result<()> {
     remove_dir_if_exists(&tmp_path(target))
 }
 
-/// Replace directory `dst` by a recursive copy of `src` (staged, then swapped
-/// in with [`install_staged_dir`]).
+/// Replace directory `dst` by a recursive copy of `src`: staged and swapped
+/// in as a whole ([`StagedDir`] with the [`STORE_SWAP`] names). Any failure
+/// is returned, also one after the swap's commit point (the copy may then
+/// be in place, but is not known to be durable).
 pub(crate) fn replace_dir_with_copy(src: &Path, dst: &Path) -> Result<()> {
-    let staged = tmp_path(dst);
-    remove_dir_if_exists(&staged)?;
-    copy_dir_all(src, &staged)?;
-    install_staged_dir(&staged, dst)
+    let staged = StagedDir::begin(dst, &STORE_SWAP)?;
+    copy_dir_all(src, staged.path())?;
+    staged.install().map_err(|e| {
+        if e.committed {
+            GStoreError::Database(format!(
+                "the copy '{}' is in place, but its swap did not finish: {}",
+                dst.display(),
+                e.error
+            ))
+        } else {
+            e.error
+        }
+    })
 }
 
 /// Complete or clean up an interrupted [`install_staged_dir`] of `target`: a
@@ -599,15 +613,316 @@ pub(crate) fn dir_or_staged_exists(target: &Path) -> bool {
     target.is_dir() || with_suffix(target, NEW_SUFFIX).is_dir()
 }
 
+// ---- stage + swap + fsync: the one way a directory is replaced or removed --
+//
+// Every path that replaces a directory as a whole — a RocksDB store a build,
+// a save or a backup copy writes, a restored database — stages the new tree
+// beside the old one and publishes it with one swap ([`StagedDir`] for the
+// incremental RocksDB build and the backup copy; the bulk RocksDB install,
+// the RocksDB save into another directory and the restore still stage
+// themselves and call [`install_staged_dir_as`], see the review backlog);
+// every path that removes a database directory moves it aside durably
+// before it deletes it ([`discard_db_dir`]); a renamed database directory
+// is made durable before anything records the new name
+// ([`rename_dir_durably`]). (Review durability#15; the disk layout's two
+// files are installed by the bulk build's install, `crate::bulk::commit`,
+// which the incremental disk build uses too.)
+
+/// `fsync` every regular file and every directory of the tree under `dir`
+/// (each directory after its entries), so a tree staged for a swap is
+/// durable before the rename that publishes it. Symbolic links are not
+/// followed.
+pub(crate) fn sync_tree(dir: &Path) -> Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            sync_tree(&entry.path())?;
+        } else if kind.is_file() {
+            File::open(entry.path())?.sync_all()?;
+        }
+    }
+    sync_dir(dir)
+}
+
+/// How a [`StagedDir::install`] failed: `committed` when the staged tree is
+/// what an open of the target sees from now on (it is in place, or waits
+/// as `<target>.new`, which every [`recover_dir_swap_as`] moves into place)
+/// and only a step after that failed; otherwise the target is untouched.
+#[derive(Debug)]
+pub(crate) struct InstallError {
+    pub(crate) committed: bool,
+    pub(crate) error: GStoreError,
+}
+
+impl From<InstallError> for GStoreError {
+    fn from(e: InstallError) -> GStoreError {
+        e.error
+    }
+}
+
+/// The replacement of directory `target`, staged beside it under the
+/// staging name of a [`DirSwap`] and published as a whole by
+/// [`install`](Self::install): the staged tree is fsynced, renamed to
+/// `<target>.new`, the parent fsynced, the old `target` moved aside, the new
+/// one renamed into place, the parent fsynced again and the old tree
+/// deleted ([`install_staged_dir_as`]). Until the rename into place the old
+/// directory is what every open sees; an interrupted swap is finished by
+/// [`recover_dir_swap_as`]. Dropped without being installed, the staging
+/// directory is removed and `target` is untouched.
+#[derive(Debug)]
+pub(crate) struct StagedDir {
+    staged: PathBuf,
+    target: PathBuf,
+    swap: &'static DirSwap,
+    /// Set once `install` took over the staged tree (it must then never be
+    /// deleted by `drop`: it may be the committed copy).
+    handed_over: bool,
+}
+
+impl StagedDir {
+    /// Start staging a replacement of `target`: a fresh, empty staging
+    /// directory (one a crash left there is removed first). The caller holds
+    /// the lock of the directory `target` belongs to.
+    pub(crate) fn begin(target: &Path, swap: &'static DirSwap) -> Result<StagedDir> {
+        let staged = swap.staging(target);
+        remove_dir_if_exists(&staged)?;
+        fs::create_dir_all(&staged)?;
+        Ok(StagedDir {
+            staged,
+            target: target.to_path_buf(),
+            swap,
+            handed_over: false,
+        })
+    }
+
+    /// The staging directory to fill.
+    pub(crate) fn path(&self) -> &Path {
+        &self.staged
+    }
+
+    /// Publish the staged tree as `target` (see the type docs).
+    pub(crate) fn install(mut self) -> std::result::Result<(), InstallError> {
+        let not_committed = |error| InstallError {
+            committed: false,
+            error,
+        };
+        sync_tree(&self.staged).map_err(not_committed)?;
+        self.handed_over = true;
+        let Err(error) = install_staged_dir_as(&self.staged, &self.target, self.swap) else {
+            return Ok(());
+        };
+        // Where did the swap stop? `staged` → `.new` → (`target` → `.old`)
+        // → `target`.
+        if self.staged.exists() {
+            let _ = remove_dir_if_exists(&self.staged);
+            return Err(not_committed(error));
+        }
+        let new = with_suffix(&self.target, self.swap.new);
+        if new.is_dir() && self.target.is_dir() {
+            // The old directory is still in place (the next recovery would
+            // discard the new one): undo.
+            let _ = remove_dir_if_exists(&new);
+            return Err(not_committed(error));
+        }
+        // The new tree is `target`, or `.new` with no `target`, which every
+        // recovery moves into place: the commit point is passed. Finish what
+        // can be finished; the caller decides what the failure means.
+        let _ = recover_dir_swap_as(&self.target, self.swap);
+        Err(InstallError {
+            committed: true,
+            error,
+        })
+    }
+}
+
+impl Drop for StagedDir {
+    fn drop(&mut self) {
+        if !self.handed_over {
+            let _ = remove_dir_if_exists(&self.staged);
+        }
+    }
+}
+
+/// The sibling names of a database directory a drop removes
+/// ([`discard_db_dir`]): `x.db` is renamed to `x.db.drop-old` before it is
+/// deleted. No database scan reads such a name (it does not end in `.db`),
+/// and the next drop of the same name removes a leftover one.
+pub(crate) const DROP_SWAP: DirSwap = DirSwap {
+    tmp: ".drop-tmp",
+    new: ".drop-new",
+    old: ".drop-old",
+};
+
+/// Test hook of the drop crash tests: with this environment variable set
+/// (non-empty), [`discard_db_dir`] parks its thread for good right after
+/// the directory was durably renamed aside — the state a crash there
+/// leaves — and says so on stderr, for the test to kill the process. Read
+/// once per drop, never on a hot path.
+const DROP_PARK_ENV: &str = "GSTORE_DROP_PARK";
+
+/// Park the calling thread for good after telling stderr `what` (a crash
+/// test's hook: the test kills the process at this point).
+pub(crate) fn park_for_crash_test(env: &str, what: &str) -> ! {
+    let mut err = io::stderr();
+    // Written straight to the stream (not through the test harness's
+    // output capture, which a parked thread would never flush).
+    let _ = writeln!(err, "{env}: parked {what}");
+    let _ = err.flush();
+    loop {
+        std::thread::park();
+    }
+}
+
+/// Delete database directory `target` such that neither a crash nor an
+/// error part-way leaves a partially deleted directory under its live name
+/// (review durability#10): `target` is renamed to `<target>.drop-old`
+/// ([`DROP_SWAP`]), the parent is fsynced — from here on the database is
+/// gone — and only then is the tree deleted. A leftover `<target>.drop-old`
+/// of an earlier interrupted drop is removed first, also when `target` no
+/// longer exists. Returns whether `target` existed.
+///
+/// Once the rename is durable the drop has happened: a failure deleting the
+/// moved-aside tree is logged (the leftover is ignored by every scan and
+/// removed by the next drop of the name), not returned. The caller holds
+/// `target`'s directory lock (it moves with the directory). A symbolic link
+/// to a database directory is renamed and removed as a link, never
+/// followed.
+pub(crate) fn discard_db_dir(target: &Path) -> Result<bool> {
+    let aside = DROP_SWAP.moved_aside(target);
+    remove_drop_leftover(target)?;
+    if !target.is_dir() {
+        return Ok(false);
+    }
+    fs::rename(target, &aside)?;
+    sync_dir(parent_of(target))?;
+    if std::env::var_os(DROP_PARK_ENV).is_some_and(|v| !v.is_empty()) {
+        park_for_crash_test(
+            DROP_PARK_ENV,
+            &format!("after renaming '{}' aside", target.display()),
+        );
+    }
+    #[cfg(test)]
+    if CRASH_BEFORE_DISCARD_DELETE.with(|c| c.get()) {
+        return Err(GStoreError::Database(
+            "simulated crash while deleting a discarded directory".into(),
+        ));
+    }
+    if let Err(e) = remove_dir_if_exists(&aside) {
+        crate::gs_warn!(
+            "dropped '{}', but its files could not all be deleted ({e}); '{}' is left \
+             behind (no database scan reads it) and the next drop of the name removes it",
+            target.display(),
+            aside.display()
+        );
+    }
+    Ok(true)
+}
+
+/// Remove what an interrupted [`discard_db_dir`] of `target` left behind
+/// (`<target>.drop-old`), leaving `target` itself alone. Returns whether
+/// there was such a leftover.
+pub(crate) fn remove_drop_leftover(target: &Path) -> Result<bool> {
+    let aside = DROP_SWAP.moved_aside(target);
+    let found = fs::symlink_metadata(&aside).is_ok();
+    remove_dir_if_exists(&aside)?;
+    Ok(found)
+}
+
+/// Rename directory `from` to `to` and make the rename durable (the parent
+/// directory, or both parents, fsynced) before anything records the new
+/// name (review durability#14).
+pub(crate) fn rename_dir_durably(from: &Path, to: &Path) -> Result<()> {
+    fs::rename(from, to)?;
+    sync_dir(parent_of(to))?;
+    if parent_of(from) != parent_of(to) {
+        sync_dir(parent_of(from))?;
+    }
+    Ok(())
+}
+
+/// `path` with its longest existing leading part resolved
+/// ([`fs::canonicalize`]: symbolic links, `.` and `..`) and the parts that
+/// do not exist yet appended as they are (`..` taking away a component).
+fn resolve_leniently(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|d| d.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let mut existing = absolute.clone();
+    let mut rest: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(mut out) = fs::canonicalize(&existing) {
+            for part in rest.iter().rev() {
+                match Path::new(part).components().next() {
+                    Some(std::path::Component::ParentDir) => {
+                        out.pop();
+                    }
+                    Some(std::path::Component::CurDir) | None => {}
+                    _ => out.push(part),
+                }
+            }
+            return out;
+        }
+        let Some(last) = existing.components().next_back() else {
+            return absolute;
+        };
+        rest.push(last.as_os_str().to_owned());
+        if !existing.pop() {
+            return absolute;
+        }
+    }
+}
+
+/// Whether `path` is directory `dir` or lies inside it, after resolving
+/// symbolic links and relative components; a `path` that does not exist
+/// yet is resolved through its nearest existing ancestor (review
+/// bulkcli#4: a backup into the database's own directory).
+pub(crate) fn is_within(path: &Path, dir: &Path) -> bool {
+    match fs::canonicalize(dir) {
+        Ok(dir) => resolve_leniently(path).starts_with(dir),
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn tmp_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("gstore_fsutil_{tag}"));
+    /// A fresh temporary directory, removed when dropped (also when the
+    /// test fails); unique per process and call.
+    struct TmpDir(PathBuf);
+
+    impl std::ops::Deref for TmpDir {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for TmpDir {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tmp_dir(tag: &str) -> TmpDir {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let d =
+            std::env::temp_dir().join(format!("gstore_fsutil_{tag}_{}_{n}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
-        d
+        TmpDir(d)
     }
 
     /// A value whose serialization writes some bytes and then fails — the
@@ -804,6 +1119,99 @@ mod tests {
         assert_eq!(fs::read(target.join("f")).unwrap(), b"restored");
         for s in [OLD_SUFFIX, NEW_SUFFIX, TMP_SUFFIX] {
             assert!(with_suffix(&target, s).is_dir(), "{s} sibling must survive");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_staged_dir_is_installed_whole_or_discarded() {
+        let dir = tmp_dir("staged_dir");
+        let target = dir.join("rocksdb");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("CURRENT"), b"old").unwrap();
+        // Dropped without installing: the staging goes, the target stays.
+        let staged = StagedDir::begin(&target, &STORE_SWAP).unwrap();
+        fs::create_dir_all(staged.path().join("sub")).unwrap();
+        fs::write(staged.path().join("CURRENT"), b"new").unwrap();
+        assert_eq!(staged.path(), tmp_path(&target));
+        drop(staged);
+        assert!(!tmp_path(&target).exists());
+        assert_eq!(fs::read(target.join("CURRENT")).unwrap(), b"old");
+        // A stale staging directory (a crash) is replaced by a fresh one.
+        fs::create_dir_all(tmp_path(&target).join("junk")).unwrap();
+        let staged = StagedDir::begin(&target, &STORE_SWAP).unwrap();
+        assert!(!staged.path().join("junk").exists());
+        fs::create_dir_all(staged.path().join("sub")).unwrap();
+        fs::write(staged.path().join("sub/f"), b"deep").unwrap();
+        fs::write(staged.path().join("CURRENT"), b"new").unwrap();
+        staged.install().unwrap();
+        assert_eq!(fs::read(target.join("CURRENT")).unwrap(), b"new");
+        assert_eq!(fs::read(target.join("sub/f")).unwrap(), b"deep");
+        assert!(!STORE_SWAP.in_progress(&target), "no sibling is left");
+        // An install that cannot even begin its swap (here: no parent for
+        // the target) is not committed and leaves nothing behind.
+        let orphan = dir.join("gone/rocksdb");
+        let staged = StagedDir::begin(&orphan, &STORE_SWAP).unwrap();
+        fs::remove_dir_all(dir.join("gone")).unwrap();
+        let e = staged.install().unwrap_err();
+        assert!(!e.committed, "{e:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_dropped_database_directory_is_moved_aside_before_it_is_deleted() {
+        let dir = tmp_dir("discard_db");
+        let target = dir.join("x.db");
+        fs::create_dir_all(target.join("rocksdb")).unwrap();
+        fs::write(target.join("meta.bin"), b"m").unwrap();
+        let aside = DROP_SWAP.moved_aside(&target);
+        assert!(
+            !aside.to_string_lossy().ends_with(".db"),
+            "scanners skip it"
+        );
+        // "Crash" right after the durable rename: only the aside name is
+        // left, never a half-deleted `x.db`.
+        CRASH_BEFORE_DISCARD_DELETE.with(|c| c.set(true));
+        let r = discard_db_dir(&target);
+        CRASH_BEFORE_DISCARD_DELETE.with(|c| c.set(false));
+        assert!(r.is_err());
+        assert!(!target.exists());
+        assert!(aside.join("meta.bin").is_file(), "moved whole");
+        // The next drop of the name removes the leftover, also with no
+        // database there.
+        assert!(!discard_db_dir(&target).unwrap());
+        assert!(!aside.exists());
+        fs::create_dir_all(&aside).unwrap();
+        assert!(remove_drop_leftover(&target).unwrap());
+        assert!(!remove_drop_leftover(&target).unwrap());
+        // A plain drop.
+        fs::create_dir_all(target.join("sub")).unwrap();
+        assert!(discard_db_dir(&target).unwrap());
+        assert!(!target.exists() && !aside.exists());
+        // A durable rename.
+        fs::create_dir_all(dir.join("a.db")).unwrap();
+        rename_dir_durably(&dir.join("a.db"), &dir.join("b.db")).unwrap();
+        assert!(dir.join("b.db").is_dir() && !dir.join("a.db").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_within_resolves_links_dots_and_missing_parts() {
+        let dir = tmp_dir("is_within");
+        let db = dir.join("x.db");
+        fs::create_dir_all(db.join("sub")).unwrap();
+        assert!(is_within(&db, &db));
+        assert!(is_within(&db.join("sub"), &db));
+        assert!(is_within(&db.join("missing/deeper"), &db));
+        assert!(is_within(&db.join("sub/../other"), &db));
+        assert!(!is_within(&db.join("../x.db2"), &db));
+        assert!(!is_within(&dir.join("bk"), &db));
+        assert!(!is_within(&dir, &db));
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&db, dir.join("link")).unwrap();
+            assert!(is_within(&dir.join("link"), &db));
+            assert!(is_within(&dir.join("link/new"), &db));
         }
         let _ = fs::remove_dir_all(&dir);
     }

@@ -26,6 +26,10 @@
 //! `kvstore.kv`** (the triple/quad difference is applied) on open; an older
 //! shadow is ignored. Either way the shadow files are then renamed to
 //! `<file>.legacy` so the decision is made once and the data is never deleted.
+//! The reconcile patches `kvstore.kv` in place in several page commits; the
+//! decision to apply a shadow is recorded first (`SHADOW.apply`, bound to
+//! that store file), so an open after a crash part-way finishes it instead
+//! of comparing mtimes the partial commits changed.
 //!
 //! ## On-disk databases: Stream and Materialize mode, commit points
 //!
@@ -82,7 +86,15 @@
 //! way before it is deleted, so a crash mid-deletion never leaves a partial
 //! store that layout detection would prefer over the newly committed layout.
 //! [`Database::restore_into`] stages and validates the copy beside the target
-//! and swaps it in as a whole directory.
+//! and swaps it in as a whole directory. Builds never write over the
+//! database they replace: the bulk builds and the incremental disk build
+//! stage the new files in `.bulk-tmp/` and install them crash-safely
+//! ([`crate::bulk::commit`]); the incremental RocksDB build writes
+//! `rocksdb.tmp/` and swaps it in. A dropped database directory is renamed
+//! aside (`<dir>.drop-old`) durably before it is deleted
+//! ([`Database::drop_dir`]). A backup copy removes the destination's
+//! VS-tree and write-ahead logs durably before the new store lands, and
+//! copies `meta.bin` last.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
@@ -114,6 +126,16 @@ const SNAPSHOT_FILES: &[&str] = &[DICT_FILE, STORE_FILE, NAMED_FILE, VSTREE_FILE
 
 /// Suffix legacy shadow-snapshot files are renamed to (see the module docs).
 const LEGACY_SUFFIX: &str = ".legacy";
+
+/// The marker a legacy-shadow reconcile writes before it changes
+/// `kvstore.kv` (see [`reconcile_legacy_shadow`]): the decision to apply the
+/// shadow, bound to the store file it was taken for.
+const SHADOW_APPLY_FILE: &str = "SHADOW.apply";
+
+/// Test hook of the reconcile crash test: with this environment variable
+/// set to `n`, a legacy-shadow reconcile commits after its first `n`
+/// changes and parks for good (see [`fsutil::park_for_crash_test`]).
+const SHADOW_PARK_ENV: &str = "GSTORE_SHADOW_PARK";
 
 /// The lock file beside a database directory that a restore creating the
 /// database holds ([`Database::lock_restore_target`]).
@@ -409,23 +431,34 @@ fn key_triple(dict: &Dictionary, t: IdTriple) -> Option<KeyTriple> {
 
 /// Remove the artifacts of every layout other than `keep` from `dir`.
 pub(crate) fn remove_other_layouts(dir: &Path, keep: StorageKind) -> Result<()> {
+    // A legacy-shadow reconcile's marker (see `reconcile_legacy_shadow`)
+    // concerns the store and the snapshot of the layouts being replaced.
+    fsutil::remove_file_if_exists(&dir.join(SHADOW_APPLY_FILE))?;
     if keep != StorageKind::Snapshot {
-        for name in SNAPSHOT_FILES {
+        // The commit record first (it would roll leftover temp files
+        // forward), then `store.bin` (the file a legacy-shadow reconcile is
+        // triggered by), then the rest.
+        fsutil::remove_file_if_exists(&dir.join(fsutil::SNAPSHOT_COMMIT_FILE))?;
+        for name in std::iter::once(STORE_FILE)
+            .chain(SNAPSHOT_FILES.iter().copied().filter(|n| *n != STORE_FILE))
+        {
             let path = dir.join(name);
             fsutil::remove_file_if_exists(&path)?;
             fsutil::remove_file_if_exists(&fsutil::tmp_path(&path))?;
         }
-        fsutil::remove_file_if_exists(&dir.join(fsutil::SNAPSHOT_COMMIT_FILE))?;
     }
     if keep != StorageKind::Disk {
         let kv = dir.join(KV_FILE);
         if kv.exists() || wal_of(&kv).exists() {
             // The out-of-core VS-tree file belongs to the disk layout; leave a
             // `vstree.kv` alone otherwise (it may be a memory database's
-            // opted-in streaming index).
+            // opted-in streaming index). Each file before its WAL: a crash
+            // between the two leaves a log beside no store (removed by the
+            // next build or save here), never a store whose committed log
+            // is gone — a torn file a legacy-shadow reconcile would patch.
             for path in [kv, dir.join(VSTREE_KV_FILE)] {
-                fsutil::remove_file_if_exists(&wal_of(&path))?;
                 fsutil::remove_file_if_exists(&path)?;
+                fsutil::remove_file_if_exists(&wal_of(&path))?;
             }
         }
     }
@@ -833,18 +866,24 @@ impl Database {
                 .is_none_or(|s| s.store.vstree_stale()),
         };
         let kv_dst = dir.join(KV_FILE);
-        // A stale WAL beside the destination would replay into the new copy.
-        fsutil::remove_file_if_exists(&wal_of(&kv_dst))?;
-        fsutil::copy_file_atomic(&home.join(KV_FILE), &kv_dst)?;
         let vs_src = home.join(VSTREE_KV_FILE);
         let vs_dst = dir.join(VSTREE_KV_FILE);
-        fsutil::remove_file_if_exists(&wal_of(&vs_dst))?;
+        // Removed durably before the new store lands: a stale WAL beside the
+        // destination (it would replay into the new copy) and the
+        // destination's VS-tree — an old tree must never pair with the new
+        // `kvstore.kv`, whose header may say "fresh" (review durability#4).
+        // A copy that stops after the store and before the tree leaves a
+        // store without a VS-tree, which an open rebuilds.
+        for path in [wal_of(&kv_dst), wal_of(&vs_dst), vs_dst.clone()] {
+            fsutil::remove_file_if_exists(&path)?;
+        }
+        fsutil::sync_dir(dir)?;
+        fsutil::copy_file_atomic(&home.join(KV_FILE), &kv_dst)?;
         if !stale && vs_src.is_file() {
             fsutil::copy_file_atomic(&vs_src, &vs_dst)?;
-        } else {
-            // The copy's header says the VS-tree is stale; it is rebuilt on open.
-            fsutil::remove_file_if_exists(&vs_dst)?;
         }
+        // (Otherwise the copy's header says the VS-tree is stale; it is
+        // rebuilt on open.)
         remove_other_layouts(dir, StorageKind::Disk)
     }
 
@@ -1060,7 +1099,10 @@ impl Database {
     }
 
     /// [`build_disk_incremental`](Self::build_disk_incremental) from
-    /// `sources` (the pre-Phase-6 body of the disk build).
+    /// `sources` (the pre-Phase-6 body of the disk build). The new store is
+    /// built in the bulk build's staging area and installed by the bulk
+    /// build's crash-safe install, so a build that fails or is interrupted
+    /// leaves the database `dir` held before as it was.
     #[doc(hidden)]
     pub fn build_disk_from_sources_incremental<P: AsRef<Path>>(
         dir: P,
@@ -1070,6 +1112,9 @@ impl Database {
     ) -> Result<import::ImportReport> {
         let dir = dir.as_ref();
         fs::create_dir_all(dir)?;
+        // Another build of this process rebuilding `dir` would share the
+        // staging area below: refused, as between bulk builds.
+        let _guard = super::dirlock::BuildGuard::enter(dir)?;
         // Replacing the files of a database another process serves (or one
         // of this process has open) would strand its later writes: refused,
         // as the bulk build refuses, and the directory held meanwhile.
@@ -1080,21 +1125,46 @@ impl Database {
             )));
         }
         let _lock = super::dirlock::DirLock::acquire(dir)?;
-        remove_other_layouts(dir, StorageKind::Disk)?;
-        // Fresh build: remove any prior store/VS-tree files *and* their WALs, so a
-        // leftover WAL from a crashed earlier build can't replay into the new file.
-        let kv = dir.join(KV_FILE);
-        super::remove_file_and_wal(&kv);
-        let mut ds = DiskStore::open(&kv, DISK_CACHE_PAGES)?;
-        let report = ds.import_sources(sources, opts, log)?;
-        ds.flush()?;
-        // Build the out-of-core VS-tree alongside the store, so a later
-        // `load_disk` filters through it on disk instead of materializing it.
-        let vskv = dir.join(VSTREE_KV_FILE);
-        super::remove_file_and_wal(&vskv);
-        drop(write_vstree_kv(&vskv, disk_vstree_entries(&ds)?)?);
-        ds.mark_vstree_fresh();
-        ds.flush()?;
+        crate::bulk::commit::refuse_open_store(dir)?;
+        // The new store and VS-tree are built in the bulk build's staging
+        // area, which no layout detection reads, and installed by its
+        // install (review durability#5): until the new `kvstore.kv` is
+        // renamed into place the old database — whatever its layout — is
+        // untouched, so a build that fails (a strict parse error, ENOSPC) or
+        // a crash leaves it as it was.
+        let staging = dir.join(crate::bulk::STAGING_DIR);
+        fsutil::remove_dir_if_exists(&staging)?;
+        fs::create_dir_all(&staging)?;
+        let built = (|| -> Result<import::ImportReport> {
+            let kv = staging.join(KV_FILE);
+            let mut ds = DiskStore::open(&kv, DISK_CACHE_PAGES)?;
+            let report = ds.import_sources(sources, opts, log)?;
+            ds.flush()?;
+            // The out-of-core VS-tree alongside the store, so a later
+            // `load_disk` filters through it on disk instead of
+            // materializing it.
+            drop(write_vstree_kv(
+                &staging.join(VSTREE_KV_FILE),
+                disk_vstree_entries(&ds)?,
+            )?);
+            ds.mark_vstree_fresh();
+            ds.flush()?;
+            Ok(report)
+        })();
+        let report = match built {
+            Ok(report) => report,
+            Err(e) => {
+                let _ = fsutil::remove_dir_if_exists(&staging);
+                return Err(e);
+            }
+        };
+        for w in crate::bulk::commit::install_staged_disk(dir, &staging)? {
+            crate::gs_warn!(
+                "incremental disk build of '{}': built (the new database is in place), but \
+                 its install did not finish: {w}",
+                dir.display()
+            );
+        }
         Ok(report)
     }
 
@@ -1304,7 +1374,9 @@ impl Database {
     }
 
     /// Write an encoded build (`db`'s dictionary, `acc`'s ids) into a fresh
-    /// RocksDB store in `dir`.
+    /// RocksDB store, staged as `dir/rocksdb.tmp` and swapped in for
+    /// `dir/rocksdb` once complete: a build that fails leaves the database
+    /// `dir` held as it was.
     #[cfg(feature = "rocksdb")]
     fn create_rocksdb(
         mut db: Database,
@@ -1329,30 +1401,64 @@ impl Database {
                 dir.display()
             )));
         }
+        // Another build of this process rebuilding `dir` would share the
+        // staging directory below: refused, as between bulk builds.
+        let _guard = super::dirlock::BuildGuard::enter(dir)?;
         let lock = super::dirlock::DirLock::acquire(dir)?;
-        // Fresh build: replace any previous database in `dir`.
-        remove_other_layouts(dir, StorageKind::RocksDb)?;
         let rocks_dir = dir.join(ROCKS_SUBDIR);
-        fsutil::discard_dir(&rocks_dir)?;
-
-        let mut rocks = RocksStore::open(&rocks_dir)?;
-        // Dictionary first: a term without a triple is harmless, the reverse not.
-        rocks.replace_dictionary(rocks_layout::dict_entries(&db.dict))?;
-        crate::store::MutableStore::bulk_load(&mut rocks, ids);
-        if let Some(e) = rocks.take_error() {
-            return Err(GStoreError::Database(e));
-        }
-        // Named graphs: the `gspo` CF and the in-memory map.
-        for (gid, quads) in named {
-            for &id in &quads {
-                rocks.insert_quad(gid, id)?;
+        // Finish a swap a crash interrupted (as every open does) before
+        // anything is staged: its `rocksdb.new` may be the database.
+        fsutil::recover_dir_swap(&rocks_dir)?;
+        // An older binary serving the store takes only `rocksdb/LOCK`.
+        crate::bulk::commit::refuse_open_store(dir)?;
+        // The new store is written into `rocksdb.tmp` and swapped in as a
+        // whole (review durability#5, #15): until the swap the database
+        // `dir` held — whatever its layout — is untouched, so a build that
+        // fails or is interrupted leaves it as it was.
+        let staged = fsutil::StagedDir::begin(&rocks_dir, &fsutil::STORE_SWAP)?;
+        {
+            let mut rocks = RocksStore::open(staged.path())?;
+            // Dictionary first: a term without a triple is harmless, the
+            // reverse not.
+            rocks.replace_dictionary(rocks_layout::dict_entries(&db.dict))?;
+            crate::store::MutableStore::bulk_load(&mut rocks, ids);
+            if let Some(e) = rocks.take_error() {
+                return Err(GStoreError::Database(e));
             }
-            db.named.bulk_load(gid, quads);
+            // Named graphs: the `gspo` CF and the in-memory map.
+            for (gid, quads) in named {
+                for &id in &quads {
+                    rocks.insert_quad(gid, id)?;
+                }
+                db.named.bulk_load(gid, quads);
+            }
+            rocks.put_meta(rocks_layout::NAME_KEY, db.name.as_bytes())?;
+            rocks.put_meta(rocks_layout::LAYOUT_KEY, rocks_layout::LAYOUT_VERSION)?;
+            rocks.flush()?;
+            // Closed before its directory is renamed.
         }
-        rocks.put_meta(rocks_layout::NAME_KEY, db.name.as_bytes())?;
-        rocks.put_meta(rocks_layout::LAYOUT_KEY, rocks_layout::LAYOUT_VERSION)?;
-        rocks.flush()?;
-        db.store = Backend::Rocks(rocks);
+        // Again, right before the swap (see `refuse_open_store`).
+        crate::bulk::commit::refuse_open_store(dir)?;
+        match staged.install() {
+            Ok(()) => {}
+            Err(e) if e.committed => crate::gs_warn!(
+                "RocksDB build of '{}': the new store is in place, but its swap did not \
+                 finish: {}",
+                dir.display(),
+                e.error
+            ),
+            Err(e) => return Err(e.error),
+        }
+        // `rocksdb/` takes precedence in layout detection: the new store is
+        // the database now, whatever else the directory still holds.
+        if let Err(e) = remove_other_layouts(dir, StorageKind::RocksDb) {
+            crate::gs_warn!(
+                "RocksDB build of '{}': built (the new store is in place), but the other \
+                 layouts could not be removed: {e}",
+                dir.display()
+            );
+        }
+        db.store = Backend::Rocks(RocksStore::open(&rocks_dir)?);
         db.home = Some(dir.to_path_buf());
         db.dir_lock = Some(lock);
         db.rebuild_index();
@@ -1455,11 +1561,30 @@ impl Database {
     /// (a `gbuild --force`, a bulk install, which hold the lock), whose staged
     /// files the repair would delete. Fails, touching nothing, while another
     /// process holds it.
+    ///
+    /// Refused, touching nothing, when `dst` is `src` or lies inside it (a
+    /// "backup" that would delete the source's own write-ahead logs, review
+    /// bulkcli#4), and while another process has a database in `dst` open.
+    /// The copy never pairs files of two states (review durability#4): what
+    /// must not meet the new files — `dst`'s write-ahead logs, its
+    /// `vstree.kv` (an old VS-tree beside a new `kvstore.kv` whose header
+    /// says "fresh" would prune the entities added since), a snapshot commit
+    /// record, and every database file `src` lacks — is removed durably
+    /// first, and `meta.bin`, the file the snapshot layout is detected by,
+    /// is copied last; so a copy that fails part-way leaves no stale
+    /// VS-tree and no mixed snapshot.
     pub fn backup_dir<P: AsRef<Path>, Q: AsRef<Path>>(src: P, dst: Q) -> Result<()> {
         let (src, dst) = (src.as_ref(), dst.as_ref());
         if !src.is_dir() {
             return Err(GStoreError::Database(format!(
                 "backup source '{}' is not a directory",
+                src.display()
+            )));
+        }
+        if fsutil::is_within(dst, src) {
+            return Err(GStoreError::Database(format!(
+                "backup destination '{}' is the database directory '{}' or lies inside it",
+                dst.display(),
                 src.display()
             )));
         }
@@ -1475,31 +1600,58 @@ impl Database {
             None
         };
         fs::create_dir_all(dst)?;
+        // A database another process has open in `dst` is not rewritten
+        // under it (as a save into another directory refuses).
+        let _dst_lock = if Database::storage_kind(dst).is_some() {
+            Some(super::dirlock::DirLock::acquire(dst)?)
+        } else {
+            None
+        };
 
         let kv = Path::new(KV_FILE);
         let vs = Path::new(VSTREE_KV_FILE);
-        let mut names: Vec<PathBuf> = SNAPSHOT_FILES.iter().map(PathBuf::from).collect();
-        // Each paged file before its WAL, so a stale destination WAL is gone
-        // before the new main file lands (see `wal_of`).
+        // The copy order: the snapshot members with `meta.bin` (the file the
+        // layout is detected by) last of all; each paged file before its WAL
+        // and `kvstore.kv` before `vstree.kv` (a store without its VS-tree
+        // just rebuilds it).
+        let mut names: Vec<PathBuf> = SNAPSHOT_FILES
+            .iter()
+            .filter(|n| **n != META_FILE)
+            .map(PathBuf::from)
+            .collect();
         for paged in [kv, vs] {
             names.push(paged.to_path_buf());
             names.push(wal_of(paged));
         }
-        for extra in [UPDATE_LOG_FILE, REDO_LOG_FILE, BACKUP_OFFSET_FILE] {
+        for extra in [
+            UPDATE_LOG_FILE,
+            REDO_LOG_FILE,
+            BACKUP_OFFSET_FILE,
+            META_FILE,
+        ] {
             names.push(PathBuf::from(extra));
         }
-        // A destination WAL must never meet a newly copied main file: drop them
-        // all first; the source's own WALs (if any) are copied after their file.
-        for paged in [kv, vs] {
-            fsutil::remove_file_if_exists(&dst.join(wal_of(paged)))?;
+        // Removed durably before anything is copied: a destination WAL (it
+        // would replay into the new main file), the destination VS-tree (it
+        // must never pair with the new store), a snapshot commit record (it
+        // would roll stale temp files forward over the copies), `meta.bin`
+        // (copied last), and every file the source lacks.
+        let mut stale: Vec<PathBuf> = vec![
+            wal_of(kv),
+            wal_of(vs),
+            vs.to_path_buf(),
+            PathBuf::from(fsutil::SNAPSHOT_COMMIT_FILE),
+            PathBuf::from(META_FILE),
+        ];
+        stale.extend(names.iter().filter(|n| !src.join(n).is_file()).cloned());
+        for name in &stale {
+            fsutil::remove_file_if_exists(&dst.join(name))?;
         }
         fsutil::sync_dir(dst)?;
         for name in &names {
-            let (from, to) = (src.join(name), dst.join(name));
+            let from = src.join(name);
             if from.is_file() {
-                fsutil::copy_file_atomic(&from, &to)?;
-            } else {
-                fsutil::remove_file_if_exists(&to)?;
+                fsutil::copy_file_atomic(&from, &dst.join(name))?;
             }
         }
         let (rocks_src, rocks_dst) = (src.join(ROCKS_SUBDIR), dst.join(ROCKS_SUBDIR));
@@ -1512,6 +1664,23 @@ impl Database {
         // whole-directory copy carries them.
         crate::reason::store::copy_rule_dir(src, dst)?;
         fsutil::sync_dir(dst)
+    }
+
+    /// Delete the database directory `dir` crash-safely: it is renamed aside
+    /// to `<dir>.drop-old` (a name no database scan reads), the rename is
+    /// made durable, and only then is the tree deleted — so neither a crash
+    /// nor an error part-way leaves a half-deleted database under its live
+    /// name (review durability#10). A leftover `<dir>.drop-old` of an
+    /// earlier interrupted drop is removed first, also when `dir` no longer
+    /// exists. Returns whether `dir` existed. Takes `dir`'s lock first
+    /// (shared with one this process holds): fails, touching nothing, while
+    /// another process has the database open. Once the rename is durable the
+    /// database is gone: a failure deleting the moved-aside files is logged,
+    /// and they go with the next drop of the name.
+    pub fn drop_dir<P: AsRef<Path>>(dir: P) -> Result<bool> {
+        let dir = dir.as_ref();
+        let _lock = super::dirlock::DirLock::acquire_existing(dir)?;
+        fsutil::discard_db_dir(dir)
     }
 
     /// Restore the database held in `backup` (any layout) into directory
@@ -2488,35 +2657,107 @@ fn read_whole_disk_store(db: &Database) -> Result<()> {
     Ok(())
 }
 
+/// What identifies the store file `kv` in a [`SHADOW_APPLY_FILE`] marker:
+/// its device and inode (a store replaced by a build, a copy or a restore —
+/// renamed into place — is another file; one the reconcile patches in place
+/// is the same). Off unix, where there is no such identity, every marker
+/// counts.
+fn store_identity(kv: &Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let m = fs::metadata(kv).ok()?;
+        Some(format!("{KV_FILE} dev={} ino={}\n", m.dev(), m.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        fs::metadata(kv).ok().map(|_| format!("{KV_FILE}\n"))
+    }
+}
+
 /// Reconcile a legacy shadow snapshot found next to `kvstore.kv` (see the
 /// module docs), then retire the shadow files.
+///
+/// Crash-atomic (review durability#9): the store is patched in place, in as
+/// many page commits as the difference needs, which changes its mtime — so
+/// once the decision to apply the shadow is taken (by mtime, for a shadow a
+/// legacy build wrote), it is first recorded durably in
+/// [`SHADOW_APPLY_FILE`], bound to this store file. An open after a crash
+/// part-way finds the marker and applies the shadow again (the difference
+/// is recomputed: applying it is idempotent) instead of comparing mtimes
+/// the partial commits have changed — which used to serve a mix of the two
+/// states. The shadow files are retired once the store equals the shadow,
+/// `store.bin` last, and the marker after them.
 fn reconcile_legacy_shadow(dir: &Path, ds: &mut DiskStore) -> Result<()> {
     let shadow = dir.join(STORE_FILE);
+    let marker = dir.join(SHADOW_APPLY_FILE);
+    let kv = dir.join(KV_FILE);
     if !shadow.is_file() {
+        // The marker of a reconcile that retired its shadow but crashed
+        // before removing it.
+        if marker.exists() {
+            fsutil::remove_file_if_exists(&marker)?;
+            fsutil::sync_dir(dir)?;
+        }
         return Ok(());
     }
-    let newer = match (mtime(&shadow), mtime(&dir.join(KV_FILE))) {
-        (Some(s), Some(k)) => s >= k,
-        _ => false,
-    };
-    if newer {
-        // An unreadable / inconsistent shadow cannot be trusted: keep the store.
+    let identity = store_identity(&kv);
+    let pending =
+        identity.is_some() && fs::read_to_string(&marker).ok().as_deref() == identity.as_deref();
+    let apply = pending
+        || match (mtime(&shadow), mtime(&kv)) {
+            (Some(s), Some(k)) => s >= k,
+            _ => false,
+        };
+    if apply {
+        // An unreadable / inconsistent shadow cannot be trusted: keep the
+        // store. (With a marker, the store already holds a part of it —
+        // which only happens once the shadow was read whole before.)
         if let Ok(snap) = Database::load_snapshot(dir) {
+            if !pending {
+                if let Some(identity) = &identity {
+                    fsutil::atomic_write(&marker, identity.as_bytes())?;
+                }
+            }
             apply_snapshot_to_disk(&snap, ds)?;
             ds.flush()?;
         }
     }
-    for name in SNAPSHOT_FILES {
+    for name in SNAPSHOT_FILES
+        .iter()
+        .copied()
+        .filter(|n| *n != STORE_FILE)
+        .chain(std::iter::once(STORE_FILE))
+    {
         let path = dir.join(name);
         if path.is_file() {
             let _ = fs::rename(&path, fsutil::with_suffix(&path, LEGACY_SUFFIX));
         }
     }
+    fsutil::sync_dir(dir)?;
+    fsutil::remove_file_if_exists(&marker)?;
     fsutil::sync_dir(dir)
 }
 
 /// Make the disk store's default and named graphs equal those of `snap`.
+/// Idempotent: the difference is computed from what the store holds now.
 fn apply_snapshot_to_disk(snap: &Database, ds: &mut DiskStore) -> Result<()> {
+    // The reconcile crash test's hook (read once per reconcile).
+    let park_after: Option<usize> = std::env::var(SHADOW_PARK_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse().ok());
+    let mut changes = 0usize;
+    let mut changed = |ds: &mut DiskStore| -> Result<()> {
+        changes += 1;
+        if park_after == Some(changes) {
+            ds.flush()?;
+            fsutil::park_for_crash_test(
+                SHADOW_PARK_ENV,
+                &format!("after {changes} changes of a legacy-shadow reconcile"),
+            );
+        }
+        Ok(())
+    };
     let disk_dict = ds.dictionary()?;
     let disk_triples: HashSet<KeyTriple> = ds
         .iter_all()?
@@ -2531,9 +2772,11 @@ fn apply_snapshot_to_disk(snap: &Database, ds: &mut DiskStore) -> Result<()> {
         .collect();
     for (s, p, o, lit) in disk_triples.difference(&snap_triples) {
         ds.delete_keys(s, p, o, *lit)?;
+        changed(ds)?;
     }
     for (s, p, o, lit) in snap_triples.difference(&disk_triples) {
         ds.insert_keys(s, p, o, *lit)?;
+        changed(ds)?;
     }
 
     let quad = |dict: &Dictionary, g: u32, t: IdTriple| -> Option<KeyQuad> {
@@ -2553,9 +2796,11 @@ fn apply_snapshot_to_disk(snap: &Database, ds: &mut DiskStore) -> Result<()> {
         .collect();
     for (g, s, p, o, lit) in disk_quads.difference(&snap_quads) {
         ds.delete_quad_keys(g, s, p, o, *lit)?;
+        changed(ds)?;
     }
     for (g, s, p, o, lit) in snap_quads.difference(&disk_quads) {
         ds.insert_quad_keys(g, s, p, o, *lit)?;
+        changed(ds)?;
     }
     Ok(())
 }
