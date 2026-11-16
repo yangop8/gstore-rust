@@ -2500,6 +2500,15 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             Vec::new()
         };
 
+        // A query that an earlier failure (or a cancel) already doomed
+        // contacts no further endpoint: an `EXISTS` evaluated per solution
+        // (in a projection, BIND or ORDER BY, where no FILTER loop polls the
+        // failure) would otherwise repeat a request already known to fail
+        // once per solution, each up to the client's timeouts.
+        if self.cancelled() {
+            return Vec::new();
+        }
+
         // Refused outright when this evaluator may not contact remote
         // endpoints (reported as an error by `check_cancel`).
         let refuse_local = match self.service_policy {

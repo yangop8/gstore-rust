@@ -18,7 +18,10 @@ Behaviour changes first:
   supported …`), the way a `SERVICE` refused by policy already did.
   `SERVICE SILENT` is unchanged: a failure is the one empty solution, so
   the outer solutions survive. Clients that relied on the empty answer add
-  `SILENT`.
+  `SILENT`. Once a `SERVICE` has failed the query, no further request is
+  sent: an `EXISTS { SERVICE … }` evaluated per solution (in a projection,
+  `BIND` or `ORDER BY`) contacted the endpoint once per solution, each up
+  to the client's timeouts.
 - **`GRAPH ?g { P }` joins `?g` with P's own binding of it** (review
   query#3, sparqlconf#1). Both executors set `?g` to each named graph's
   name over whatever P had bound it to, so `SELECT ?g ?t WHERE { GRAPH ?g
@@ -81,7 +84,8 @@ New files and tests:
   8x the data, linear in both executors and the full path about as fast as
   the streaming `LIMIT` path), a cancellation poll
   test, GRAPH ?g / INSERT, EXISTS, alias, evaluated-once and SERVICE error
-  tests (fake HTTP endpoints), and a randomized differential battery.
+  tests (fake HTTP endpoints; a failed SERVICE is contacted once per
+  query), and a randomized differential battery.
 - W3C-style cases (`tests/w3c_subset.rs`): `tests/w3c/optional-minus/`
   (6), `graph/` (6), `exists/` (6), `projection/` (6), `service/` (3); the
   `xfail` markers of `tricky/graph-variable-bound-inside-the-graph`,

@@ -913,6 +913,39 @@ fn a_failed_service_is_a_query_error_naming_its_cause() {
     assert_eq!(http500.hits.load(Ordering::SeqCst), before);
 }
 
+/// Once a non-`SILENT` SERVICE has failed the query, no further request is
+/// sent: an `EXISTS` evaluated per solution — here in the projection, where
+/// no FILTER loop polls the failure — contacts the endpoint once per query,
+/// not once per solution (review robust#6 / sec#17: the failure is final,
+/// so later requests only repeat it, each up to the client's timeouts).
+#[test]
+fn a_failed_service_is_contacted_once_per_query() {
+    let http500 =
+        FakeEndpoint::start("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 4\r\n\r\nboom");
+    let mut db = Database::build_from_str(
+        "service_once",
+        "@prefix : <http://ex/> . :a :p 1 . :b :p 2 . :c :p 3 . :d :p 4 . :e :p 5 .",
+    )
+    .unwrap();
+    let q = format!(
+        "{PREFIX}SELECT ?s (EXISTS {{ SERVICE <{}> {{ ?s :q ?x }} }} AS ?e) WHERE {{ ?s :p ?o }}",
+        http500.url()
+    );
+    for (opts, q) in [
+        (TopKOptions::NONE, q.clone()),
+        (TopKOptions::ALL, format!("{q} LIMIT 10")),
+    ] {
+        let before = http500.hits.load(Ordering::SeqCst);
+        let r = run_db(&mut db, &q, opts);
+        let Err(e) = r else {
+            panic!("a failed SERVICE answered {r:?}: {q} ({opts:?})")
+        };
+        assert!(e.contains("HTTP 500"), "{e} ({q})");
+        let sent = http500.hits.load(Ordering::SeqCst) - before;
+        assert_eq!(sent, 1, "requests for one query ({opts:?})");
+    }
+}
+
 /// With `SILENT`, the same failures are the join identity: the outer
 /// solutions survive with the service's variables unbound (SPARQL 1.1
 /// Federated Query §4 / Query §18.5).
