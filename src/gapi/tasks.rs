@@ -426,12 +426,46 @@ struct Shared {
     st: Mutex<Inner>,
     /// Signalled whenever a task finishes or a runner exits.
     changed: Condvar,
+    /// The runner and callback threads started, for
+    /// [`TaskManager::join_threads`] (finished ones are dropped as new
+    /// ones start).
+    threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, Inner> {
         locked(&self.st)
     }
+}
+
+/// Start a runner (`callbacks`: a callback thread) of `shared`'s pools, its
+/// handle kept for [`TaskManager::join_threads`]. The caller counted it in
+/// its pool already.
+fn spawn_pool_thread(shared: &Arc<Shared>, callbacks: bool) -> std::io::Result<()> {
+    let shared2 = Arc::clone(shared);
+    // The stack of the HTTP workers: an operation parses and evaluates here
+    // what a synchronous request does on a worker (review design#8).
+    let thread = std::thread::Builder::new()
+        .name(
+            if callbacks {
+                "gstore-callback"
+            } else {
+                "gstore-task"
+            }
+            .to_string(),
+        )
+        .stack_size(crate::server::WORKER_STACK_SIZE)
+        .spawn(move || {
+            if callbacks {
+                callback_runner(shared2)
+            } else {
+                runner(shared2)
+            }
+        })?;
+    let mut threads = locked(&shared.threads);
+    threads.retain(|t| !t.is_finished());
+    threads.push(thread);
+    Ok(())
 }
 
 struct Inner {
@@ -704,6 +738,7 @@ impl TaskManager {
                     seq: 0,
                 }),
                 changed: Condvar::new(),
+                threads: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -839,15 +874,7 @@ impl TaskManager {
         };
         remove_files(files);
         if spawn {
-            let shared = Arc::clone(&self.shared);
-            // The stack of the HTTP workers: an operation parses and
-            // evaluates here what a synchronous request does on a worker
-            // (review design#8).
-            let started = std::thread::Builder::new()
-                .name("gstore-task".to_string())
-                .stack_size(crate::server::WORKER_STACK_SIZE)
-                .spawn(move || runner(shared));
-            if let Err(e) = started {
+            if let Err(e) = spawn_pool_thread(&self.shared, false) {
                 let mut st = self.shared.lock();
                 st.workers -= 1;
                 if st.workers == 0 {
@@ -978,6 +1005,47 @@ impl TaskManager {
         self.shared.lock().idle()
     }
 
+    /// Join the runner and callback threads once they have left their pools
+    /// (they do when no work is left), waiting at most `timeout` for that;
+    /// returns whether every thread was joined. A thread still busy then (an
+    /// operation that ignores its cancel, a delivery to a slow callback
+    /// host) is left to finish on its own. For a shutdown, after
+    /// [`close`](Self::close) and [`wait_async_idle`](Self::wait_async_idle)
+    /// (review conc#14: no thread of a stopped server outlives it).
+    pub fn join_threads(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut st = self.shared.lock();
+        let left = loop {
+            if st.workers == 0 && st.callback_workers == 0 {
+                break true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break false;
+            }
+            st = self
+                .shared
+                .changed
+                .wait_timeout(st, deadline - now)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        };
+        drop(st);
+        let threads = std::mem::take(&mut *locked(&self.shared.threads));
+        let mut all = true;
+        for thread in threads {
+            // Out of its pool, a thread only returns (or is parked there by
+            // a test, `crate::exit_park`).
+            if left || thread.is_finished() {
+                crate::exit_park::joining(thread.thread());
+                let _ = thread.join();
+            } else {
+                all = false;
+            }
+        }
+        all
+    }
+
     /// Wait up to `timeout` until no asynchronous operation is queued or
     /// running (callback deliveries included); returns whether that is so.
     pub fn wait_async_idle(&self, timeout: Duration) -> bool {
@@ -1076,26 +1144,8 @@ impl Drop for ThreadSlot {
         }
         drop(st);
         if respawn {
-            let shared = Arc::clone(&self.shared);
             let callbacks = self.callbacks;
-            let started = std::thread::Builder::new()
-                .name(
-                    if callbacks {
-                        "gstore-callback"
-                    } else {
-                        "gstore-task"
-                    }
-                    .to_string(),
-                )
-                .stack_size(crate::server::WORKER_STACK_SIZE)
-                .spawn(move || {
-                    if callbacks {
-                        callback_runner(shared)
-                    } else {
-                        runner(shared)
-                    }
-                });
-            if started.is_err() {
+            if spawn_pool_thread(&self.shared, callbacks).is_err() {
                 let mut st = self.shared.lock();
                 if callbacks {
                     st.callback_workers -= 1;
@@ -1127,6 +1177,7 @@ fn runner(shared: Arc<Shared>) {
                     slot.left = true;
                     drop(st);
                     slot.shared.changed.notify_all();
+                    crate::exit_park::exiting();
                     return;
                 }
             }
@@ -1155,6 +1206,7 @@ fn callback_runner(shared: Arc<Shared>) {
                     slot.left = true;
                     drop(st);
                     slot.shared.changed.notify_all();
+                    crate::exit_park::exiting();
                     return;
                 }
             }
@@ -1197,12 +1249,7 @@ fn queue_callback(shared: &Arc<Shared>, delivery: Delivery) {
     if !spawn {
         return;
     }
-    let shared2 = Arc::clone(shared);
-    let started = std::thread::Builder::new()
-        .name("gstore-callback".to_string())
-        .stack_size(crate::server::WORKER_STACK_SIZE)
-        .spawn(move || callback_runner(shared2));
-    if let Err(e) = started {
+    if let Err(e) = spawn_pool_thread(shared, true) {
         let mut st = shared.lock();
         st.callback_workers -= 1;
         if st.callback_workers == 0 {

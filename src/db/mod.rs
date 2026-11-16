@@ -776,6 +776,14 @@ impl Database {
         self.csr().map(|_| ())
     }
 
+    /// [`preload_csr`](Self::preload_csr) for a request with a cancel flag
+    /// (see [`csr_cancellable`](Self::csr_cancellable)): a raised `cancel`
+    /// stops the build at its next check with [`GStoreError::Cancelled`],
+    /// and nothing is cached.
+    pub fn preload_csr_cancellable(&self, cancel: Option<&AtomicBool>) -> Result<()> {
+        self.csr_cancellable(cancel).map(|_| ())
+    }
+
     /// Whether a CSR for the current data is cached (no rebuild needed).
     pub fn csr_is_cached(&self) -> bool {
         self.check_store_readable().is_ok() && self.csr_cache.peek(self.mutations).is_some()

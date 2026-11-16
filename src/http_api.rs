@@ -955,6 +955,7 @@ impl Drop for TxnReaper {
             Err(std::sync::mpsc::RecvTimeoutError::Timeout)
         ) {
             if let Some(thread) = self.thread.take() {
+                crate::exit_park::joining(thread.thread());
                 let _ = thread.join();
             }
         }
@@ -3545,14 +3546,27 @@ impl ApiServer {
         report
     }
 
-    /// After a shutdown: join the connection workers and the cancel bridge
-    /// (if no other server uses it), bounded, so a program that stops this
-    /// server and starts another in the same process is not left with this
-    /// one's threads — nor with the database handles they hold (review
-    /// conc#14; the statistics refreshes were joined by `finish_shutdown`).
+    /// After a shutdown: join the connection workers, the cancel bridge (if
+    /// no other server uses it) and the asynchronous operations' runner and
+    /// callback threads, bounded, so a program that stops this server and
+    /// starts another in the same process is not left with this one's
+    /// threads — nor with the database handles they hold (review conc#14;
+    /// the statistics refreshes were joined by `finish_shutdown`, the
+    /// idle-transaction reaper is joined when `serve_forever` drops it). A
+    /// runner still running an operation that ignored its cancel past
+    /// `TaskConfig::shutdown_wait` (or a callback still being delivered,
+    /// bounded by `callback_timeout`) is not waited for again: it finishes
+    /// on its own.
     fn join_threads(&self, workers: crate::server::WorkerThreads) {
         crate::server::join_workers(workers);
         cancel_bridge::quiesce();
+        let tasks = &self.inner.tasks;
+        let bound = if tasks.async_idle() {
+            tasks.config().shutdown_wait
+        } else {
+            Duration::ZERO
+        };
+        let _ = tasks.join_threads(bound);
     }
 
     /// The tail of a graceful shutdown, after the listener closed and in-flight
@@ -6403,6 +6417,7 @@ impl ApiInner {
                     state.finished_pass(seen);
                 }
                 drop(done_tx);
+                crate::exit_park::exiting();
             });
         match spawned {
             Ok(thread) => Some(TxnReaper {

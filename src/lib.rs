@@ -34,6 +34,9 @@ pub mod console;
 pub mod deadline;
 pub mod dict;
 pub mod error;
+// A test hook: park a server's background thread right before it exits.
+#[doc(hidden)]
+pub mod exit_park;
 // The upstream-compatible gStore `/api` operation layer (see `docs/GAP_PLAN.md` §2).
 pub mod gapi;
 pub mod http_api;

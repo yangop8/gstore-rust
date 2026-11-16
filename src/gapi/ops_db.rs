@@ -826,6 +826,12 @@ fn show(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
 /// it). `Ok(true)` when it was already built for the current data. The
 /// database is held shared meanwhile (concurrent builds share one, see
 /// [`Database::csr`]; upstream holds its `csr_lock`), the state lock is not.
+///
+/// The build is a registered task (listed by `/tasklist`, kind `loadcsr`)
+/// with a cancel flag: `/cancel` and a shutdown past its grace period stop
+/// it at its next check, nothing is cached, and the shutdown's final pass
+/// never waits for a whole build (round-2 review of conc#5). Run
+/// asynchronously, it is cancelled as its operation.
 fn load_csr(ctx: &Ctx<'_>, db: &str) -> Result<bool, GResp> {
     let handle = ctx.state().dbs.get(db).map(Arc::clone);
     let Some(handle) = handle else {
@@ -834,6 +840,8 @@ fn load_csr(ctx: &Ctx<'_>, db: &str) -> Result<bool, GResp> {
             format!("database[{db}] is not loaded yet"),
         ));
     };
+    let (task_id, cancel) = ctx.inner.tasks.register("loadcsr", db, "", ctx.user());
+    let mut task = crate::http_api::TaskGuard::new(ctx.inner, task_id);
     // Shared: building the CSR is a read (the database caches it), so
     // queries keep running meanwhile.
     let slot = handle.read().map_err(lock_error)?;
@@ -844,10 +852,12 @@ fn load_csr(ctx: &Ctx<'_>, db: &str) -> Result<bool, GResp> {
         ));
     }
     if slot.db.csr_is_cached() {
+        task.set_ok(true);
         return Ok(true);
     }
-    slot.db
-        .preload_csr()
+    let built = slot.db.preload_csr_cancellable(Some(&cancel));
+    task.set_ok(built.is_ok());
+    built
         .map(|()| false)
         .map_err(|e| GResp::error(Status::OperationFailed, format!("load csr fail: {e}")))
 }
@@ -1162,23 +1172,19 @@ fn refreshing() -> &'static Mutex<HashMap<usize, Refresh>> {
 /// next request starts another). Review conc#9. While a transaction is
 /// open the committed state's statistics come from its snapshot, in one
 /// go as before.
-fn refresh_stats_in_background(db: &str, h: &DbHandle) {
+///
+/// No refresh starts once the server is `closing`: that is checked, the
+/// thread started and its handle registered under the registry's lock,
+/// which [`stop_stats_refreshes`] takes after the shutdown set `closing` —
+/// so every refresh either is registered with its thread before the
+/// shutdown stops (and joins) them, or never starts (review conc#14).
+fn refresh_stats_in_background(db: &str, h: &DbHandle, closing: &AtomicBool) {
     let key = Arc::as_ptr(h) as usize;
     let cancel = Arc::new(AtomicBool::new(false));
     let done = Arc::new((Mutex::new(false), Condvar::new()));
-    {
-        let mut running = locked(refreshing());
-        if running.contains_key(&key) {
-            return;
-        }
-        running.insert(
-            key,
-            Refresh {
-                cancel: Arc::clone(&cancel),
-                thread: None,
-                done: Arc::clone(&done),
-            },
-        );
+    let mut running = locked(refreshing());
+    if closing.load(Ordering::SeqCst) || running.contains_key(&key) {
+        return;
     }
     let (db, h, flag, ended) = (
         db.to_string(),
@@ -1189,7 +1195,9 @@ fn refresh_stats_in_background(db: &str, h: &DbHandle) {
     let spawned = std::thread::Builder::new()
         .name("gstore-stats-refresh".into())
         .spawn(move || {
-            /// Ends the refresh, also when computing it panicked.
+            /// Ends the refresh, also when computing it panicked (its
+            /// registry entry goes once the spawning request released the
+            /// registry's lock).
             struct Done(usize, DoneLatch);
             impl Drop for Done {
                 fn drop(&mut self) {
@@ -1198,22 +1206,22 @@ fn refresh_stats_in_background(db: &str, h: &DbHandle) {
                     self.1 .1.notify_all();
                 }
             }
-            let _done = Done(key, ended);
-            // A read error is not cached; the next request retries.
-            let _ = refresh_stats(&db, &h, &flag);
-        });
-    match spawned {
-        Ok(thread) => {
-            // Unless it already ended (and removed its entry).
-            if let Some(r) = locked(refreshing()).get_mut(&key) {
-                if Arc::ptr_eq(&r.cancel, &cancel) {
-                    r.thread = Some(thread);
-                }
+            {
+                let _done = Done(key, ended);
+                // A read error is not cached; the next request retries.
+                let _ = refresh_stats(&db, &h, &flag);
             }
-        }
-        Err(_) => {
-            locked(refreshing()).remove(&key);
-        }
+            crate::exit_park::exiting();
+        });
+    if let Ok(thread) = spawned {
+        running.insert(
+            key,
+            Refresh {
+                cancel,
+                thread: Some(thread),
+                done,
+            },
+        );
     }
 }
 
@@ -1254,8 +1262,12 @@ fn refresh_stats(db: &str, h: &DbHandle, cancel: &AtomicBool) -> Result<bool, St
         if slot.retired {
             return Ok(false);
         }
-        // A transaction is open: the snapshot's statistics, in one go.
+        // A transaction is open: the snapshot's statistics, in one go
+        // (unless the refresh was stopped meanwhile).
         if slot.txn.is_some() {
+            if stopped() {
+                return Ok(false);
+            }
             class_stats(db, h, &slot)?;
             return Ok(true);
         }
@@ -1357,6 +1369,7 @@ impl StoppingRefreshes {
             let finished = *g;
             drop(g);
             if finished {
+                crate::exit_park::joining(thread.thread());
                 let _ = thread.join();
             } else {
                 lingering += 1;
@@ -1517,7 +1530,7 @@ fn inspect(ctx: &Ctx<'_>, db: &str) -> Result<Inspection, GResp> {
                 return Ok(published(hit));
             }
             if let Some(earlier) = cached_stats(db, &h, None) {
-                refresh_stats_in_background(db, &h);
+                refresh_stats_in_background(db, &h, &ctx.inner.closing);
                 // A small database's refresh is done at once: wait for it a
                 // little (polling the cache), then answer with what there is.
                 let deadline = Instant::now() + STATS_REFRESH_WAIT;
@@ -2900,6 +2913,41 @@ fn statement_count(db: &Database) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Round-2 review (conc#14): no statistics refresh starts once the
+    /// server is closing — one started after the shutdown stopped the
+    /// refreshes would be neither stopped nor joined. The database's guard
+    /// is held, so a refresh that started would still be registered (it
+    /// waits for its first pass) when the registry is looked at.
+    #[test]
+    fn no_stats_refresh_starts_once_the_server_is_closing() {
+        let dir = std::env::temp_dir().join(format!(
+            "gstore_opsdb_closing_refresh_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
+        let h = DbSlot::handle(
+            Database::new("closing_refresh"),
+            dir.join("closing_refresh.db"),
+            false,
+            &crate::db::LoadPolicy::default(),
+            &crate::db::QuerySettings::default(),
+        );
+        let key = Arc::as_ptr(&h) as usize;
+        let held = h.write().unwrap();
+        refresh_stats_in_background("closing_refresh", &h, &AtomicBool::new(true));
+        let started = locked(refreshing()).contains_key(&key);
+        drop(held);
+        assert!(!started, "a refresh started while the server was closing");
+    }
 
     #[test]
     fn paths_compare_as_written() {
