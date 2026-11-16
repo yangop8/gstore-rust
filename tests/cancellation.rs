@@ -72,6 +72,8 @@ struct Park {
     builder: Arc<Mutex<Option<thread::Thread>>>,
     /// Set by [`release`](Self::release): a held build goes on.
     released: Arc<AtomicBool>,
+    /// The parked build's own cancel flag was raised when it went on.
+    saw_cancel: Arc<AtomicBool>,
     uninstall: fn(),
 }
 
@@ -115,10 +117,12 @@ impl Park {
         let checks = Arc::new(AtomicUsize::new(0));
         let builder: Arc<Mutex<Option<thread::Thread>>> = Arc::new(Mutex::new(None));
         let released = Arc::new(AtomicBool::new(false));
-        let (c, b, r) = (
+        let saw_cancel = Arc::new(AtomicBool::new(false));
+        let (c, b, r, saw) = (
             Arc::clone(&checks),
             Arc::clone(&builder),
             Arc::clone(&released),
+            Arc::clone(&saw_cancel),
         );
         let hook = move |cancel: Option<&AtomicBool>| {
             c.fetch_add(1, Ordering::SeqCst);
@@ -137,6 +141,9 @@ impl Park {
                 // then: a server may raise it).
                 thread::park_timeout(Duration::from_millis(20));
             }
+            if cancel.is_some_and(|f| f.load(Ordering::SeqCst)) {
+                saw.store(true, Ordering::SeqCst);
+            }
         };
         let uninstall: fn() = match build {
             Build::Csr => {
@@ -153,6 +160,7 @@ impl Park {
             checks,
             builder,
             released,
+            saw_cancel,
             uninstall,
         }
     }
@@ -175,6 +183,12 @@ impl Park {
 
     fn checks(&self) -> usize {
         self.checks.load(Ordering::SeqCst)
+    }
+
+    /// Whether the parked build's own cancel flag was raised when it went
+    /// on (not the hang guard, nor a release).
+    fn saw_cancel(&self) -> bool {
+        self.saw_cancel.load(Ordering::SeqCst)
     }
 }
 
@@ -449,6 +463,12 @@ fn shutdown_stops_a_csr_build_and_saves_every_database() {
         let _ = reader.join();
         report
     });
+    // review conc#5: the shutdown's cancel reached the parked build (before,
+    // the build had no flag and ran on once the hang guard let it go).
+    assert!(
+        park.saw_cancel(),
+        "the parked CSR build did not observe the shutdown's cancel"
+    );
     let saved: Vec<String> = report
         .saved
         .iter()

@@ -17,15 +17,17 @@ Behaviour changes first:
   Stream mode has no index and was right). A term whose two forms differ is
   now indexed under both, so the candidates of a bare `?v` and of `STR(?v)`
   are each a sound superset.
-- **Keep-alive is decided when the response is written** (http#15). While
-  connections wait for a worker, a response now says `Connection: close`
-  (no `Keep-Alive` header) and the connection closes after it, instead of
-  promising keep-alive and closing the idle connection a moment later,
-  when the client may be sending its next request (which then got a reset
-  or EOF). A connection that promised keep-alive and then finds a queued
-  connection yields its worker only after a last 1 ms look finds no
-  request on its way (in the socket, in the TLS layer's buffer, or partly
-  received). A next request already received is still served first.
+- **Keep-alive is decided with the response, not broken after it**
+  (http#15). While connections wait for a worker (checked once the request
+  has been read, before its handler runs), a response now says
+  `Connection: close` (no `Keep-Alive` header) and the connection closes
+  after it, instead of promising keep-alive and closing the idle connection
+  a moment later, when the client may be sending its next request (which
+  then got a reset or EOF). A connection that promised keep-alive and then
+  finds a queued connection yields its worker only after a last 1 ms look
+  finds no request on its way (in the socket, in the TLS layer's buffer,
+  or partly received). A next request already received is still served
+  first.
 - **`/cancel` and a shutdown stop CSR and substring-index builds** (conc#5,
   analytics#6). The CSR build of the advanced graph functions — for a plain
   read, an UPDATE's WHERE clause, a read on an open transaction's in-memory
@@ -111,8 +113,12 @@ Behaviour changes first:
   shutdown stops a build and saves every database; a busy database delays
   only its own save; a refresh parked between passes does not block a
   writer and stops at shutdown; no worker, refresh or bridge thread
-  outlives `serve_forever`); unit tests in `analytics/csr.rs`,
-  `kvstore/string_index.rs` and `server.rs` (`keep_alive_tests`).
+  outlives `serve_forever`) and `tests/csr_build_memory.rs` (a counting
+  allocator: the CSR build of an in-memory database with 200,000 literal
+  triples and 2,000 entity edges peaks at about 89 KB above its start;
+  before, it copied every triple first, 2.4 MB); unit tests in
+  `analytics/csr.rs`, `kvstore/string_index.rs` and `server.rs`
+  (`keep_alive_tests`).
 
 ## GAP_PLAN status line
 
@@ -150,7 +156,13 @@ none
 - docs/REFACTOR_BACKLOG.md — conc#9 (remainder): a refresh is cancelled at
   pass granularity (`subject_num`, `type_statistics`, `schema_graph` have no
   internal checks); "skip starting a refresh while a writer waits" is not
-  done (the standard `RwLock` exposes no waiting-writer count).
+  done (the standard `RwLock` exposes no waiting-writer count). A refresh
+  whose data changed between two of its passes is dropped and the next
+  `monitor` starts another, so under a steady stream of writes the
+  statistics `monitor` / `schema` report may stay those of earlier data
+  (with the current published figures) until the writes pause; a refresh
+  that falls back to all three passes under one guard after a few dropped
+  attempts would bound that.
 - docs/REFACTOR_BACKLOG.md — conc#5 / conc#14 (remainder): a statement that
   does not poll its cancel flag still delays its own database's final save
   (the shutdown waits for it rather than skip the save: no data loss), as
@@ -215,6 +227,8 @@ gstore-bench`.
 
 - Edits outside the owned files and the granted functions (for the
   integrator):
+  - `tests/csr_build_memory.rs` (new, analytics#6): a separate test binary
+    because it installs a counting global allocator; nobody else edits it.
   - `src/db/mod.rs`: the `StringIndexCache` struct and its `Debug` impl,
     plus the new `StringIndexSlot`, `CachedStringIndex`,
     `StringIndexCache::lock` and `STRING_INDEX_STALE_MIN` next to it (the
