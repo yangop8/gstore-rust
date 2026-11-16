@@ -20,6 +20,7 @@
   - Ended outcomes keep their database's load generation and begin time and survive reloads; before, a reused id's record was deleted.
   - When a server starts serving, it marks the transactions a previous process left `RUNNING` in the transaction log (`logs/transaction.json`) as `ABORTED`.
   - `begin` still answers the bare id, as upstream.
+- **`ConcurrentDb`: a commit the database rolled back publishes nothing** (follows gap-txn-lifecycle#3; found in review). `ConcurrentDb`'s `Txn::commit` treated every commit-point failure as "applied but not durable": it published a new version and recorded the writes in its per-key version chains, so after the binary commit rolled a transaction back, a version-pinned reader (`version_view`) still saw its writes. `apply_txn_ops` now asks `Database::commit_checked`: a rolled-back commit fails the `ConcurrentDb` transaction as a whole (`Err`, nothing published, as an insert that cannot be encoded); a commit whose writes stay applied is published and reported as before (`Err` from `Txn::commit` after publishing).
 - **An empty rollback keeps the caches** (db#7). Rolling back a transaction that changed nothing (only reads, or writes that changed no triple) no longer advances `mutation_count` nor drops the cached query results and the CSR.
 - **RocksDB `/begin` no longer blocks the database's readers** (gap-rocksdb-exec#3). The whole-store copy for the transaction's read snapshot (REFACTOR_BACKLOG D4) is taken under the shared guard. The exclusive guard is taken only to register the transaction, after checking that the committed state did not change since the copy. If a write slipped in, the copy is taken again; after 3 copies the last one is taken under the exclusive guard, with an info log line.
 - **Monitoring shows the open transaction** (gap-txn-lifecycle#1). REST `/show` and `/monitor`, and `/api` `show` and `monitor`, report each database's open transaction as a new `transaction` object: `TID`, `txnlog_TID` (`<begin>_<tid>`), `user`, `isolation`, `begin_time`, `idle_seconds` and `running_statements`.
@@ -42,7 +43,8 @@
     - REST TID parsing;
     - db#7;
     - with `rocksdb`, a read completing while the RocksDB begin copy is parked, and a write that slips in forcing a new copy.
-  - `src/txn_commit_tests.rs` (new, crate-internal, `lib.rs` `mod` line): the commit outcome under the pager failpoints (both disk modes) and RocksDB's journal-deletion failpoint, the redo log included.
+  - `src/txn_commit_tests.rs` (new, crate-internal, `lib.rs` `mod` line): the commit outcome under the pager failpoints (both disk modes) and RocksDB's journal-deletion failpoint, the redo log included; a `ConcurrentDb` commit rolled back at its commit point publishes nothing (fails before the review fix: the version view holds the rolled-back triple). The RocksDB not-durable case ends its transaction with a named-graph quad, so the journal replay deterministically fails at it (the review made it assert `NotDurable`; it accepted a rolled-back outcome too, which was the only one reached).
+  - `tests/txn_lifecycle.rs`'s in-process server is joined before its temporary directory is removed (review: the shutdown's `txn.log` append recreated the directory, and earlier runs left `/tmp/gstore_txn_lifecycle_*` behind).
   - Run against the parent commit (b8b1c8e), the tests that need no new hook fail. In `tests/txn_lifecycle.rs` that is all 8: the failed commit is visible, the stale id commits the new transaction, the begin is refused 1008, the read-only rollback moves the mutation count, `+1` is accepted, and admin gets 403. With the park hook ported to the parent, the RocksDB read hangs past its 60 s hang guard. In `src/txn_commit_tests.rs` the three rolled-back cases fail.
   - Corrected tests, each with a `review <id>` note:
     - `tests/upstream_transaction.rs` (gap-txn-lifecycle#6): asserted that a reload "forgets how the old ids ended"; it now checks that the earlier load's id is refused as already committed.
@@ -65,6 +67,7 @@ none
   - `RUNNING` rows of a killed server become `ABORTED` at the next start.
   - The new `transaction` object in `/show`, `/monitor` and `/api` `show` / `monitor`.
   - The commit failure answers, and that after a "not durable" answer the database must be unloaded and loaded; the reload keeps what the write-ahead log committed.
+  - `refreshconf` applies a new `txn_idle_timeout` at once to `begin` and the request path, but the background pass keeps the interval it was started with, and is not started at all when the server started with `0`, until a restart.
 - docs/STORAGE_BACKEND.md: no format change.
   - `Pager::wal_batches` is an in-memory counter.
   - A commit's outcome depends on whether a flush of it named its write-ahead log.
@@ -91,6 +94,7 @@ none
   - `src/db/persist.rs`: new `rocks_rollback_uncleared_journal` after `rocks_rollback_journal`.
   - `src/db/mod.rs`: `begin` is unchanged; `commit` and `rollback` were rewritten, and `CommitFailure` / `RocksUndo` were added after `enum UndoOp`.
   - `src/lib.rs`: one `#[cfg(test)] mod txn_commit_tests;` line.
+  - `src/concurrent.rs` (review fix, follows gap-txn-lifecycle#3): `apply_txn_ops`'s commit arm and its doc comment, the two comments in `Txn::commit` next to its call, and the `CommitFailure` import. No R2 package owns the file; r4-concurrent owns it in R4.
   - `src/config.rs`: one `upstream_compat_warnings()` entry for `txn_idle_timeout=0` (convention 13(c)).
   - `src/http_api.rs`, regions granted by the amendments: the `ApiInner::handle` line, the `serve_forever[_tls]` lines, and the fields and initialisers at their anchors. Also the module docs' Transactions paragraph.
   - `ApiState::remember_ended` and `ApiState::ended_outcome` keep their signatures, so `finish_shutdown` is not edited.
