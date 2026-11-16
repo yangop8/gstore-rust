@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §18.3 Compatible Mappings and §18.5 Join: a variable unbound in one
+# solution is not in its domain, so the solution of :s3 (no :name) is compatible with every :nick
+PREFIX : <http://example.org/>
+SELECT ?s ?k WHERE { { ?s :p ?o OPTIONAL { ?s :name ?n } } { ?k :nick ?n } }

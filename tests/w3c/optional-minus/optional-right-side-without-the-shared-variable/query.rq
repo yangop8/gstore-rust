@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §18.5 LeftJoin: the second UNION branch does not bind ?s, so its
+# solution is compatible with every left solution; the first only with :s1
+PREFIX : <http://example.org/>
+SELECT ?s ?x WHERE { ?s :p ?o OPTIONAL { { ?s :q ?x } UNION { ?y :r ?x } } }

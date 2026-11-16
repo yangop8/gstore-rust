@@ -387,10 +387,16 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     // No shared variable: MINUS removes nothing.
                     return self.stream_pattern(a, layout, sink);
                 }
-                let mut right: Option<Vec<Binding>> = None;
+                // The right side, hashed on the shared variables (review
+                // sparqlconf#2: this was a scan of it per left solution).
+                let mut right: Option<(Vec<Binding>, RowIndex)> = None;
                 self.stream_pattern(a, layout, &mut |l| {
-                    let right = right.get_or_insert_with(|| self.eval_pattern(b, layout));
-                    if minus_removes(&l, right, &shared) {
+                    let (rows, index) = right.get_or_insert_with(|| {
+                        let rows = self.eval_pattern(b, layout);
+                        let index = RowIndex::new(&rows, &shared);
+                        (rows, index)
+                    });
+                    if index.removes(rows, &l) {
                         GO
                     } else {
                         sink(l)
@@ -1556,52 +1562,31 @@ fn tree_leaves(tree: &JoinTree, out: &mut Vec<usize>) {
 
 /// One materialized join operand, indexed for probing: yields, for a left
 /// solution, every compatible right solution merged with it, in the right
-/// operand's order — what [`join_sets`] pairs it with.
+/// operand's order — what [`join_sets`] pairs it with. The index is the
+/// shared [`RowIndex`]: hashed on the shared variables each row binds, so a
+/// left solution or right rows that leave a shared variable unbound cost no
+/// scan of the operand (review query#10).
 struct Probe {
     rows: Vec<Binding>,
-    /// Shared variables bound in every row (the hash key).
-    key: Vec<usize>,
-    index: HashMap<Vec<u32>, Vec<usize>>,
+    index: RowIndex,
 }
 
 impl Probe {
-    /// Index `rows` on the variables of `hint` (the shared variables) that
-    /// every row binds. Which variables are used only affects speed: a left
-    /// solution that leaves one of them unbound is matched by a scan.
+    /// Index `rows` on the variables of `hint` (the shared variables).
+    /// Which variables are used only affects speed: every candidate is
+    /// still checked by the full compatible-merge.
     fn new(rows: Vec<Binding>, hint: &[usize]) -> Probe {
-        let key: Vec<usize> = hint
-            .iter()
-            .copied()
-            .filter(|&i| rows.iter().all(|r| r[i].is_some()))
-            .collect();
-        let mut index: HashMap<Vec<u32>, Vec<usize>> = HashMap::new();
-        if !key.is_empty() {
-            for (ri, r) in rows.iter().enumerate() {
-                let k = key.iter().map(|&i| r[i].unwrap_or(u32::MAX)).collect();
-                index.entry(k).or_default().push(ri);
-            }
-        }
-        Probe { rows, key, index }
+        let index = RowIndex::new(&rows, hint);
+        Probe { rows, index }
     }
 
     fn for_each_compatible(&self, l: &Binding, f: &mut Sink<'_>) -> Flow {
-        if !self.key.is_empty() {
-            let k: Option<Vec<u32>> = self.key.iter().map(|&i| l[i]).collect();
-            if let Some(k) = k {
-                for &ri in self.index.get(&k).map(Vec::as_slice).unwrap_or(&[]) {
-                    if let Some(m) = merge_bindings(l, &self.rows[ri]) {
-                        f(m)?;
-                    }
-                }
-                return GO;
+        self.index.for_each_candidate(&self.rows, l, |ri| {
+            match merge_bindings(l, &self.rows[ri]) {
+                Some(m) => f(m),
+                None => GO,
             }
-        }
-        for r in &self.rows {
-            if let Some(m) = merge_bindings(l, r) {
-                f(m)?;
-            }
-        }
-        GO
+        })
     }
 }
 

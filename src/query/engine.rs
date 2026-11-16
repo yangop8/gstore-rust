@@ -217,6 +217,12 @@ mod topk;
 use topk::PreparedBgp;
 pub use topk::{DpbMode, EvalStats, TopKOptions};
 
+// The hash index of OPTIONAL, MINUS and the joins over maybe-unbound
+// variables, shared by both executors (review sparqlconf#2 / query#10).
+#[path = "probe.rs"]
+mod probe;
+use probe::RowIndex;
+
 /// `xsd:dateTime`, the datatype produced by `NOW()`.
 const XSD_DATETIME: &str = "http://www.w3.org/2001/XMLSchema#dateTime";
 /// `xsd:dayTimeDuration`, the datatype produced by `TIMEZONE()`.
@@ -2611,6 +2617,14 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// OPTIONAL (left outer join). For each left solution, keep all compatible
     /// right solutions (after applying the OPTIONAL's inner FILTERs to the
     /// merged binding); if none, keep the left solution unextended.
+    ///
+    /// A hash join: the right solutions are indexed on the variables the
+    /// right pattern shares with what the left solutions bind ([`RowIndex`],
+    /// also when some solutions leave them unbound), so each left solution
+    /// meets only its compatible right solutions — not every one of them
+    /// (review sparqlconf#2: quadratic, 12-16 s for 20,000 x 10,000 rows).
+    /// Cancellation is polled between left solutions. The output order is
+    /// unchanged: left-major, right-minor.
     fn eval_left_join(
         &self,
         left: Vec<Binding>,
@@ -2619,14 +2633,22 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         filters: &[Expr],
         layout: &VarLayout,
     ) -> Vec<Binding> {
-        let lvars: Vec<usize> = (0..layout.len()).collect();
-        let rvars = pattern_vars(b_pat, layout);
-        let _ = &lvars; // left may bind anything; merge handles compatibility
+        // The right pattern's variables some left solution binds (any other
+        // one is compatible with every left solution).
+        let shared: Vec<usize> = pattern_vars(b_pat, layout)
+            .into_iter()
+            .filter(|&v| left.iter().any(|l| l[v].is_some()))
+            .collect();
+        let index = RowIndex::new(&right, &shared);
         let mut out = Vec::new();
         for l in &left {
+            if self.cancelled() {
+                // Reported by the caller's `check_cancel`.
+                return Vec::new();
+            }
             let mut matched = false;
-            for r in &right {
-                if let Some(m) = merge_bindings(l, r) {
+            let _ = index.for_each_candidate(&right, l, |ri| {
+                if let Some(m) = merge_bindings(l, &right[ri]) {
                     if filters
                         .iter()
                         .all(|f| self.eval_ebv(f, &m, layout) == Some(true))
@@ -2635,12 +2657,12 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                         matched = true;
                     }
                 }
-            }
+                ControlFlow::<()>::Continue(())
+            });
             if !matched {
                 out.push(l.clone());
             }
         }
-        let _ = rvars;
         out
     }
 
@@ -6145,6 +6167,10 @@ fn bind_node(b: &mut Binding, pt: &PatternTerm, id: u32, layout: &VarLayout) -> 
 
 /// MINUS: drop left solutions that have a compatible right solution sharing at
 /// least one bound variable (SPARQL `MINUS` semantics).
+///
+/// The right solutions are indexed on the shared variables ([`RowIndex`]), so
+/// each left solution costs a few hash lookups, not a scan of the right side
+/// (review sparqlconf#2: MINUS was a nested loop in both executors).
 fn eval_minus(
     left: Vec<Binding>,
     lvars: &[usize],
@@ -6159,28 +6185,10 @@ fn eval_minus(
     if shared.is_empty() {
         return left; // no shared variables ⇒ MINUS removes nothing
     }
+    let index = RowIndex::new(&right, &shared);
     left.into_iter()
-        .filter(|l| !minus_removes(l, &right, &shared))
+        .filter(|l| !index.removes(&right, l))
         .collect()
-}
-
-/// Whether MINUS drops `l`: some right solution is compatible with it on the
-/// `shared` variables and they share at least one bound one.
-fn minus_removes(l: &Binding, right: &[Binding], shared: &[usize]) -> bool {
-    right.iter().any(|r| {
-        let mut compatible = true;
-        let mut any_shared = false;
-        for &v in shared {
-            if let (Some(a), Some(b)) = (l[v], r[v]) {
-                any_shared = true;
-                if a != b {
-                    compatible = false;
-                    break;
-                }
-            }
-        }
-        compatible && any_shared
-    })
 }
 
 /// DISTINCT, OFFSET and LIMIT over a SELECT's projected rows, in that order.
@@ -6382,17 +6390,8 @@ fn join_sets(
         .filter(|v| right_vars.contains(v))
         .collect();
 
-    // Cross product when there is no shared variable, OR when a shared variable
-    // is left *unbound* (None) on some row: SPARQL compatibility treats an
-    // unbound value as a wildcard that matches anything, which the hash key
-    // (keyed on `Option<u32>`, where `None` is a distinct key) cannot express.
-    // This arises with OPTIONAL results re-joined later and with a SILENT
-    // SERVICE's identity solution. `merge_bindings` does the correct per-pair
-    // compatible-merge (None acts as a wildcard).
-    let unbound_shared = shared
-        .iter()
-        .any(|&i| left.iter().chain(right.iter()).any(|b| b[i].is_none()));
-    if shared.is_empty() || unbound_shared {
+    // Cross product when there is no shared variable.
+    if shared.is_empty() {
         let mut out = Vec::new();
         for l in left {
             for r in right {
@@ -6400,6 +6399,31 @@ fn join_sets(
                     out.push(m);
                 }
             }
+        }
+        return out;
+    }
+    // A shared variable *unbound* (None) on some row: SPARQL compatibility
+    // treats an unbound value as a wildcard that matches anything, which the
+    // hash key below (keyed on `Option<u32>`, where `None` is a distinct key)
+    // cannot express. This arises with OPTIONAL results re-joined later and
+    // with a SILENT SERVICE's identity solution. The [`RowIndex`] hashes the
+    // right rows on the shared variables each one binds, so a left row meets
+    // only the rows compatible with it — in the same left-major, right-minor
+    // order the cross product had (review query#10: this used to be the
+    // whole cross product, quadratic).
+    let unbound_shared = shared
+        .iter()
+        .any(|&i| left.iter().chain(right.iter()).any(|b| b[i].is_none()));
+    if unbound_shared {
+        let index = RowIndex::new(right, &shared);
+        let mut out = Vec::new();
+        for l in left {
+            let _ = index.for_each_candidate(right, l, |ri| {
+                if let Some(m) = merge_bindings(l, &right[ri]) {
+                    out.push(m);
+                }
+                ControlFlow::<()>::Continue(())
+            });
         }
         return out;
     }
