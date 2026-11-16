@@ -42,12 +42,12 @@
 //! later be handed out twice).
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard};
 
 use crate::dict::{Dictionary, DiskTermSource, Space};
 use crate::error::{GStoreError, Result};
@@ -183,6 +183,52 @@ pub struct DiskStore {
     /// The statistics were rebuilt when the store was opened (a file
     /// written before they were maintained) and are not flushed yet.
     stats_rebuilt: bool,
+    /// The terms the named-graph quads use (see [`QuadRefs`]): built from
+    /// `GSPO` by the first [`free_key`](Self::free_key) that needs it, kept
+    /// current by every quad write after, dropped when a write operation
+    /// fails or the store is refreshed (and built again on demand).
+    quad_refs: Option<QuadRefs>,
+}
+
+/// Reference counts of the terms named-graph quads use (review disk#3):
+/// `GSPO` is keyed graph-first, so whether a term is some quad's subject,
+/// predicate or object cannot be answered by a prefix probe.
+#[derive(Default)]
+struct QuadRefs {
+    /// Graph IRIs, subjects and objects (entity and literal ids: their
+    /// ranges are disjoint), with the number of quad positions each fills.
+    nodes: HashMap<u32, u32>,
+    /// Predicates, likewise.
+    preds: HashMap<u32, u32>,
+}
+
+impl QuadRefs {
+    fn change(map: &mut HashMap<u32, u32>, id: u32, add: bool) {
+        if add {
+            *map.entry(id).or_insert(0) += 1;
+        } else if let Some(n) = map.get_mut(&id) {
+            *n -= 1;
+            if *n == 0 {
+                map.remove(&id);
+            }
+        }
+    }
+
+    /// Count (`add`) or uncount the terms of the quad `(g, t)`.
+    fn quad(&mut self, g: EntityLiteralId, t: IdTriple, add: bool) {
+        for node in [g, t.sub, t.obj] {
+            QuadRefs::change(&mut self.nodes, node, add);
+        }
+        QuadRefs::change(&mut self.preds, t.pred, add);
+    }
+
+    /// Whether a quad uses the term `id` of `space`.
+    fn references(&self, space: Space, id: u32) -> bool {
+        match space {
+            Space::Predicate => self.preds.contains_key(&id),
+            Space::Entity | Space::Literal => self.nodes.contains_key(&id),
+        }
+    }
 }
 
 /// Source of [`DiskStore::instance`] ids.
@@ -382,19 +428,24 @@ fn scan_keys(
 impl DiskStore {
     /// Open (or create) a disk store at `path` with a `cache_pages`-page cache.
     ///
-    /// A store created here keeps a free-id list (feature `FREE_IDS`, a
-    /// version-2 file that binaries older than Phase 6 refuse) when the
-    /// process's id-reclamation policy is on
-    /// ([`default_id_reclaim`](crate::db::default_id_reclaim)); with it off
-    /// (`GSTORE_ID_RECLAIM=off`) it is a version-1 file, as before. An
-    /// existing file is never upgraded here.
+    /// An existing file keeps the format its header records — version 1
+    /// without a free-id list, version 2 with one — whatever the process's
+    /// id-reclamation policy; only [`enable_reclaim`](Self::enable_reclaim)
+    /// upgrades it. A store *created* here (an empty or missing file) takes
+    /// the format of the process's default open options
+    /// ([`OpenOptions::free_ids_if_new`](crate::db::OpenOptions::free_ids_if_new)
+    /// of [`default_open_options`](crate::db::default_open_options): with id
+    /// reclamation on — the default — a free-id list, feature `FREE_IDS`, a
+    /// version-2 file that binaries older than Phase 6 refuse; with
+    /// `GSTORE_ID_RECLAIM=off` a version-1 file). [`open_with`](Self::open_with)
+    /// chooses explicitly (review disk#8 / design#6).
     pub fn open<P: AsRef<Path>>(path: P, cache_pages: usize) -> Result<DiskStore> {
-        let free_ids = crate::db::default_id_reclaim() == crate::db::IdReclaim::Immediate;
+        let free_ids = crate::db::default_open_options().free_ids_if_new;
         DiskStore::open_with(path, cache_pages, free_ids)
     }
 
     /// [`open`](Self::open), choosing whether a store *created* here keeps a
-    /// free-id list.
+    /// free-id list (an existing file keeps its header's format).
     pub fn open_with<P: AsRef<Path>>(
         path: P,
         cache_pages: usize,
@@ -402,7 +453,7 @@ impl DiskStore {
     ) -> Result<DiskStore> {
         let path = path.as_ref();
         let fresh = std::fs::metadata(path).map_or(true, |m| m.len() == 0)
-            && !super::super::db::persist::wal_of(path).exists();
+            && !Pager::wal_path(path).exists();
         let mut pager = Pager::open(path, cache_pages)?;
         if fresh && free_ids_if_new {
             disk_dict::enable_free_ids(&mut pager)?;
@@ -485,6 +536,7 @@ impl DiskStore {
             instance: NEXT_INSTANCE.fetch_add(1, Ordering::Relaxed),
             version: AtomicU64::new(0),
             stats_rebuilt: false,
+            quad_refs: None,
         };
         store.refresh()?;
         Ok(store)
@@ -494,7 +546,7 @@ impl DiskStore {
     /// mirror (`O(P)`). A writer's own counters are always current; this is for
     /// a read-only view catching up with its writer.
     pub fn refresh(&mut self) -> Result<()> {
-        let pager = self.pager.read().unwrap();
+        let pager = Pager::lock_read(&self.pager);
         // The term counts are dense ids into the `id2*` arrays, so a count
         // past their capacity is a damaged header: fail here, before anything
         // is sized from it.
@@ -533,7 +585,11 @@ impl DiskStore {
         self.nonempty_preds = stats.iter().filter(|s| s.0 > 0).count();
         self.stats = stats;
         self.stats_undo.clear();
-        *self.disk_dict.lock().unwrap() = None;
+        self.quad_refs = None;
+        *self
+            .disk_dict
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
         self.version.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
@@ -661,7 +717,7 @@ impl DiskStore {
     /// from then on ("not a gStore KV file"). A no-op if it is on already.
     pub fn enable_reclaim(&mut self) -> Result<()> {
         self.check_writable()?;
-        let mut pager = self.pager.write().unwrap_or_else(|e| e.into_inner());
+        let mut pager = Pager::lock_write(&self.pager);
         disk_dict::enable_free_ids(&mut pager)
     }
 
@@ -741,7 +797,12 @@ impl DiskStore {
     /// `Ok(false)`, writing nothing, without the `FREE_IDS` feature, for an
     /// unknown key, or when this store still references the term (the working
     /// set decided it is unused; the store keeps it rather than corrupt
-    /// itself).
+    /// itself): a triple of the default graph, or a named-graph quad in any
+    /// position — graph, subject, predicate or object (review disk#3: only a
+    /// graph IRI was checked, so a term only a quad used was freed and the
+    /// next new term took its id, changing the quad). The quad check reads
+    /// the terms the quads use, gathered from `GSPO` once (`O(quads)`) and
+    /// kept current by the quad writes after (`O(1)` each).
     pub fn free_key(&mut self, space: Space, key: &str) -> Result<bool> {
         if !self.frees_ids() {
             return Ok(false);
@@ -757,12 +818,8 @@ impl DiskStore {
             };
             let referenced = match space {
                 Space::Predicate => st.pos.prefix_exists(pg, &be32(id))?,
-                _ => {
-                    st.spo.prefix_exists(pg, &be32(id))?
-                        || st.osp.prefix_exists(pg, &be32(id))?
-                        || st.gspo.prefix_exists(pg, &be32(id))?
-                }
-            };
+                _ => st.spo.prefix_exists(pg, &be32(id))? || st.osp.prefix_exists(pg, &be32(id))?,
+            } || st.quads_reference(pg, space, id)?;
             if referenced {
                 return Ok(false);
             }
@@ -782,6 +839,23 @@ impl DiskStore {
         })
     }
 
+    /// Whether a named-graph quad uses the term `id` of `space` (see
+    /// [`QuadRefs`]), gathering the quads' terms first if they are not.
+    fn quads_reference(&mut self, pager: &Pager, space: Space, id: u32) -> Result<bool> {
+        if self.quad_refs.is_none() {
+            let mut refs = QuadRefs::default();
+            scan_keys(&self.gspo, pager, &[], 16, |k| {
+                let t = IdTriple::new(id_at(k, 4), id_at(k, 8), id_at(k, 12));
+                refs.quad(id_at(k, 0), t, true);
+            })?;
+            self.quad_refs = Some(refs);
+        }
+        Ok(self
+            .quad_refs
+            .as_ref()
+            .is_some_and(|r| r.references(space, id)))
+    }
+
     /// Catch this struct's term counters up with the header (see
     /// [`header_term_counts`](Self::header_term_counts)).
     fn sync_term_counts(&mut self, pager: &Pager) {
@@ -794,7 +868,7 @@ impl DiskStore {
     /// The current term counts `(entities, literals, predicates)`, terms
     /// interned through a shared [`DiskDict`] included.
     fn term_counts(&self) -> (u32, u32, u32) {
-        let pager = self.pager.read().unwrap_or_else(|e| e.into_inner());
+        let pager = self.read_pager();
         self.header_term_counts(&pager)
     }
 
@@ -853,7 +927,7 @@ impl DiskStore {
         // Cached SPO leaves of earlier versions are not used again.
         self.version.fetch_add(1, Ordering::AcqRel);
         let pager = Arc::clone(&self.pager);
-        let mut guard = pager.write().unwrap();
+        let mut guard = Pager::lock_write(&pager);
         // Terms a shared dictionary interned since the last operation.
         self.sync_term_counts(&guard);
         let before = self.counters();
@@ -873,12 +947,21 @@ impl DiskStore {
         match outcome {
             Ok(r) => {
                 self.stats_undo.clear();
-                op.commit()?;
+                if let Err(e) = op.commit() {
+                    // Ending the operation failed (a nested abort rolled it
+                    // back, or its commit failed): the quads' terms are
+                    // gathered again from the pages on demand.
+                    self.quad_refs = None;
+                    return Err(e);
+                }
                 Ok(r)
             }
             Err(e) => {
                 drop(op); // rolls the pages and the header back
                 self.restore_counters(before);
+                // The quad writes of the failed operation may have counted
+                // terms: gathered again on demand.
+                self.quad_refs = None;
                 Err(e)
             }
         }
@@ -1082,6 +1165,9 @@ impl DiskStore {
         self.gspo.insert(pager, &key, b"")?;
         self.quad_count += 1;
         pager.set_root(ROOT_QUAD_COUNT, self.quad_count);
+        if let Some(refs) = &mut self.quad_refs {
+            refs.quad(g, t, true);
+        }
         Ok(true)
     }
 
@@ -1096,6 +1182,9 @@ impl DiskStore {
         }
         self.quad_count = self.quad_count.saturating_sub(1);
         pager.set_root(ROOT_QUAD_COUNT, self.quad_count);
+        if let Some(refs) = &mut self.quad_refs {
+            refs.quad(g, t, false);
+        }
         Ok(true)
     }
 
@@ -1116,7 +1205,7 @@ impl DiskStore {
     /// Every named-graph quad as `(graph_id, triple)` in this store's id space,
     /// sorted by graph then `(s, p, o)`.
     pub fn quads(&self) -> Result<Vec<(EntityLiteralId, IdTriple)>> {
-        let pager = self.pager.read().unwrap();
+        let pager = self.read_pager();
         let mut out = with_hint(self.quad_count);
         scan_keys(&self.gspo, &pager, &[], 16, |k| {
             out.push((
@@ -1167,7 +1256,7 @@ impl DiskStore {
             return;
         }
         self.vstree_stale = false;
-        self.pager.write().unwrap().set_root(ROOT_VSTREE_STALE, 0);
+        Pager::lock_write(&self.pager).set_root(ROOT_VSTREE_STALE, 0);
     }
 
     /// Insert one triple by id: the three indexes, the counters and the
@@ -1323,9 +1412,16 @@ impl DiskStore {
     /// Commit every completed operation durably (one WAL-protected pager
     /// flush). Through `&self`: every operation keeps the header roots
     /// current, so there is nothing else to write. Refused on a read-only view.
+    ///
+    /// The log is written, applied and fsynced under the pager's *shared*
+    /// guard ([`Pager::commit_shared`]): readers of the shared pager (the
+    /// out-of-core dictionary, read-only views) go on meanwhile; only taking
+    /// the batch and marking it clean hold the exclusive guard (review
+    /// disk#10).
     pub fn commit(&self) -> Result<()> {
         self.check_writable()?;
-        self.pager.write().unwrap().flush()
+        let staged = self.read_pager().commit_shared()?;
+        Pager::lock_write(&self.pager).finish_commit(staged)
     }
 
     /// The pager's [`wal_batches`](Pager::wal_batches): flushes of this
@@ -1338,7 +1434,7 @@ impl DiskStore {
     pub fn flush(&mut self) -> Result<()> {
         self.check_writable()?;
         let shared = Arc::clone(&self.pager);
-        let mut guard = shared.write().unwrap();
+        let mut guard = Pager::lock_write(&shared);
         let pager = &mut *guard;
         // The term counts are the header's (every intern and free sets them).
         self.sync_term_counts(pager);
@@ -1385,14 +1481,14 @@ impl DiskStore {
     /// Out-degree of `sub`: number of triples with `sub` as subject (gStore
     /// `getEntityOutDegree`). Degree-bounded prefix count over SPO.
     pub fn subject_degree(&self, sub: EntityLiteralId) -> Result<usize> {
-        let pager = self.pager.read().unwrap();
+        let pager = self.read_pager();
         self.spo.count_prefix(&pager, &be32(sub))
     }
 
     /// In-degree of `obj`: number of triples with `obj` as object (gStore
     /// `getEntityInDegree`). Degree-bounded prefix count over OSP.
     pub fn object_degree(&self, obj: EntityLiteralId) -> Result<usize> {
-        let pager = self.pager.read().unwrap();
+        let pager = self.read_pager();
         self.osp.count_prefix(&pager, &be32(obj))
     }
 
@@ -1400,14 +1496,14 @@ impl DiskStore {
     /// Degree-bounded prefix count over SPO (independent of VList compaction,
     /// since SPO is always authoritative).
     pub fn subject_predicate_degree(&self, sub: EntityLiteralId, pred: PredId) -> Result<usize> {
-        let pager = self.pager.read().unwrap();
+        let pager = self.read_pager();
         self.spo.count_prefix(&pager, &cat(sub, pred))
     }
 
     /// Number of subjects for `(obj, pred)` — gStore `getObjectPredicateDegree`.
     /// Degree-bounded prefix count over POS.
     pub fn object_predicate_degree(&self, obj: EntityLiteralId, pred: PredId) -> Result<usize> {
-        let pager = self.pager.read().unwrap();
+        let pager = self.read_pager();
         self.pos.count_prefix(&pager, &cat(pred, obj))
     }
 
@@ -1488,7 +1584,7 @@ impl DiskStore {
 
     pub fn term_id(&self, t: &Term) -> Result<Option<EntityLiteralId>> {
         let key = t.dict_key();
-        let pager = self.pager.read().unwrap();
+        let pager = self.read_pager();
         let tree = if t.is_literal() {
             &self.literal2id
         } else {
@@ -1498,12 +1594,12 @@ impl DiskStore {
     }
 
     pub fn predicate_id(&self, dict_key: &str) -> Result<Option<PredId>> {
-        let pager = self.pager.read().unwrap();
+        let pager = self.read_pager();
         lookup_id(&self.predicate2id, &pager, dict_key.as_bytes())
     }
 
     pub fn id_to_string(&self, id: EntityLiteralId) -> Result<Option<String>> {
-        let pager = self.pager.read().unwrap();
+        let pager = self.read_pager();
         // Literals are keyed by their local index (see `intern_literal`).
         let (arr, key) = if is_literal_id(id) {
             (&self.id2literal, id - LITERAL_FIRST_ID)
@@ -1514,15 +1610,18 @@ impl DiskStore {
     }
 
     pub fn predicate_to_string(&self, id: PredId) -> Result<Option<String>> {
-        let pager = self.pager.read().unwrap();
+        let pager = self.read_pager();
         self.id2predicate
             .get_with(&pager, id, |b| String::from_utf8_lossy(b).into_owned())
     }
 
     // ---- fallible reads in the C1 contract order -------------------------
 
+    /// The pager for reading. Poison-tolerant (review conc#8): a panic
+    /// under the write guard leaves the pages consistent and the pager
+    /// failed, so reads go on and writes are refused ([`Pager::lock_read`]).
     fn read_pager(&self) -> RwLockReadGuard<'_, Pager> {
-        self.pager.read().unwrap()
+        Pager::lock_read(&self.pager)
     }
 
     /// The SPO keys in `[lo, hi]`, read through this thread's [`SpoWalk`]
@@ -2082,7 +2181,7 @@ impl DiskStore {
         // 1. Drop any previous VList entries so vanished groups can't be read,
         //    freeing each overflow chain so its pages return to the free list.
         let stale: Vec<(Vec<u8>, Vec<u8>)> = {
-            let guard = self.pager.read().unwrap();
+            let guard = self.read_pager();
             self.sp2o_vlist.iter_all(&guard)?
         };
         for (k, v) in &stale {
@@ -2131,7 +2230,7 @@ impl DiskStore {
     /// Total allocated page count (for tests asserting no page leaks).
     #[cfg(test)]
     fn page_count_for_test(&self) -> u32 {
-        self.pager.read().unwrap().page_count()
+        self.read_pager().page_count()
     }
 
     /// Test aid: set the header's term counts (and this struct's), e.g. to
@@ -2139,7 +2238,7 @@ impl DiskStore {
     #[cfg(test)]
     fn set_term_counts_for_test(&mut self, e: Option<u32>, l: Option<u32>, p: Option<u32>) {
         let shared = Arc::clone(&self.pager);
-        let mut pager = shared.write().unwrap();
+        let mut pager = Pager::lock_write(&shared);
         for (slot, v) in [
             (ROOT_ENTITY_COUNT, e),
             (ROOT_LITERAL_COUNT, l),
@@ -2158,7 +2257,7 @@ impl DiskStore {
     /// inline or in an [`overflow`] chain, so size/round-trip assertions are
     /// independent of where the bytes physically live.
     pub fn compact_value_len(&self, s: EntityLiteralId, p: PredId) -> Result<Option<usize>> {
-        let pager = self.pager.read().unwrap();
+        let pager = self.read_pager();
         self.sp2o_vlist
             .get_with(&pager, &cat(s, p), record_logical_len)
     }
@@ -2168,7 +2267,7 @@ impl DiskStore {
     /// the group is absent from the compressed index. Exposes the inline/overflow
     /// decision for tests.
     pub fn compact_value_is_overflow(&self, s: EntityLiteralId, p: PredId) -> Result<Option<bool>> {
-        let pager = self.pager.read().unwrap();
+        let pager = self.read_pager();
         self.sp2o_vlist
             .get_with(&pager, &cat(s, p), |v| v.first() == Some(&OVERFLOW_TAG))
     }
@@ -2190,7 +2289,7 @@ impl DiskStore {
     /// line up with the on-disk triple indexes). One sequential pass over each
     /// `id2*` array (a directory page serves 32 ids).
     pub fn dictionary(&self) -> Result<Dictionary> {
-        let pager = self.pager.read().unwrap();
+        let pager = self.read_pager();
         let (entities, literals, preds) = self.header_term_counts(&pager);
         // Every id keeps its value: a freed id is a hole (free again in the
         // dictionary), so the terms line up with the triple indexes.
@@ -2220,7 +2319,10 @@ impl DiskStore {
                 disk_dict::frees_ids(&pager),
             )
         };
-        let mut cached = self.disk_dict.lock().unwrap();
+        let mut cached = self
+            .disk_dict
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if let Some((d, g)) = cached.as_ref() {
             // Current while the counts are the header's — ids only get added
             // then — and, on a file whose ids are freed and reused (where a
@@ -2612,7 +2714,7 @@ mod tests {
     fn tmp(tag: &str) -> std::path::PathBuf {
         let p = std::env::temp_dir().join(format!("gstore_disk_{tag}_{}.kv", std::process::id()));
         let _ = std::fs::remove_file(&p);
-        let _ = std::fs::remove_file(p.with_extension("kv.wal"));
+        let _ = std::fs::remove_file(Pager::wal_path(&p));
         p
     }
 
@@ -3592,14 +3694,14 @@ mod tests {
         assert!(ds.intern_predicate("<contain>").is_ok());
         drop(ds);
         std::fs::remove_file(&path).ok();
-        std::fs::remove_file(path.with_extension("kv.wal")).ok();
+        std::fs::remove_file(Pager::wal_path(&path)).ok();
     }
 
     // ---- Phase 6 R1-KV: contract-ordered try_* reads, exact counts --------
 
     fn cleanup(path: &std::path::Path) {
         std::fs::remove_file(path).ok();
-        std::fs::remove_file(path.with_extension("kv.wal")).ok();
+        std::fs::remove_file(Pager::wal_path(path)).ok();
     }
 
     /// xorshift64*: deterministic data for the equivalence tests.
@@ -4367,6 +4469,63 @@ mod tests {
         drop(DiskStore::open_with(&v1, 64, false).unwrap());
         assert!(!DiskStore::open_with(&v1, 64, true).unwrap().frees_ids());
         cleanup(&v1);
+    }
+
+    /// Review disk#10: a commit held the pager's exclusive lock while it
+    /// checksummed, wrote and fsynced its log and applied it, so every
+    /// reader sharing the pager (the out-of-core dictionary, read-only
+    /// views) waited for the whole commit. Now the log is written under a
+    /// shared guard: with the commit parked inside its log write, a reader
+    /// takes the lock and reads; the commit then finishes and is durable.
+    #[test]
+    fn readers_run_while_a_commit_writes_its_log() {
+        use std::sync::mpsc::channel;
+        /// Removes the test's files when dropped, also when it fails.
+        struct Files(std::path::PathBuf);
+        impl Drop for Files {
+            fn drop(&mut self) {
+                cleanup(&self.0);
+            }
+        }
+        let path = tmp("commit_shared");
+        let _files = Files(path.clone());
+        let mut ds = DiskStore::open_with(&path, 64, true).unwrap();
+        for i in 0..200 {
+            ds.insert_keys(&format!("<s{i}>"), "<p>", &format!("<o{i}>"), false)
+                .unwrap();
+        }
+        let ds = Arc::new(ds);
+        let (parked_tx, parked_rx) = channel::<()>();
+        let (go_tx, go_rx) = channel::<()>();
+        let committer = {
+            let ds = Arc::clone(&ds);
+            std::thread::spawn(move || {
+                let _armed = super::super::pager::failpoints::park_next_wal_write(move || {
+                    parked_tx.send(()).unwrap();
+                    go_rx.recv().unwrap();
+                });
+                ds.commit()
+            })
+        };
+        parked_rx.recv().unwrap(); // the commit is inside its log write
+        let shared = ds.shared_pager();
+        let readable = shared.try_read().is_ok();
+        let read = readable.then(|| ds.try_iter_all().map(|t| t.len()));
+        go_tx.send(()).unwrap();
+        committer.join().unwrap().unwrap();
+        assert!(
+            readable,
+            "a reader of the shared pager was locked out while the commit wrote its log"
+        );
+        assert_eq!(read.unwrap().unwrap(), 200);
+        assert_eq!(
+            ds.read_pager().dirty_pages(),
+            0,
+            "the batch was marked clean"
+        );
+        drop((ds, shared));
+        let back = DiskStore::open(&path, 64).unwrap();
+        assert_eq!(back.triple_count(), 200, "the commit is durable");
     }
 
     #[test]

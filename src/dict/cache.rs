@@ -14,6 +14,18 @@
 //! first access under a new generation empties them, since an id or a key may
 //! have changed meaning (an intern, a free).
 //!
+//! ## Generations and racing reads
+//! A reader that misses reads the backing store and then caches what it
+//! read; a free may run in between. So a value is cached *at the generation
+//! it was read under* ([`ClockCache::insert_at`]): every shard records the
+//! generation its entries belong to, and an access first brings the shard to
+//! the cache's newest generation (emptying it if it is older) under the
+//! shard's lock. An insert carrying an older generation than the shard's is
+//! dropped there, under the same lock, so a value read before a free can
+//! never be cached after it — whatever order the free, the reader and the
+//! readers that move the cache to the new generation run in (review disk#6,
+//! conc#12, db#20). Generations passed to the `*_at` methods only grow.
+//!
 //! [`DiskTermSource::generation`]: super::DiskTermSource::generation
 
 use std::borrow::Borrow;
@@ -87,6 +99,8 @@ struct Shard<K, V, S> {
     holes: Vec<usize>,
     hand: usize,
     bytes: usize,
+    /// The generation the entries belong to (see the module docs).
+    generation: u64,
 }
 
 impl<K: Hash + Eq + Clone, V: Clone, S: BuildHasher + Default> Shard<K, V, S> {
@@ -97,11 +111,15 @@ impl<K: Hash + Eq + Clone, V: Clone, S: BuildHasher + Default> Shard<K, V, S> {
             holes: Vec::new(),
             hand: 0,
             bytes: 0,
+            generation: 0,
         }
     }
 
+    /// Drop every entry (the generation stays).
     fn clear(&mut self) {
+        let generation = self.generation;
         *self = Shard::new();
+        self.generation = generation;
     }
 
     /// Evict one entry by CLOCK, returning its cost; `None` if the shard is
@@ -170,47 +188,88 @@ impl<K: Hash + Eq + Clone, V: Clone, S: BuildHasher + Default> ClockCache<K, V, 
         self.shard_budget * SHARDS
     }
 
-    fn shard<Q: Hash + ?Sized>(&self, key: &Q) -> MutexGuard<'_, Shard<K, V, S>> {
-        let i = (self.hasher.hash_one(key) >> 40) as usize % SHARDS;
+    /// Lock shard `i`, brought to the cache's current generation: a shard
+    /// whose entries belong to another generation is emptied first (under
+    /// its lock, see the module docs).
+    fn lock_shard(&self, i: usize) -> MutexGuard<'_, Shard<K, V, S>> {
         // A panic while a shard was locked leaves it consistent enough to
         // empty: recover by clearing it (it only holds copies).
-        match self.shards[i].lock() {
+        let mut g = match self.shards[i].lock() {
             Ok(g) => g,
             Err(poisoned) => {
                 self.shards[i].clear_poison();
                 let mut g = poisoned.into_inner();
-                self.entries.fetch_sub(g.map.len(), Ordering::Relaxed);
-                self.bytes.fetch_sub(g.bytes, Ordering::Relaxed);
-                g.clear();
+                self.drop_entries(&mut g);
                 g
             }
+        };
+        // Read under the shard's lock: a generation change stores the new
+        // generation before it empties the shards, so an entry of an older
+        // generation is never visible past this point.
+        let current = self.generation.load(Ordering::Acquire);
+        if g.generation != current {
+            self.drop_entries(&mut g);
+            g.generation = current;
+        }
+        g
+    }
+
+    /// Empty a locked shard, keeping the totals in step.
+    fn drop_entries(&self, g: &mut Shard<K, V, S>) {
+        self.entries.fetch_sub(g.map.len(), Ordering::Relaxed);
+        self.bytes.fetch_sub(g.bytes, Ordering::Relaxed);
+        g.clear();
+    }
+
+    fn shard<Q: Hash + ?Sized>(&self, key: &Q) -> MutexGuard<'_, Shard<K, V, S>> {
+        self.lock_shard((self.hasher.hash_one(key) >> 40) as usize % SHARDS)
+    }
+
+    /// Bring every shard to the current generation (emptying the ones of
+    /// another), so a generation change frees the memory at once.
+    fn sync_all(&self) {
+        for i in 0..SHARDS {
+            drop(self.lock_shard(i));
+        }
+    }
+
+    /// The generation the cache's entries belong to now.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Adopt `generation` if it is newer than the cache's (emptying it);
+    /// an older one changes nothing. What the `*_at` methods do first.
+    pub fn advance(&self, generation: u64) {
+        // A plain load first: the common case (no change) writes nothing,
+        // so concurrent readers do not contend on the counter's cache line.
+        if self.generation.load(Ordering::Acquire) >= generation {
+            return;
+        }
+        let previous = self.generation.fetch_max(generation, Ordering::AcqRel);
+        if previous < generation {
+            self.invalidations.fetch_add(1, Ordering::Relaxed);
+            self.sync_all();
         }
     }
 
     /// Empty the cache if `generation` differs from the one its entries
-    /// belong to (and adopt it).
+    /// belong to (and adopt it, also when it is older). A cache whose
+    /// readers race with changes of meaning uses the `*_at` methods instead
+    /// (see the module docs).
     pub fn check_generation(&self, generation: u64) {
-        if self.generation.load(Ordering::Acquire) == generation {
+        if self.generation.swap(generation, Ordering::AcqRel) == generation {
             return;
         }
-        self.clear();
-        self.generation.store(generation, Ordering::Release);
         self.invalidations.fetch_add(1, Ordering::Relaxed);
+        self.sync_all();
     }
 
     /// Drop every entry.
     pub fn clear(&self) {
-        for s in self.shards.iter() {
-            let mut g = match s.lock() {
-                Ok(g) => g,
-                Err(p) => {
-                    s.clear_poison();
-                    p.into_inner()
-                }
-            };
-            self.entries.fetch_sub(g.map.len(), Ordering::Relaxed);
-            self.bytes.fetch_sub(g.bytes, Ordering::Relaxed);
-            g.clear();
+        for i in 0..SHARDS {
+            let mut g = self.lock_shard(i);
+            self.drop_entries(&mut g);
         }
     }
 
@@ -230,7 +289,47 @@ impl<K: Hash + Eq + Clone, V: Clone, S: BuildHasher + Default> ClockCache<K, V, 
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let mut g = self.shard(key);
+        let g = self.shard(key);
+        self.lookup(g, key)
+    }
+
+    /// [`get`](Self::get) for a reader of `generation` (adopted first if
+    /// newer): `None` when the cache has moved past it — what that reader
+    /// may know is not what the cache holds.
+    pub fn get_at<Q>(&self, key: &Q, generation: u64) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.advance(generation);
+        let g = self.shard(key);
+        if g.generation != generation {
+            drop(g);
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        self.lookup(g, key)
+    }
+
+    /// [`contains`](Self::contains) at `generation` (see
+    /// [`get_at`](Self::get_at)).
+    pub fn contains_at<Q>(&self, key: &Q, generation: u64) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.advance(generation);
+        let g = self.shard(key);
+        g.generation == generation && g.map.contains_key(key)
+    }
+
+    /// The value of `key` in the locked shard `g` (marking it used),
+    /// counted as a hit or a miss.
+    fn lookup<Q>(&self, mut g: MutexGuard<'_, Shard<K, V, S>>, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         let hit = match g.map.get(key) {
             Some(&pos) => {
                 let slot = g.ring[pos].as_mut().expect("mapped slot is live");
@@ -255,7 +354,27 @@ impl<K: Hash + Eq + Clone, V: Clone, S: BuildHasher + Default> ClockCache<K, V, 
         if cost > self.shard_budget || cost > u32::MAX as usize {
             return;
         }
-        let mut g = self.shard(&key);
+        let g = self.shard(&key);
+        self.insert_locked(g, key, value, cost);
+    }
+
+    /// [`insert`](Self::insert) a value read at `generation` (adopted first
+    /// if newer): dropped when the cache has moved past it, checked under
+    /// the shard's lock — so a value read before a change of meaning is
+    /// never cached after it (see the module docs).
+    pub fn insert_at(&self, key: K, value: V, cost: usize, generation: u64) {
+        if cost > self.shard_budget || cost > u32::MAX as usize {
+            return;
+        }
+        self.advance(generation);
+        let g = self.shard(&key);
+        if g.generation != generation {
+            return;
+        }
+        self.insert_locked(g, key, value, cost);
+    }
+
+    fn insert_locked(&self, mut g: MutexGuard<'_, Shard<K, V, S>>, key: K, value: V, cost: usize) {
         if g.map.contains_key(&key) {
             return;
         }
@@ -368,6 +487,24 @@ impl TermCache {
         self.inner.insert(term_key(space, id), s, cost)
     }
 
+    /// See [`ClockCache::get_at`].
+    pub fn get_at(&self, space: Space, id: u32, generation: u64) -> Option<Arc<str>> {
+        self.inner.get_at(&term_key(space, id), generation)
+    }
+
+    /// See [`ClockCache::contains_at`].
+    pub fn contains_at(&self, space: Space, id: u32, generation: u64) -> bool {
+        self.inner.contains_at(&term_key(space, id), generation)
+    }
+
+    /// Cache the string of `id` in `space`, read at `generation` (see
+    /// [`ClockCache::insert_at`]).
+    pub fn insert_at(&self, space: Space, id: u32, s: Arc<str>, generation: u64) {
+        let cost = s.len() + ENTRY_OVERHEAD;
+        self.inner
+            .insert_at(term_key(space, id), s, cost, generation)
+    }
+
     /// The underlying cache.
     pub(crate) fn cache(&self) -> &ClockCache<u64, Arc<str>, FxBuildHasher> {
         &self.inner
@@ -437,6 +574,19 @@ impl KeyCache {
     pub fn insert(&self, space: Space, key: &str, id: u32) {
         let cost = key.len() + ENTRY_OVERHEAD;
         self.of(space).insert(Arc::from(key), id, cost)
+    }
+
+    /// See [`ClockCache::get_at`].
+    pub fn get_at(&self, space: Space, key: &str, generation: u64) -> Option<u32> {
+        self.of(space).get_at(key, generation)
+    }
+
+    /// Cache `key → id` in `space`, read at `generation` (see
+    /// [`ClockCache::insert_at`]).
+    pub fn insert_at(&self, space: Space, key: &str, id: u32, generation: u64) {
+        let cost = key.len() + ENTRY_OVERHEAD;
+        self.of(space)
+            .insert_at(Arc::from(key), id, cost, generation)
     }
 
     /// Entries resident.
@@ -524,6 +674,35 @@ mod tests {
         assert_eq!(k.get(Space::Entity, "\"x\""), None, "spaces are separate");
         k.check_generation(9);
         assert!(k.is_empty());
+    }
+
+    /// Review disk#6 / db#20: a value read at an older generation is not
+    /// cached once the cache moved on — whichever of the two happens first
+    /// — and a reader of an older generation gets no answer from a newer one.
+    #[test]
+    fn a_value_read_at_an_older_generation_is_not_cached() {
+        let c: ClockCache<u64, u32> = ClockCache::new(1 << 16);
+        c.insert_at(1, 10, 8, 3);
+        assert_eq!(c.get_at(&1, 3), Some(10));
+        // The cache moves to generation 4 (a free), then the late insert of
+        // a value read at 3 arrives: dropped.
+        c.advance(4);
+        assert!(c.is_empty());
+        c.insert_at(2, 20, 8, 3);
+        assert_eq!(c.get_at(&2, 4), None, "a stale value was cached");
+        assert!(!c.contains_at(&2, 4));
+        // A reader still at 3 gets no answer from generation 4's entries.
+        c.insert_at(5, 50, 8, 4);
+        assert_eq!(c.get_at(&5, 3), None);
+        assert_eq!(c.get_at(&5, 4), Some(50));
+        // An insert carrying a newer generation moves the cache there.
+        c.insert_at(6, 60, 8, 7);
+        assert_eq!(c.generation(), 7);
+        assert_eq!(c.get_at(&5, 7), None, "emptied by the move");
+        assert_eq!(c.get_at(&6, 7), Some(60));
+        assert_eq!(c.len(), 1);
+        assert_eq!(c.bytes(), 8);
+        assert_eq!(c.counters().3, 3, "generation changes: 0 to 3, to 4, to 7");
     }
 
     #[test]

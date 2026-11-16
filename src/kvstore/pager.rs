@@ -54,14 +54,49 @@
 //! [`open`](Pager::open) replays a complete log and discards a torn one; a
 //! log that exists but cannot be read fails the open (only "not found" means
 //! "no log"), and so does a file shorter than its header's page count.
+//!
+//! A commit holds the pager **exclusively only to take its batch and to mark
+//! it clean** ([`commit_shared`](Pager::commit_shared) /
+//! [`finish_commit`](Pager::finish_commit)): checksumming and writing the log,
+//! applying it and the fsyncs run under a shared guard, so readers of a
+//! shared pager go on meanwhile (the batch's pages are resident and dirty,
+//! never read from the file); writers wait as before. The checksum is a
+//! table-driven CRC-32 and the log is streamed through a bounded buffer
+//! instead of being copied whole first (review disk#10).
+//!
+//! ## One process per file, one log path
+//! [`open`](Pager::open) takes an advisory exclusive lock on the file
+//! (`flock` on Unix, `LockFileEx` on Windows) before it looks at the log, and
+//! the process holds it while any of its pagers on the file lives: an open
+//! from **another process** fails, touching nothing (not even the log).
+//! Within one process the lock is shared, as the directory lock is
+//! ([`dirlock`](crate::db::dirlock)): a second pager of the same process on
+//! the same file is not refused — two pagers on one file would replay and
+//! remove each other's log and overwrite each other's pages, so avoiding
+//! them is the caller's job (share one pager instead: `Arc<RwLock<Pager>>`,
+//! see [`DiskStore::shared_pager`](super::DiskStore::shared_pager); the
+//! servers open a database once, under its directory lock). The process's
+//! last pager on the file releases the lock explicitly, so a child process
+//! being spawned at that moment (which briefly shares the descriptor) cannot
+//! keep it. A file renamed over or unlinked while a pager has it open keeps
+//! its lock; a new file at the path is another file. The log's path is
+//! derived in one place,
+//! [`wal_path`](Pager::wal_path), and [`remove_with_wal`](Pager::remove_with_wal)
+//! removes a paged file with its log, failing on any error but "not found"
+//! (review disk#9). The log records no identity of its file: the lock, the
+//! single path rule and the checked removal are what keep a log from
+//! meeting a file it does not belong to.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::hash::{BuildHasherDefault, Hasher};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
+};
 
 use crate::error::{GStoreError, Result};
 
@@ -289,8 +324,14 @@ pub struct Pager {
     /// is refused from then on (see the module docs).
     failed: FailureFlag,
     /// Flushes whose write-ahead log got its name (see
-    /// [`wal_batches`](Self::wal_batches)).
-    wal_batches: u64,
+    /// [`wal_batches`](Self::wal_batches)); counted under a shared guard.
+    wal_batches: AtomicU64,
+    /// The file's entry in this process's advisory locks (see
+    /// [`lock_file`]), given back when the pager is dropped.
+    lock: FileKey,
+    /// Serializes the commits running under a shared guard (see
+    /// [`commit_shared`](Self::commit_shared)).
+    commit_lock: Mutex<()>,
     /// Number of committed flushes (tests assert when commits happen).
     #[cfg(test)]
     flushes: u64,
@@ -300,7 +341,10 @@ impl Pager {
     /// Open (or create) a paged file at `path` with a cache of `capacity` pages.
     ///
     /// An existing file must carry a header this binary supports (see
-    /// [`format::check_header`]); a new file is created as version 1.
+    /// [`format::check_header`]); a new file is created as version 1. The
+    /// file's advisory lock is taken first (see the module docs): while
+    /// another process has the file open, the open fails and touches
+    /// nothing, not even the log.
     pub fn open<P: AsRef<Path>>(path: P, capacity: usize) -> Result<Pager> {
         let path = path.as_ref();
         let wal_path = wal_path_for(path);
@@ -310,6 +354,9 @@ impl Pager {
             .create(true)
             .truncate(false)
             .open(path)?;
+        let lock = lock_file(&file, path)?;
+        // Until the pager owns it, an early return gives the share back.
+        let share = LockShare(Some(lock.clone()));
         // Crash recovery: replay a fully-committed WAL into the main file (redo),
         // discard a torn one, then clear the log — before reading the header.
         // A log that exists but cannot be read fails the open.
@@ -333,10 +380,13 @@ impl Pager {
             op_failed: false,
             write_gen: 0,
             failed: Arc::new(OnceLock::new()),
-            wal_batches: 0,
+            wal_batches: AtomicU64::new(0),
+            commit_lock: Mutex::new(()),
+            lock,
             #[cfg(test)]
             flushes: 0,
         };
+        share.disarm();
         if len == 0 {
             // Fresh file: page 0 is the header, data starts at page 1.
             p.write_header()?;
@@ -385,7 +435,82 @@ impl Pager {
     /// or a flush the cache made in the middle of the work (the dirty pages
     /// of a large operation outgrew it).
     pub fn wal_batches(&self) -> u64 {
-        self.wal_batches
+        self.wal_batches.load(Ordering::Acquire)
+    }
+
+    /// The write-ahead log of the paged file at `path`: `<path>.wal`. The one
+    /// place this rule lives (review disk#9).
+    pub fn wal_path(path: &Path) -> PathBuf {
+        wal_path_for(path)
+    }
+
+    /// Remove the paged file at `path` together with its write-ahead log (and
+    /// a staged log), the log first, then make the removals durable: a log
+    /// must never outlive its file, or it would replay into a new file
+    /// created at the path. "Not found" counts as removed; every other error
+    /// is returned — with the file still in place when the log could not be
+    /// removed (review disk#9: callers used to ignore these errors).
+    pub fn remove_with_wal(path: &Path) -> Result<()> {
+        let wal = wal_path_for(path);
+        let mut removed = false;
+        for victim in [wal_tmp_path(&wal), wal, path.to_path_buf()] {
+            match std::fs::remove_file(&victim) {
+                Ok(()) => removed = true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(GStoreError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!("cannot remove '{}': {e}", victim.display()),
+                    )))
+                }
+            }
+        }
+        if removed {
+            sync_parent_dir(path)?;
+        }
+        Ok(())
+    }
+
+    /// Read access to a pager shared behind `lock` (a
+    /// [`DiskStore`](super::DiskStore), its views and its out-of-core
+    /// dictionary). A lock poisoned by a panic under the write guard is
+    /// recovered — the pages are consistent: an operation unwinding rolls
+    /// back — and the pager is marked failed (see
+    /// [`lock_write`](Self::lock_write)), so reads go on and writes are
+    /// refused (review conc#8).
+    pub fn lock_read(lock: &RwLock<Pager>) -> RwLockReadGuard<'_, Pager> {
+        lock.read().unwrap_or_else(|poisoned| {
+            let guard = poisoned.into_inner();
+            guard.note_poisoned();
+            guard
+        })
+    }
+
+    /// Write access to a pager shared behind `lock`. On a lock poisoned by a
+    /// panic under the write guard the pager is marked failed — the panic
+    /// may have stopped a commit half-way — so every write and commit is
+    /// refused with [`GStoreError::StorageFailed`] until the file is
+    /// reopened (which replays a complete log), instead of panicking
+    /// (review conc#8).
+    pub fn lock_write(lock: &RwLock<Pager>) -> RwLockWriteGuard<'_, Pager> {
+        lock.write().unwrap_or_else(|poisoned| {
+            let guard = poisoned.into_inner();
+            guard.note_poisoned();
+            guard
+        })
+    }
+
+    fn note_poisoned(&self) {
+        self.mark_failed(
+            "a panic happened while the pager was locked for writing; nothing more is \
+             written until the database is reopened",
+        );
+    }
+
+    /// The buffer cache (a poisoned cache lock is recovered: every critical
+    /// section leaves the cache consistent).
+    fn cache(&self) -> MutexGuard<'_, CacheState> {
+        self.cache.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The flag behind [`failure`](Self::failure), for a store sharing this
@@ -514,7 +639,7 @@ impl Pager {
     /// not change the bytes behind a handle already returned.
     pub fn read_page_shared(&self, id: PageId) -> Result<Arc<Page>> {
         {
-            let mut cache = self.cache.lock().unwrap();
+            let mut cache = self.cache();
             if let Some(&i) = cache.map.get(&id) {
                 let f = &mut cache.frames[i];
                 f.referenced = true;
@@ -523,7 +648,7 @@ impl Pager {
         }
         // Miss: read from the file without holding the cache lock.
         let data = Arc::new(self.read_from_file(id)?);
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self.cache();
         if let Some(&i) = cache.map.get(&id) {
             // A concurrent reader inserted it meanwhile (same bytes).
             return Ok(Arc::clone(&cache.frames[i].data));
@@ -550,7 +675,7 @@ impl Pager {
         self.write_gen += 1;
         let gen = (self.op_depth > 0).then_some(self.op_gen);
         // `&mut self` ⇒ exclusive access; reach the cache without locking.
-        let cache = self.cache.get_mut().unwrap();
+        let cache = self.cache.get_mut().unwrap_or_else(PoisonError::into_inner);
         if let Some(&i) = cache.map.get(&id) {
             let f = &mut cache.frames[i];
             if let Some(g) = gen {
@@ -582,7 +707,7 @@ impl Pager {
     /// first (then every page is clean).
     fn insert_dirty(&mut self, id: PageId, data: Arc<Page>, op_gen: u64) -> Result<()> {
         loop {
-            let cache = self.cache.get_mut().unwrap();
+            let cache = self.cache.get_mut().unwrap_or_else(PoisonError::into_inner);
             let slot = if cache.frames.len() < self.capacity {
                 Some(None)
             } else {
@@ -674,33 +799,57 @@ impl Pager {
     /// log holds the batch, the next open replays it, and until then nothing
     /// is written (see the module docs).
     pub fn flush(&mut self) -> Result<()> {
+        let staged = self.commit_shared()?;
+        self.finish_commit(staged)
+    }
+
+    /// The durable steps of a [`flush`](Self::flush) through `&self`, so a
+    /// store sharing the pager runs them under a **shared** guard and its
+    /// readers go on meanwhile (review disk#10): the batch (the header and
+    /// every dirty page, as shared handles) is taken, then checksummed and
+    /// written to the log, applied to the file and fsynced as `flush`
+    /// describes — every page of the batch is resident and dirty, so no
+    /// reader reads it from the file in between. A writer cannot run while
+    /// the guard is held. The batch's pages stay dirty until
+    /// [`finish_commit`](Self::finish_commit), under the exclusive guard,
+    /// marks them clean. Concurrent calls are serialized.
+    ///
+    /// `Err` (nothing done) for a failed pager or an open operation; the
+    /// outcome of the steps themselves comes back from `finish_commit`.
+    pub fn commit_shared(&self) -> Result<StagedCommit> {
         self.check_writable()?;
         if self.op_depth > 0 {
             return Err(GStoreError::Database(
                 "cannot commit the page cache inside an open operation".into(),
             ));
         }
+        let _serial = self
+            .commit_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         // The committed batch: the header (page 0) plus all dirty pages.
         let header = Arc::new(self.header_bytes());
         let mut batch: Vec<(PageId, Arc<Page>)> = vec![(0, header)];
-        {
-            let cache = self.cache.get_mut().unwrap();
-            batch.extend(
-                cache
-                    .frames
-                    .iter()
-                    .filter(|f| f.dirty)
-                    .map(|f| (f.id, Arc::clone(&f.data))),
-            );
-        }
+        batch.extend(
+            self.cache()
+                .frames
+                .iter()
+                .filter(|f| f.dirty)
+                .map(|f| (f.id, Arc::clone(&f.data))),
+        );
 
         // 1. Write-ahead: stage the log under a temporary name and fsync it,
         //    then give it its name. Nothing on disk changed if this fails.
-        write_wal(&self.wal_path, &batch)?;
-        self.wal_batches += 1;
+        if let Err(e) = write_wal(&self.wal_path, &batch) {
+            return Ok(StagedCommit {
+                batch,
+                outcome: Err(e),
+            });
+        }
+        self.wal_batches.fetch_add(1, Ordering::AcqRel);
         // From here the log may be durable: an error leaves the file possibly
         // half-applied, which only a replay of the log can finish.
-        if let Err(e) = self.apply_committed(&batch) {
+        let outcome = self.apply_committed(&batch).map_err(|e| {
             let why = format!(
                 "a committed page batch could not be applied to '{}' ({e}); it stays in the \
                  write-ahead log '{}', which the next open replays",
@@ -708,19 +857,34 @@ impl Pager {
                 self.wal_path.display()
             );
             self.mark_failed(why.clone());
-            return Err(GStoreError::StorageFailed(
-                self.failure().map_or(why, str::to_string),
-            ));
+            GStoreError::StorageFailed(self.failure().map_or(why, str::to_string))
+        });
+        Ok(StagedCommit { batch, outcome })
+    }
+
+    /// End a commit begun by [`commit_shared`](Self::commit_shared) (under
+    /// the exclusive guard): its error, if a step failed — the pages stay
+    /// dirty, and a failure after the log got its name left the pager failed
+    /// — else every page of the batch is marked clean unless a writer
+    /// changed it since (it then stays dirty for the next commit), and the
+    /// cache returns to its capacity.
+    pub fn finish_commit(&mut self, staged: StagedCommit) -> Result<()> {
+        let StagedCommit { batch, outcome } = staged;
+        outcome?;
+        let capacity = self.capacity;
+        let cache = self.cache.get_mut().unwrap_or_else(PoisonError::into_inner);
+        for (id, data) in &batch[1..] {
+            let Some(&i) = cache.map.get(id) else {
+                continue;
+            };
+            let f = &mut cache.frames[i];
+            if f.dirty && Arc::ptr_eq(&f.data, data) {
+                f.dirty = false;
+                cache.dirty -= 1;
+            }
         }
         drop(batch);
-
-        // Every cached page is clean now; return to capacity.
-        let cache = self.cache.get_mut().unwrap();
-        for f in &mut cache.frames {
-            f.dirty = false;
-        }
-        cache.dirty = 0;
-        cache.trim(self.capacity);
+        cache.trim(capacity);
         #[cfg(test)]
         {
             self.flushes += 1;
@@ -729,22 +893,41 @@ impl Pager {
     }
 
     /// Steps 2 and 3 of a flush, once the batch's log has its name: make the
-    /// name durable, apply the batch to the main file and fsync it, remove
-    /// the log and make the removal durable.
-    fn apply_committed(&mut self, batch: &[(PageId, Arc<Page>)]) -> Result<()> {
+    /// name durable, apply the batch to the main file (positioned writes, so
+    /// a shared guard suffices) and fsync it, remove the log and make the
+    /// removal durable.
+    fn apply_committed(&self, batch: &[(PageId, Arc<Page>)]) -> Result<()> {
         sync_parent_dir(&self.wal_path)?;
         for (i, (id, data)) in batch.iter().enumerate() {
             #[cfg(test)]
             failpoints::apply(i)?;
             #[cfg(not(test))]
             let _ = i;
-            self.file
-                .seek(SeekFrom::Start(*id as u64 * PAGE_SIZE as u64))?;
-            self.file.write_all(&data[..])?;
+            self.write_page_at(*id, data)?;
         }
         self.file.sync_all()?;
         remove_wal(&self.wal_path)?;
         sync_parent_dir(&self.wal_path)
+    }
+
+    /// Write page `id` of the file at its offset, through `&self`.
+    fn write_page_at(&self, id: PageId, data: &Page) -> std::io::Result<()> {
+        let offset = id as u64 * PAGE_SIZE as u64;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            self.file.write_all_at(&data[..], offset)
+        }
+        #[cfg(not(unix))]
+        {
+            let _cursor = self
+                .seek_lock
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let mut f = &self.file;
+            f.seek(SeekFrom::Start(offset))?;
+            f.write_all(&data[..])
+        }
     }
 
     /// Number of allocated pages (including the header).
@@ -760,12 +943,12 @@ impl Pager {
 
     /// Number of dirty (uncommitted) pages in the cache.
     pub fn dirty_pages(&self) -> usize {
-        self.cache.lock().unwrap().dirty
+        self.cache().dirty
     }
 
     /// Number of pages currently cached.
     pub fn cached_pages(&self) -> usize {
-        self.cache.lock().unwrap().frames.len()
+        self.cache().frames.len()
     }
 
     // ---- operation brackets -------------------------------------------------
@@ -835,7 +1018,7 @@ impl Pager {
     fn rollback_op(&mut self) {
         self.write_gen += 1;
         let undo = std::mem::take(&mut self.op_undo);
-        let cache = self.cache.get_mut().unwrap();
+        let cache = self.cache.get_mut().unwrap_or_else(PoisonError::into_inner);
         for (id, before) in undo.into_iter().rev() {
             let Some(&i) = cache.map.get(&id) else {
                 continue;
@@ -863,7 +1046,7 @@ impl Pager {
 
     /// Bring the cache back to its capacity after an operation that grew it.
     fn restore_capacity(&mut self) -> Result<()> {
-        let cache = self.cache.get_mut().unwrap();
+        let cache = self.cache.get_mut().unwrap_or_else(PoisonError::into_inner);
         if cache.frames.len() <= self.capacity {
             return Ok(());
         }
@@ -890,6 +1073,16 @@ impl Pager {
     pub(crate) fn flush_count(&self) -> u64 {
         self.flushes
     }
+}
+
+/// A commit whose durable steps ran under a shared guard
+/// ([`Pager::commit_shared`]); [`Pager::finish_commit`] ends it.
+#[must_use = "a staged commit's pages stay dirty until finish_commit"]
+pub struct StagedCommit {
+    /// The batch written (page 0 is the header).
+    batch: Vec<(PageId, Arc<Page>)>,
+    /// The outcome of the log write, the apply and the fsyncs.
+    outcome: Result<()>,
 }
 
 /// An open operation bracket on a [`Pager`] (see the module docs). Derefs to
@@ -935,7 +1128,135 @@ impl Drop for PagerOp<'_> {
     }
 }
 
-/// The WAL path beside a database file: `<path>.wal`.
+/// The identity of a paged file in this process's lock registry.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct FileKey(#[cfg(unix)] (u64, u64), #[cfg(not(unix))] PathBuf);
+
+/// One locked paged file of this process: the descriptor holding the
+/// advisory lock (a duplicate of the first pager's) and how many pagers
+/// share it.
+struct HeldFile {
+    lock: File,
+    locked: bool,
+    pagers: usize,
+}
+
+fn held_files() -> MutexGuard<'static, HashMap<FileKey, HeldFile>> {
+    static HELD: OnceLock<Mutex<HashMap<FileKey, HeldFile>>> = OnceLock::new();
+    HELD.get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Take — or, when a pager of this process holds it already, share — the
+/// advisory exclusive lock of the paged file `file` at `path` (see the
+/// module docs). Another process holding it fails the open; a file system
+/// without locks opens unlocked.
+fn lock_file(file: &File, path: &Path) -> Result<FileKey> {
+    #[cfg(unix)]
+    let key = {
+        use std::os::unix::fs::MetadataExt;
+        let m = file.metadata()?;
+        FileKey((m.dev(), m.ino()))
+    };
+    #[cfg(not(unix))]
+    let key = FileKey(std::fs::canonicalize(path)?);
+    let mut held = held_files();
+    if let Some(h) = held.get_mut(&key) {
+        h.pagers += 1;
+        return Ok(key);
+    }
+    let lock = file.try_clone()?;
+    let locked = match lock.try_lock() {
+        Ok(()) => true,
+        Err(std::fs::TryLockError::WouldBlock) => {
+            return Err(GStoreError::Database(format!(
+                "'{}' is in use: another process has it open",
+                path.display()
+            )))
+        }
+        Err(std::fs::TryLockError::Error(e)) if e.kind() == std::io::ErrorKind::Unsupported => {
+            false
+        }
+        Err(std::fs::TryLockError::Error(e)) => {
+            return Err(GStoreError::Io(std::io::Error::new(
+                e.kind(),
+                format!("cannot lock '{}': {e}", path.display()),
+            )))
+        }
+    };
+    held.insert(
+        key.clone(),
+        HeldFile {
+            lock,
+            locked,
+            pagers: 1,
+        },
+    );
+    Ok(key)
+}
+
+/// Give back a pager's share of a file's lock; the last share unlocks it
+/// explicitly before the descriptor is closed — a child process being
+/// spawned meanwhile shares the descriptor until its `exec`, and would
+/// otherwise keep the lock alive that long.
+fn release_file(key: &FileKey) {
+    let mut held = held_files();
+    let last = match held.get_mut(key) {
+        Some(h) => {
+            h.pagers -= 1;
+            h.pagers == 0
+        }
+        None => false,
+    };
+    if last {
+        if let Some(h) = held.remove(key) {
+            if h.locked {
+                let _ = h.lock.unlock();
+            }
+        }
+    }
+}
+
+/// A lock share that is given back on drop unless disarmed (the error
+/// paths of [`Pager::open`] before the pager owns it).
+struct LockShare(Option<FileKey>);
+
+impl LockShare {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for LockShare {
+    fn drop(&mut self) {
+        if let Some(key) = self.0.take() {
+            release_file(&key);
+        }
+    }
+}
+
+impl Drop for Pager {
+    fn drop(&mut self) {
+        release_file(&self.lock);
+    }
+}
+
+/// How many pagers of this process share the lock of the file at `path`
+/// (tests).
+#[cfg(all(test, unix))]
+pub(crate) fn lock_shares(path: &Path) -> usize {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(m) = std::fs::metadata(path) else {
+        return 0;
+    };
+    held_files()
+        .get(&FileKey((m.dev(), m.ino())))
+        .map_or(0, |h| h.pagers)
+}
+
+/// The WAL path beside a database file: `<path>.wal` (public as
+/// [`Pager::wal_path`]; the only derivation of the rule).
 fn wal_path_for(path: &Path) -> PathBuf {
     let mut s = path.as_os_str().to_owned();
     s.push(".wal");
@@ -989,38 +1310,82 @@ fn read_wal(path: &Path) -> std::io::Result<Vec<u8>> {
     std::fs::read(path)
 }
 
+/// The buffer a log is streamed through (the batch is never copied whole).
+const WAL_BUFFER: usize = 1 << 20;
+
+/// The staged log file; under test it carries the "fail after `n` bytes"
+/// failpoint ([`failpoints::fail_wal_write_after`]).
+struct WalFile {
+    file: File,
+    #[cfg(test)]
+    budget: Option<usize>,
+}
+
+impl Write for WalFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        #[cfg(test)]
+        if let Some(left) = self.budget {
+            if left == 0 {
+                self.file.sync_all()?;
+                return Err(failpoints::wal_write_failed());
+            }
+            let n = self.file.write(&buf[..buf.len().min(left)])?;
+            self.budget = Some(left - n);
+            return Ok(n);
+        }
+        self.file.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
 /// Serialize a committed batch and give it the WAL's name durably-ready:
 /// written and fsynced under [`wal_tmp_path`], then renamed over `path` (an
 /// existing log is replaced atomically, never truncated). The caller fsyncs
 /// the directory before it touches the main file. On an error the staged
-/// file is removed and `path` is as it was.
+/// file is removed and `path` is as it was. The record is streamed through
+/// a bounded buffer with its checksum computed on the way (review disk#10:
+/// the whole batch used to be copied into one buffer first).
 fn write_wal<P: Deref<Target = Page>>(path: &Path, batch: &[(PageId, P)]) -> Result<()> {
-    let mut buf = Vec::with_capacity(8 + 4 + batch.len() * (4 + PAGE_SIZE) + 12);
-    buf.extend_from_slice(WAL_MAGIC);
-    buf.extend_from_slice(&(batch.len() as u32).to_le_bytes());
-    for (id, data) in batch {
-        buf.extend_from_slice(&id.to_le_bytes());
-        buf.extend_from_slice(&data[..]);
-    }
-    // Checksum covers the count + entries (everything after the magic).
-    let crc = crc32(&buf[8..]);
-    buf.extend_from_slice(&crc.to_le_bytes());
-    buf.extend_from_slice(COMMIT_MAGIC);
-
     let tmp = wal_tmp_path(path);
     let staged = (|| -> Result<()> {
         // The staging file is never a log anyone replays, so truncating a
         // leftover one is harmless.
-        let mut f = OpenOptions::new()
+        let file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .open(&tmp)?;
         #[cfg(test)]
-        failpoints::wal_write(&mut f, &buf)?;
-        f.write_all(&buf)?;
-        f.sync_all()?;
-        drop(f);
+        failpoints::park_in_wal_write();
+        let mut w = BufWriter::with_capacity(
+            WAL_BUFFER,
+            WalFile {
+                file,
+                #[cfg(test)]
+                budget: failpoints::wal_write_budget(),
+            },
+        );
+        let mut crc = Crc32::new();
+        let mut body = |w: &mut BufWriter<WalFile>, bytes: &[u8]| -> std::io::Result<()> {
+            crc.update(bytes);
+            w.write_all(bytes)
+        };
+        w.write_all(WAL_MAGIC)?;
+        // The checksum covers the count and the entries (everything after
+        // the magic).
+        body(&mut w, &(batch.len() as u32).to_le_bytes())?;
+        for (id, data) in batch {
+            body(&mut w, &id.to_le_bytes())?;
+            body(&mut w, &data[..])?;
+        }
+        w.write_all(&crc.finish().to_le_bytes())?;
+        w.write_all(COMMIT_MAGIC)?;
+        let file = w.into_inner().map_err(|e| e.into_error())?.file;
+        file.sync_all()?;
+        drop(file);
         std::fs::rename(&tmp, path)?;
         Ok(())
     })();
@@ -1095,18 +1460,77 @@ fn parse_wal(data: &[u8]) -> Option<Vec<(PageId, [u8; PAGE_SIZE])>> {
     Some(out)
 }
 
-/// CRC-32 (IEEE 802.3, reflected) — a dependency-free integrity check for WAL
-/// records. Not cryptographic; only detects accidental corruption / torn writes.
-fn crc32(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for &b in data {
-        crc ^= b as u32;
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg(); // 0x0 or 0xFFFFFFFF
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+/// The slicing-by-8 tables of the CRC-32 (IEEE 802.3, reflected polynomial
+/// `0xEDB88320`): `T[0]` is the classic byte table, `T[k][b]` the CRC of
+/// byte `b` followed by `k` zero bytes.
+const CRC_TABLES: [[u32; 256]; 8] = {
+    let mut t = [[0u32; 256]; 8];
+    let mut b = 0;
+    while b < 256 {
+        let mut crc = b as u32;
+        let mut k = 0;
+        while k < 8 {
+            crc = (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg());
+            k += 1;
         }
+        t[0][b] = crc;
+        b += 1;
     }
-    !crc
+    let mut b = 0;
+    while b < 256 {
+        let mut k = 1;
+        while k < 8 {
+            let prev = t[k - 1][b];
+            t[k][b] = (prev >> 8) ^ t[0][(prev & 0xFF) as usize];
+            k += 1;
+        }
+        b += 1;
+    }
+    t
+};
+
+/// A running CRC-32 (IEEE 802.3, reflected) — a dependency-free integrity
+/// check for WAL records. Not cryptographic; only detects accidental
+/// corruption / torn writes. Table-driven, eight bytes per step (review
+/// disk#10: the bit-at-a-time loop took ~90 ms per 16 MiB batch).
+struct Crc32(u32);
+
+impl Crc32 {
+    fn new() -> Crc32 {
+        Crc32(0xFFFF_FFFF)
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        let t = &CRC_TABLES;
+        let mut crc = self.0;
+        let (chunks, rest) = data.as_chunks::<8>();
+        for c in chunks {
+            let lo = crc ^ u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            crc = t[7][(lo & 0xFF) as usize]
+                ^ t[6][((lo >> 8) & 0xFF) as usize]
+                ^ t[5][((lo >> 16) & 0xFF) as usize]
+                ^ t[4][(lo >> 24) as usize]
+                ^ t[3][c[4] as usize]
+                ^ t[2][c[5] as usize]
+                ^ t[1][c[6] as usize]
+                ^ t[0][c[7] as usize];
+        }
+        for &b in rest {
+            crc = (crc >> 8) ^ t[0][((crc ^ u32::from(b)) & 0xFF) as usize];
+        }
+        self.0 = crc;
+    }
+
+    fn finish(&self) -> u32 {
+        !self.0
+    }
+}
+
+/// The CRC-32 of `data` (see [`Crc32`]).
+fn crc32(data: &[u8]) -> u32 {
+    let mut c = Crc32::new();
+    c.update(data);
+    c.finish()
 }
 
 /// Test-only failpoints of the commit path and of recovery, standing in for
@@ -1116,8 +1540,7 @@ fn crc32(data: &[u8]) -> u32 {
 #[cfg(test)]
 pub(crate) mod failpoints {
     use std::cell::Cell;
-    use std::fs::File;
-    use std::io::{self, Write};
+    use std::io;
     use std::path::Path;
 
     thread_local! {
@@ -1126,6 +1549,8 @@ pub(crate) mod failpoints {
         static WAL_DELETE: Cell<bool> = const { Cell::new(false) };
         static WAL_UNREADABLE: Cell<bool> = const { Cell::new(false) };
         static DIR_SYNCS: Cell<u64> = const { Cell::new(0) };
+        static PARK_WAL_WRITE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
     }
 
     fn injected(what: &str) -> io::Error {
@@ -1144,6 +1569,7 @@ pub(crate) mod failpoints {
             WAL_WRITE_AFTER.with(|c| c.set(None));
             WAL_DELETE.with(|c| c.set(false));
             WAL_UNREADABLE.with(|c| c.set(false));
+            PARK_WAL_WRITE.with(|c| c.borrow_mut().take());
         }
     }
 
@@ -1188,14 +1614,27 @@ pub(crate) mod failpoints {
         }
     }
 
-    pub(super) fn wal_write(f: &mut File, buf: &[u8]) -> io::Result<()> {
-        match WAL_WRITE_AFTER.with(Cell::get) {
-            Some(n) => {
-                f.write_all(&buf[..n.min(buf.len())])?;
-                f.sync_all()?;
-                Err(injected("writing the write-ahead log"))
-            }
-            None => Ok(()),
+    /// The bytes a staged log may take before its write fails, if armed.
+    pub(super) fn wal_write_budget() -> Option<usize> {
+        WAL_WRITE_AFTER.with(Cell::get)
+    }
+
+    pub(super) fn wal_write_failed() -> io::Error {
+        injected("writing the write-ahead log")
+    }
+
+    /// Park this thread's next log write (after its staging file is
+    /// created) in `hook`, which runs once: a test holds a commit there
+    /// while it checks what other threads can do meanwhile.
+    pub(crate) fn park_next_wal_write(hook: impl FnOnce() + 'static) -> Armed {
+        PARK_WAL_WRITE.with(|c| *c.borrow_mut() = Some(Box::new(hook)));
+        Armed
+    }
+
+    pub(super) fn park_in_wal_write() {
+        let hook = PARK_WAL_WRITE.with(|c| c.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
         }
     }
 
@@ -1226,6 +1665,100 @@ mod tests {
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_file(wal_path_for(&p));
         p
+    }
+
+    /// The bit-at-a-time CRC-32 the log used before (review disk#10), as
+    /// the reference for the table-driven one.
+    fn crc32_bitwise(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &b in data {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg());
+            }
+        }
+        !crc
+    }
+
+    #[test]
+    fn the_table_driven_crc_equals_the_bitwise_one() {
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926, "the IEEE check value");
+        assert_eq!(crc32(b""), 0);
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let data: Vec<u8> = (0..3 * PAGE_SIZE + 13)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        for len in [0, 1, 7, 8, 9, 63, 4096, 4100, data.len()] {
+            assert_eq!(
+                crc32(&data[..len]),
+                crc32_bitwise(&data[..len]),
+                "{len} bytes"
+            );
+        }
+        // Fed in pieces of any size, as the log writer feeds it.
+        let mut c = Crc32::new();
+        for piece in data.chunks(1000) {
+            c.update(piece);
+        }
+        assert_eq!(c.finish(), crc32_bitwise(&data));
+    }
+
+    /// Review disk#9: the advisory lock is shared by the pagers of this
+    /// process on one file and given back by the last of them (another
+    /// process is refused meanwhile: `tests/storage_kernel_regressions.rs`).
+    #[cfg(unix)]
+    #[test]
+    fn pagers_of_one_process_share_the_file_lock() {
+        let path = tmp("lock_share");
+        let _files = Files(path.clone());
+        let a = Pager::open(&path, 16).unwrap();
+        assert_eq!(lock_shares(&path), 1);
+        let b = Pager::open(&path, 16).unwrap();
+        assert_eq!(lock_shares(&path), 2);
+        drop(a);
+        assert_eq!(lock_shares(&path), 1, "the lock stays while a pager lives");
+        drop(b);
+        assert_eq!(lock_shares(&path), 0, "given back by the last pager");
+        // An open that fails after taking its share gives it back.
+        std::fs::write(&path, [0u8; 100]).unwrap();
+        assert!(Pager::open(&path, 16).is_err(), "not a pager file");
+        assert_eq!(lock_shares(&path), 0);
+    }
+
+    /// Review disk#9: `remove_with_wal` removes a file with its logs,
+    /// "not found" is not an error, any other error is — and the file stays
+    /// when its log could not be removed.
+    #[test]
+    fn remove_with_wal_removes_the_log_first_and_reports_errors() {
+        let path = tmp("remove_with_wal");
+        let _files = Files(path.clone());
+        drop(Pager::open(&path, 8).unwrap());
+        let wal = Pager::wal_path(&path);
+        assert_eq!(wal, wal_path_for(&path));
+        std::fs::write(&wal, b"log").unwrap();
+        std::fs::write(wal_tmp_path(&wal), b"staged").unwrap();
+        Pager::remove_with_wal(&path).unwrap();
+        assert!(!path.exists() && !wal.exists() && !wal_tmp_path(&wal).exists());
+        Pager::remove_with_wal(&path).expect("nothing there is not an error");
+        // A log that cannot be removed (a directory): the error names it and
+        // the file is kept.
+        struct RmDir(PathBuf);
+        impl Drop for RmDir {
+            fn drop(&mut self) {
+                std::fs::remove_dir_all(&self.0).ok();
+            }
+        }
+        drop(Pager::open(&path, 8).unwrap());
+        let _dir = RmDir(wal.clone());
+        std::fs::create_dir_all(wal.join("x")).unwrap();
+        let e = Pager::remove_with_wal(&path).expect_err("the log stays");
+        assert!(e.to_string().contains(".wal"), "{e}");
+        assert!(path.exists(), "the file is not removed without its log");
     }
 
     #[test]

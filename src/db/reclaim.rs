@@ -102,6 +102,16 @@ static DEFAULT_POLICY: AtomicU8 = AtomicU8::new(0);
 /// Install the policy new databases of this process start with (a server
 /// installs `conf.ini`'s `[system] id_reclaim`). The environment
 /// ([`ENV_ID_RECLAIM`]) still overrides it.
+///
+/// The policy also chooses the format of the store files this process
+/// *creates* — and only of those (review disk#8 / design#6): a new
+/// `kvstore.kv` keeps a free-id list (version 2) when it is on, none
+/// (version 1) when it is off. It reaches them explicitly, through
+/// [`OpenOptions::free_ids_if_new`](super::OpenOptions::free_ids_if_new)
+/// (filled by [`default_open_options`](super::default_open_options)) and
+/// [`BulkOptions::free_ids`](crate::bulk::BulkOptions::free_ids). A file that
+/// exists keeps the format its header records whatever the policy; only
+/// `gcompact --enable-reclaim` upgrades one.
 pub fn set_default_id_reclaim(policy: IdReclaim) {
     let v = match policy {
         IdReclaim::Immediate => 1,
@@ -113,11 +123,18 @@ pub fn set_default_id_reclaim(policy: IdReclaim) {
 /// The policy a new database starts with: [`ENV_ID_RECLAIM`] when it is set
 /// to a valid value, else the installed default, else
 /// [`IdReclaim::Immediate`]. An invalid environment value is logged once and
-/// ignored.
+/// ignored. (Which files it chooses the format of: see
+/// [`set_default_id_reclaim`].)
 pub fn default_id_reclaim() -> IdReclaim {
+    configured_id_reclaim().unwrap_or(IdReclaim::Immediate)
+}
+
+/// The policy the environment or [`set_default_id_reclaim`] set, if either
+/// did (see [`default_id_reclaim`]).
+pub(crate) fn configured_id_reclaim() -> Option<IdReclaim> {
     if let Ok(v) = std::env::var(ENV_ID_RECLAIM) {
         match v.parse::<IdReclaim>() {
-            Ok(p) => return p,
+            Ok(p) => return Some(p),
             Err(e) => {
                 static WARNED: std::sync::Once = std::sync::Once::new();
                 WARNED.call_once(|| crate::gs_warn!("{ENV_ID_RECLAIM}: {e}; ignored"));
@@ -125,8 +142,9 @@ pub fn default_id_reclaim() -> IdReclaim {
         }
     }
     match DEFAULT_POLICY.load(Ordering::Relaxed) {
-        2 => IdReclaim::Off,
-        _ => IdReclaim::Immediate,
+        1 => Some(IdReclaim::Immediate),
+        2 => Some(IdReclaim::Off),
+        _ => None,
     }
 }
 

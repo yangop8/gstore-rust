@@ -329,11 +329,17 @@ fn workload(layout: Layout, seed: u64, ops: usize, check_every: usize) {
     assert!(db.reclaims_ids(), "{layout:?} frees ids");
     let queries = lubm_queries();
     let mut rng = Rng(seed);
-    let mut peak_live = 0usize;
+    // review tests-b#4: the most live terms of each space after any
+    // operation — what lowest-first reuse keeps the id space near.
+    let mut peak = [0u64; 3];
     for step in 0..ops {
         let op = random_op(&mut rng, &base, &pool, false);
         apply(&mut oracle, &op);
         apply(&mut db, &op);
+        let now = db.id_space_stats().live;
+        for (p, n) in peak.iter_mut().zip(now) {
+            *p = (*p).max(n);
+        }
         let full = step % check_every == check_every - 1 || step + 1 == ops;
         if full {
             assert_eq!(
@@ -346,7 +352,6 @@ fn workload(layout: Layout, seed: u64, ops: usize, check_every: usize) {
             db.verify_integrity()
                 .unwrap_or_else(|e| panic!("{layout:?} step {step}: {e}"));
             let stats = db.id_space_stats();
-            peak_live = peak_live.max(want.0 + want.1);
             assert!(
                 stats.live.iter().sum::<u64>() as usize == want.0 + want.1,
                 "{layout:?} step {step}: {stats:?}"
@@ -366,7 +371,7 @@ fn workload(layout: Layout, seed: u64, ops: usize, check_every: usize) {
             db = reopen(layout, db, tmp.path());
         }
     }
-    // The id space stays near the live terms: lowest-first reuse.
+    // Every id below the limits is live or free (no id leaks).
     let stats = db.id_space_stats();
     let limit: u64 = stats.limits[0] + stats.limits[1];
     let live_nodes = stats.live[0] + stats.live[1];
@@ -374,6 +379,32 @@ fn workload(layout: Layout, seed: u64, ops: usize, check_every: usize) {
         limit <= live_nodes + stats.free[0] + stats.free[1],
         "{layout:?}: {stats:?}"
     );
+    // review tests-b#4: the check above holds whether or not freed ids are
+    // ever reused, so it did not test reuse (the peak was computed and never
+    // read). Lowest-first reuse keeps each space's id limit near the most
+    // terms it ever held live at once; without reuse the limit grows with
+    // every term the churn re-creates. The slack covers the terms an
+    // operation holds between its interns and its frees (a transaction
+    // frees at its commit). Checked on the open database (its working
+    // dictionary) and after a reopen, so the layout's persisted id space
+    // (Materialize: the store's own, by key; RocksDB: the `dict` column
+    // family with its holes) is measured too.
+    const SLACK: u64 = 32;
+    let bounded = |db: &Database, when: &str| {
+        let stats = db.id_space_stats();
+        for (i, space) in ["entity", "literal", "predicate"].iter().enumerate() {
+            assert!(
+                stats.limits[i] <= peak[i] + SLACK,
+                "{layout:?} {when}: the {space} id space grew to {} with at most {} live: \
+                 freed ids were not reused ({stats:?})",
+                stats.limits[i],
+                peak[i]
+            );
+        }
+    };
+    bounded(&db, "at the end");
+    let db = reopen(layout, db, tmp.path());
+    bounded(&db, "after a reopen");
     drop(db);
 }
 
@@ -399,6 +430,103 @@ fn rocksdb_matches_the_oracle() {
 }
 
 // ---- targeted cases -------------------------------------------------------------
+
+/// Review tests-b#4: lowest-first reuse on a layout, through its own
+/// persistence: two freed entity ids and two freed literal ids are reused
+/// lowest first, before and after a reopen (a freed id is persisted as
+/// free), and the reopened database agrees on every id (Materialize writes
+/// by key, so the store's own id space must make the same choice).
+fn lowest_first_reuse(layout: Layout) {
+    let tmp = TempDir::new(&format!("reuse_{layout:?}"));
+    let t = |s: &str, p: &str, o: Term| Triple::new(Term::iri(s), Term::iri(p), o);
+    let base = vec![
+        t("http://ex/a", "http://ex/p", Term::iri("http://ex/b")),
+        t("http://ex/c", "http://ex/p", Term::iri("http://ex/b")),
+        t("http://ex/d", "http://ex/p", Term::iri("http://ex/b")),
+        t("http://ex/a", "http://ex/q", Term::plain_literal("l1")),
+        t("http://ex/a", "http://ex/q", Term::plain_literal("l2")),
+        t("http://ex/a", "http://ex/q", Term::plain_literal("l3")),
+        // The highest entity ids: c and d leave holes below them (not a
+        // trim of the id space's end), so only the free list can hand them
+        // out again.
+        t("http://ex/z", "http://ex/p", Term::iri("http://ex/zz")),
+    ];
+    let lid = |db: &Database, v: &str| db.dict().literal_id(&Term::plain_literal(v).dict_key());
+    let mut db = make(layout, tmp.path(), &base);
+    let limits = db.id_space_stats().limits;
+    let (c, d) = (
+        eid(&db, "http://ex/c").unwrap(),
+        eid(&db, "http://ex/d").unwrap(),
+    );
+    assert!(c.max(d) < eid(&db, "http://ex/zz").unwrap());
+    let (l1, l2) = (lid(&db, "l1").unwrap(), lid(&db, "l2").unwrap());
+    db.query(
+        "DELETE DATA { <http://ex/d> <http://ex/p> <http://ex/b> . \
+                       <http://ex/c> <http://ex/p> <http://ex/b> . \
+                       <http://ex/a> <http://ex/q> \"l2\" . <http://ex/a> <http://ex/q> \"l1\" }",
+    )
+    .unwrap();
+    assert_eq!(
+        (eid(&db, "http://ex/c"), eid(&db, "http://ex/d")),
+        (None, None)
+    );
+    db.query("INSERT DATA { <http://ex/e> <http://ex/p> <http://ex/b> . <http://ex/a> <http://ex/q> \"m1\" }")
+        .unwrap();
+    assert_eq!(
+        eid(&db, "http://ex/e"),
+        Some(c.min(d)),
+        "{layout:?}: lowest first"
+    );
+    assert_eq!(
+        lid(&db, "m1"),
+        Some(l1.min(l2)),
+        "{layout:?}: lowest literal first"
+    );
+    let mut db = reopen(layout, db, tmp.path());
+    db.query("INSERT DATA { <http://ex/f> <http://ex/p> <http://ex/b> . <http://ex/a> <http://ex/q> \"m2\" }")
+        .unwrap();
+    assert_eq!(
+        eid(&db, "http://ex/f"),
+        Some(c.max(d)),
+        "{layout:?}: the other freed id, after a reopen"
+    );
+    assert_eq!(lid(&db, "m2"), Some(l1.max(l2)), "{layout:?}");
+    assert_eq!(
+        db.id_space_stats().limits,
+        limits,
+        "{layout:?}: no space grew"
+    );
+    let db = reopen(layout, db, tmp.path());
+    assert_eq!(
+        eid(&db, "http://ex/e"),
+        Some(c.min(d)),
+        "{layout:?}: as persisted"
+    );
+    assert_eq!(
+        eid(&db, "http://ex/f"),
+        Some(c.max(d)),
+        "{layout:?}: as persisted"
+    );
+    assert_eq!(lid(&db, "m1"), Some(l1.min(l2)), "{layout:?}: as persisted");
+    assert_eq!(lid(&db, "m2"), Some(l1.max(l2)), "{layout:?}: as persisted");
+    db.verify_integrity().unwrap();
+}
+
+#[test]
+fn materialize_reuses_freed_ids_lowest_first_across_reopens() {
+    lowest_first_reuse(Layout::Materialize);
+}
+
+#[test]
+fn stream_reuses_freed_ids_lowest_first_across_reopens() {
+    lowest_first_reuse(Layout::Stream);
+}
+
+#[cfg(feature = "rocksdb")]
+#[test]
+fn rocksdb_reuses_freed_ids_lowest_first_across_reopens() {
+    lowest_first_reuse(Layout::Rocks);
+}
 
 fn small() -> Database {
     Database::build_from_str(

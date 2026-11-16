@@ -24,6 +24,13 @@
 //! reader stays within its budget however many terms it touches; strings are
 //! handed out as `Arc<str>` (nothing is leaked).
 //!
+//! A read takes the caches' epoch *before* it reads the pages and caches
+//! what it read at that epoch ([`TermCache::insert_at`]); a free moves the
+//! epoch under the pager's write lock. So a value read before a free is
+//! never cached after it, whatever the interleaving of readers and frees
+//! (review disk#6, conc#12, db#20; the check runs under the cache shard's
+//! lock, see [`crate::dict::cache`]).
+//!
 //! ## Interning (Stream mode)
 //! [`intern`](DiskTermSource::intern) adds a term through the shared pager:
 //! its id is the lowest free id of its space when the file has the
@@ -275,6 +282,11 @@ pub struct DiskDict {
     writable: bool,
     /// Asked before every write (see [`with_write_check`](Self::with_write_check)).
     write_check: Option<WriteCheck>,
+    /// Test hook: called by a cache-filling read between reading the pages
+    /// and caching what it read, so a test can park the read there and run
+    /// a free meanwhile (review disk#6).
+    #[cfg(test)]
+    read_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// What a writable [`DiskDict`] asks before it writes a term: `Err` refuses
@@ -338,6 +350,8 @@ impl DiskDict {
             cache_epoch: AtomicU64::new(0),
             writable: false,
             write_check: None,
+            #[cfg(test)]
+            read_hook: None,
         }
     }
 
@@ -356,7 +370,7 @@ impl DiskDict {
     /// with the term counts read from its header now.
     pub fn open_shared(pager: Arc<RwLock<Pager>>) -> Result<DiskDict> {
         let (counts, free) = {
-            let p = pager.read().unwrap_or_else(|e| e.into_inner());
+            let p = Pager::lock_read(&pager);
             let dense = |slot: usize, what: &str| -> Result<usize> {
                 let n = p.root(slot);
                 if n > ivarray::CAPACITY as u64 {
@@ -531,18 +545,23 @@ impl DiskDict {
     }
 
     fn pager(&self) -> std::sync::RwLockReadGuard<'_, Pager> {
-        // A reader that panicked cannot have left the pager half-written.
-        self.pager.read().unwrap_or_else(|e| e.into_inner())
+        // Poison-tolerant, as every user of a shared pager (review conc#8).
+        Pager::lock_read(&self.pager)
     }
 
-    fn fresh_terms(&self) {
-        self.terms
-            .check_generation(self.cache_epoch.load(Ordering::Acquire));
+    /// Run the test hook (see `read_hook`).
+    #[inline]
+    fn after_read(&self) {
+        #[cfg(test)]
+        if let Some(hook) = &self.read_hook {
+            hook();
+        }
     }
 
-    fn fresh_keys(&self) {
-        self.keys
-            .check_generation(self.cache_epoch.load(Ordering::Acquire));
+    /// The caches' epoch now: taken by a read before it reads the pages,
+    /// and passed with what it caches (see the module docs).
+    fn epoch(&self) -> u64 {
+        self.cache_epoch.load(Ordering::Acquire)
     }
 
     /// Read the strings of `keys` (array keys, ascending, within `arr`'s
@@ -582,8 +601,8 @@ fn decode(bytes: &[u8]) -> Arc<str> {
 
 impl DiskTermSource for DiskDict {
     fn lookup(&self, space: Space, key: &str) -> Result<Option<u32>> {
-        self.fresh_keys();
-        if let Some(id) = self.keys.get(space, key) {
+        let epoch = self.epoch();
+        if let Some(id) = self.keys.get_at(space, key, epoch) {
             return Ok(Some(id));
         }
         // The literal tree stores the *public* id (offset by LITERAL_FIRST_ID).
@@ -592,10 +611,11 @@ impl DiskTermSource for DiskDict {
             .get_with(&self.pager(), key.as_bytes(), |v| {
                 <[u8; 4]>::try_from(v).map(u32::from_be_bytes)
             })?;
+        self.after_read();
         match found {
             None => Ok(None),
             Some(Ok(id)) => {
-                self.keys.insert(space, key, id);
+                self.keys.insert_at(space, key, id, epoch);
                 Ok(Some(id))
             }
             Some(Err(_)) => Err(GStoreError::Database(format!(
@@ -606,16 +626,17 @@ impl DiskTermSource for DiskDict {
     }
 
     fn resolve(&self, space: Space, id: u32) -> Result<Option<Arc<str>>> {
-        self.fresh_terms();
-        if let Some(s) = self.terms.get(space, id) {
+        let epoch = self.epoch();
+        if let Some(s) = self.terms.get_at(space, id, epoch) {
             return Ok(Some(s));
         }
         let Some((arr, key)) = self.slot(space, id) else {
             return Ok(None);
         };
         let s = arr.get_with(&self.pager(), key, decode)?;
+        self.after_read();
         if let Some(s) = &s {
-            self.terms.insert(space, id, Arc::clone(s));
+            self.terms.insert_at(space, id, Arc::clone(s), epoch);
         }
         Ok(s)
     }
@@ -638,8 +659,11 @@ impl DiskTermSource for DiskDict {
         if let Some(check) = &self.write_check {
             check()?;
         }
-        let (id, new) = {
-            let mut guard = self.pager.write().unwrap_or_else(|e| e.into_inner());
+        let (id, new, epoch) = {
+            let mut guard = Pager::lock_write(&self.pager);
+            // The epoch the pages are at: a free moves it only under this
+            // lock, so what this intern caches below is current at it.
+            let epoch = self.epoch();
             let mut op = PagerOp::begin(&mut guard);
             // A panic (a bug) is rolled back like an error instead of
             // unwinding through the write guard, which would poison the
@@ -661,7 +685,7 @@ impl DiskTermSource for DiskDict {
                         // Visible to readers only now that the pages hold it.
                         self.reload_roots(&guard, space);
                     }
-                    r
+                    (r.0, r.1, epoch)
                 }
                 Err(e) => {
                     drop(op); // rolls the pages and the header back
@@ -672,10 +696,8 @@ impl DiskTermSource for DiskDict {
         if new {
             self.generation.fetch_add(1, Ordering::AcqRel);
         }
-        self.fresh_keys();
-        self.keys.insert(space, key, id);
-        self.fresh_terms();
-        self.terms.insert(space, id, Arc::from(key));
+        self.keys.insert_at(space, key, id, epoch);
+        self.terms.insert_at(space, id, Arc::from(key), epoch);
         Ok(id)
     }
 
@@ -695,7 +717,7 @@ impl DiskTermSource for DiskDict {
             check()?;
         }
         let freed = {
-            let mut guard = self.pager.write().unwrap_or_else(|e| e.into_inner());
+            let mut guard = Pager::lock_write(&self.pager);
             if !frees_ids(&guard) {
                 return Ok(false);
             }
@@ -715,6 +737,11 @@ impl DiskTermSource for DiskDict {
                     }
                     if freed {
                         self.reload_roots(&guard, space);
+                        // An id and a key changed meaning: both caches are
+                        // emptied. The epoch moves under the write lock, so
+                        // every read of the old pages took the old epoch.
+                        self.cache_epoch.fetch_add(1, Ordering::AcqRel);
+                        self.generation.fetch_add(1, Ordering::AcqRel);
                     }
                     freed
                 }
@@ -724,25 +751,20 @@ impl DiskTermSource for DiskDict {
                 }
             }
         };
-        if freed {
-            // An id and a key changed meaning: both caches are emptied.
-            self.cache_epoch.fetch_add(1, Ordering::AcqRel);
-            self.generation.fetch_add(1, Ordering::AcqRel);
-        }
         Ok(freed)
     }
 
     /// One cache probe per id; the misses are read run by run in id order
     /// and cached.
     fn resolve_sorted(&self, space: Space, ids: &[u32]) -> Result<Vec<Option<Arc<str>>>> {
-        self.fresh_terms();
+        let epoch = self.epoch();
         let first = space.first_id();
         let mut out: Vec<Option<Arc<str>>> = Vec::with_capacity(ids.len());
         // (position in `ids`, array key) of each miss, ascending.
         let mut missing: Vec<(usize, u32)> = Vec::new();
         let mut arr = None;
         for (i, &id) in ids.iter().enumerate() {
-            let hit = self.terms.get(space, id);
+            let hit = self.terms.get_at(space, id, epoch);
             if hit.is_none() {
                 if let Some((a, key)) = self.slot(space, id) {
                     arr = Some(a);
@@ -763,14 +785,14 @@ impl DiskTermSource for DiskDict {
                         break;
                     }
                 }
-                self.terms.insert(space, id, s);
+                self.terms.insert_at(space, id, s, epoch);
             })?;
         }
         Ok(out)
     }
 
     fn prefetch(&self, space: Space, ids: &[u32]) -> Result<()> {
-        self.fresh_terms();
+        let epoch = self.epoch();
         let first = space.first_id();
         let mut missing: Vec<u32> = Vec::new();
         let mut arr = None;
@@ -779,7 +801,7 @@ impl DiskTermSource for DiskDict {
                 continue;
             };
             arr = Some(a);
-            if !self.terms.contains(space, id) {
+            if !self.terms.contains_at(space, id, epoch) {
                 missing.push(key);
             }
         }
@@ -788,7 +810,7 @@ impl DiskTermSource for DiskDict {
         };
         let pager = self.pager();
         self.read_keys(&pager, arr, first, &missing, &mut |id, s| {
-            self.terms.insert(space, id, s)
+            self.terms.insert_at(space, id, s, epoch)
         })
     }
 
@@ -980,9 +1002,7 @@ mod tests {
     }
 
     fn wal(path: &std::path::Path) -> std::path::PathBuf {
-        let mut w = path.as_os_str().to_owned();
-        w.push(".wal");
-        std::path::PathBuf::from(w)
+        Pager::wal_path(path)
     }
 
     #[test]
@@ -1043,6 +1063,122 @@ mod tests {
         drop(ds);
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(wal(&path)).ok();
+    }
+
+    /// Removes a test's store file and its log when dropped, also when the
+    /// test fails (declare it before the store, so it is dropped last).
+    struct Files(std::path::PathBuf);
+
+    impl Drop for Files {
+        fn drop(&mut self) {
+            std::fs::remove_file(&self.0).ok();
+            std::fs::remove_file(wal(&self.0)).ok();
+        }
+    }
+
+    /// A writable backend over a fresh store with a free-id list holding
+    /// the entities `<x>`, `<keep>` and `<other>` (ids 0, 1, 2), and the
+    /// guard of its files.
+    fn reclaiming(name: &str) -> (Files, DiskStore, Arc<DiskDict>) {
+        let files = Files(tmp(name));
+        let _ = std::fs::remove_file(&files.0);
+        let _ = std::fs::remove_file(wal(&files.0));
+        let mut ds = DiskStore::open_with(&files.0, 64, true).unwrap();
+        ds.insert_keys("<x>", "<p>", "<keep>", false).unwrap();
+        ds.insert_keys("<other>", "<p>", "<keep>", false).unwrap();
+        ds.flush().unwrap();
+        let dd = DiskDict::open_shared(ds.shared_pager()).unwrap().writable();
+        (files, ds, Arc::new(dd))
+    }
+
+    /// A hook that parks the first read reaching it: it reports `parked`,
+    /// then waits for `go`. Every later read passes.
+    fn park_first_read(
+        dd: &mut DiskDict,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let once = std::sync::Mutex::new(Some((parked_tx, go_rx)));
+        dd.read_hook = Some(Arc::new(move || {
+            let taken = once.lock().unwrap().take();
+            if let Some((parked, go)) = taken {
+                parked.send(()).unwrap();
+                go.recv().unwrap();
+            }
+        }));
+        (parked_rx, go_tx)
+    }
+
+    /// Review disk#6 (conc#12, db#20): a read that fetched `id → string`
+    /// before a free of `id` cached it after the free, once another reader
+    /// had moved the cache to the new generation — and the new term that
+    /// took the freed id then resolved to the old string (the cache keeps
+    /// the first value of a key). The interleaving is forced with the test
+    /// hook: the read parks between the page read and the cache insert.
+    #[test]
+    fn a_term_read_before_a_free_is_not_cached_after_it() {
+        let (_files, ds, dd) = reclaiming("race_terms");
+        let x = dd.lookup(Space::Entity, "<x>").unwrap().unwrap();
+        let other = dd.lookup(Space::Entity, "<other>").unwrap().unwrap();
+        let mut dd = Arc::into_inner(dd).unwrap();
+        let (parked, go) = park_first_read(&mut dd);
+        let dd = Arc::new(dd);
+        let reader = {
+            let dd = Arc::clone(&dd);
+            std::thread::spawn(move || dd.resolve(Space::Entity, x).unwrap())
+        };
+        parked.recv().unwrap(); // the reader read "<x>" and is parked
+        assert!(dd.free(Space::Entity, x).unwrap());
+        // Another reader adopts the new cache generation.
+        assert!(dd.resolve(Space::Entity, other).unwrap().is_some());
+        go.send(()).unwrap();
+        assert_eq!(reader.join().unwrap().as_deref(), Some("<x>"));
+        // The freed id is reused, lowest first.
+        assert_eq!(dd.intern(Space::Entity, "<new>").unwrap(), x);
+        assert_eq!(
+            dd.resolve(Space::Entity, x).unwrap().as_deref(),
+            Some("<new>"),
+            "the reused id resolves to its new term"
+        );
+        drop((dd, ds));
+    }
+
+    /// The `key → id` direction of the same race: a stale `<x> → id` cached
+    /// after the free made `intern("<x>")` answer the freed id without
+    /// writing the term, and the next new term took that id too — two terms,
+    /// one id.
+    #[test]
+    fn a_key_read_before_a_free_is_not_cached_after_it() {
+        let (_files, ds, dd) = reclaiming("race_keys");
+        let x = dd.lookup(Space::Entity, "<x>").unwrap().unwrap();
+        let other = dd.lookup(Space::Entity, "<other>").unwrap().unwrap();
+        // A fresh backend: nothing cached yet, so the reader reads the tree.
+        let mut dd = DiskDict::open_shared(ds.shared_pager()).unwrap().writable();
+        let (parked, go) = park_first_read(&mut dd);
+        let dd = Arc::new(dd);
+        let reader = {
+            let dd = Arc::clone(&dd);
+            std::thread::spawn(move || dd.lookup(Space::Entity, "<x>").unwrap())
+        };
+        parked.recv().unwrap(); // the reader read `<x> → x` and is parked
+        assert!(dd.free(Space::Entity, x).unwrap());
+        // Another reader adopts the new generation of the key cache.
+        assert_eq!(dd.lookup(Space::Entity, "<other>").unwrap(), Some(other));
+        go.send(()).unwrap();
+        assert_eq!(reader.join().unwrap(), Some(x));
+        let again = dd.intern(Space::Entity, "<x>").unwrap();
+        let fresh = dd.intern(Space::Entity, "<y>").unwrap();
+        assert_ne!(again, fresh, "two terms were given one id");
+        assert_eq!(
+            dd.resolve(Space::Entity, again).unwrap().as_deref(),
+            Some("<x>")
+        );
+        assert_eq!(
+            dd.resolve(Space::Entity, fresh).unwrap().as_deref(),
+            Some("<y>")
+        );
+        assert_eq!(dd.lookup(Space::Entity, "<x>").unwrap(), Some(again));
+        drop((dd, ds));
     }
 
     #[test]

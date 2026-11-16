@@ -561,6 +561,10 @@ fn merge_sorted_into(vec: &mut Vec<(u32, u32)>, run: &[(u32, u32)]) {
 /// sorted `vec` in one pass: only the values after `run`'s first value
 /// move, each once. A list left using less than a quarter of its allocation
 /// gives the rest back (as [`sorted_remove`]).
+///
+/// A value of `run` that `vec` does not hold is skipped, in every build
+/// (review db#19: the presence check was a `debug_assert`, so a release
+/// build removed the next larger element in its place).
 fn remove_sorted_from(vec: &mut Vec<(u32, u32)>, run: &[(u32, u32)]) {
     let Some(&first) = run.first() else {
         return;
@@ -570,16 +574,41 @@ fn remove_sorted_from(vec: &mut Vec<(u32, u32)>, run: &[(u32, u32)]) {
     let mut write = read;
     for &value in run {
         let pos = read + vec[read..].partition_point(|&e| e < value);
-        debug_assert_eq!(vec.get(pos), Some(&value), "a removed value is present");
         vec.copy_within(read..pos, write);
         write += pos - read;
-        read = pos + 1;
+        // `vec[pos]` is the first element not below `value`: it goes only
+        // when it is `value` itself.
+        read = if vec.get(pos) == Some(&value) {
+            pos + 1
+        } else {
+            pos
+        };
     }
     let len = vec.len();
     vec.copy_within(read..len, write);
     vec.truncate(write + (len - read));
     if vec.len() < vec.capacity() / 4 {
         vec.shrink_to_fit();
+    }
+}
+
+#[cfg(test)]
+mod remove_sorted_from_tests {
+    use super::remove_sorted_from;
+
+    /// Review db#19: a value the list does not hold removes nothing — not
+    /// its successor — in every build.
+    #[test]
+    fn an_absent_value_removes_nothing() {
+        let mut v = vec![(1, 1), (3, 3), (5, 5), (7, 7)];
+        remove_sorted_from(&mut v, &[(2, 2), (5, 5), (9, 9)]);
+        assert_eq!(v, [(1, 1), (3, 3), (7, 7)]);
+        let mut v = vec![(1, 1), (3, 3)];
+        remove_sorted_from(&mut v, &[(0, 0), (4, 4)]);
+        assert_eq!(v, [(1, 1), (3, 3)]);
+        let mut v = vec![(1, 1), (3, 3), (5, 5)];
+        remove_sorted_from(&mut v, &[(1, 1), (3, 3), (5, 5)]);
+        assert!(v.is_empty());
     }
 }
 

@@ -206,9 +206,11 @@ impl fmt::Display for StorageKind {
     }
 }
 
-/// `<path>.wal`, the pager write-ahead log beside a paged file.
+/// `<path>.wal`, the pager write-ahead log beside a paged file (the rule
+/// lives in [`Pager::wal_path`](crate::kvstore::Pager::wal_path) only,
+/// review disk#9).
 pub(crate) fn wal_of(path: &Path) -> PathBuf {
-    fsutil::with_suffix(path, ".wal")
+    crate::kvstore::Pager::wal_path(path)
 }
 
 // ---- disk write-through sink --------------------------------------------------
@@ -1237,7 +1239,7 @@ impl Database {
             )));
         }
         let lock = super::dirlock::DirLock::acquire(dir)?;
-        let mut ds = DiskStore::open(&kv, options.disk_cache_pages)?;
+        let mut ds = DiskStore::open_with(&kv, options.disk_cache_pages, options.free_ids_if_new)?;
         reconcile_legacy_shadow(dir, &mut ds)?;
         let mut db = match options.disk_query_mode {
             DiskQueryMode::Stream => Database::load_disk_stream(dir, ds, options),
@@ -3057,25 +3059,48 @@ mod rocks_layout {
     /// exactly as stored ([`Dictionary::from_slots`]). Gaps (ids freed by
     /// reclamation, or interned but never used by a persisted triple) become
     /// free ids; a term stored under two ids is refused.
+    ///
+    /// Every id is checked against its space's bound
+    /// ([`ENTITY_ID_LIMIT`](crate::dict::ENTITY_ID_LIMIT) and the others)
+    /// *before* its slot is allocated, and the slots are reserved fallibly:
+    /// one corrupt entry with an id near `u32::MAX` used to size a vector of
+    /// ~100 GB and abort the process (review db#18); it now fails the open
+    /// as a corrupt dictionary.
     pub(super) fn dictionary_from_terms(
         terms: Vec<(TermSpace, u32, String)>,
     ) -> Result<Dictionary> {
+        use crate::dict::{ENTITY_ID_LIMIT, LITERAL_INDEX_LIMIT, PREDICATE_ID_LIMIT};
         let mut slots: [Vec<Option<String>>; 3] = Default::default();
         for (space, id, key) in terms {
-            let (i, first) = match space {
-                TermSpace::Entity => (0, 0),
-                TermSpace::Literal => (1, LITERAL_FIRST_ID),
-                TermSpace::Predicate => (2, 0),
+            let (i, first, limit) = match space {
+                TermSpace::Entity => (0, 0, ENTITY_ID_LIMIT),
+                TermSpace::Literal => (1, LITERAL_FIRST_ID, LITERAL_INDEX_LIMIT),
+                TermSpace::Predicate => (2, 0, PREDICATE_ID_LIMIT),
             };
             let Some(index) = id.checked_sub(first) else {
                 return Err(GStoreError::Database(format!(
                     "corrupt RocksDB dictionary: literal id {id} below the literal range"
                 )));
             };
+            if index >= limit {
+                return Err(GStoreError::Database(format!(
+                    "corrupt RocksDB dictionary: {} id {id} is beyond its id space",
+                    dict_space(space).name()
+                )));
+            }
             let v = &mut slots[i];
             if (index as usize) < v.len() {
                 return Err(GStoreError::Database(format!(
                     "corrupt RocksDB dictionary: id {id} stored out of order"
+                )));
+            }
+            let grow = index as usize + 1 - v.len();
+            if v.try_reserve(grow).is_err() {
+                return Err(GStoreError::Database(format!(
+                    "corrupt RocksDB dictionary: {} id {id} leaves a gap of {} ids that \
+                     cannot be allocated",
+                    dict_space(space).name(),
+                    grow - 1
                 )));
             }
             v.resize(index as usize, None);

@@ -1538,6 +1538,7 @@ impl GStoreConfig {
             },
             temp_dir: self.build_tmp_dir.clone(),
             fill_percent: self.build_fill_factor,
+            ..crate::bulk::BulkOptions::default()
         }
     }
 
@@ -1555,6 +1556,7 @@ impl GStoreConfig {
             dict_cache_bytes: self.dict_cache_mb.saturating_mul(1 << 20),
             vstree_on_open: self.vstree_on_open,
             default_layout: self.default_layout,
+            ..OpenOptions::default()
         }
     }
 
@@ -2213,6 +2215,7 @@ upload_allow_compress_packages = "zip"
                 dict_cache_bytes: 32 << 20,
                 vstree_on_open: true,
                 default_layout: Some(StorageKind::Disk),
+                ..OpenOptions::default()
             }
         );
         assert_eq!(c.value("disk_query_mode").unwrap(), "stream");

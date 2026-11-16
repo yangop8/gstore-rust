@@ -699,13 +699,17 @@ pub(crate) fn write_ivarray<'v>(
 // ---- header and free list ----------------------------------------------------
 
 /// The header page of a new file (the pager's `header_bytes`). A bulk image
-/// is a *new* database, so — like a `DiskStore` created by `open` — it keeps
-/// a free-id list when the process's id-reclamation policy is on
-/// ([`crate::db::default_id_reclaim`]): the `FREE_IDS` feature bit and
-/// `MAGIC_V2`, with the list empty (its root and the `FREE_COUNT_*` roots
-/// are 0). With the policy off it is a version-1 file, as before.
-pub(crate) fn header_page(page_count: PageId, free_head: PageId, roots: &[u64; NROOTS]) -> Page {
-    let free_ids = crate::db::default_id_reclaim() == crate::db::IdReclaim::Immediate;
+/// is a *new* database: with `free_ids` (the build's
+/// [`BulkOptions::free_ids`](crate::bulk::BulkOptions::free_ids), passed
+/// explicitly — review disk#8 / design#6) it keeps a free-id list, the
+/// `FREE_IDS` feature bit and `MAGIC_V2` with the list empty (its root and
+/// the `FREE_COUNT_*` roots are 0); without, it is a version-1 file.
+pub(crate) fn header_page(
+    page_count: PageId,
+    free_head: PageId,
+    roots: &[u64; NROOTS],
+    free_ids: bool,
+) -> Page {
     header_page_with(page_count, free_head, roots, free_ids)
 }
 
@@ -830,7 +834,7 @@ mod tests {
             out.flush().unwrap();
             let mut roots = [0u64; NROOTS];
             roots[0] = u64::from(root);
-            write_header(&file, &header_page(alloc.next(), 0, &roots)).unwrap();
+            write_header(&file, &header_page(alloc.next(), 0, &roots, true)).unwrap();
             drop(out);
             drop(file);
 
@@ -925,7 +929,7 @@ mod tests {
         roots[3] = u64::from(root);
         roots[6] = u64::from(iv_root);
         roots[15] = u64::from(sp_root);
-        write_header(&file, &header_page(alloc.next(), free, &roots)).unwrap();
+        write_header(&file, &header_page(alloc.next(), free, &roots, true)).unwrap();
         drop(out);
         drop(file);
 
