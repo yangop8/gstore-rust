@@ -3,6 +3,11 @@
 
 use gstore::{Database, QueryResult};
 
+/// `"lex"^^xsd:integer` as a result cell (an N-Triples term).
+fn int(lex: &str) -> String {
+    format!("\"{lex}\"^^<http://www.w3.org/2001/XMLSchema#integer>")
+}
+
 const DATA: &str = r#"
 @prefix : <http://ex/> .
 @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
@@ -70,7 +75,9 @@ fn bind_computes_value() {
         .iter()
         .find(|r| r[0].as_deref() == Some("<http://ex/carol>"))
         .unwrap();
-    assert!(carol[1].as_ref().unwrap().contains("8000"));
+    // review sparqlconf#18 / query#18: the full typed term, not a substring
+    // ("18000" or "8000"^^xsd:string would have passed `contains("8000")`).
+    assert_eq!(carol[1].as_deref(), Some(int("8000").as_str()));
 }
 
 #[test]
@@ -100,16 +107,22 @@ fn count_per_group() {
         .select("SELECT ?dept (COUNT(?p) AS ?c) WHERE { ?p <http://ex/dept> ?dept } GROUP BY ?dept")
         .unwrap();
     assert_eq!(rs.row_count(), 2);
-    // d1 → 2, d2 → 1
-    for r in &rs.rows {
-        let dept = r[0].as_deref().unwrap();
-        let c = r[1].as_deref().unwrap();
-        if dept == "<http://ex/d1>" {
-            assert!(c.contains('2'));
-        } else {
-            assert!(c.contains('1'));
-        }
-    }
+    // d1 → 2, d2 → 1. review sparqlconf#18 / query#18: the full typed term
+    // (COUNT is an xsd:integer), and the d2 row is checked by name — the
+    // old `contains('2')` / `contains('1')` accepted "12" or any row order.
+    let mut got: Vec<(String, String)> = rs
+        .rows
+        .iter()
+        .map(|r| (r[0].clone().unwrap(), r[1].clone().unwrap()))
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            ("<http://ex/d1>".to_string(), int("2")),
+            ("<http://ex/d2>".to_string(), int("1")),
+        ]
+    );
 }
 
 #[test]
@@ -125,7 +138,8 @@ fn sum_and_having() {
         .unwrap();
     assert_eq!(rs.row_count(), 1); // only d1 has >1 member
     assert_eq!(rs.rows[0][0].as_deref(), Some("<http://ex/d1>"));
-    assert!(rs.rows[0][1].as_ref().unwrap().contains("5500")); // 2500 + 3000
+    // 2500 + 3000; review sparqlconf#18 / query#18: the full typed term.
+    assert_eq!(rs.rows[0][1].as_deref(), Some(int("5500").as_str()));
 }
 
 #[test]
@@ -139,10 +153,17 @@ fn avg_min_max_over_all() {
         .unwrap();
     assert_eq!(rs.row_count(), 1);
     let row = &rs.rows[0];
-    assert!(row[0].as_ref().unwrap().contains("3166")); // (2500+3000+4000)/3
-    assert!(row[1].as_ref().unwrap().contains("2500"));
-    assert!(row[2].as_ref().unwrap().contains("4000"));
-    assert!(row[3].as_ref().unwrap().contains('3'));
+    // review sparqlconf#18 / query#18: full typed terms instead of
+    // substrings. AVG = 9500 / 3 by op:numeric-divide: an xsd:decimal whose
+    // precision XPath leaves to the implementation (at least 18 digits);
+    // here 18 fractional digits, rounded (value.rs DECIMAL_DIV_SCALE).
+    assert_eq!(
+        row[0].as_deref(),
+        Some("\"3166.666666666666666667\"^^<http://www.w3.org/2001/XMLSchema#decimal>")
+    );
+    assert_eq!(row[1].as_deref(), Some(int("2500").as_str()));
+    assert_eq!(row[2].as_deref(), Some(int("4000").as_str()));
+    assert_eq!(row[3].as_deref(), Some(int("3").as_str()));
 }
 
 #[test]
@@ -155,10 +176,17 @@ fn group_concat_names() {
         )
         .unwrap();
     let names = rs.rows[0][0].as_ref().unwrap();
-    // All three names present, comma-separated.
-    for n in ["Alice", "Bob", "Carol"] {
-        assert!(names.contains(n), "missing {n} in {names}");
-    }
+    // All three names, comma-separated, as one simple literal. review
+    // sparqlconf#18 / query#18: the old per-name `contains` also accepted
+    // extra or repeated names, another separator and a typed literal; the
+    // order of GROUP_CONCAT is unspecified, so the names are compared sorted.
+    let inner = names
+        .strip_prefix('"')
+        .and_then(|n| n.strip_suffix('"'))
+        .unwrap_or_else(|| panic!("not a simple literal: {names}"));
+    let mut parts: Vec<&str> = inner.split(',').collect();
+    parts.sort();
+    assert_eq!(parts, vec!["Alice", "Bob", "Carol"], "{names}");
 }
 
 #[test]
@@ -167,7 +195,8 @@ fn count_distinct() {
     let rs = db
         .select("SELECT (COUNT(DISTINCT ?dept) AS ?c) WHERE { ?p <http://ex/dept> ?dept }")
         .unwrap();
-    assert!(rs.rows[0][0].as_ref().unwrap().contains('2')); // d1, d2
+    // d1, d2; review sparqlconf#18 / query#18: the full typed term.
+    assert_eq!(rs.rows[0][0].as_deref(), Some(int("2").as_str()));
 }
 
 const CHAIN: &str = r#"
