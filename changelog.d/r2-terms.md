@@ -206,6 +206,10 @@ none
   - `src/bin/gquery.rs` (`Construct` arm of the output match) and
     `src/console/local.rs` (`Construct` arm of `run_query`): `to_ntriples`
     instead of `Display` (sparqlconf#11).
+  - Doc comments only: `src/query/value.rs`'s module docs (UPDATE no longer
+    stores every ill-typed literal), `src/zipio.rs::write_export` and
+    `src/db/admin.rs::export_ntriples` (every term, not only IRIs, goes
+    through `export_key`).
   - Tests changed per convention 13b, each with a `review <id>` comment:
     `tests/dt_phase3_review_fixes.rs` (the one sameTerm assertion that
     pinned the xsd:string folding, sparqlconf#14);
