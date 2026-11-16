@@ -78,7 +78,8 @@ New files and tests:
   materializing and streaming executors (the streaming settings with a
   `LIMIT` larger than the answer must give the same rows in the same
   order), a scaling test (OPTIONAL, MINUS and a join after an OPTIONAL over
-  4x the data, against the streaming `LIMIT` path), a cancellation poll
+  8x the data, linear in both executors and the full path about as fast as
+  the streaming `LIMIT` path), a cancellation poll
   test, GRAPH ?g / INSERT, EXISTS, alias, evaluated-once and SERVICE error
   tests (fake HTTP endpoints), and a randomized differential battery.
 - W3C-style cases (`tests/w3c_subset.rs`): `tests/w3c/optional-minus/`
@@ -143,6 +144,19 @@ none
   - Branch: OPTIONAL 1.4 ms / 6.8 ms (streamed 8.9 ms); MINUS 1.0 ms /
     5.3 ms (streamed 6.5 ms); join after an OPTIONAL 4.1 ms / 25.5 ms
     (streamed 36.1 ms). All linear (about 4-6x for 4x the data).
+  - Independent review: the test as first written measured the streaming
+    path at 20,000 only, so a regression of the streaming `Probe` alone
+    (join after an OPTIONAL streamed: 7.4 s) still passed it. It now runs
+    2,500 / 20,000 subjects and requires both executors to grow at most
+    20x (+30 ms) for the 8x data. Same session, same command: base 0f74615
+    full / streamed at 2,500 → 20,000: OPTIONAL 49 ms → 3.17 s / 0.97 ms →
+    8.1 ms; MINUS 2.7 ms → 156 ms / 2.8 ms → 163 ms; join after an
+    OPTIONAL 209 ms → 14.6 s / 204 ms → 13.4 s (all three fail). Branch:
+    OPTIONAL 0.67 ms → 6.2 ms / 0.99 ms → 8.7 ms; MINUS 0.51 ms → 4.8 ms /
+    0.77 ms → 6.1 ms; join after an OPTIONAL 1.9 ms → 24 ms / 2.9 ms →
+    31 ms. With only the streaming `Probe` and both MINUS operators
+    reverted to the old scans, the MINUS and the streamed join-after-OPTIONAL
+    rows fail (156 ms and 7.4 s against bounds of 82 ms and 2.2 s).
 - Bench smoke gate, base 0f74615 vs branch c8d10b9, measured one after
   the other in the same session. Release builds of `gbuild` +
   `gstore-bench` (`cargo +1.99.1 build --release --locked -p gstore -p

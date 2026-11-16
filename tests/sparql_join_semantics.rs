@@ -235,17 +235,20 @@ fn best_time(data: &Data, q: &str, opts: TopKOptions, runs: usize) -> Duration {
 }
 
 /// OPTIONAL, MINUS and a join after an OPTIONAL (whose shared variable is
-/// unbound in one row) cost about what the streaming LIMIT path costs and
-/// grow linearly with the data — they used to compare every left solution
-/// with every right one (review sparqlconf#2: 12-16 s for 20,000 x 10,000
-/// rows against 0.06 s with LIMIT; query#10: the cross product after one
-/// unbound row). Elapsed time is the measure (the operators have no work
-/// counter; the unit tests of `src/query/probe.rs` count probe visits);
-/// the bounds are generous ratios over 4x the data, and a miss is measured
-/// again before it fails, so a busy machine does not fail the test.
+/// unbound in one row) grow linearly with the data in both executors, and
+/// the full path costs about what the streaming LIMIT path costs — they
+/// used to compare every left solution with every right one (review
+/// sparqlconf#2: 12-16 s for 20,000 x 10,000 rows against 0.06 s with
+/// LIMIT; the streaming MINUS scanned too; query#10: the cross product
+/// after one unbound row, and the streaming `Probe`'s scan of an operand
+/// whose key some row leaves unbound). Elapsed time is the measure (the
+/// operators have no work counter; the unit tests of `src/query/probe.rs`
+/// count probe visits); the bounds are generous ratios over 8x the data
+/// (linear ~8x, quadratic ~64x), and a miss is measured again before it
+/// fails, so a busy machine does not fail the test.
 #[test]
 fn optional_minus_and_unbound_joins_scale_linearly() {
-    let (small, large) = (5_000, 20_000);
+    let (small, large) = (2_500, 20_000);
     let queries = [
         (
             "OPTIONAL",
@@ -291,15 +294,21 @@ fn optional_minus_and_unbound_joins_scale_linearly() {
             let runs = 1 + attempt;
             let t_small = best_time(&datasets[0], full, TopKOptions::NONE, runs);
             let t_large = best_time(&datasets[1], full, TopKOptions::NONE, runs);
-            let t_stream = best_time(&datasets[1], streamed, TopKOptions::ALL, runs);
-            // Linear: ~4x for 4x the data (quadratic: ~16x). The constant
-            // covers timer noise on the small run.
-            let scales = t_large <= t_small * 9 + Duration::from_millis(30);
+            let s_small = best_time(&datasets[0], streamed, TopKOptions::ALL, runs);
+            let s_large = best_time(&datasets[1], streamed, TopKOptions::ALL, runs);
+            // Linear: ~8x for 8x the data (quadratic: ~64x), in both
+            // executors (review: the streaming MINUS and the streaming
+            // Probe were quadratic too). The constant covers timer noise on
+            // the small runs.
+            let linear = |at_small: Duration, at_large: Duration| {
+                at_large <= at_small * 20 + Duration::from_millis(30)
+            };
+            let scales = linear(t_small, t_large) && linear(s_small, s_large);
             // The full path costs about what the streaming path costs.
-            let like_stream = t_large <= t_stream * 10 + Duration::from_millis(100);
+            let like_stream = t_large <= s_large * 10 + Duration::from_millis(100);
             let verdict = format!(
-                "{what}: {small} rows {t_small:?}, {large} rows {t_large:?}, \
-                 streamed {t_stream:?} (attempt {attempt})"
+                "{what}: full {small} rows {t_small:?}, {large} rows {t_large:?}; \
+                 streamed {s_small:?}, {s_large:?} (attempt {attempt})"
             );
             eprintln!("{verdict}");
             if scales && like_stream {
