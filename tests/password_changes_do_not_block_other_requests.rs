@@ -326,14 +326,19 @@ fn a_user_dropped_while_its_password_is_hashed_is_not_recreated() {
         "the password hash never started"
     );
     // Dropped meanwhile (the state lock is free).
-    let (status, body) = send(
-        addr,
-        "POST",
-        "/user/drop?op_username=pw_gone",
-        &[("Authorization", &basic("root", "root"))],
-        "",
-    );
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(send(
+            addr,
+            "POST",
+            "/user/drop?op_username=pw_gone",
+            &[("Authorization", &basic("root", "root"))],
+            "",
+        ));
+    });
+    let dropped = rx.recv_timeout(HANG_GUARD);
     park.release();
+    let (status, body) = dropped.expect("the drop was not served while the hash was parked");
     assert_eq!(status, 200, "{body}");
     let (status, body) = changing.join().unwrap();
     assert_eq!(status, 400, "{body}");
