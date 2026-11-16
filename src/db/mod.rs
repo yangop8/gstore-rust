@@ -1742,9 +1742,10 @@ impl Database {
     /// not be deleted), the transaction is undone in memory — RocksDB: its
     /// journal is replayed — and [`CommitFailure::RolledBack`] is returned;
     /// otherwise its writes stay applied and [`CommitFailure::NotDurable`]
-    /// says so. Only a committed transaction frees the ids its deletes left
-    /// unreferenced (written to an on-disk store at the next commit point)
-    /// and reaches the redo log.
+    /// says so. The ids a transaction's deletes left unreferenced are freed
+    /// in the same commit point (the in-memory dictionary retires them only
+    /// once it succeeded), and only a committed transaction reaches the redo
+    /// log.
     pub fn commit_checked(&mut self) -> std::result::Result<(), CommitFailure> {
         if self.txn.is_none() {
             return Err(CommitFailure::NotCommitted(GStoreError::Database(
@@ -1791,15 +1792,39 @@ impl Database {
             }
             self.free_dead(dead, true);
         }
+        // The other layouts: the transaction's frees, after its writes and
+        // in the same commit point — the ids its deletes left unreferenced
+        // in the committed state. A Stream-mode store frees them in its
+        // pages (a failed commit point breaks it: the reopen drops them with
+        // the rest); a Materialize-mode one gets them queued to its file now
+        // and the in-memory dictionary retires them only once the commit
+        // point succeeded, so an undo still finds every term it re-adds.
+        let retire = if rocks {
+            Vec::new()
+        } else {
+            let dead = self.committed_dead();
+            if self.store.as_disk().is_some() {
+                self.free_dead(dead, false);
+                Vec::new()
+            } else {
+                self.persist_frees(dead, false)
+            }
+        };
         if let Err(e) = self.commit_point() {
             return Err(self.failed_commit(log, minted, e, batches, rocks));
         }
-        // Committed and durable. The transaction's frees, after its writes:
-        // the ids its deletes left unreferenced in the committed state
-        // (RocksDB freed them in its journal batch above).
-        if !rocks {
-            let dead = self.committed_dead();
-            self.free_dead(dead, false);
+        // Committed and durable.
+        if !retire.is_empty() {
+            let mut retired = 0;
+            for t in retire {
+                if self.dict.retire(t.space, t.id) {
+                    retired += 1;
+                }
+            }
+            if retired > 0 {
+                self.touched();
+            }
+            self.dict.release();
         }
         drop(log);
         drop(minted);
