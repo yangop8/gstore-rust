@@ -130,3 +130,52 @@ fn free_key_keeps_terms_named_graph_quads_use() {
     assert!(!ds.free_key(Space::Entity, "<g>").unwrap(), "still a graph");
     ds.verify_free_list().unwrap();
 }
+
+// ---- db#18: a RocksDB dictionary id beyond its space ---------------------------
+
+/// Review db#18: loading the RocksDB `dict` column family sized a vector by
+/// an untrusted id before checking it against its id space, so one corrupt
+/// entry with an id near `u32::MAX` made the open allocate ~100 GB and abort
+/// the process. Now the open fails with "corrupt RocksDB dictionary".
+#[cfg(feature = "rocksdb")]
+#[test]
+fn a_rocksdb_dictionary_id_beyond_its_space_fails_the_open() {
+    use gstore::dict::{ENTITY_ID_LIMIT, LITERAL_INDEX_LIMIT, PREDICATE_ID_LIMIT};
+    use gstore::model::id::LITERAL_FIRST_ID;
+    const CFS: [&str; 7] = ["spo", "pos", "osp", "stats", "dict", "gspo", "meta"];
+    let cases: [(u8, u32); 5] = [
+        (b'E', u32::MAX - 1),
+        (b'E', ENTITY_ID_LIMIT),
+        (b'P', PREDICATE_ID_LIMIT),
+        (b'L', u32::MAX),
+        (b'L', LITERAL_FIRST_ID + LITERAL_INDEX_LIMIT),
+    ];
+    for (tag, id) in cases {
+        let tmp = TmpDir::new("rocks_dict_id");
+        let dir = tmp.path().join("d.db");
+        drop(
+            gstore::Database::build_rocksdb_from_str(
+                "d",
+                &dir,
+                "<http://ex/a> <http://ex/p> \"x\" .\n",
+            )
+            .unwrap(),
+        );
+        {
+            let db =
+                rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.join("rocksdb"), CFS)
+                    .unwrap();
+            let mut key = vec![tag];
+            key.extend_from_slice(&id.to_be_bytes());
+            db.put_cf(db.cf_handle("dict").unwrap(), &key, b"<http://ex/far>")
+                .unwrap();
+            db.flush().unwrap();
+        }
+        let e = gstore::Database::open(&dir)
+            .err()
+            .unwrap_or_else(|| panic!("{} id {id} was accepted", tag as char));
+        let msg = e.to_string();
+        assert!(msg.contains("corrupt RocksDB dictionary"), "{msg}");
+        assert!(msg.contains(&id.to_string()), "{msg}");
+    }
+}
