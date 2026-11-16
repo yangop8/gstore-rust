@@ -769,6 +769,8 @@ fn clear_records_are_refused_by_readers_that_predate_them() {
          GRAPH <http://ex/h> { <http://ex/s> <http://ex/p> <http://ex/o> } }",
     )
     .unwrap();
+    // The inserts, checksums and commit marks included, read as before.
+    assert_eq!(pre_clear_reader(&fs::read(&log).unwrap()), Ok(2));
     for clear in ["CLEAR GRAPH <http://ex/g>", "CLEAR NAMED", "CLEAR DEFAULT"] {
         let before = fs::read(&log).unwrap();
         db.query(clear).unwrap();

@@ -83,7 +83,7 @@ impl LogKind {
         let len = match self {
             LogKind::Redo => match (fields.first(), num(1), num(2)) {
                 (Some(_), Some(Ok(g)), Some(Ok(t))) => g.checked_add(t).ok_or(()),
-                (Some(_), Some(g), Some(t)) => g.and(t).and(Err(())),
+                (Some(_), Some(_), Some(_)) => Err(()),
                 _ => return BodyLen::Malformed,
             },
             LogKind::Update => match num(2) {
