@@ -1,0 +1,5 @@
+@prefix : <http://example.org/> .
+:a :id 1 .
+:b :id 2 .
+:a :alias :n1 .
+:n1 :next :n2 .

@@ -2178,27 +2178,20 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     }
 
     // ---- property paths --------------------------------------------------
+    //
+    // SPARQL 1.1 §18.4 defines a path pattern's solutions as a multiset:
+    // a predicate step is a triple pattern, `inv(P)` swaps the end points,
+    // `seq(P, Q)` is a join through a fresh variable and `alt(P, Q)` a union
+    // (so both keep every route: review query#9 / sparqlconf#4), while the
+    // closures (`*`, `+`, ALP) and `?` and a negated property set produce
+    // each solution once. Reached nodes come out in a fixed order — the
+    // stores' sorted lists, followed breadth first — never in a hash set's
+    // iteration order, so `LIMIT` / `OFFSET` pages and `ORDER BY` ties are
+    // the same on every run (review gap-accel-soundness#1).
 
     /// Evaluate a single property-path pattern into bindings over the layout.
     fn eval_path_pattern(&self, p: &PathPattern, layout: &VarLayout) -> Vec<Binding> {
-        let subj_const = match &p.subject {
-            PatternTerm::Term(t) => Some(self.dict.term_id(t)),
-            PatternTerm::Var(_) => None,
-        };
-        let obj_const = match &p.object {
-            PatternTerm::Term(t) => Some(self.dict.term_id(t)),
-            PatternTerm::Var(_) => None,
-        };
-        // A constant endpoint absent from the dictionary ⇒ no matches.
-        if matches!(subj_const, Some(None)) || matches!(obj_const, Some(None)) {
-            return Vec::new();
-        }
-        let subj_id = subj_const.flatten();
-        let obj_id = obj_const.flatten();
-
-        let pairs = self.path_pairs(&p.path, subj_id, obj_id);
-
-        pairs
+        self.path_pattern_pairs(p)
             .into_iter()
             .filter_map(|(s, o)| {
                 let mut b = vec![None; layout.len()];
@@ -2212,7 +2205,21 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             .collect()
     }
 
-    /// All `(start, end)` pairs matching `path`, constrained by known endpoints.
+    /// The `(start, end)` pairs of a path pattern, with its constant end
+    /// points fixed. A constant that is not in the dictionary still matches
+    /// itself at length zero (`<unknown> :p* ?x` binds `?x` to `<unknown>`,
+    /// §18.4 ZeroLengthPath / ALP): it gets a synthetic id, which has no
+    /// edges, so only the zero-length matches reach it (review sparqlconf#13).
+    fn path_pattern_pairs(&self, p: &PathPattern) -> Vec<(u32, u32)> {
+        let end = |t: &PatternTerm| match t {
+            PatternTerm::Term(t) => Some(self.term_to_id(t)),
+            PatternTerm::Var(_) => None,
+        };
+        self.path_pairs(&p.path, end(&p.subject), end(&p.object))
+    }
+
+    /// All `(start, end)` pairs matching `path`, constrained by known
+    /// endpoints — a multiset, in a deterministic order.
     fn path_pairs(&self, path: &PathExpr, subj: Option<u32>, obj: Option<u32>) -> Vec<(u32, u32)> {
         match (subj, obj) {
             (Some(s), _) => {
@@ -2228,7 +2235,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 starts.into_iter().map(|s| (s, o)).collect()
             }
             (None, None) => {
-                // Both ends free: enumerate from every entity node.
+                // Both ends free: enumerate from every node of the graph
+                // (§18.4: the zero-length matches are `nodes(G)`).
                 let mut nodes: Vec<u32> = self.store.subject_keys();
                 nodes.extend(self.store.object_keys());
                 nodes.sort_unstable();
@@ -2244,23 +2252,26 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         }
     }
 
-    /// Nodes reachable from `start` by following `path` (or, if `reverse`, the
-    /// nodes from which `start` is reachable via `path`).
-    fn path_reach(
-        &self,
-        path: &PathExpr,
-        start: u32,
-        reverse: bool,
-    ) -> std::collections::HashSet<u32> {
-        let mut out = std::collections::HashSet::new();
+    /// The nodes reached from `start` by following `path` (or, if `reverse`,
+    /// the nodes from which `start` is reached via `path`), once per route
+    /// for `/` and `|` (see the section comment), in a deterministic order.
+    fn path_reach(&self, path: &PathExpr, start: u32, reverse: bool) -> Vec<u32> {
+        let mut out = Vec::new();
+        self.path_reach_into(path, start, reverse, &mut out);
+        out
+    }
+
+    /// [`path_reach`](Self::path_reach), appending to `out`.
+    fn path_reach_into(&self, path: &PathExpr, start: u32, reverse: bool, out: &mut Vec<u32>) {
         // Cooperative cancellation (a deadline or `/cancel`): a path over
         // every node, or a closure, can run long (review robust#5); the
-        // Result-returning caller turns the cut-short set into Cancelled.
+        // Result-returning caller turns the cut-short result into Cancelled.
         if self.cancelled() {
-            return out;
+            return;
         }
         match path {
             PathExpr::Pred(iri) => {
+                self.note_path_step();
                 if let Some(pid) = self.path_pred_id(iri) {
                     if reverse {
                         out.extend(self.store.s_by_po(pid, start));
@@ -2269,80 +2280,118 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     }
                 }
             }
-            PathExpr::Inverse(inner) => return self.path_reach(inner, start, !reverse),
+            PathExpr::Inverse(inner) => self.path_reach_into(inner, start, !reverse, out),
             PathExpr::Seq(a, b) => {
-                // forward: a then b; reverse: b then a (with reverse traversal).
+                // forward: a then b; reverse: b then a (with reverse
+                // traversal). Every intermediate node, with its multiplicity,
+                // is a separate route (a join through a fresh variable).
                 let (first, second) = if reverse { (b, a) } else { (a, b) };
                 for mid in self.path_reach(first, start, reverse) {
                     if self.cancelled() {
                         break;
                     }
-                    out.extend(self.path_reach(second, mid, reverse));
+                    self.path_reach_into(second, mid, reverse, out);
                 }
             }
             PathExpr::Alt(a, b) => {
-                out.extend(self.path_reach(a, start, reverse));
-                out.extend(self.path_reach(b, start, reverse));
+                // A union: a node reached by both branches comes twice.
+                self.path_reach_into(a, start, reverse, out);
+                self.path_reach_into(b, start, reverse, out);
             }
             PathExpr::ZeroOrOne(inner) => {
-                out.insert(start);
-                out.extend(self.path_reach(inner, start, reverse));
-            }
-            PathExpr::ZeroOrMore(inner) => {
-                self.path_closure(inner, start, reverse, true, &mut out);
-            }
-            PathExpr::OneOrMore(inner) => {
-                self.path_closure(inner, start, reverse, false, &mut out);
-            }
-            PathExpr::NegatedSet(preds) => {
-                // One step via any predicate not in the negated set.
-                let banned: std::collections::HashSet<u32> = preds
-                    .iter()
-                    .filter(|(_, inv)| *inv == reverse) // direction match
-                    .filter_map(|(iri, _)| self.path_pred_id(iri))
-                    .collect();
-                if reverse {
-                    for (p, s) in self.store.ps_by_o(start) {
-                        if !banned.contains(&p) {
-                            out.insert(s);
-                        }
-                    }
-                } else {
-                    for (p, o) in self.store.po_by_s(start) {
-                        if !banned.contains(&p) {
-                            out.insert(o);
-                        }
+                // A set (§18.4 ZeroOrOnePath): `start` itself, then every
+                // other node one step away, each once.
+                let mut seen = PathSeen::default();
+                seen.insert(start);
+                out.push(start);
+                for n in self.path_reach(inner, start, reverse) {
+                    if seen.insert(n) {
+                        out.push(n);
                     }
                 }
             }
+            PathExpr::ZeroOrMore(inner) => {
+                self.path_closure(inner, start, reverse, true, out);
+            }
+            PathExpr::OneOrMore(inner) => {
+                self.path_closure(inner, start, reverse, false, out);
+            }
+            PathExpr::NegatedSet(members) => {
+                // §18.2.2.3: `!(p₁|…|pᵢ|^pᵢ₊₁|…|^pₘ)` is
+                // `alt(NPS({p₁…pᵢ}), inv(NPS({pᵢ₊₁…pₘ})))`: the forward
+                // members are excluded from one step in the walk's own
+                // direction, the inverse members from one step against it.
+                // `!^p` alone has no forward branch, `!p` and `!()` no
+                // inverse one (review query#2 / sparqlconf#3).
+                let forward: Vec<&str> = members
+                    .iter()
+                    .filter(|(_, inv)| !*inv)
+                    .map(|(iri, _)| iri.as_str())
+                    .collect();
+                let inverse: Vec<&str> = members
+                    .iter()
+                    .filter(|(_, inv)| *inv)
+                    .map(|(iri, _)| iri.as_str())
+                    .collect();
+                if !forward.is_empty() || inverse.is_empty() {
+                    self.negated_step(&forward, start, reverse, out);
+                }
+                if !inverse.is_empty() {
+                    self.negated_step(&inverse, start, !reverse, out);
+                }
+            }
         }
-        out
     }
 
-    /// Transitive closure for `*`/`+` via BFS over the inner path.
+    /// One step of `NPS(banned)` from `start` — forward along a triple, or
+    /// backward when `reverse` — over every predicate not in `banned`. The
+    /// step is a set (§18.4: `{ μ | ∃ triple(x, p, y), p ∉ S }`), so a node
+    /// linked through several such predicates comes once.
+    fn negated_step(&self, banned: &[&str], start: u32, reverse: bool, out: &mut Vec<u32>) {
+        self.note_path_step();
+        let banned: Vec<PredId> = banned
+            .iter()
+            .filter_map(|iri| self.path_pred_id(iri))
+            .collect();
+        let edges = if reverse {
+            self.store.ps_by_o(start)
+        } else {
+            self.store.po_by_s(start)
+        };
+        let mut seen = PathSeen::default();
+        for (p, n) in edges {
+            if !banned.contains(&p) && seen.insert(n) {
+                out.push(n);
+            }
+        }
+    }
+
+    /// Transitive closure for `*`/`+` (§18.4 ALP): every node reached from
+    /// `start` in one or more steps of `inner` (plus `start` itself when
+    /// `reflexive`), each once, breadth first in discovery order.
     fn path_closure(
         &self,
         inner: &PathExpr,
         start: u32,
         reverse: bool,
         reflexive: bool,
-        out: &mut std::collections::HashSet<u32>,
+        out: &mut Vec<u32>,
     ) {
-        let mut frontier = vec![start];
-        let mut visited = std::collections::HashSet::new();
+        let mut frontier = std::collections::VecDeque::from([start]);
+        let mut visited = PathSeen::default();
         if reflexive {
-            out.insert(start);
+            out.push(start);
             visited.insert(start);
         }
-        while let Some(n) = frontier.pop() {
+        while let Some(n) = frontier.pop_front() {
             // One cancellation check per frontier step (review robust#5).
             if self.cancelled() {
                 return;
             }
             for next in self.path_reach(inner, n, reverse) {
                 if visited.insert(next) {
-                    out.insert(next);
-                    frontier.push(next);
+                    out.push(next);
+                    frontier.push_back(next);
                 }
             }
         }
@@ -2351,6 +2400,13 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     fn path_pred_id(&self, iri: &str) -> Option<PredId> {
         self.dict
             .predicate_id(&Term::iri(iri.to_string()).dict_key())
+    }
+
+    /// Count one property-path step ([`EvalStats::path_steps`]).
+    fn note_path_step(&self) {
+        let mut s = self.stats.get();
+        s.path_steps += 1;
+        self.stats.set(s);
     }
 
     // ---- graph-pattern algebra -------------------------------------------
@@ -6124,6 +6180,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             .or_else(|| self.functions.get(iri_local_name(iri)))
     }
 }
+
+/// The nodes a property-path walk has met: membership only, never iterated
+/// (results keep their discovery order, review gap-accel-soundness#1).
+type PathSeen = HashSet<u32, FxBuildHasher>;
 
 /// Bind a path endpoint (variable or constant) into a binding; false on conflict.
 fn bind_node(b: &mut Binding, pt: &PatternTerm, id: u32, layout: &VarLayout) -> bool {

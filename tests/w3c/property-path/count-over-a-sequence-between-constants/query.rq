@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §9.3 Property Paths and Equivalent Patterns, §18.4 (Sequence):
+# with both ends constant, each route is one empty solution (review query#9)
+PREFIX : <http://example.org/>
+SELECT (COUNT(*) AS ?c) { :x :p/:q :y }

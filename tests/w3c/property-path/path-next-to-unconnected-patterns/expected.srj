@@ -1,0 +1,6 @@
+{
+  "head": {"vars": ["x", "l"]},
+  "results": {"bindings": [
+    {"x": {"type": "uri", "value": "http://example.org/n5"}, "l": {"type": "literal", "value": "end"}}
+  ]}
+}

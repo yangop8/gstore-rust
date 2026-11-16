@@ -1,0 +1,14 @@
+{
+  "head": {"vars": ["s", "t", "x"]},
+  "results": {"bindings": [
+    {"s": {"type": "uri", "value": "http://example.org/a"}, "t": {"type": "uri", "value": "http://example.org/n1"}, "x": {"type": "uri", "value": "http://example.org/n1"}},
+    {"s": {"type": "uri", "value": "http://example.org/a"}, "t": {"type": "uri", "value": "http://example.org/n1"}, "x": {"type": "uri", "value": "http://example.org/n2"}},
+    {"s": {"type": "uri", "value": "http://example.org/b"}, "t": {"type": "uri", "value": "http://example.org/a"}, "x": {"type": "uri", "value": "http://example.org/a"}},
+    {"s": {"type": "uri", "value": "http://example.org/b"}, "t": {"type": "uri", "value": "http://example.org/b"}, "x": {"type": "uri", "value": "http://example.org/b"}},
+    {"s": {"type": "uri", "value": "http://example.org/b"}, "t": {"type": "uri", "value": "http://example.org/n1"}, "x": {"type": "uri", "value": "http://example.org/n1"}},
+    {"s": {"type": "uri", "value": "http://example.org/b"}, "t": {"type": "uri", "value": "http://example.org/n1"}, "x": {"type": "uri", "value": "http://example.org/n2"}},
+    {"s": {"type": "uri", "value": "http://example.org/b"}, "t": {"type": "uri", "value": "http://example.org/n2"}, "x": {"type": "uri", "value": "http://example.org/n2"}},
+    {"s": {"type": "uri", "value": "http://example.org/b"}, "t": {"type": "literal", "value": "1", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}, "x": {"type": "literal", "value": "1", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}},
+    {"s": {"type": "uri", "value": "http://example.org/b"}, "t": {"type": "literal", "value": "2", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}, "x": {"type": "literal", "value": "2", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}}
+  ]}
+}

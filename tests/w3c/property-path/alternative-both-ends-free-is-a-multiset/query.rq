@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §9.3 and §18.4 (Alternative): P|Q is a UNION, so a node reached
+# by both alternatives is a solution once per alternative (review sparqlconf#4)
+PREFIX : <http://example.org/>
+SELECT ?s ?o { ?s :p|:r ?o }

@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §9.3 Property Paths and Equivalent Patterns, §18.4 (Sequence):
+# with both ends free, (:x, :y) is a solution once per route (review query#9)
+PREFIX : <http://example.org/>
+SELECT ?s ?o { ?s :p/:q ?o }

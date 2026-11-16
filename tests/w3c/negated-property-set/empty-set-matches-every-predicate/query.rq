@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §9.1 Property Path Syntax and §18.2.2.3 / §18.4 (Negated Property Set):
+# !() is NPS({}): one step over any predicate
+PREFIX : <http://example.org/>
+SELECT ?x { :b !() ?x }

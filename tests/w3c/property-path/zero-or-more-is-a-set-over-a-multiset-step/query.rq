@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §9.3 and §18.4 (ALP, ZeroOrOnePath): the closures and ? match
+# distinct nodes, whatever the multiplicity of their inner path
+PREFIX : <http://example.org/>
+SELECT ?n { :x (:p/:q)* ?n }

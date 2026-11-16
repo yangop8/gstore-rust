@@ -1,0 +1,10 @@
+{
+  "head": {"vars": ["a", "b"]},
+  "results": {"bindings": [
+    {"a": {"type": "uri", "value": "http://example.org/n1"}, "b": {"type": "uri", "value": "http://example.org/n5"}},
+    {"a": {"type": "uri", "value": "http://example.org/n1"}, "b": {"type": "uri", "value": "http://example.org/n5"}},
+    {"a": {"type": "uri", "value": "http://example.org/n1"}, "b": {"type": "uri", "value": "http://example.org/n5"}},
+    {"a": {"type": "uri", "value": "http://example.org/n1"}, "b": {"type": "uri", "value": "http://example.org/n5"}},
+    {"a": {"type": "uri", "value": "http://example.org/n1"}, "b": {"type": "uri", "value": "http://example.org/n5"}}
+  ]}
+}

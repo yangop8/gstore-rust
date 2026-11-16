@@ -1,0 +1,5 @@
+@prefix : <http://example.org/> .
+:d :likes :a .
+:a :knows :b .
+:e :likes :c .
+:c :admires :b .

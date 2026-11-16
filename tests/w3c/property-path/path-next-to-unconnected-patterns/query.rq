@@ -1,0 +1,5 @@
+# spec: SPARQL 1.1 Query §18.5 Join and §18.4: a path whose end point another pattern of the
+# group binds joins with that pattern's solutions (review sparqlconf#9);
+# the pattern on the far end connects only through the path
+PREFIX : <http://example.org/>
+SELECT ?x ?l { ?s :id 3 . ?s :next* ?x . ?x :label ?l }

@@ -196,6 +196,11 @@ pub struct EvalStats {
     pub dpb_topk: u64,
     /// Complete BGP matches DP-B enumerated (in score order).
     pub dpb_matches: u64,
+    /// Property-path steps: one per adjacency lookup a path's predicate or
+    /// negated property set makes from one node (a closure makes one per
+    /// node it expands, per step of its inner path) — the work a path
+    /// pattern costs.
+    pub path_steps: u64,
 }
 
 /// What a streaming consumer tells the producer: go on, or stop.
