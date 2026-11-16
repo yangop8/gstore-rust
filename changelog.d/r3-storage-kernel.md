@@ -161,6 +161,14 @@ none
 - docs/REFACTOR_BACKLOG.md — conc#8 follow-up: `DiskTriples`' own test code
   still unwraps the shared pager's lock (`disk_triples.rs` tests only; no
   production path left).
+- docs/REFACTOR_BACKLOG.md — db#18 remainder: an id *inside* its space
+  (below 2,000,000,000) still sizes that space's slot vector (24 B per id)
+  when the RocksDB dictionary loads; `try_reserve` turns a request the
+  allocator refuses into "corrupt RocksDB dictionary", but under memory
+  overcommit a corrupt id near the bound still costs that allocation. No
+  ratio bound against the entry count is applied: reclamation can leave
+  legitimate gaps of any size, and the `dict` CF records no id-space limit
+  to check against (persisting one, a `meta` key, would close it).
 
 ## Measured numbers
 
@@ -202,6 +210,24 @@ none
   --features rocksdb` 2,638 passed / 0 failed; `tests/dt_reclaim.rs` 12–15 s
   (17 tests), `tests/dt_reclaim_crash.rs` 6.8 s, `tests/dt_bulk_crash.rs`
   9.3 s, `tests/storage_kernel_regressions.rs` 0.5 s.
+- Independent review (same machine, other worktrees building): every fix
+  reverted at once (cache generation check, quad check, poison-tolerant
+  read lock, shared commit, `remove_sorted_from` presence check, checked
+  WAL removal, pager `flock`, the bulk install's WAL replay, the
+  dictionary's free-list reuse, a crash child that dies at start) made the
+  new tests fail — the two cache-race tests, the `ClockCache` generation
+  test, the shared-commit test, `an_absent_value_removes_nothing`, five of
+  `storage_kernel_regressions.rs`, both WAL-replay tests of
+  `dt_bulk_crash.rs` on ext4 and on tmpfs (`TMPDIR=/dev/shm`), the Memory
+  and Materialize workloads and the Materialize reuse test of
+  `dt_reclaim.rs`, both crash tests of `dt_reclaim_crash.rs` ("the child
+  acknowledged nothing"); restored, all pass. Then: `cargo test
+  --workspace` 2,778 passed / 0 failed with `GSTORE_DISK_QUERY_MODE=memory`
+  and with `=stream`; `cargo test -p gstore --features rocksdb` 2,638
+  passed / 0 failed; workspace and rocksdb clippy `-D warnings`, `cargo
+  doc -p gstore` with `RUSTDOCFLAGS=-D warnings` and `cargo fmt --check`
+  clean; `scripts/conformance.sh --no-build` (dev binaries): all six
+  suites pass.
 
 ## Requests/Not yet
 
