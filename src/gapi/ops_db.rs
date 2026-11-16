@@ -40,7 +40,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use super::envelope::{GResp, Status};
@@ -1115,45 +1116,261 @@ struct Inspection {
 /// 100 ms a monitoring request may take).
 const STATS_REFRESH_WAIT: Duration = Duration::from_millis(40);
 
+/// A statistics refresh running in the background (see
+/// [`refresh_stats_in_background`]).
+struct Refresh {
+    /// Raised to stop it (between its phases) — at a shutdown.
+    cancel: Arc<AtomicBool>,
+    /// Its thread, once spawned (taken by whoever waits for it).
+    thread: Option<std::thread::JoinHandle<()>>,
+    /// Set (and notified) when it ended, also by a panic.
+    done: Arc<(Mutex<bool>, Condvar)>,
+}
+
 /// Statistics refreshes running in the background (by the slot's address),
-/// so a database gets at most one at a time.
-fn refreshing() -> &'static Mutex<HashSet<usize>> {
-    static REFRESHING: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
-    REFRESHING.get_or_init(|| Mutex::new(HashSet::new()))
+/// so a database gets at most one at a time — and a shutdown can stop and
+/// wait for those of its databases ([`stop_stats_refreshes`]).
+fn refreshing() -> &'static Mutex<HashMap<usize, Refresh>> {
+    static REFRESHING: OnceLock<Mutex<HashMap<usize, Refresh>>> = OnceLock::new();
+    REFRESHING.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Recompute loaded database `db`'s statistics (handle `h`) for its current
-/// data off the request path: on a thread of its own, under a shared guard
-/// (it waits for a writer, never for other readers), caching the result for
-/// the next `monitor` / `schema`. At most one refresh per database runs at a
-/// time; a request that finds one running starts none.
+/// data off the request path, caching the result for the next `monitor` /
+/// `schema`. At most one refresh per database runs at a time; a request
+/// that finds one running starts none.
+///
+/// It runs on a thread of its own, tracked in [`refreshing`] with a cancel
+/// flag ([`stop_stats_refreshes`] raises it at a shutdown and waits for the
+/// thread), and computes its three passes over the data — the subject
+/// count, the class statistics, the schema graph — each under a shared
+/// guard of its own (it waits for a writer, never for other readers): a
+/// writer queued behind it waits for one pass, not for the whole refresh,
+/// and a refresh whose data changed between two passes is dropped (the
+/// next request starts another). Review conc#9. While a transaction is
+/// open the committed state's statistics come from its snapshot, in one
+/// go as before.
 fn refresh_stats_in_background(db: &str, h: &DbHandle) {
     let key = Arc::as_ptr(h) as usize;
-    if !locked(refreshing()).insert(key) {
-        return;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let done = Arc::new((Mutex::new(false), Condvar::new()));
+    {
+        let mut running = locked(refreshing());
+        if running.contains_key(&key) {
+            return;
+        }
+        running.insert(
+            key,
+            Refresh {
+                cancel: Arc::clone(&cancel),
+                thread: None,
+                done: Arc::clone(&done),
+            },
+        );
     }
-    let (db, h) = (db.to_string(), Arc::clone(h));
+    let (db, h, flag, ended) = (
+        db.to_string(),
+        Arc::clone(h),
+        Arc::clone(&cancel),
+        Arc::clone(&done),
+    );
     let spawned = std::thread::Builder::new()
         .name("gstore-stats-refresh".into())
         .spawn(move || {
             /// Ends the refresh, also when computing it panicked.
-            struct Done(usize);
+            struct Done(usize, Arc<(Mutex<bool>, Condvar)>);
             impl Drop for Done {
                 fn drop(&mut self) {
                     locked(refreshing()).remove(&self.0);
+                    *locked(&self.1 .0) = true;
+                    self.1 .1.notify_all();
                 }
             }
-            let _done = Done(key);
-            if let Ok(slot) = h.read() {
-                if !slot.retired {
-                    // A read error is not cached; the next request retries.
-                    let _ = class_stats(&db, &h, &slot);
-                }
-            }
+            let _done = Done(key, ended);
+            // A read error is not cached; the next request retries.
+            let _ = refresh_stats(&db, &h, &flag);
         });
-    if spawned.is_err() {
-        locked(refreshing()).remove(&key);
+    match spawned {
+        Ok(thread) => {
+            // Unless it already ended (and removed its entry).
+            if let Some(r) = locked(refreshing()).get_mut(&key) {
+                if Arc::ptr_eq(&r.cancel, &cancel) {
+                    r.thread = Some(thread);
+                }
+            }
+        }
+        Err(_) => {
+            locked(refreshing()).remove(&key);
+        }
     }
+}
+
+/// The work of one background refresh (see
+/// [`refresh_stats_in_background`]): `Ok(false)` when it stopped early (a
+/// cancel, a change of the data, the database unloaded).
+fn refresh_stats(db: &str, h: &DbHandle, cancel: &AtomicBool) -> Result<bool, String> {
+    /// One pass under a shared guard of its own, on the data of generation
+    /// `at` (the first pass fixes it): `None` when the database was
+    /// unloaded or changed meanwhile, or a transaction holds it; a read
+    /// error fails it (contract C2).
+    fn pass<T>(
+        h: &DbHandle,
+        at: Option<u64>,
+        f: impl FnOnce(&Database) -> T,
+    ) -> Option<Result<(u64, T), String>> {
+        let slot = h.read().ok()?;
+        if slot.retired || slot.txn.is_some() {
+            return None;
+        }
+        let generation = slot.committed_generation();
+        if at.is_some_and(|g| g != generation) {
+            return None;
+        }
+        let scope = crate::store::read_scope::ReadScope::enter();
+        let out = f(&slot.db);
+        Some(match scope.take_error() {
+            Some(e) => Err(e),
+            None => Ok((generation, out)),
+        })
+    }
+    let stopped = || {
+        stats_refresh_hook::check(cancel);
+        cancel.load(Ordering::SeqCst)
+    };
+    {
+        let slot = h.read().map_err(|e| e.msg)?;
+        if slot.retired {
+            return Ok(false);
+        }
+        // A transaction is open: the snapshot's statistics, in one go.
+        if slot.txn.is_some() {
+            class_stats(db, h, &slot)?;
+            return Ok(true);
+        }
+        if cached_stats(db, h, Some(slot.committed_generation())).is_some() {
+            return Ok(true);
+        }
+    }
+    if stopped() {
+        return Ok(false);
+    }
+    let Some(subjects) = pass(h, None, |d| d.subject_num()) else {
+        return Ok(false);
+    };
+    let (generation, subjects) = subjects?;
+    if stopped() {
+        return Ok(false);
+    }
+    let Some(classes) = pass(h, Some(generation), |d| d.type_statistics()) else {
+        return Ok(false);
+    };
+    let (_, classes) = classes?;
+    if stopped() {
+        return Ok(false);
+    }
+    let Some(graph) = pass(h, Some(generation), |d| d.schema_graph()) else {
+        return Ok(false);
+    };
+    let (_, graph) = graph?;
+    locked(stats_cache()).insert(
+        db.to_string(),
+        CachedStats {
+            slot: Arc::downgrade(h),
+            mutations: generation,
+            subjects,
+            classes: Arc::new(classes),
+            graph: Arc::new(graph),
+        },
+    );
+    Ok(true)
+}
+
+/// A process-wide hook that runs at every check of a background statistics
+/// refresh (before each of its passes, no guard held) with its cancel flag
+/// — so a test can park a refresh between passes and prove that a writer
+/// is not blocked meanwhile and that a shutdown's cancel is observed at the
+/// next check. Not for production use.
+#[doc(hidden)]
+pub mod stats_refresh_hook {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    /// What runs at a check: it gets the refresh's cancel flag.
+    pub type Hook = Arc<dyn Fn(&AtomicBool) + Send + Sync>;
+
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    static HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+
+    /// Install (`Some`) or remove (`None`) the hook.
+    pub fn set(hook: Option<Hook>) {
+        let mut slot = HOOK.lock().unwrap_or_else(PoisonError::into_inner);
+        INSTALLED.store(hook.is_some(), Ordering::SeqCst);
+        *slot = hook;
+    }
+
+    pub(super) fn check(cancel: &AtomicBool) {
+        if !INSTALLED.load(Ordering::Acquire) {
+            return;
+        }
+        let hook = HOOK.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        if let Some(hook) = hook {
+            hook(cancel);
+        }
+    }
+}
+
+/// The background statistics refreshes of a shutdown's databases, asked to
+/// stop (see [`stop_stats_refreshes`]).
+pub(crate) struct StoppingRefreshes(
+    Vec<(std::thread::JoinHandle<()>, Arc<(Mutex<bool>, Condvar)>)>,
+);
+
+impl StoppingRefreshes {
+    /// Wait (at most `wait` in all) for the refreshes to end and join their
+    /// threads. Returns how many were still running.
+    pub(crate) fn join(self, wait: Duration) -> usize {
+        let deadline = Instant::now() + wait;
+        let mut lingering = 0;
+        for (thread, done) in self.0 {
+            let (ended, cv) = &*done;
+            let mut g = locked(ended);
+            while !*g {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                g = cv
+                    .wait_timeout(g, deadline - now)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .0;
+            }
+            let finished = *g;
+            drop(g);
+            if finished {
+                let _ = thread.join();
+            } else {
+                lingering += 1;
+            }
+        }
+        lingering
+    }
+}
+
+/// Ask the background statistics refreshes of the databases `handles` to
+/// stop (at their next pass); [`StoppingRefreshes::join`] waits for them.
+/// For a shutdown (review conc#9, conc#14).
+pub(crate) fn stop_stats_refreshes(handles: &[DbHandle]) -> StoppingRefreshes {
+    let keys: HashSet<usize> = handles.iter().map(|h| Arc::as_ptr(h) as usize).collect();
+    let mut stopping = Vec::new();
+    for (key, r) in locked(refreshing()).iter_mut() {
+        if keys.contains(key) {
+            r.cancel.store(true, Ordering::SeqCst);
+            if let Some(thread) = r.thread.take() {
+                stopping.push((thread, Arc::clone(&r.done)));
+            }
+        }
+    }
+    StoppingRefreshes(stopping)
 }
 
 /// A cached class statistics + schema graph of one loaded database instance

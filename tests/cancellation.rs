@@ -589,3 +589,163 @@ fn a_reader_does_not_wait_for_another_requests_index_build() {
     });
     assert!(db.cached_string_index().is_some());
 }
+
+// ---- background statistics refreshes and server threads (conc#9, conc#14) -----
+
+/// `POST /api` as root with `pairs` (JSON body).
+fn api(srv: &Srv, pairs: &[(&str, &str)]) -> String {
+    let mut body = String::from("{\"username\":\"root\",\"password\":\"root\"");
+    for (k, v) in pairs {
+        body.push_str(&format!(",\"{k}\":\"{v}\""));
+    }
+    body.push('}');
+    let (s, b) = srv.req("POST", "/api", &body);
+    assert_eq!(s, 200, "{b}");
+    assert!(b.contains("\"StatusCode\":0"), "{b}");
+    b
+}
+
+/// The threads of this process whose name starts with `prefix` (Linux:
+/// `/proc/self/task/*/comm`; elsewhere none are counted).
+fn threads_named(prefix: &str) -> usize {
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+        return 0;
+    };
+    tasks
+        .flatten()
+        .filter(|t| {
+            std::fs::read_to_string(t.path().join("comm"))
+                .is_ok_and(|name| name.trim_end().starts_with(prefix))
+        })
+        .count()
+}
+
+/// A background statistics refresh (started by `/api monitor` after a
+/// write) holds no guard between its passes — a writer goes on while it is
+/// parked there — and a shutdown stops it at its next check, joins its
+/// thread and saves the database.
+#[test]
+fn a_statistics_refresh_yields_between_passes_and_stops_at_shutdown() {
+    let _serial = serial();
+    let mut srv = Srv::start("stats", false);
+    srv.build("mon", "snapshot", &chain(50));
+    let insert = |srv: &Srv, n: usize| {
+        let (s, b) = sparql(
+            srv,
+            "mon",
+            &format!("INSERT DATA {{ <http://ex/x{n}> <http://ex/p> <http://ex/y{n}> }}"),
+        );
+        assert_eq!(s, 200, "{b}");
+    };
+    // Statistics computed (and cached) for the data as built ...
+    api(&srv, &[("operation", "monitor"), ("db_name", "mon")]);
+    // ... then stale: the next monitor refreshes them in the background.
+    insert(&srv, 0);
+
+    // Park the refresh at its second check (after its first pass).
+    let (tx, parked) = mpsc::channel();
+    let tx = Mutex::new(tx);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c = Arc::clone(&calls);
+    gstore::gapi::stats_refresh_hook::set(Some(Arc::new(move |cancel: &AtomicBool| {
+        if c.fetch_add(1, Ordering::SeqCst) + 1 != 2 {
+            return;
+        }
+        let _ = tx.lock().unwrap().send(());
+        let deadline = Instant::now() + HANG_GUARD;
+        while !cancel.load(Ordering::SeqCst) && Instant::now() < deadline {
+            thread::park_timeout(Duration::from_millis(20));
+        }
+    })));
+    struct Unhook;
+    impl Drop for Unhook {
+        fn drop(&mut self) {
+            gstore::gapi::stats_refresh_hook::set(None);
+        }
+    }
+    let _unhook = Unhook;
+
+    api(&srv, &[("operation", "monitor"), ("db_name", "mon")]);
+    parked
+        .recv_timeout(HANG_GUARD)
+        .expect("no background refresh reached its second check (hang guard)");
+    // A writer is not blocked by the parked refresh.
+    insert(&srv, 1);
+    assert!(threads_named("gstore-stats-re") > 0);
+
+    let report = srv.stop();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "the refresh must stop at the check that saw the shutdown's cancel"
+    );
+    assert_eq!(
+        threads_named("gstore-stats-re"),
+        0,
+        "the refresh thread was joined"
+    );
+    assert!(
+        report.saved.iter().any(|p| p.ends_with("mon.db")),
+        "{report:?}"
+    );
+}
+
+/// After `serve_forever` returns, the server's connection workers (one of
+/// them idling on a kept-alive connection), its statistics refreshes and
+/// the cancel bridge are gone: joined, not left running.
+#[test]
+fn no_server_thread_outlives_serve_forever() {
+    let _serial = serial();
+    let mut srv = Srv::start("threads", false);
+    srv.build("t", "snapshot", &chain(20));
+    let (s, b) = sparql(&srv, "t", "SELECT * WHERE { ?s ?p ?o } LIMIT 1");
+    assert_eq!(s, 200, "{b}");
+    // A kept-alive connection left idle.
+    let mut idle = TcpStream::connect(srv.addr).unwrap();
+    idle.set_read_timeout(Some(HANG_GUARD)).unwrap();
+    idle.write_all(
+        b"GET /status HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic cm9vdDpyb290\r\n\r\n",
+    )
+    .unwrap();
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        assert_eq!(idle.read(&mut byte).unwrap(), 1);
+        head.push(byte[0]);
+    }
+    assert!(String::from_utf8_lossy(&head).contains("keep-alive"));
+    assert!(threads_named("gstore-http-") > 0);
+
+    let report = srv.stop();
+    assert!(report.drained, "{report:?}");
+    for prefix in ["gstore-http-", "gstore-stats-re", "gstore-cancel-b"] {
+        assert_eq!(
+            threads_named(prefix),
+            0,
+            "{prefix}* threads outlived serve_forever"
+        );
+    }
+    drop(idle);
+}
+
+/// The single-database `Server` joins its connection workers too.
+#[test]
+fn no_single_database_server_worker_outlives_serve_forever() {
+    let _serial = serial();
+    let db = Database::build_from_str("single", &chain(20)).unwrap();
+    let server = Arc::new(gstore::server::Server::bind(db, "127.0.0.1:0").unwrap());
+    let addr = server.local_addr().unwrap();
+    let s2 = Arc::clone(&server);
+    let serving = thread::spawn(move || s2.serve_forever());
+    let (status, body) = request(&addr, "GET", "/status", "");
+    assert_eq!(status, 200, "{body}");
+    assert!(threads_named("gstore-http-") > 0);
+    server.shutdown();
+    let report = serving.join().unwrap();
+    assert!(report.drained, "{report:?}");
+    assert_eq!(
+        threads_named("gstore-http-"),
+        0,
+        "workers outlived serve_forever"
+    );
+}
