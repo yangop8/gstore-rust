@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Federated Query §4 Service Execution Failure: with SILENT a failed SERVICE
+# (here an endpoint variable no solution binds) is treated as a single solution with no bindings
+PREFIX : <http://example.org/>
+SELECT ?s ?o WHERE { SERVICE SILENT ?endpoint { ?s :name ?o } }

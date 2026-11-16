@@ -15,8 +15,11 @@
 //! projection,service}` (run by `tests/w3c_subset.rs`).
 
 use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use gstore::dict::Dictionary;
@@ -724,6 +727,207 @@ fn select_expressions_are_evaluated_once_per_solution() {
                 rs.windows(2).all(|w| w[0] <= w[1]),
                 "{q} ({opts:?}): {rs:?}"
             );
+        }
+    }
+}
+
+// ---- SERVICE ---------------------------------------------------------------
+
+/// A one-shot fake SPARQL endpoint: answers every request with `reply`,
+/// counting them; stops (and is joined) when dropped.
+struct FakeEndpoint {
+    addr: SocketAddr,
+    stop: Arc<AtomicBool>,
+    hits: Arc<AtomicUsize>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl FakeEndpoint {
+    fn start(reply: &'static str) -> FakeEndpoint {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let handle = {
+            let (stop, hits) = (Arc::clone(&stop), Arc::clone(&hits));
+            std::thread::spawn(move || {
+                for conn in listener.incoming() {
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let Ok(mut conn) = conn else { continue };
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    // Read the head and the body, then answer and close.
+                    let mut reader = BufReader::new(conn.try_clone().unwrap());
+                    let mut len = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                            break;
+                        }
+                        let lower = line.to_ascii_lowercase();
+                        if let Some(v) = lower.strip_prefix("content-length:") {
+                            len = v.trim().parse().unwrap_or(0);
+                        }
+                        if line == "\r\n" {
+                            break;
+                        }
+                    }
+                    let mut body = vec![0u8; len];
+                    let _ = reader.read_exact(&mut body);
+                    let _ = conn.write_all(reply.as_bytes());
+                }
+            })
+        };
+        FakeEndpoint {
+            addr,
+            stop,
+            hits,
+            handle: Some(handle),
+        }
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}/sparql", self.addr)
+    }
+}
+
+impl Drop for FakeEndpoint {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        // Wake the accept loop.
+        let _ = TcpStream::connect(self.addr);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// An address nothing listens on (bound, then released).
+fn dead_url() -> String {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    drop(l);
+    format!("http://{addr}/sparql")
+}
+
+fn service_db() -> Database {
+    Database::build_from_str(
+        "service_errors",
+        "@prefix : <http://ex/> . :alice :knows :bob . :alice :knows :carol .",
+    )
+    .unwrap()
+}
+
+/// The SELECT rows of `q` with `opts`, or the error's text.
+fn run_db(
+    db: &mut Database,
+    q: &str,
+    opts: TopKOptions,
+) -> Result<Vec<Vec<Option<String>>>, String> {
+    db.set_topk_options(opts);
+    db.select(q).map(|rs| rs.rows).map_err(|e| e.to_string())
+}
+
+/// A non-`SILENT` SERVICE that fails — an HTTP error, a reply that is not
+/// SPARQL results JSON, no endpoint listening, a variable endpoint, an
+/// inner pattern that cannot be sent — fails the query with an error
+/// naming the endpoint and the cause, in a join, under OPTIONAL and in
+/// both executors (SPARQL 1.1 Federated Query §4; review robust#6,
+/// tests-b#2, sec#17: the query answered as if the endpoint had no data).
+#[test]
+fn a_failed_service_is_a_query_error_naming_its_cause() {
+    let http500 =
+        FakeEndpoint::start("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 4\r\n\r\nboom");
+    let not_json = FakeEndpoint::start(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/sparql-results+json\r\n\
+         Content-Length: 20\r\n\r\n<html>not json</html",
+    );
+    let dead = dead_url();
+    let mut db = service_db();
+    let cases: Vec<(String, &str)> = vec![
+        (http500.url(), "HTTP 500"),
+        (not_json.url(), "JSON"),
+        (dead.clone(), ""),
+    ];
+    for (url, cause) in &cases {
+        for shape in [
+            "SELECT ?f ?n WHERE { :alice :knows ?f . SERVICE <URL> { ?f :name ?n } }",
+            "SELECT ?f ?n WHERE { :alice :knows ?f OPTIONAL { SERVICE <URL> { ?f :name ?n } } }",
+            "SELECT * WHERE { SERVICE <URL> { ?s ?p ?o } }",
+        ] {
+            let q = format!("{PREFIX}{}", shape.replace("URL", url));
+            for (opts, q) in [
+                (TopKOptions::NONE, q.clone()),
+                (TopKOptions::ALL, format!("{q} LIMIT 10")),
+            ] {
+                let r = run_db(&mut db, &q, opts);
+                let Err(e) = r else {
+                    panic!("a failed SERVICE answered {r:?}: {q} ({opts:?})")
+                };
+                assert!(
+                    e.contains("SERVICE") && e.contains(url.as_str()) && e.contains(cause),
+                    "{e} ({q})"
+                );
+            }
+        }
+    }
+    assert!(http500.hits.load(Ordering::SeqCst) > 0);
+    assert!(not_json.hits.load(Ordering::SeqCst) > 0);
+    // A variable endpoint (unsupported) and an inner pattern the request
+    // cannot carry: errors too, before any connection.
+    let silent_free = [
+        (
+            format!(
+                "{PREFIX}SELECT * WHERE {{ :alice :knows ?f . SERVICE ?ep {{ ?f :name ?n }} }}"
+            ),
+            "variable",
+        ),
+        (
+            format!(
+                "{PREFIX}SELECT * WHERE {{ SERVICE <{}> {{ ?s ?p ?o FILTER(?o != 1) }} }}",
+                http500.url()
+            ),
+            "cannot",
+        ),
+    ];
+    let before = http500.hits.load(Ordering::SeqCst);
+    for (q, cause) in &silent_free {
+        for opts in [TopKOptions::NONE, TopKOptions::ALL] {
+            let r = run_db(&mut db, q, opts);
+            let Err(e) = r else {
+                panic!("answered {r:?}: {q}")
+            };
+            assert!(e.contains("SERVICE") && e.contains(cause), "{e} ({q})");
+        }
+    }
+    assert_eq!(http500.hits.load(Ordering::SeqCst), before);
+}
+
+/// With `SILENT`, the same failures are the join identity: the outer
+/// solutions survive with the service's variables unbound (SPARQL 1.1
+/// Federated Query §4 / Query §18.5).
+#[test]
+fn a_failed_silent_service_is_the_identity() {
+    let http500 =
+        FakeEndpoint::start("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 4\r\n\r\nboom");
+    let dead = dead_url();
+    let mut db = service_db();
+    let both = vec![vec![iri("bob"), None], vec![iri("carol"), None]];
+    for target in [
+        format!("<{}>", http500.url()),
+        format!("<{dead}>"),
+        "?ep".to_string(),
+    ] {
+        let q = format!(
+            "{PREFIX}SELECT ?f ?n WHERE {{ :alice :knows ?f . SERVICE SILENT {target} {{ ?f :name ?n }} }}"
+        );
+        for (opts, q) in [
+            (TopKOptions::NONE, q.clone()),
+            (TopKOptions::ALL, format!("{q} LIMIT 10")),
+        ] {
+            let rows = run_db(&mut db, &q, opts).unwrap_or_else(|e| panic!("{e}: {q}"));
+            assert_eq!(sorted(rows), both, "{q} ({opts:?})");
         }
     }
 }

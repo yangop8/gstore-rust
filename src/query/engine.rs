@@ -2471,10 +2471,13 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// decoded into bindings over this query's [`VarLayout`] (each returned term
     /// interned via the shared dictionary/extras so it joins with outer
     /// solutions). On any failure (variable endpoint, unserializable inner
-    /// pattern, connection or parse error) a non-`SILENT` service yields no
-    /// solutions, while a `SILENT` one yields the single identity solution so the
+    /// pattern, connection, HTTP or parse error) a non-`SILENT` service is
+    /// the query's error, naming the endpoint and the cause (SPARQL 1.1
+    /// Federated Query §4; review robust#6 / tests-b#2 / sec#17: it used to
+    /// yield no solutions, so the query answered as if the endpoint had no
+    /// data), while a `SILENT` one yields the single identity solution so the
     /// outer query still returns. A refusal by policy is the query's error
-    /// instead, `SILENT` or not: `SERVICE` denied altogether, or an endpoint
+    /// too, `SILENT` or not: `SERVICE` denied altogether, or an endpoint
     /// at a host-local address under [`ServicePolicy::RemoteHosts`](crate::db::ServicePolicy::RemoteHosts).
     fn eval_service(
         &self,
@@ -2483,15 +2486,18 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         inner: &GraphPattern,
         layout: &VarLayout,
     ) -> Vec<Binding> {
-        // The identity solution: one all-unbound row (preserves outer bindings
-        // under a join). Returned for SILENT failures.
-        let identity = || vec![vec![None; layout.len()]];
-        let fail = |silent: bool| -> Vec<Binding> {
+        // A failure: under SILENT the identity solution, one all-unbound row
+        // (preserves outer bindings under a join); otherwise the query's
+        // error (see `failed`, reported by `check_cancel`), carrying `why`.
+        let fail = |silent: bool, why: String| -> Vec<Binding> {
             if silent {
-                identity()
-            } else {
-                Vec::new()
+                return vec![vec![None; layout.len()]];
             }
+            let mut failed = self.failed.borrow_mut();
+            if failed.is_none() {
+                *failed = Some(GStoreError::Query(why));
+            }
+            Vec::new()
         };
 
         // Refused outright when this evaluator may not contact remote
@@ -2509,12 +2515,26 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         // be resolved without per-solution evaluation (uncommon — see backlog).
         let url = match endpoint {
             ServiceRef::Iri(iri) => iri.as_str(),
-            ServiceRef::Var(_) => return fail(silent),
+            ServiceRef::Var(v) => {
+                return fail(
+                    silent,
+                    format!(
+                        "SERVICE ?{v}: a variable endpoint is not supported (name the endpoint's \
+                         IRI, or use SERVICE SILENT to skip it)"
+                    ),
+                )
+            }
         };
 
         // Serialize the inner pattern to a remote SELECT query.
         let Some(query) = serialize_service_query(inner) else {
-            return fail(silent);
+            return fail(
+                silent,
+                format!(
+                    "SERVICE <{url}>: the pattern cannot be sent to the endpoint (only triple \
+                     patterns, groups and UNION can; use SERVICE SILENT to skip it)"
+                ),
+            );
         };
 
         // Fetch + parse the remote SPARQL-results JSON (depth-limited: a
@@ -2540,7 +2560,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 }
                 return Vec::new();
             }
-            Err(_) => return fail(silent),
+            Err(e) => return fail(silent, format!("SERVICE <{url}>: {e}")),
         };
 
         // Map each returned solution into this query's layout. Variables the
