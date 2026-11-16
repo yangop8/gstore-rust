@@ -1,6 +1,6 @@
 //! Hand-authored RDF reader conformance cases (decision D5; review parser#4,
 //! parser#5, parser#7, parser#8, parser#9, parser#10, parser#11, parser#12,
-//! parser#15).
+//! parser#14, parser#15).
 //!
 //! Every case gives a document, the triples the specification requires for it
 //! and the section it comes from: RFC 3986 §5.4 (reference resolution, the
@@ -13,7 +13,9 @@
 //! The resource tests (single-token caps, tokenizer memory, the complexity
 //! of IRI resolution and of JSON-LD / RDFa contexts) measure what one
 //! thread allocates with a counting allocator, or compare the run time of an
-//! input against one several times larger.
+//! input against one several times larger; the blank-graph test counts the
+//! graphs of a generated million-label document kept apart by a false
+//! positive.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -1130,4 +1132,92 @@ fn invalid_utf8_in_a_turtle_term_fails_its_own_statement() {
     );
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert!(errors[0].starts_with("line 1:"), "{errors:?}");
+}
+
+// ---- blank graph labels in large documents (parser#14) ------------------------
+
+/// A reader of N-Quads: `n` statements with distinct blank subjects, then,
+/// for each of `graphs` blank graph labels, one quad in the graph and one
+/// statement describing the label (generated as it is read).
+struct BlankGraphDoc {
+    n: usize,
+    graphs: usize,
+    i: usize,
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+impl Read for BlankGraphDoc {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        use std::io::Write;
+        while self.pos == self.buf.len() {
+            self.buf.clear();
+            self.pos = 0;
+            let i = self.i;
+            if i < self.n {
+                writeln!(self.buf, "_:b{i} <http://ex/p> <http://ex/o> .")?;
+            } else if i < self.n + self.graphs {
+                let j = i - self.n;
+                writeln!(
+                    self.buf,
+                    "<http://ex/s> <http://ex/p> <http://ex/o> _:g{j} ."
+                )?;
+                writeln!(self.buf, "_:g{j} <http://ex/desc> \"x\" .")?;
+            } else {
+                return Ok(0);
+            }
+            self.i += 1;
+        }
+        let k = out.len().min(self.buf.len() - self.pos);
+        out[..k].copy_from_slice(&self.buf[self.pos..self.pos + k]);
+        self.pos += k;
+        Ok(k)
+    }
+}
+
+/// Review parser#14: whether a blank graph label was used before as a
+/// subject or object was tracked in a fixed 2^23-bit Bloom filter with two
+/// hash bits: 4.5% false positives after 1M labels, 51% after 5M. A false
+/// positive keeps the graph apart from the statements describing its label
+/// (they stay a blank node). The filter now grows with the labels and keeps
+/// the rate under 1% (the 5M-label measurement is a unit test of
+/// `src/parser/import.rs`).
+#[test]
+fn blank_graph_labels_join_their_descriptions_in_a_large_document() {
+    use gstore::parser::import::{import_reader, ImportOptions, RdfFormat};
+    use gstore::parser::nquads::Quad;
+    let (n, graphs) = (1 << 20, 4000);
+    let doc = BlankGraphDoc {
+        n,
+        graphs,
+        i: 0,
+        buf: Vec::new(),
+        pos: 0,
+    };
+    let desc = iri("http://ex/desc");
+    let (mut joined, mut apart) = (0, 0);
+    let mut errors: Vec<(String, gstore::parser::stream::SyntaxError)> = Vec::new();
+    import_reader(
+        std::io::BufReader::new(doc),
+        RdfFormat::NQuads,
+        "doc",
+        &ImportOptions::strict(),
+        &mut errors,
+        &mut |b: &mut Vec<Quad>| {
+            for q in b.drain(..).filter(|q| q.predicate == desc) {
+                match q.subject {
+                    Term::Iri(_) => joined += 1,
+                    _ => apart += 1,
+                }
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    eprintln!("measured: {n} blank labels, {graphs} blank graphs: {apart} kept apart");
+    assert_eq!(joined + apart, graphs);
+    assert!(
+        apart * 100 < graphs,
+        "{apart} of {graphs} graphs kept apart"
+    );
 }
