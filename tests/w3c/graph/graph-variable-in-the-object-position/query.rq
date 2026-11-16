@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §18.5 Graph(var, P) is the union over the named graphs of
+# Join(eval(P), {var -> name}): in :g1 the solution binds ?g to :g2, not compatible with :g1
+PREFIX : <http://example.org/>
+SELECT ?g ?s WHERE { GRAPH ?g { ?s :p ?g } }

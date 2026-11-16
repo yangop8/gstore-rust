@@ -410,6 +410,96 @@ fn hashed_operators_keep_compatible_merge_semantics() {
     );
 }
 
+// ---- GRAPH ?g --------------------------------------------------------------
+
+fn graph_data() -> Data {
+    Data::parse(
+        ":g1 :created \"2020\" :g1 .
+         :doc7 :created \"1999\" :g1 .
+         :doc8 :created \"2001\" :g2 .
+         :s1 :p :g2 :g1 .
+         :a :g3 :b :g3 .
+         :a :q :c :g3 .
+         :d :p :e .",
+    )
+}
+
+/// `GRAPH ?g { P }` joins the graph name with P's solutions: a solution of
+/// P that binds ?g to another term is not compatible (SPARQL 1.1 §18.5
+/// Graph(var, P); review query#3 / sparqlconf#1 — the binding was
+/// overwritten). Through both executors.
+#[test]
+fn a_graph_variable_joins_with_its_binding_inside_the_graph() {
+    let data = graph_data();
+    let rows = data.rows_everywhere("SELECT ?g ?t WHERE { GRAPH ?g { ?g :created ?t } }");
+    assert_eq!(rows, vec![vec![iri("g1"), lit("2020")]]);
+    // ?g in the object position: :s1 :p :g2 is in :g1, so no solution.
+    assert!(!data.ask_everywhere("ASK { GRAPH ?g { ?s :p ?g } }"));
+    let rows = data.rows_everywhere("SELECT ?s WHERE { GRAPH ?g { ?s :p ?g } }");
+    assert!(rows.is_empty(), "{rows:?}");
+    // ?g in the predicate position (a variable bound in two id spaces):
+    // only the triple whose predicate is the graph's own name.
+    let rows = data.rows_everywhere("SELECT ?g ?s ?o WHERE { GRAPH ?g { ?s ?g ?o } }");
+    assert_eq!(rows, vec![vec![iri("g3"), iri("a"), iri("b")]]);
+    // A plain GRAPH ?g still ranges over every named graph.
+    let rows = data.rows_everywhere("SELECT DISTINCT ?g WHERE { GRAPH ?g { ?s ?p ?o } }");
+    assert_eq!(
+        sorted(rows),
+        vec![vec![iri("g1")], vec![iri("g2")], vec![iri("g3")]]
+    );
+}
+
+/// Inside EXISTS, a graph variable the current solution binds to a literal
+/// names no graph: no solution (review sparqlconf#1 — the variable was left
+/// free, so EXISTS ranged over every graph).
+#[test]
+fn exists_with_a_graph_variable_bound_to_a_literal_finds_nothing() {
+    let data = graph_data();
+    let rows = data.rows_everywhere(
+        "SELECT ?x WHERE { BIND(\"lit\" AS ?g) FILTER EXISTS { GRAPH ?g { ?s ?p ?o } } BIND(1 AS ?x) }",
+    );
+    assert!(rows.is_empty(), "{rows:?}");
+    let rows = data.rows_everywhere(
+        "SELECT ?x WHERE { BIND(\"lit\" AS ?g) FILTER NOT EXISTS { GRAPH ?g { ?s ?p ?o } } BIND(1 AS ?x) }",
+    );
+    assert_eq!(rows, vec![vec![int(1)]]);
+    // Bound to a graph's IRI, EXISTS looks in that graph only.
+    let rows = data.rows_everywhere(
+        "SELECT ?g WHERE { VALUES ?g { :g1 :g2 } FILTER EXISTS { GRAPH ?g { :doc8 ?p ?o } } }",
+    );
+    assert_eq!(rows, vec![vec![iri("g2")]]);
+}
+
+/// `INSERT { ?g :meta ?t } WHERE { GRAPH ?g { ?g :created ?t } }` writes the
+/// one compatible solution, durably — not one triple per subject of the
+/// graph (review sparqlconf#1). Through both executors' settings.
+#[test]
+fn insert_where_graph_variable_writes_only_compatible_solutions() {
+    for opts in [TopKOptions::NONE, TopKOptions::ALL] {
+        let mut db = Database::new("graphvar_insert");
+        db.set_topk_options(opts);
+        db.query(
+            "PREFIX : <http://ex/> INSERT DATA { \
+               GRAPH :g1 { :g1 :created \"2020\" . :doc7 :created \"1999\" } \
+               GRAPH :g2 { :doc8 :created \"2001\" } }",
+        )
+        .unwrap();
+        let r = db
+            .query(
+                "PREFIX : <http://ex/> INSERT { ?g :meta ?t } WHERE { GRAPH ?g { ?g :created ?t } }",
+            )
+            .unwrap();
+        assert!(
+            matches!(r, QueryResult::Update { changed: 1 }),
+            "{opts:?}: {r:?}"
+        );
+        let rs = db
+            .select("PREFIX : <http://ex/> SELECT ?s ?t WHERE { ?s :meta ?t }")
+            .unwrap();
+        assert_eq!(rs.rows, vec![vec![iri("g1"), lit("2020")]], "{opts:?}");
+    }
+}
+
 // ---- the executors agree ---------------------------------------------------
 
 /// SplitMix64.

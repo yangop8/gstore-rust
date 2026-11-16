@@ -1,0 +1,4 @@
+@prefix : <http://example.org/> .
+:g1 { :x :q :y . }
+:g3 { :a :g3 :b .
+      :a :q :c . }

@@ -454,6 +454,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 for (&gid, gstore) in named {
                     let sub = self.graph_sub_evaluator(gstore, named);
                     sub.stream_pattern(inner, layout, &mut |mut b| {
+                        // A solution binding ?g itself must bind it to this
+                        // graph (review query#3 / sparqlconf#1).
+                        if !self.graph_name_agrees(b[vi], gid, layout.is_pred[vi]) {
+                            return GO;
+                        }
                         b[vi] = Some(gid);
                         sink(b)
                     })?;

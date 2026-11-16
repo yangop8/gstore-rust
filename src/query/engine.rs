@@ -2605,12 +2605,34 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 for (&gid, gstore) in named {
                     let sub = self.graph_sub_evaluator(gstore, named);
                     for mut b in sub.eval_pattern(inner, layout) {
-                        b[vi] = Some(gid);
-                        out.push(b);
+                        if self.graph_name_agrees(b[vi], gid, layout.is_pred[vi]) {
+                            b[vi] = Some(gid);
+                            out.push(b);
+                        }
                     }
                 }
                 out
             }
+        }
+    }
+
+    /// `Graph(?g, P)` joins the graph name with P's solutions (SPARQL 1.1
+    /// §18.5): a solution of P that binds `?g` itself — `?g` used inside the
+    /// graph pattern — is kept only when it binds it to this graph, `gid`
+    /// (review query#3 / sparqlconf#1: the binding was overwritten, so
+    /// `GRAPH ?g { ?g :created ?t }` returned every subject's row and an
+    /// `INSERT … WHERE` wrote them). Compared in the entity space: equal
+    /// dictionary ids are the same term; a computed (synthetic) id or a
+    /// predicate-space slot is compared by its term.
+    fn graph_name_agrees(&self, bound: Option<u32>, gid: u32, is_pred: bool) -> bool {
+        match bound {
+            None => true,
+            Some(id) if id == gid && !is_pred => true,
+            Some(id) if is_pred || is_synth(id) => match self.id_to_term(id, is_pred) {
+                Some(t) => self.id_to_term(gid, false).as_ref() == Some(&t),
+                None => false,
+            },
+            Some(_) => false,
         }
     }
 
@@ -3918,6 +3940,14 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                         .and_then(|(id, p)| self.id_to_term(id, p))
                     {
                         Some(Term::Iri(s)) => GraphTerm::Iri(s),
+                        // A literal names no graph: no solution (review
+                        // sparqlconf#1 — the variable was left free, so the
+                        // pattern ranged over every named graph).
+                        Some(Term::Literal { .. }) => {
+                            return GraphPattern::Values(Vec::new(), Vec::new())
+                        }
+                        // A blank node stays a variable; `eval_exists`
+                        // requires the solutions to agree with its value.
                         _ => g.clone(),
                     },
                     GraphTerm::Iri(_) => g.clone(),
