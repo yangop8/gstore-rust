@@ -689,7 +689,7 @@ pub fn debug_poll_hook(hook: Option<Arc<dyn Fn(&'static str) + Send + Sync>>) {
 
 /// Run the [`debug_poll_hook`], if one is installed.
 #[inline]
-fn run_poll_hook(site: &'static str) {
+pub(crate) fn run_poll_hook(site: &'static str) {
     if POLL_HOOK_SET.load(Ordering::Relaxed) {
         let hook = poll_hook()
             .read()

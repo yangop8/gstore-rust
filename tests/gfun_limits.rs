@@ -659,3 +659,297 @@ fn graph_blocks_share_the_output_budget() {
     assert_eq!(wcc_len(&mut db), one);
     expect_budget_error(db.select(both), "a GRAPH block");
 }
+
+// ---------------------------------------------------------------------------
+// the legacy rs: built-ins (analytics#3, analytics#4)
+// ---------------------------------------------------------------------------
+
+/// A [`TripleSource`] that counts whole-store reads (`iter_all`, one
+/// `so_by_p` per predicate) — what building a legacy view from the store
+/// costs — and delegates everything.
+struct ScanCounting<'a> {
+    inner: &'a gstore::store::TripleStore,
+    scans: AtomicUsize,
+}
+
+mod scan_counting {
+    use super::ScanCounting;
+    use gstore::model::id::{EntityLiteralId, PredId};
+    use gstore::model::IdTriple;
+    use gstore::store::TripleSource;
+    use std::sync::atomic::Ordering;
+
+    impl TripleSource for ScanCounting<'_> {
+        fn exists(&self, s: EntityLiteralId, p: PredId, o: EntityLiteralId) -> bool {
+            TripleSource::exists(self.inner, s, p, o)
+        }
+        fn po_by_s(&self, s: EntityLiteralId) -> Vec<(PredId, EntityLiteralId)> {
+            TripleSource::po_by_s(self.inner, s)
+        }
+        fn o_by_sp(&self, s: EntityLiteralId, p: PredId) -> Vec<EntityLiteralId> {
+            TripleSource::o_by_sp(self.inner, s, p)
+        }
+        fn p_by_so(&self, s: EntityLiteralId, o: EntityLiteralId) -> Vec<PredId> {
+            TripleSource::p_by_so(self.inner, s, o)
+        }
+        fn ps_by_o(&self, o: EntityLiteralId) -> Vec<(PredId, EntityLiteralId)> {
+            TripleSource::ps_by_o(self.inner, o)
+        }
+        fn s_by_po(&self, p: PredId, o: EntityLiteralId) -> Vec<EntityLiteralId> {
+            TripleSource::s_by_po(self.inner, p, o)
+        }
+        fn so_by_p(&self, p: PredId) -> Vec<(EntityLiteralId, EntityLiteralId)> {
+            self.scans.fetch_add(1, Ordering::SeqCst);
+            TripleSource::so_by_p(self.inner, p)
+        }
+        fn subs_by_p(&self, p: PredId) -> Vec<EntityLiteralId> {
+            TripleSource::subs_by_p(self.inner, p)
+        }
+        fn objs_by_p(&self, p: PredId) -> Vec<EntityLiteralId> {
+            TripleSource::objs_by_p(self.inner, p)
+        }
+        fn subject_keys(&self) -> Vec<EntityLiteralId> {
+            TripleSource::subject_keys(self.inner)
+        }
+        fn object_keys(&self) -> Vec<EntityLiteralId> {
+            TripleSource::object_keys(self.inner)
+        }
+        fn triple_count(&self) -> u64 {
+            TripleSource::triple_count(self.inner)
+        }
+        fn distinct_subjects(&self) -> usize {
+            TripleSource::distinct_subjects(self.inner)
+        }
+        fn distinct_objects(&self) -> usize {
+            TripleSource::distinct_objects(self.inner)
+        }
+        fn num_predicates(&self) -> usize {
+            TripleSource::num_predicates(self.inner)
+        }
+        fn pred_card(&self, p: PredId) -> usize {
+            TripleSource::pred_card(self.inner, p)
+        }
+        fn pred_distinct_subj(&self, p: PredId) -> usize {
+            TripleSource::pred_distinct_subj(self.inner, p)
+        }
+        fn pred_distinct_obj(&self, p: PredId) -> usize {
+            TripleSource::pred_distinct_obj(self.inner, p)
+        }
+        fn iter_all(&self) -> Vec<IdTriple> {
+            self.scans.fetch_add(1, Ordering::SeqCst);
+            TripleSource::iter_all(self.inner)
+        }
+    }
+}
+
+/// Entities with entity edges (a cycle, two predicates on one pair), an
+/// entity with only a literal object, literal objects shared by two
+/// subjects, and an entity used only as a predicate.
+const MIXED: &str = "<http://x/a> <http://x/p> <http://x/b> .\n\
+    <http://x/a> <http://x/q> <http://x/b> .\n\
+    <http://x/b> <http://x/p> <http://x/c> .\n\
+    <http://x/c> <http://x/p> <http://x/a> .\n\
+    <http://x/c> <http://x/p> <http://x/d> .\n\
+    <http://x/a> <http://x/name> \"Alice\" .\n\
+    <http://x/d> <http://x/name> \"Alice\" .\n\
+    <http://x/e> <http://x/name> \"Eve\" .\n";
+
+const MIXED_TERMS: [&str; 7] = [
+    "<http://x/a>",
+    "<http://x/b>",
+    "<http://x/c>",
+    "<http://x/d>",
+    "<http://x/e>",
+    "\"Alice\"",
+    "\"Eve\"",
+];
+
+/// With a CSR provider, the literal-independent legacy built-ins (cycles,
+/// paths between entities) build their view from the provided CSR: the
+/// store is never scanned (it was, once per query).
+#[test]
+fn literal_independent_legacy_built_ins_use_the_provided_csr() {
+    use gstore::query::engine::CsrProvider;
+    use gstore::query::{Evaluator, QueryResult};
+    let _s = serial();
+    let db = Database::build_from_str("legacy-csr", MIXED).unwrap();
+    let csr = db.csr().unwrap();
+    let counting = ScanCounting {
+        inner: db.store(),
+        scans: AtomicUsize::new(0),
+    };
+    let provider = move || Ok(Arc::clone(&csr));
+    let provider: &CsrProvider<'_> = &provider;
+    for q in [
+        "SELECT ?c WHERE { BIND(rs:CYCLEBOOLEAN() AS ?c) }",
+        "SELECT ?l WHERE { VALUES ?x { 1 2 3 } BIND(rs:SHORTESTPATHLEN(<http://x/a>, <http://x/d>) AS ?l) }",
+        "SELECT ?l WHERE { BIND(rs:SSSPLEN(<http://x/e>, <http://x/e>) AS ?l) }",
+        "SELECT ?l WHERE { BIND(rs:SSSP(<http://x/b>, <http://x/a>) AS ?l) }",
+        "SELECT ?l WHERE { BIND(rs:KHOPREACHABLE(<http://x/a>, <http://x/d>, 2) AS ?l) }",
+        "SELECT ?l WHERE { BIND(rs:SHORTESTPATHS(<http://x/a>, <http://x/e>) AS ?l) }",
+    ] {
+        let parsed = gstore::parser::sparql::parse(q).unwrap();
+        let ev = Evaluator::new(db.dict(), &counting).with_csr_provider(provider);
+        match ev.evaluate(&parsed).unwrap() {
+            QueryResult::Select(rs) => assert!(rs.rows[0][0].is_some(), "{q}: {rs:?}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(counting.scans.load(Ordering::SeqCst), 0, "{q} scanned the store");
+    }
+    // The ones that count literal objects still build the full view.
+    let parsed =
+        gstore::parser::sparql::parse("SELECT ?n WHERE { BIND(rs:BFSCOUNT(<http://x/a>) AS ?n) }")
+            .unwrap();
+    let ev = Evaluator::new(db.dict(), &counting).with_csr_provider(provider);
+    assert!(ev.evaluate(&parsed).is_ok());
+    assert!(counting.scans.load(Ordering::SeqCst) > 0);
+}
+
+/// The entity view answers exactly what the full view (every triple,
+/// literals as nodes) answers, for every pair of terms — entities with and
+/// without entity edges, literals — and for cycles.
+#[test]
+fn legacy_path_built_ins_answer_as_on_the_full_view() {
+    use gstore::analytics::GraphView;
+    let _s = serial();
+    let mut db = Database::build_from_str("legacy-paths", MIXED).unwrap();
+    let full = GraphView::from_store(db.store());
+    let id = |db: &Database, t: &str| {
+        db.dict()
+            .term_id(&gstore::parser::ntriples::parse_term(t).unwrap())
+            .unwrap()
+    };
+    let cell = |db: &mut Database, expr: &str| -> Option<String> {
+        let rs = db
+            .select(&format!("SELECT ?v WHERE {{ BIND({expr} AS ?v) }}"))
+            .unwrap();
+        rs.rows[0][0].clone()
+    };
+    for a in MIXED_TERMS {
+        for c in MIXED_TERMS {
+            let (ia, ic) = (id(&db, a), id(&db, c));
+            let len = full.shortest_path_len(ia, ic).map_or(-1, |x| x as i64);
+            assert_eq!(
+                cell(&mut db, &format!("rs:SHORTESTPATHLEN({a}, {c})")),
+                Some(format!(
+                    "\"{len}\"^^<http://www.w3.org/2001/XMLSchema#integer>"
+                )),
+                "SHORTESTPATHLEN({a}, {c})"
+            );
+            let reach = full.khop_reachable(ia, ic, 2).unwrap_or(false);
+            assert_eq!(
+                cell(&mut db, &format!("rs:KHOPREACHABLE({a}, {c}, 2)")),
+                Some(format!(
+                    "\"{reach}\"^^<http://www.w3.org/2001/XMLSchema#boolean>"
+                )),
+                "KHOPREACHABLE({a}, {c})"
+            );
+            let count = full.count_shortest_paths(ia, ic);
+            assert_eq!(
+                cell(&mut db, &format!("rs:SHORTESTPATHS({a}, {c})")),
+                count.map(|n| format!("\"{n}\"^^<http://www.w3.org/2001/XMLSchema#integer>")),
+                "SHORTESTPATHS({a}, {c})"
+            );
+            let hops = full.shortest_path(ia, ic).map_or(0, |p| p.len());
+            let sssp = cell(&mut db, &format!("rs:SSSP({a}, {c})")).unwrap();
+            assert_eq!(
+                sssp.matches(' ').count() + usize::from(sssp != "\"\""),
+                hops,
+                "SSSP({a}, {c}) = {sssp}"
+            );
+        }
+    }
+    assert_eq!(
+        cell(&mut db, "rs:CYCLEBOOLEAN()"),
+        Some(format!(
+            "\"{}\"^^<http://www.w3.org/2001/XMLSchema#boolean>",
+            full.has_cycle()
+        ))
+    );
+}
+
+/// `rs:LOUVAIN` gives the same partition on every run (it changed from run
+/// to run on equal gains; review analytics#3).
+#[test]
+fn legacy_louvain_is_deterministic() {
+    let _s = serial();
+    let mut nt = String::new();
+    for i in 1..=4 {
+        nt.push_str(&format!("<http://x/c> <http://x/p> <http://x/l{i}> .\n"));
+        nt.push_str(&format!("<http://x/l{i}> <http://x/p> <http://x/x{i}> .\n"));
+    }
+    let q = "SELECT ?o ?same WHERE { <http://x/c> <http://x/p> ?o \
+             BIND(rs:LOUVAIN(<http://x/c>, ?o) AS ?same) } ORDER BY ?o";
+    let mut answers = std::collections::BTreeSet::new();
+    for _ in 0..12 {
+        let mut db = Database::build_from_str("legacy-louvain", &nt).unwrap();
+        let rs = db.select(q).unwrap();
+        answers.insert(format!("{:?}", rs.rows));
+    }
+    assert_eq!(answers.len(), 1, "{answers:#?}");
+}
+
+/// A cancel raised while a legacy built-in builds its view or runs its
+/// algorithm (from inside its loop) fails the query at that poll; it used
+/// to run to the end (no poll at all).
+#[test]
+fn legacy_built_ins_stop_at_a_mid_run_cancel() {
+    let _s = serial();
+    let mut db = Database::build_from_str("legacy-cancel", &chain_nt(20_000)).unwrap();
+    for q in [
+        // full view (store build, then WCC)
+        "SELECT ?n WHERE { BIND(rs:WCC(<http://x/s0>) AS ?n) }",
+        // entity view (CSR → view, then Tarjan)
+        "SELECT ?c WHERE { BIND(rs:CYCLEBOOLEAN() AS ?c) }",
+        "SELECT ?c WHERE { BIND(rs:SHORTESTPATHLEN(<http://x/s0>, <http://x/s19999>) AS ?c) }",
+    ] {
+        let flag = Arc::new(AtomicBool::new(false));
+        let after = Arc::new(AtomicUsize::new(0));
+        let r = {
+            let (flag2, after2) = (Arc::clone(&flag), Arc::clone(&after));
+            let _hook = HookGuard::install(move |s| {
+                if s != "graph-view" {
+                    return;
+                }
+                if flag2.load(Ordering::SeqCst) {
+                    after2.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    flag2.store(true, Ordering::SeqCst);
+                }
+            });
+            db.query_cancellable(q, Arc::clone(&flag))
+        };
+        assert!(flag.load(Ordering::SeqCst), "{q}: never polled");
+        assert!(matches!(r, Err(GStoreError::Cancelled)), "{q}: {r:?}");
+        assert_eq!(after.load(Ordering::SeqCst), 0, "{q}: ran past the poll");
+    }
+}
+
+/// `rs:CYCLEBOOLEAN()` is computed once per query, not once per row.
+#[test]
+fn legacy_cycle_boolean_is_memoised_per_query() {
+    let _s = serial();
+    let mut db = Database::build_from_str("legacy-cycle-memo", &chain_nt(20_000)).unwrap();
+    let polls = |db: &mut Database, rows: usize| {
+        let n = Arc::new(AtomicUsize::new(0));
+        let n2 = Arc::clone(&n);
+        let _hook = HookGuard::install(move |s| {
+            if s == "graph-view" {
+                n2.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let q = format!(
+            "SELECT ?c WHERE {{ ?s <http://x/p> ?o FILTER(rs:CYCLEBOOLEAN() = false) }} LIMIT {rows}"
+        );
+        // the hook only counts while a cancel flag is attached
+        let rs = db
+            .query_cancellable(&q, Arc::new(AtomicBool::new(false)))
+            .unwrap();
+        drop(rs);
+        n.load(Ordering::SeqCst)
+    };
+    let one = polls(&mut db, 1);
+    let many = polls(&mut db, 500);
+    assert!(one > 0);
+    assert_eq!(one, many, "the cycle test ran again for later rows");
+}
