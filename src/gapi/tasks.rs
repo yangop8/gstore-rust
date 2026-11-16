@@ -195,6 +195,18 @@ pub struct TaskConfig {
     /// [`max_pending`](Self::max_pending), beyond which one is recorded as
     /// failed without being attempted.
     pub callback_workers: usize,
+    /// The most bytes of result bodies the callbacks waiting for a callback
+    /// thread may hold in memory (default 64 MiB). A result spilled to
+    /// `<root>/tasks` waits as its file's name and is read when it is
+    /// delivered (it counts nothing here). Beyond it a callback is recorded
+    /// as failed without being attempted (round-2 review).
+    pub callback_queue_bytes: usize,
+    /// The most callbacks of one user that may wait for a callback thread
+    /// (default 32): beyond it that user's next callbacks are recorded as
+    /// failed without being attempted, while other users' are still queued
+    /// (round-2 review: one user's results to a host that never answers no
+    /// longer fill the queue for everyone).
+    pub callback_pending_per_user: usize,
 }
 
 impl Default for TaskConfig {
@@ -213,6 +225,8 @@ impl Default for TaskConfig {
             shutdown_wait: Duration::from_secs(5),
             spill_threshold: 256 * 1024,
             callback_workers: 2,
+            callback_queue_bytes: 64 << 20,
+            callback_pending_per_user: 32,
         }
     }
 }
@@ -481,6 +495,8 @@ struct Inner {
     active: usize,
     /// Callbacks waiting for a callback thread.
     callbacks: VecDeque<Delivery>,
+    /// The bytes of the bodies `callbacks` hold in memory.
+    callback_bytes: usize,
     /// Live callback threads.
     callback_workers: usize,
     /// Callbacks being delivered.
@@ -511,8 +527,29 @@ struct Job {
 /// A finished operation's callback, waiting for a callback thread.
 struct Delivery {
     id: u64,
+    /// The operation's user (for the per-user bound of the queue).
+    user: String,
     url: String,
-    body: Vec<u8>,
+    body: DeliveryBody,
+}
+
+/// What a callback POSTs: the result envelope, kept in memory, or — a
+/// result spilled to the task directory — its file, read when it is
+/// delivered (round-2 review: a queued callback no longer pins a spilled
+/// result in memory).
+enum DeliveryBody {
+    Inline(Vec<u8>),
+    File(PathBuf),
+}
+
+impl DeliveryBody {
+    /// The bytes it holds in memory while queued.
+    fn queued_bytes(&self) -> usize {
+        match self {
+            DeliveryBody::Inline(b) => b.len(),
+            DeliveryBody::File(_) => 0,
+        }
+    }
 }
 
 fn now_ms() -> u64 {
@@ -731,6 +768,7 @@ impl TaskManager {
                     workers: 0,
                     active: 0,
                     callbacks: VecDeque::new(),
+                    callback_bytes: 0,
                     callback_workers: 0,
                     delivering: 0,
                     closed: false,
@@ -999,6 +1037,14 @@ impl TaskManager {
         self.shared.lock().closed
     }
 
+    /// The callbacks waiting for a callback thread, and the bytes of result
+    /// bodies they hold in memory (monitoring and tests).
+    #[doc(hidden)]
+    pub fn queued_callbacks(&self) -> (usize, usize) {
+        let st = self.shared.lock();
+        (st.callbacks.len(), st.callback_bytes)
+    }
+
     /// Whether no asynchronous operation is queued or running (callback
     /// deliveries included).
     pub fn async_idle(&self) -> bool {
@@ -1198,6 +1244,7 @@ fn callback_runner(shared: Arc<Shared>) {
             let mut st = slot.shared.lock();
             match st.callbacks.pop_front() {
                 Some(d) => {
+                    st.callback_bytes = st.callback_bytes.saturating_sub(d.body.queued_bytes());
                     st.delivering += 1;
                     (d, st.config.clone())
                 }
@@ -1212,7 +1259,13 @@ fn callback_runner(shared: Arc<Shared>) {
             }
         };
         slot.busy = Some(delivery.id);
-        let outcome = deliver_callback(&delivery.url, &delivery.body, &config);
+        let outcome = match &delivery.body {
+            DeliveryBody::Inline(body) => deliver_callback(&delivery.url, body, &config),
+            DeliveryBody::File(path) => match fs::read(path) {
+                Ok(body) => deliver_callback(&delivery.url, &body, &config),
+                Err(e) => format!("failed: reading the result file: {e}"),
+            },
+        };
         slot.busy = None;
         let mut st = slot.shared.lock();
         st.delivering -= 1;
@@ -1225,20 +1278,48 @@ fn callback_runner(shared: Arc<Shared>) {
 }
 
 /// Queue `delivery` for a callback thread (starting one if fewer than
-/// [`TaskConfig::callback_workers`] run). A full queue records the callback
-/// as failed without attempting it.
+/// [`TaskConfig::callback_workers`] run). A full queue — by count
+/// ([`TaskConfig::max_pending`]), by the bytes it holds
+/// ([`TaskConfig::callback_queue_bytes`]) or by the user's own count
+/// ([`TaskConfig::callback_pending_per_user`]) — records the callback as
+/// failed without attempting it.
 fn queue_callback(shared: &Arc<Shared>, delivery: Delivery) {
     let spawn = {
         let mut st = shared.lock();
         let max = st.config.max_pending.max(1);
-        if st.callbacks.len() >= max {
+        let max_bytes = st.config.callback_queue_bytes;
+        let per_user = st.config.callback_pending_per_user.max(1);
+        let bytes = delivery.body.queued_bytes();
+        let refusal = if st.callbacks.len() >= max {
+            Some(format!(
+                "failed: too many callbacks are waiting for delivery (at most {max})"
+            ))
+        } else if st
+            .callbacks
+            .iter()
+            .filter(|d| d.user == delivery.user)
+            .count()
+            >= per_user
+        {
+            Some(format!(
+                "failed: too many of this user's callbacks are waiting for delivery (at most \
+                 {per_user})"
+            ))
+        } else if st.callback_bytes.saturating_add(bytes) > max_bytes {
+            Some(format!(
+                "failed: the callbacks waiting for delivery hold too many bytes (at most \
+                 {max_bytes})"
+            ))
+        } else {
+            None
+        };
+        if let Some(why) = refusal {
             if let Some(r) = st.tasks.get_mut(&delivery.id) {
-                r.info.callback_status = Some(format!(
-                    "failed: too many callbacks are waiting for delivery (at most {max})"
-                ));
+                r.info.callback_status = Some(why);
             }
             return;
         }
+        st.callback_bytes += bytes;
         st.callbacks.push_back(delivery);
         let spawn = st.callback_workers < st.config.callback_workers.max(1);
         if spawn {
@@ -1255,6 +1336,7 @@ fn queue_callback(shared: &Arc<Shared>, delivery: Delivery) {
         if st.callback_workers == 0 {
             // Nobody would deliver them: record them as failed.
             let stranded: Vec<Delivery> = st.callbacks.drain(..).collect();
+            st.callback_bytes = 0;
             for d in stranded {
                 if let Some(r) = st.tasks.get_mut(&d.id) {
                     r.info.callback_status =
@@ -1356,10 +1438,18 @@ fn run_job(shared: &Arc<Shared>, job: Job) {
         }
         _ => TaskResult::Json(envelope),
     };
+    // What a callback will POST: a spilled result by its file (read when it
+    // is delivered), else the text itself.
+    let callback_body = job.callback.as_ref().map(|_| match &result {
+        TaskResult::File(path) => DeliveryBody::File(path.clone()),
+        TaskResult::Json(_) => DeliveryBody::Inline(text.into_bytes()),
+    });
+    let mut user = String::new();
     let info = {
         let mut st = shared.lock();
         let cancelled = job.cancel.load(Ordering::Relaxed);
         if let Some(r) = st.tasks.get_mut(&job.id) {
+            user.clone_from(&r.info.user);
             r.info.status_code = Some(code);
             r.info.status_msg = msg;
             r.info.success_num = success_num;
@@ -1394,13 +1484,14 @@ fn run_job(shared: &Arc<Shared>, job: Job) {
         panic!("test-triggered panic outside the operation's catch_unwind");
     }
     // Delivered by a callback thread, not this runner (review gapi#12).
-    if let Some(url) = job.callback {
+    if let (Some(url), Some(body)) = (job.callback, callback_body) {
         queue_callback(
             shared,
             Delivery {
                 id: job.id,
+                user,
                 url,
-                body: text.into_bytes(),
+                body,
             },
         );
     }
