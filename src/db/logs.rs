@@ -25,10 +25,11 @@
 //! Readers that predate the token ignore header tokens they do not know, so
 //! they read new records unchanged (they apply them one by one).
 //!
-//! **Torn tails.** A crash can leave the last append torn: a record that is
-//! incomplete at the end of the file, or whose checksum or terminator is
-//! wrong with no record header after it, or a commit whose `e=` record is
-//! missing at the end of the file. That tail is ignored by replay and cut off
+//! **Torn tails.** A crash can leave the last append torn: a record that
+//! runs past the end of the file with no whole record after it (text inside
+//! its body that looks like a record header does not count), one whose
+//! checksum or terminator is wrong with no record header after it, or a
+//! commit whose `e=` record is missing at the end of the file. That tail is ignored by replay and cut off
 //! by the next append (or backup), which therefore always starts on a commit
 //! boundary. An append that fails (`ENOSPC`, `EFBIG`, a failed `fdatasync`)
 //! is cut off again at once and its records are kept for the next append.
@@ -241,23 +242,40 @@ pub(super) struct Walk {
     pub(super) torn: Option<(usize, String)>,
 }
 
-/// Whether a record header follows offset `pos` (a newline then the magic
-/// word): a defective record with one after it is corruption, without one a
-/// torn tail.
-fn header_after(bytes: &[u8], pos: usize, kind: LogKind) -> Option<usize> {
+/// Where the next record header after offset `pos` starts (a newline, then
+/// the magic word): a defective record with one after it is corruption,
+/// without one a torn tail. With `whole`, only a header that starts a whole
+/// record counts (complete, its checksum right when it has one): the text
+/// a torn record holds — an update-log statement may hold a line that
+/// starts with `REC ` — is not taken for a record after it.
+fn header_after(bytes: &[u8], pos: usize, kind: LogKind, whole: bool) -> Option<usize> {
     let magic = kind.magic().as_bytes();
-    let from = pos.checked_add(1)?;
-    bytes
-        .get(from..)?
-        .windows(magic.len() + 2)
-        .position(|w| w[0] == b'\n' && &w[1..=magic.len()] == magic && w[magic.len() + 1] == b' ')
-        .map(|i| from + i + 1)
+    let mut from = pos.checked_add(1)?;
+    loop {
+        let at = bytes
+            .get(from..)?
+            .windows(magic.len() + 2)
+            .position(|w| {
+                w[0] == b'\n' && &w[1..=magic.len()] == magic && w[magic.len() + 1] == b' '
+            })
+            .map(|i| from + i + 1)?;
+        if !whole || matches!(parse_at(bytes, at, kind), Parsed::Record(_)) {
+            return Some(at);
+        }
+        from = at;
+    }
 }
 
 /// A defect in the record at `pos`: a torn tail when no record header
-/// follows it, else corruption.
-fn torn_or_corrupt(bytes: &[u8], pos: usize, kind: LogKind, why: String) -> Result<Step<'_>> {
-    if header_after(bytes, pos, kind).is_some() {
+/// follows it, else corruption. `whole`: see [`header_after`].
+fn torn_or_corrupt(
+    bytes: &[u8],
+    pos: usize,
+    kind: LogKind,
+    why: String,
+    whole: bool,
+) -> Result<Step<'_>> {
+    if header_after(bytes, pos, kind, whole).is_some() {
         return Err(corrupt(kind, pos, &why));
     }
     Ok(Step::Torn { at: pos, why })
@@ -287,20 +305,33 @@ fn checksum_token(line: &str) -> Option<(&str, bool, u32)> {
     Some((head, ends, u32::from_str_radix(digits, 16).ok()?))
 }
 
-/// The record starting at `pos`.
-fn record_at(bytes: &[u8], pos: usize, kind: LogKind) -> Result<Step<'_>> {
+/// What the bytes at a record's offset hold, before a defect is told torn
+/// or corrupt (see [`record_at`]).
+enum Parsed<'a> {
+    Record(Record<'a>),
+    End,
+    /// A defective record: why.
+    Defect(String),
+    /// A complete header whose body runs past the end of the buffer.
+    Incomplete,
+    /// A length no write produces: corruption, whatever follows.
+    OutOfRange(String),
+}
+
+/// Parse the record starting at `pos`.
+fn parse_at(bytes: &[u8], pos: usize, kind: LogKind) -> Parsed<'_> {
     if pos >= bytes.len() {
-        return Ok(Step::End);
+        return Parsed::End;
     }
     let Some(nl) = bytes[pos..]
         .iter()
         .position(|&b| b == b'\n')
         .map(|i| pos + i)
     else {
-        return torn_or_corrupt(bytes, pos, kind, "incomplete record header".into());
+        return Parsed::Defect("incomplete record header".into());
     };
     let Ok(line) = std::str::from_utf8(&bytes[pos..nl]) else {
-        return torn_or_corrupt(bytes, pos, kind, "non-UTF-8 record header".into());
+        return Parsed::Defect("non-UTF-8 record header".into());
     };
     let checksum = checksum_token(line);
     let fields_text = match checksum {
@@ -309,43 +340,25 @@ fn record_at(bytes: &[u8], pos: usize, kind: LogKind) -> Result<Step<'_>> {
     };
     let mut words = fields_text.split_whitespace();
     if words.next() != Some(kind.magic()) {
-        return torn_or_corrupt(
-            bytes,
-            pos,
-            kind,
-            format!("malformed record header {line:?}"),
-        );
+        return Parsed::Defect(format!("malformed record header {line:?}"));
     }
     let fields: Vec<&str> = words.collect();
-    let out_of_range = || {
-        corrupt(
-            kind,
-            pos,
-            &format!("record length out of range in {line:?}"),
-        )
-    };
+    let out_of_range = || Parsed::OutOfRange(format!("record length out of range in {line:?}"));
     let body_len = match kind.body_len(&fields) {
         BodyLen::Len(n) => n,
-        BodyLen::Malformed => {
-            return torn_or_corrupt(
-                bytes,
-                pos,
-                kind,
-                format!("malformed record header {line:?}"),
-            )
-        }
-        BodyLen::OutOfRange => return Err(out_of_range()),
+        BodyLen::Malformed => return Parsed::Defect(format!("malformed record header {line:?}")),
+        BodyLen::OutOfRange => return out_of_range(),
     };
     let body_start = nl + 1;
     let Some(body_end) = body_start.checked_add(body_len) else {
-        return Err(out_of_range());
+        return out_of_range();
     };
     if body_end >= bytes.len() {
         // The body, or its terminating newline, is missing.
-        return torn_or_corrupt(bytes, pos, kind, "incomplete record".into());
+        return Parsed::Incomplete;
     }
     if bytes[body_end] != b'\n' {
-        return torn_or_corrupt(bytes, pos, kind, "record terminator missing".into());
+        return Parsed::Defect("record terminator missing".into());
     }
     let body = &bytes[body_start..body_end];
     if let Some((head, _, want)) = checksum {
@@ -354,16 +367,31 @@ fn record_at(bytes: &[u8], pos: usize, kind: LogKind) -> Result<Step<'_>> {
         crc.update(b"\n");
         crc.update(body);
         if crc.finish() != want {
-            return torn_or_corrupt(bytes, pos, kind, "checksum mismatch".into());
+            return Parsed::Defect("checksum mismatch".into());
         }
     }
-    Ok(Step::Record(Record {
+    Parsed::Record(Record {
         start: pos,
         fields,
         body,
         end: body_end + 1,
         ends_commit: checksum.map(|(_, ends, _)| ends),
-    }))
+    })
+}
+
+/// The record starting at `pos`, or where the log is torn.
+fn record_at(bytes: &[u8], pos: usize, kind: LogKind) -> Result<Step<'_>> {
+    match parse_at(bytes, pos, kind) {
+        Parsed::Record(r) => Ok(Step::Record(r)),
+        Parsed::End => Ok(Step::End),
+        Parsed::Defect(why) => torn_or_corrupt(bytes, pos, kind, why, false),
+        // A record that runs past the end is the torn tail, unless a whole
+        // record comes after it (its length field was damaged). Any header
+        // inside its declared body is not enough: that is the torn
+        // record's own text.
+        Parsed::Incomplete => torn_or_corrupt(bytes, pos, kind, "incomplete record".into(), true),
+        Parsed::OutOfRange(why) => Err(corrupt(kind, pos, &why)),
+    }
 }
 
 /// Walk the whole commits of a log buffer in order, handing each to
@@ -387,7 +415,7 @@ pub(super) fn walk<'a>(
             Err(_) => {
                 // Corrupt: resume at the next header (there is one).
                 group.clear();
-                pos = header_after(bytes, pos, kind).unwrap_or(bytes.len());
+                pos = header_after(bytes, pos, kind, false).unwrap_or(bytes.len());
                 group_start = pos;
                 continue;
             }
@@ -735,6 +763,58 @@ mod tests {
             "{err}"
         );
         // The appender's scan skips the corrupt record and keeps the rest.
+        assert_eq!(
+            walk(&log, LogKind::Redo, true, |_| Ok(())).unwrap().end,
+            log.len()
+        );
+    }
+
+    #[test]
+    fn header_text_inside_a_torn_record_is_not_a_record_after_it() {
+        // An update-log statement whose text holds lines that start with
+        // `REC ` (a long literal), torn anywhere after the first of them:
+        // a torn tail, not corruption (that text used to count as a record
+        // header after the torn record).
+        let mut first = Vec::new();
+        frame_update(&mut first, 1, 1, "CLEAR ALL", true);
+        let mut second = Vec::new();
+        frame_update(
+            &mut second,
+            2,
+            1,
+            "INSERT DATA { <a> <b> \"\"\"x\nREC 1 2 3\nREC 4 5 30 e=00000000\nnot a record\ny\"\"\" }",
+            true,
+        );
+        let log = [first.clone(), second].concat();
+        let fake = first.len()
+            + 1
+            + log[first.len()..]
+                .windows(5)
+                .position(|w| w == b"\nREC ")
+                .unwrap();
+        for cut in fake + 4..log.len() {
+            let (sizes, w) = commits(&log[..cut], LogKind::Update)
+                .unwrap_or_else(|e| panic!("cut at {cut}: {e}"));
+            assert_eq!(sizes, [1], "cut at {cut}");
+            assert_eq!(w.end, first.len(), "cut at {cut}");
+            assert!(w.torn.is_some(), "cut at {cut}");
+        }
+    }
+
+    #[test]
+    fn a_record_running_past_the_end_with_a_whole_record_after_it_is_corrupt() {
+        // A damaged length field, not a torn tail: replay reports it.
+        let first = commit_of(&[(b'I', None, T1)]);
+        let second = commit_of(&[(b'I', None, T2)]);
+        let at = first.windows(4).position(|w| w == b" 43 ").unwrap() + 1;
+        let mut log = first.clone();
+        log.splice(at..at + 2, *b"993");
+        log.extend_from_slice(&second);
+        let err = commits(&log, LogKind::Redo).unwrap_err().to_string();
+        assert!(
+            err.contains("corrupt at byte 0") && err.contains("incomplete"),
+            "{err}"
+        );
         assert_eq!(
             walk(&log, LogKind::Redo, true, |_| Ok(())).unwrap().end,
             log.len()
