@@ -619,8 +619,9 @@ impl Extractor {
         let mut vocab = ctx.vocab.clone();
         let mut lang = ctx.lang.clone();
         // `xml:base` (rare in RDFa) overrides the inherited base for this subtree.
+        // A relative one is resolved against the inherited base.
         let base = match el.attr("xml:base") {
-            Some(b) => b.to_string(),
+            Some(b) => resolve_iri(&ctx.base, b),
             None => ctx.base.clone(),
         };
 
@@ -962,7 +963,9 @@ fn parse_prefix_attr(s: &str, out: &mut HashMap<String, String>) {
 fn resolve_resource(value: &str, local: &LocalCtx) -> Option<Term> {
     let v = value.trim();
     if v.is_empty() {
-        return None;
+        // An empty IRI reference is the base itself (RFC 3986 §5.2: the
+        // document, without a fragment; review parser#4).
+        return Some(Term::Iri(resolve_iri(local.base, "")));
     }
     if let Some(inner) = v.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
         return resolve_curie(inner, local);
@@ -1050,51 +1053,14 @@ fn datatype_iri(value: &str, local: &LocalCtx) -> Option<String> {
 }
 
 fn is_absolute_iri(s: &str) -> bool {
-    match s.find(':') {
-        Some(i) => {
-            let scheme = &s[..i];
-            !scheme.is_empty()
-                && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-                && scheme
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
-        }
-        None => false,
-    }
+    crate::parser::iri::is_absolute(s)
 }
 
-/// Resolve a (possibly relative) IRI reference against `base` (practical subset).
+/// Resolve a (possibly relative) IRI reference against `base` with the
+/// shared RFC 3986 resolver of every reader ([`crate::parser::iri`]; review
+/// parser#4). Surrounding whitespace of the attribute value is ignored.
 fn resolve_iri(base: &str, reference: &str) -> String {
-    let reference = reference.trim();
-    if reference.is_empty() {
-        return base.to_string();
-    }
-    if is_absolute_iri(reference) {
-        return reference.to_string();
-    }
-    if base.is_empty() {
-        return reference.to_string();
-    }
-    if let Some(frag) = reference.strip_prefix('#') {
-        let stem = base.split('#').next().unwrap_or(base);
-        return format!("{stem}#{frag}");
-    }
-    if reference.starts_with('/') {
-        // Replace path from the authority onward (best-effort).
-        if let Some(scheme_end) = base.find("://") {
-            let after = &base[scheme_end + 3..];
-            let auth_end = after
-                .find('/')
-                .map(|i| scheme_end + 3 + i)
-                .unwrap_or(base.len());
-            return format!("{}{}", &base[..auth_end], reference);
-        }
-        return reference.to_string();
-    }
-    match base.rfind('/') {
-        Some(i) => format!("{}{}", &base[..=i], reference),
-        None => reference.to_string(),
-    }
+    crate::parser::iri::resolve(base, reference.trim())
 }
 
 /// The subset of RDFa 1.1 initial-context prefixes we predefine.

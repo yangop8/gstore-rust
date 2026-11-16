@@ -40,6 +40,7 @@ use std::path::Path;
 
 use crate::error::{GStoreError, Result};
 use crate::model::{Term, Triple};
+use crate::parser::iri::resolve;
 use crate::parser::stream::{BlankLabeler, TermBudget};
 
 const RDF_NS: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
@@ -797,7 +798,9 @@ impl Extractor {
             } else if let Some(prefix) = k.strip_prefix("xmlns:") {
                 ctx.ns.insert(prefix.to_string(), v.clone());
             } else if k == "xml:base" {
-                ctx.base = v.clone();
+                // XML Base: a relative `xml:base` is resolved against the
+                // base in scope (RFC 3986, review parser#4).
+                ctx.base = resolve(&parent.base, v);
             } else if k == "xml:lang" {
                 ctx.lang = crate::model::term::normalize_lang_tag(v).map_err(|msg| {
                     GStoreError::RdfParse {
@@ -984,7 +987,9 @@ impl Extractor {
         }
 
         // Otherwise a literal from the text content.
-        let datatype = attr_value(pe, RDF_NS, "datatype", &ctx.ns)?;
+        // `rdf:datatype` is an IRI reference too (resolved like the others).
+        let datatype =
+            attr_value(pe, RDF_NS, "datatype", &ctx.ns)?.map(|dt| resolve(&ctx.base, &dt));
         let lang = if datatype.is_some() {
             None
         } else {
@@ -1089,46 +1094,6 @@ fn is_syntax_attr(raw: &str, a_ns: &str, a_local: &str) -> bool {
     }
     // Unprefixed spelling of the identity attributes.
     a_ns.is_empty() && matches!(a_local, "about" | "ID" | "nodeID" | "resource")
-}
-
-/// Resolve a (possibly relative) IRI reference against `base` — a practical
-/// subset: absolute references pass through; `#frag` and relative references are
-/// joined to the base.
-fn resolve(base: &str, reference: &str) -> String {
-    if reference.is_empty() {
-        return base.to_string();
-    }
-    if is_absolute(reference) {
-        return reference.to_string();
-    }
-    if base.is_empty() {
-        return reference.to_string();
-    }
-    if let Some(frag) = reference.strip_prefix('#') {
-        let stem = base.split('#').next().unwrap_or(base);
-        return format!("{stem}#{frag}");
-    }
-    // Relative path: replace the last segment of the base.
-    match base.rfind('/') {
-        Some(i) => format!("{}{}", &base[..=i], reference),
-        None => reference.to_string(),
-    }
-}
-
-/// Does `s` have an absolute-IRI scheme (`scheme:` where scheme starts with a
-/// letter)?
-fn is_absolute(s: &str) -> bool {
-    match s.find(':') {
-        Some(i) => {
-            let scheme = &s[..i];
-            !scheme.is_empty()
-                && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-                && scheme
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
-        }
-        None => false,
-    }
 }
 
 #[cfg(test)]

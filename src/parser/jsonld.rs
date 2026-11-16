@@ -184,7 +184,14 @@ impl Processor {
             Json::Obj(defs) => {
                 for (k, v) in defs {
                     match k.as_str() {
-                        "@base" => ctx.base = as_opt_string(v),
+                        // A relative `@base` is resolved against the base
+                        // in force (JSON-LD 1.1 §4.1.2; review parser#4).
+                        "@base" => {
+                            ctx.base = as_opt_string(v).map(|b| match &ctx.base {
+                                Some(outer) => crate::parser::iri::resolve(outer, &b),
+                                None => b,
+                            })
+                        }
                         "@vocab" => ctx.vocab = as_opt_string(v),
                         "@language" => {
                             ctx.language = match v {
@@ -251,7 +258,7 @@ impl Processor {
             for tv in item_refs(t) {
                 if let Json::Str(s) = tv {
                     let iri = expand_iri(&ctx, s, true, false);
-                    if is_absolute_iri(&iri) || iri.starts_with("_:") {
+                    if crate::parser::iri::is_absolute(&iri) || iri.starts_with("_:") {
                         let ty = self.term(&iri);
                         self.push(subject.clone(), rdf_type(), ty);
                     }
@@ -268,7 +275,7 @@ impl Processor {
                 continue;
             }
             let pred_iri = expand_iri(&ctx, key, true, false);
-            if !is_absolute_iri(&pred_iri) {
+            if !crate::parser::iri::is_absolute(&pred_iri) {
                 continue; // drop keys that do not expand to an absolute IRI
             }
             let predicate = Term::Iri(pred_iri);
@@ -458,7 +465,8 @@ fn rdf_type() -> Term {
 fn expand_iri(ctx: &Context, value: &str, vocab: bool, document: bool) -> String {
     if value.is_empty() {
         return match &ctx.base {
-            Some(b) if document => b.clone(),
+            // The document itself: the base without its fragment.
+            Some(b) if document => crate::parser::iri::resolve(b, value),
             _ => value.to_string(),
         };
     }
@@ -493,7 +501,8 @@ fn expand_iri(ctx: &Context, value: &str, vocab: bool, document: bool) -> String
     }
     if document {
         if let Some(b) = &ctx.base {
-            return resolve_against_base(b, value);
+            // The shared RFC 3986 resolver (review parser#4).
+            return crate::parser::iri::resolve(b, value);
         }
     }
     value.to_string()
@@ -571,44 +580,6 @@ fn rdf_err(msg: impl Into<String>) -> GStoreError {
     GStoreError::RdfParse {
         line: 0,
         msg: msg.into(),
-    }
-}
-
-/// Does `s` carry an absolute-IRI scheme (`scheme:` where scheme starts alpha)?
-fn is_absolute_iri(s: &str) -> bool {
-    match s.find(':') {
-        Some(i) => {
-            let scheme = &s[..i];
-            !scheme.is_empty()
-                && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
-                && scheme
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
-        }
-        None => false,
-    }
-}
-
-/// A practical relative-reference resolver (absolute pass-through; `#frag` and
-/// relative paths joined onto the base). Copied minimally to keep this module
-/// self-contained.
-fn resolve_against_base(base: &str, reference: &str) -> String {
-    if reference.is_empty() {
-        return base.to_string();
-    }
-    if is_absolute_iri(reference) {
-        return reference.to_string();
-    }
-    if base.is_empty() {
-        return reference.to_string();
-    }
-    if let Some(frag) = reference.strip_prefix('#') {
-        let stem = base.split('#').next().unwrap_or(base);
-        return format!("{stem}#{frag}");
-    }
-    match base.rfind('/') {
-        Some(i) => format!("{}{}", &base[..=i], reference),
-        None => reference.to_string(),
     }
 }
 
