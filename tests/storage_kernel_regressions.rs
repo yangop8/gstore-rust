@@ -10,7 +10,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use gstore::dict::Space;
-use gstore::kvstore::DiskStore;
+use gstore::kvstore::{DiskStore, Pager};
 
 /// A temporary directory, removed when dropped (also when a test fails).
 struct TmpDir(PathBuf);
@@ -130,6 +130,201 @@ fn free_key_keeps_terms_named_graph_quads_use() {
     assert!(ds.free_key(Space::Literal, "\"lit\"").unwrap());
     assert!(!ds.free_key(Space::Entity, "<g>").unwrap(), "still a graph");
     ds.verify_free_list().unwrap();
+}
+
+// ---- conc#8: a poisoned pager lock ------------------------------------------------
+
+/// Poison the pager lock of `ds` the way a panic under its write guard does.
+fn poison(ds: &DiskStore) {
+    let pager = ds.shared_pager();
+    let joined = std::thread::spawn(move || {
+        let _guard = pager.write().unwrap();
+        panic!("a panic while the pager is locked for writing (test)");
+    })
+    .join();
+    assert!(joined.is_err());
+    assert!(ds.shared_pager().is_poisoned());
+}
+
+/// Review conc#8: after a panic under the pager's write guard every read of
+/// the store panicked (`read().unwrap()` on the poisoned lock) while the
+/// out-of-core dictionary sharing the pager tolerated it. Now the reads go
+/// on, and a write is refused with an error (the pager is marked failed:
+/// nothing the panic may have left half-done reaches the file) instead of a
+/// panic.
+#[test]
+fn a_poisoned_pager_lock_keeps_reads_working_and_refuses_writes() {
+    let tmp = TmpDir::new("poison");
+    let path = tmp.path().join("kvstore.kv");
+    let mut ds = DiskStore::open_with(&path, 64, true).unwrap();
+    ds.insert_keys("<a>", "<p>", "<b>", false).unwrap();
+    ds.insert_quad_keys("<g>", "<a>", "<p>", "\"x\"", true)
+        .unwrap();
+    ds.flush().unwrap();
+    let a = ds
+        .term_id(&gstore::Term::iri("a"))
+        .unwrap()
+        .expect("<a> is a term");
+    poison(&ds);
+    let reads = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_eq!(ds.id_to_string(a).unwrap().as_deref(), Some("<a>"));
+        assert!(ds.predicate_id("<p>").unwrap().is_some());
+        assert_eq!(ds.try_po_by_s(a).unwrap().len(), 1);
+        assert_eq!(ds.try_iter_all().unwrap().len(), 1);
+        assert_eq!(ds.quads().unwrap().len(), 1);
+        assert_eq!(ds.subject_degree(a).unwrap(), 1);
+        assert!(ds.frees_ids());
+        assert_eq!(ds.dictionary().unwrap().entity_num(), ds.entity_num());
+    }));
+    assert!(reads.is_ok(), "a read panicked on the poisoned lock");
+    let write = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ds.insert_keys("<c>", "<p>", "<d>", false)
+    }));
+    let write = write.expect("a write panicked on the poisoned lock");
+    let e = write.expect_err("a write after the panic is refused");
+    assert!(matches!(e, gstore::GStoreError::StorageFailed(_)), "{e}");
+    let commit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ds.commit()));
+    assert!(
+        commit.expect("a commit panicked").is_err(),
+        "nothing is committed"
+    );
+    drop(ds);
+    // The file holds what was committed before the panic.
+    let ds = DiskStore::open(&path, 64).unwrap();
+    assert_eq!(ds.triple_count(), 1);
+    assert_eq!(ds.quad_count(), 1);
+}
+
+// ---- disk#9: one handle per pager file ---------------------------------------------
+
+/// The probe child of [`a_pager_file_open_here_is_refused_to_another_process`]:
+/// tries to open the file and reports.
+#[test]
+fn lock_probe_child() {
+    let Ok(path) = std::env::var("GSTORE_KERNEL_LOCK_PROBE") else {
+        return;
+    };
+    match Pager::open(&path, 8) {
+        Ok(_) => println!("PROBE-OPENED"),
+        Err(e) => println!("PROBE-REFUSED {e}"),
+    }
+}
+
+/// Whether another process can open the pager file at `path` now.
+fn probe_from_another_process(path: &Path) -> Result<(), String> {
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "lock_probe_child", "--nocapture", "--test-threads=1"])
+        .env("GSTORE_KERNEL_LOCK_PROBE", path)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    if stdout.contains("PROBE-OPENED") {
+        Ok(())
+    } else {
+        Err(stdout)
+    }
+}
+
+/// Review disk#9: `Pager::open` took no lock, so a store open here could be
+/// opened by another process too — each replaying and deleting the other's
+/// write-ahead log and overwriting its pages. Now the file is locked while
+/// any pager of this process has it open (a second pager of this process
+/// shares the lock); another process is refused, touching nothing, until
+/// the last one is dropped.
+#[test]
+fn a_pager_file_open_here_is_refused_to_another_process() {
+    let tmp = TmpDir::new("pager_lock");
+    let path = tmp.path().join("kvstore.kv");
+    let mut ds = DiskStore::open_with(&path, 64, true).unwrap();
+    ds.insert_keys("<a>", "<p>", "<b>", false).unwrap();
+    ds.flush().unwrap();
+    let e = probe_from_another_process(&path).expect_err("refused while open here");
+    assert!(e.contains("PROBE-REFUSED") && e.contains("in use"), "{e}");
+    assert!(e.contains("kvstore.kv"), "{e}");
+    // A second pager of this process shares the lock: still refused after
+    // the first one is gone, while the second lives.
+    let second = Pager::open(&path, 8).unwrap();
+    drop(ds);
+    probe_from_another_process(&path).expect_err("the second pager holds it");
+    drop(second);
+    probe_from_another_process(&path).expect("released with the last pager");
+    let ds = DiskStore::open(&path, 64).unwrap();
+    assert_eq!(ds.triple_count(), 1);
+}
+
+/// The other direction: a file another process holds fails this process's
+/// open; once that process exits, the open succeeds.
+#[cfg(unix)]
+#[test]
+fn a_pager_file_held_by_another_process_is_refused() {
+    if let Ok(path) = std::env::var("GSTORE_KERNEL_LOCK_HOLDER") {
+        // The child: hold the file until stdin closes.
+        let _pager = Pager::open(&path, 8).unwrap();
+        println!("HELD");
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+        return;
+    }
+    use std::io::{BufRead, BufReader};
+    let tmp = TmpDir::new("pager_lock_proc");
+    let path = tmp.path().join("kvstore.kv");
+    drop(Pager::open(&path, 8).unwrap());
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "a_pager_file_held_by_another_process_is_refused",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("GSTORE_KERNEL_LOCK_HOLDER", &path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut out = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    loop {
+        line.clear();
+        assert!(
+            out.read_line(&mut line).unwrap() > 0,
+            "the child exited before holding the file"
+        );
+        if line.contains("HELD") {
+            break;
+        }
+    }
+    let e = Pager::open(&path, 8).err().expect("held by the child");
+    assert!(e.to_string().contains("in use"), "{e}");
+    drop(child.stdin.take()); // the child exits
+    assert!(child.wait().unwrap().success());
+    Pager::open(&path, 8).expect("released when the child exited");
+}
+
+/// Review disk#9: `use_streaming_vstree` removed a stale node file and its
+/// write-ahead log ignoring every error, so a log it could not remove was
+/// left beside the fresh file. Now an error other than "not found" fails the
+/// call before anything is built.
+#[test]
+fn a_wal_that_cannot_be_removed_fails_the_streaming_vstree_build() {
+    let tmp = TmpDir::new("vstree_wal");
+    let mut db = gstore::Database::build_from_str(
+        "v",
+        "<http://ex/a> <http://ex/p> <http://ex/b> .\n",
+    )
+    .unwrap();
+    let path = tmp.path().join("vs.kv");
+    // A "log" that is a non-empty directory cannot be removed as a file.
+    let wal = tmp.path().join("vs.kv.wal");
+    fs::create_dir_all(wal.join("x")).unwrap();
+    let e = db
+        .use_streaming_vstree(&path)
+        .expect_err("the stale log could not be removed");
+    let msg = e.to_string();
+    assert!(msg.contains("vs.kv.wal"), "{msg}");
+    assert!(msg.contains("remove"), "{msg}");
+    assert!(!path.exists(), "nothing was built");
+    fs::remove_dir_all(&wal).unwrap();
+    db.use_streaming_vstree(&path).unwrap();
 }
 
 // ---- disk#8 / design#6: the free-id format of a file ----------------------------

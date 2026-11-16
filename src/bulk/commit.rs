@@ -164,11 +164,10 @@ pub(crate) fn remove_rule_dir(dir: &Path) -> Result<()> {
     remove_dir_if_exists(&dir.join(RULE_DIR)).and_then(|()| sync_dir(dir))
 }
 
-/// `<path>.wal`, the pager's write-ahead log beside a paged file.
+/// `<path>.wal`, the pager's write-ahead log beside a paged file (the rule
+/// lives in [`Pager::wal_path`] only, review disk#9).
 fn wal_of(path: &Path) -> PathBuf {
-    let mut s = path.as_os_str().to_owned();
-    s.push(".wal");
-    PathBuf::from(s)
+    Pager::wal_path(path)
 }
 
 fn sync_file(path: &Path) -> Result<()> {

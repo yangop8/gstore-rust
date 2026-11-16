@@ -1127,7 +1127,7 @@ impl Database {
         // leaves the current tree (and its file) as they were.
         let entries = checked_vstree_entries(&self.store)?;
         // Fresh build: drop any prior node file (and its WAL) at this path.
-        remove_file_and_wal(path);
+        remove_file_and_wal(path)?;
         self.vstree = VsTree::build_disk(path, entries)?;
         self.index_valid = true;
         self.vs_shrink_debt = 0;
@@ -4715,14 +4715,14 @@ fn split_lines(content: &str, n: usize) -> Vec<&str> {
     chunks
 }
 
-/// Remove a pager-backed file and its sibling `<path>.wal`, ignoring absence.
+/// Remove a pager-backed file and its sibling `<path>.wal`, ignoring only
+/// absence ([`Pager::remove_with_wal`](crate::kvstore::Pager::remove_with_wal)).
 /// Used before a fresh disk build so a stale WAL from a crashed prior build can
-/// never replay into the new file (see [`crate::kvstore::pager`] recovery).
-fn remove_file_and_wal(path: &Path) {
-    let _ = fs::remove_file(path);
-    let mut wal = path.as_os_str().to_owned();
-    wal.push(".wal");
-    let _ = fs::remove_file(PathBuf::from(wal));
+/// never replay into the new file (see [`crate::kvstore::pager`] recovery):
+/// a log that cannot be removed fails the build (review disk#9: every error
+/// used to be ignored).
+fn remove_file_and_wal(path: &Path) -> Result<()> {
+    crate::kvstore::Pager::remove_with_wal(path)
 }
 
 #[cfg(test)]

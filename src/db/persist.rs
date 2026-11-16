@@ -206,9 +206,11 @@ impl fmt::Display for StorageKind {
     }
 }
 
-/// `<path>.wal`, the pager write-ahead log beside a paged file.
+/// `<path>.wal`, the pager write-ahead log beside a paged file (the rule
+/// lives in [`Pager::wal_path`](crate::kvstore::Pager::wal_path) only,
+/// review disk#9).
 pub(crate) fn wal_of(path: &Path) -> PathBuf {
-    fsutil::with_suffix(path, ".wal")
+    crate::kvstore::Pager::wal_path(path)
 }
 
 // ---- disk write-through sink --------------------------------------------------

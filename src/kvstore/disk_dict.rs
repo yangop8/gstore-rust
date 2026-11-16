@@ -370,7 +370,7 @@ impl DiskDict {
     /// with the term counts read from its header now.
     pub fn open_shared(pager: Arc<RwLock<Pager>>) -> Result<DiskDict> {
         let (counts, free) = {
-            let p = pager.read().unwrap_or_else(|e| e.into_inner());
+            let p = Pager::lock_read(&pager);
             let dense = |slot: usize, what: &str| -> Result<usize> {
                 let n = p.root(slot);
                 if n > ivarray::CAPACITY as u64 {
@@ -545,8 +545,8 @@ impl DiskDict {
     }
 
     fn pager(&self) -> std::sync::RwLockReadGuard<'_, Pager> {
-        // A reader that panicked cannot have left the pager half-written.
-        self.pager.read().unwrap_or_else(|e| e.into_inner())
+        // Poison-tolerant, as every user of a shared pager (review conc#8).
+        Pager::lock_read(&self.pager)
     }
 
     /// Run the test hook (see `read_hook`).
@@ -660,7 +660,7 @@ impl DiskTermSource for DiskDict {
             check()?;
         }
         let (id, new, epoch) = {
-            let mut guard = self.pager.write().unwrap_or_else(|e| e.into_inner());
+            let mut guard = Pager::lock_write(&self.pager);
             // The epoch the pages are at: a free moves it only under this
             // lock, so what this intern caches below is current at it.
             let epoch = self.epoch();
@@ -717,7 +717,7 @@ impl DiskTermSource for DiskDict {
             check()?;
         }
         let freed = {
-            let mut guard = self.pager.write().unwrap_or_else(|e| e.into_inner());
+            let mut guard = Pager::lock_write(&self.pager);
             if !frees_ids(&guard) {
                 return Ok(false);
             }
@@ -1002,9 +1002,7 @@ mod tests {
     }
 
     fn wal(path: &std::path::Path) -> std::path::PathBuf {
-        let mut w = path.as_os_str().to_owned();
-        w.push(".wal");
-        std::path::PathBuf::from(w)
+        Pager::wal_path(path)
     }
 
     #[test]
