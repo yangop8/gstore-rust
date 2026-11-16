@@ -300,6 +300,10 @@ fn a_pager_file_held_by_another_process_is_refused() {
     }
     let e = Pager::open(&path, 8).err().expect("held by the child");
     assert!(e.to_string().contains("in use"), "{e}");
+    // Round-3 integration (r3-storage-kernel's lock meets r3-rest-parity's
+    // typed errors, review design#3): a lock another process holds is a
+    // conflict to retry (409 on every endpoint), not a storage failure.
+    assert_eq!(e.kind(), gstore::error::ErrorKind::Locked, "{e}");
     drop(child.stdin.take()); // the child exits
     assert!(child.wait().unwrap().success());
     Pager::open(&path, 8).expect("released when the child exited");

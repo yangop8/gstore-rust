@@ -343,8 +343,8 @@ impl Pager {
     /// An existing file must carry a header this binary supports (see
     /// [`format::check_header`]); a new file is created as version 1. The
     /// file's advisory lock is taken first (see the module docs): while
-    /// another process has the file open, the open fails and touches
-    /// nothing, not even the log.
+    /// another process has the file open, the open fails with
+    /// [`GStoreError::Locked`] and touches nothing, not even the log.
     pub fn open<P: AsRef<Path>>(path: P, capacity: usize) -> Result<Pager> {
         let path = path.as_ref();
         let wal_path = wal_path_for(path);
@@ -1170,10 +1170,13 @@ fn lock_file(file: &File, path: &Path) -> Result<FileKey> {
     let locked = match lock.try_lock() {
         Ok(()) => true,
         Err(std::fs::TryLockError::WouldBlock) => {
-            return Err(GStoreError::Database(format!(
+            // A lock another process holds: a conflict to retry later, typed
+            // like the directory locks' (review design#3) so every endpoint
+            // answers it 409, not as an unclassified failure.
+            return Err(GStoreError::Locked(format!(
                 "'{}' is in use: another process has it open",
                 path.display()
-            )))
+            )));
         }
         Err(std::fs::TryLockError::Error(e)) if e.kind() == std::io::ErrorKind::Unsupported => {
             false
