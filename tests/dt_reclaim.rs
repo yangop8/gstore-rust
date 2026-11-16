@@ -454,7 +454,10 @@ fn lowest_first_reuse(layout: Layout) {
     let lid = |db: &Database, v: &str| db.dict().literal_id(&Term::plain_literal(v).dict_key());
     let mut db = make(layout, tmp.path(), &base);
     let limits = db.id_space_stats().limits;
-    let (c, d) = (eid(&db, "http://ex/c").unwrap(), eid(&db, "http://ex/d").unwrap());
+    let (c, d) = (
+        eid(&db, "http://ex/c").unwrap(),
+        eid(&db, "http://ex/d").unwrap(),
+    );
     assert!(c.max(d) < eid(&db, "http://ex/zz").unwrap());
     let (l1, l2) = (lid(&db, "l1").unwrap(), lid(&db, "l2").unwrap());
     db.query(
@@ -463,11 +466,22 @@ fn lowest_first_reuse(layout: Layout) {
                        <http://ex/a> <http://ex/q> \"l2\" . <http://ex/a> <http://ex/q> \"l1\" }",
     )
     .unwrap();
-    assert_eq!((eid(&db, "http://ex/c"), eid(&db, "http://ex/d")), (None, None));
+    assert_eq!(
+        (eid(&db, "http://ex/c"), eid(&db, "http://ex/d")),
+        (None, None)
+    );
     db.query("INSERT DATA { <http://ex/e> <http://ex/p> <http://ex/b> . <http://ex/a> <http://ex/q> \"m1\" }")
         .unwrap();
-    assert_eq!(eid(&db, "http://ex/e"), Some(c.min(d)), "{layout:?}: lowest first");
-    assert_eq!(lid(&db, "m1"), Some(l1.min(l2)), "{layout:?}: lowest literal first");
+    assert_eq!(
+        eid(&db, "http://ex/e"),
+        Some(c.min(d)),
+        "{layout:?}: lowest first"
+    );
+    assert_eq!(
+        lid(&db, "m1"),
+        Some(l1.min(l2)),
+        "{layout:?}: lowest literal first"
+    );
     let mut db = reopen(layout, db, tmp.path());
     db.query("INSERT DATA { <http://ex/f> <http://ex/p> <http://ex/b> . <http://ex/a> <http://ex/q> \"m2\" }")
         .unwrap();
@@ -477,10 +491,22 @@ fn lowest_first_reuse(layout: Layout) {
         "{layout:?}: the other freed id, after a reopen"
     );
     assert_eq!(lid(&db, "m2"), Some(l1.max(l2)), "{layout:?}");
-    assert_eq!(db.id_space_stats().limits, limits, "{layout:?}: no space grew");
+    assert_eq!(
+        db.id_space_stats().limits,
+        limits,
+        "{layout:?}: no space grew"
+    );
     let db = reopen(layout, db, tmp.path());
-    assert_eq!(eid(&db, "http://ex/e"), Some(c.min(d)), "{layout:?}: as persisted");
-    assert_eq!(eid(&db, "http://ex/f"), Some(c.max(d)), "{layout:?}: as persisted");
+    assert_eq!(
+        eid(&db, "http://ex/e"),
+        Some(c.min(d)),
+        "{layout:?}: as persisted"
+    );
+    assert_eq!(
+        eid(&db, "http://ex/f"),
+        Some(c.max(d)),
+        "{layout:?}: as persisted"
+    );
     assert_eq!(lid(&db, "m1"), Some(l1.min(l2)), "{layout:?}: as persisted");
     assert_eq!(lid(&db, "m2"), Some(l1.max(l2)), "{layout:?}: as persisted");
     db.verify_integrity().unwrap();

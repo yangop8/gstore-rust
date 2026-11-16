@@ -823,7 +823,10 @@ impl Pager {
                 "cannot commit the page cache inside an open operation".into(),
             ));
         }
-        let _serial = self.commit_lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let _serial = self
+            .commit_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         // The committed batch: the header (page 0) plus all dirty pages.
         let header = Arc::new(self.header_bytes());
         let mut batch: Vec<(PageId, Arc<Page>)> = vec![(0, header)];
@@ -917,7 +920,10 @@ impl Pager {
         }
         #[cfg(not(unix))]
         {
-            let _cursor = self.seek_lock.lock().unwrap_or_else(PoisonError::into_inner);
+            let _cursor = self
+                .seek_lock
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             let mut f = &self.file;
             f.seek(SeekFrom::Start(offset))?;
             f.write_all(&data[..])
@@ -1688,7 +1694,11 @@ mod tests {
             })
             .collect();
         for len in [0, 1, 7, 8, 9, 63, 4096, 4100, data.len()] {
-            assert_eq!(crc32(&data[..len]), crc32_bitwise(&data[..len]), "{len} bytes");
+            assert_eq!(
+                crc32(&data[..len]),
+                crc32_bitwise(&data[..len]),
+                "{len} bytes"
+            );
         }
         // Fed in pieces of any size, as the log writer feeds it.
         let mut c = Crc32::new();

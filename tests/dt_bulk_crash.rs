@@ -650,8 +650,13 @@ fn a_failed_replay_of_the_old_wal_keeps_the_log() {
     let wal_path = dir.join("kvstore.kv.wal");
     fs::write(&wal_path, &wal).unwrap();
     let mut cmd = Command::new(std::env::current_exe().unwrap());
-    cmd.args(["--exact", "limited_build_helper", "--nocapture", "--test-threads=1"])
-        .env("GSTORE_TEST_LIMITED_BUILD", &dir);
+    cmd.args([
+        "--exact",
+        "limited_build_helper",
+        "--nocapture",
+        "--test-threads=1",
+    ])
+    .env("GSTORE_TEST_LIMITED_BUILD", &dir);
     // SAFETY: only async-signal-safe calls between fork and exec.
     unsafe {
         cmd.pre_exec(|| {
@@ -674,7 +679,11 @@ fn a_failed_replay_of_the_old_wal_keeps_the_log() {
     }
     let out = cmd.output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let e = stdout
         .lines()
         .find_map(|l| l.split_once("BUILD-ERR ").map(|(_, e)| e.to_string()))

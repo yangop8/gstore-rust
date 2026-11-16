@@ -586,7 +586,10 @@ impl DiskStore {
         self.stats = stats;
         self.stats_undo.clear();
         self.quad_refs = None;
-        *self.disk_dict.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        *self
+            .disk_dict
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
         self.version.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
@@ -815,10 +818,7 @@ impl DiskStore {
             };
             let referenced = match space {
                 Space::Predicate => st.pos.prefix_exists(pg, &be32(id))?,
-                _ => {
-                    st.spo.prefix_exists(pg, &be32(id))?
-                        || st.osp.prefix_exists(pg, &be32(id))?
-                }
+                _ => st.spo.prefix_exists(pg, &be32(id))? || st.osp.prefix_exists(pg, &be32(id))?,
             } || st.quads_reference(pg, space, id)?;
             if referenced {
                 return Ok(false);
@@ -2319,7 +2319,10 @@ impl DiskStore {
                 disk_dict::frees_ids(&pager),
             )
         };
-        let mut cached = self.disk_dict.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut cached = self
+            .disk_dict
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if let Some((d, g)) = cached.as_ref() {
             // Current while the counts are the header's — ids only get added
             // then — and, on a file whose ids are freed and reused (where a
@@ -4508,7 +4511,11 @@ mod tests {
             "a reader of the shared pager was locked out while the commit wrote its log"
         );
         assert_eq!(read.unwrap().unwrap(), 200);
-        assert_eq!(ds.read_pager().dirty_pages(), 0, "the batch was marked clean");
+        assert_eq!(
+            ds.read_pager().dirty_pages(),
+            0,
+            "the batch was marked clean"
+        );
         drop((ds, shared));
         let back = DiskStore::open(&path, 64).unwrap();
         assert_eq!(back.triple_count(), 200, "the commit is durable");

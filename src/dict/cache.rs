@@ -501,7 +501,8 @@ impl TermCache {
     /// [`ClockCache::insert_at`]).
     pub fn insert_at(&self, space: Space, id: u32, s: Arc<str>, generation: u64) {
         let cost = s.len() + ENTRY_OVERHEAD;
-        self.inner.insert_at(term_key(space, id), s, cost, generation)
+        self.inner
+            .insert_at(term_key(space, id), s, cost, generation)
     }
 
     /// The underlying cache.
@@ -584,7 +585,8 @@ impl KeyCache {
     /// [`ClockCache::insert_at`]).
     pub fn insert_at(&self, space: Space, key: &str, id: u32, generation: u64) {
         let cost = key.len() + ENTRY_OVERHEAD;
-        self.of(space).insert_at(Arc::from(key), id, cost, generation)
+        self.of(space)
+            .insert_at(Arc::from(key), id, cost, generation)
     }
 
     /// Entries resident.

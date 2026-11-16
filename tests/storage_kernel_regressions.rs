@@ -213,7 +213,12 @@ fn lock_probe_child() {
 /// Whether another process can open the pager file at `path` now.
 fn probe_from_another_process(path: &Path) -> Result<(), String> {
     let out = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "lock_probe_child", "--nocapture", "--test-threads=1"])
+        .args([
+            "--exact",
+            "lock_probe_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
         .env("GSTORE_KERNEL_LOCK_PROBE", path)
         .output()
         .unwrap();
@@ -307,11 +312,9 @@ fn a_pager_file_held_by_another_process_is_refused() {
 #[test]
 fn a_wal_that_cannot_be_removed_fails_the_streaming_vstree_build() {
     let tmp = TmpDir::new("vstree_wal");
-    let mut db = gstore::Database::build_from_str(
-        "v",
-        "<http://ex/a> <http://ex/p> <http://ex/b> .\n",
-    )
-    .unwrap();
+    let mut db =
+        gstore::Database::build_from_str("v", "<http://ex/a> <http://ex/p> <http://ex/b> .\n")
+            .unwrap();
     let path = tmp.path().join("vs.kv");
     // A "log" that is a non-empty directory cannot be removed as a file.
     let wal = tmp.path().join("vs.kv.wal");
@@ -411,9 +414,17 @@ fn existing_files_keep_their_format_under_either_policy() {
     assert_eq!(magic(&v1), "GSTOREKV");
     assert_eq!(magic(&v2), "GSTOREK2");
     for policy in ["on", "off"] {
-        run_with_policy("format_child_writes_through_existing_files", policy, tmp.path());
+        run_with_policy(
+            "format_child_writes_through_existing_files",
+            policy,
+            tmp.path(),
+        );
         assert_eq!(magic(&v1), "GSTOREKV", "policy {policy} upgraded a v1 file");
-        assert_eq!(magic(&v2), "GSTOREK2", "policy {policy} downgraded a v2 file");
+        assert_eq!(
+            magic(&v2),
+            "GSTOREK2",
+            "policy {policy} downgraded a v2 file"
+        );
     }
 }
 
@@ -430,7 +441,10 @@ fn explicit_format_child() {
     let policy_on = gstore::db::default_id_reclaim() == gstore::db::IdReclaim::Immediate;
     // The defaults follow the process policy...
     assert_eq!(gstore::bulk::BulkOptions::default().free_ids, policy_on);
-    assert_eq!(gstore::db::default_open_options().free_ids_if_new, policy_on);
+    assert_eq!(
+        gstore::db::default_open_options().free_ids_if_new,
+        policy_on
+    );
     // ...and an explicit choice wins over it: the opposite format.
     let nt = dir.join("d.nt");
     fs::write(&nt, "<http://ex/a> <http://ex/p> <http://ex/b> .\n").unwrap();
@@ -474,7 +488,12 @@ fn new_files_take_the_explicitly_chosen_format() {
     for (policy, want) in [("on", "GSTOREKV"), ("off", "GSTOREK2")] {
         let tmp = TmpDir::new(&format!("explicit_{policy}"));
         let out = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "explicit_format_child", "--nocapture", "--test-threads=1"])
+            .args([
+                "--exact",
+                "explicit_format_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
             .env("GSTORE_ID_RECLAIM", policy)
             .env(EXPLICIT_CHILD, tmp.path())
             .output()
@@ -526,9 +545,8 @@ fn a_rocksdb_dictionary_id_beyond_its_space_fails_the_open() {
             .unwrap(),
         );
         {
-            let db =
-                rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.join("rocksdb"), CFS)
-                    .unwrap();
+            let db = rocksdb::DB::open_cf(&rocksdb::Options::default(), dir.join("rocksdb"), CFS)
+                .unwrap();
             let mut key = vec![tag];
             key.extend_from_slice(&id.to_be_bytes());
             db.put_cf(db.cf_handle("dict").unwrap(), &key, b"<http://ex/far>")

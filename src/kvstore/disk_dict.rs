@@ -1083,10 +1083,7 @@ mod tests {
     /// then waits for `go`. Every later read passes.
     fn park_first_read(
         dd: &mut DiskDict,
-    ) -> (
-        std::sync::mpsc::Receiver<()>,
-        std::sync::mpsc::Sender<()>,
-    ) {
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
         let (parked_tx, parked_rx) = std::sync::mpsc::channel::<()>();
         let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
         let once = std::sync::Mutex::new(Some((parked_tx, go_rx)));
@@ -1162,8 +1159,14 @@ mod tests {
         let again = dd.intern(Space::Entity, "<x>").unwrap();
         let fresh = dd.intern(Space::Entity, "<y>").unwrap();
         assert_ne!(again, fresh, "two terms were given one id");
-        assert_eq!(dd.resolve(Space::Entity, again).unwrap().as_deref(), Some("<x>"));
-        assert_eq!(dd.resolve(Space::Entity, fresh).unwrap().as_deref(), Some("<y>"));
+        assert_eq!(
+            dd.resolve(Space::Entity, again).unwrap().as_deref(),
+            Some("<x>")
+        );
+        assert_eq!(
+            dd.resolve(Space::Entity, fresh).unwrap().as_deref(),
+            Some("<y>")
+        );
         assert_eq!(dd.lookup(Space::Entity, "<x>").unwrap(), Some(again));
         drop((dd, ds));
         std::fs::remove_file(&path).ok();
