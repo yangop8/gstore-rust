@@ -23,7 +23,11 @@ Behaviour changes first (query results; no wire-format or on-disk change):
   solutions, `:a :p|:r ?z` returns a node reached by both alternatives
   twice, and `COUNT(*)` over such paths counts every route. `*`, `+`, `?`
   still return each node once (ALP / ZeroOrOnePath are sets), whatever the
-  multiplicity of their inner path.
+  multiplicity of their inner path. A walk keeps the multiset as counts
+  (each node once, with the number of routes to it), so `/` and `|` cost
+  the distinct nodes of each step rather than the routes, which grow as
+  degree^length: `(:p/:p/:p/:p)+` over a dense graph is as cheap as the
+  set-valued walk was, and only the solutions handed out are expanded.
 - **Zero-length paths match constants that are not in the data** (review
   M14: sparqlconf#13). `<unknown> :p* ?x` and `<unknown> :p? ?x` bind `?x`
   to `<unknown>`, `?x :p* <unknown>` binds `?x` likewise, `ASK { <u> :p*
@@ -88,7 +92,10 @@ New tests and counters:
   the base engine); the scaling test on the review's chain (3,000 and
   6,000 nodes; subject side, object side, both ends, a far-end pattern;
   both executors) asserts the same, small `path_steps` on both sizes
-  (4,504,500 on 3,000 nodes before).
+  (4,504,500 on 3,000 nodes before); a sequence costs its distinct
+  intermediate nodes, not its routes (cliques of 8 and 16 nodes: `/`
+  inside `*`, `+`, `?`, a dead-end sequence and `/`/`|` multisets, both
+  executors, `path_steps` bounded by k·n or k·n²).
 
 ## GAP_PLAN status line
 
@@ -155,6 +162,12 @@ campaign VM (other worktrees building at the same time, load average 4.6 to
   :next* ?x` (4.5 million solutions, COUNT) took base 1.26 to 1.38 s and
   branch 1.02 to 1.06 s; `:n0 :next+ ?x` took 1 ms on both and `?s
   :next/:next ?x` 1 to 2 ms on both.
+- **Sequences keep their cost while returning every route** (debug test
+  build, 30-node clique with every `:p` edge, measured in the independent
+  review): `:n0 (:p/:p/:p/:p)+ ?x` base 0.002 s, multiset walk that
+  followed each route 0.228 s, counted walk 0.001 s; `path_steps` for
+  `:n0 (:p/:p/:p/:p)* ?x` on 8 nodes 4,680 per-route against 200 counted
+  (784 on 16 nodes, against 69,904).
 
 ## Requests/Not yet
 
@@ -165,10 +178,12 @@ campaign VM (other worktrees building at the same time, load average 4.6 to
   - `src/query/topk.rs` module doc: the "A group of several conjuncts"
     bullet gains two sentences on the bind-joined path.
   - `src/query/engine.rs`: new private items outside the listed functions
-    — `type PathSeen` directly before `bind_node`; `struct PathJoin`, `enum
+    — `type PathSeen` and `struct Reached` (the counted multiset of a
+    walk) directly before `bind_node`; `struct PathJoin`, `enum
     PathJoinStep`, `struct BoundPathCache`, `fn extend_by_path` and `fn
     bgp_components` directly before `struct MixedCaches`; new `Evaluator`
-    methods `path_pattern_pairs`, `path_reach_into`, `negated_step`,
+    methods `path_pattern_pairs`, `path_reach_counted` (it replaces
+    `path_reach`), `path_reach_into`, `push_pairs`, `negated_step`,
     `note_path_step` (path section) and `eval_path_join`, `path_join_plan`,
     `bound_path_pairs`, `is_graph_node` (directly after `eval_join`); `use
     std::borrow::Cow`. No existing function outside the grant was edited.
