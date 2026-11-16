@@ -617,13 +617,16 @@ pub(crate) fn dir_or_staged_exists(target: &Path) -> bool {
 //
 // Every path that replaces a directory as a whole — a RocksDB store a build,
 // a save or a backup copy writes, a restored database — stages the new tree
-// beside the old one and publishes it with one swap ([`StagedDir`]); every
-// path that removes a database directory moves it aside durably before it
-// deletes it ([`discard_db_dir`]); a renamed database directory is made
-// durable before anything records the new name ([`rename_dir_durably`]).
-// (Review durability#15; the disk layout's two files are installed by the
-// bulk build's install, `crate::bulk::commit`, which the incremental disk
-// build uses too.)
+// beside the old one and publishes it with one swap ([`StagedDir`] for the
+// incremental RocksDB build and the backup copy; the bulk RocksDB install,
+// the RocksDB save into another directory and the restore still stage
+// themselves and call [`install_staged_dir_as`], see the review backlog);
+// every path that removes a database directory moves it aside durably
+// before it deletes it ([`discard_db_dir`]); a renamed database directory
+// is made durable before anything records the new name
+// ([`rename_dir_durably`]). (Review durability#15; the disk layout's two
+// files are installed by the bulk build's install, `crate::bulk::commit`,
+// which the incremental disk build uses too.)
 
 /// `fsync` every regular file and every directory of the tree under `dir`
 /// (each directory after its entries), so a tree staged for a swap is

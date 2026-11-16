@@ -156,8 +156,10 @@ none
   that are not the database's, which a swap would delete — a staged backup
   needs that contract changed first. (3) The flush-failure policy
   divergence the review lists under durability#15 (`DiskSink::flush`
-  retries vs `DiskTriples::commit_point` poisons) is durability#16's, not
-  touched here. (4) The first decision on a legacy shadow is still by
+  retried where `DiskTriples::commit_point` poisons) was durability#16's
+  and is already fixed on the base of this round (r1-storage-failstate:
+  `DiskSink::flush` now breaks the sink); nothing of it is left for the
+  backlog. (4) The first decision on a legacy shadow is still by
   mtime (`>=`), the only information a legacy build left; and
   `copy_disk_files_to` over a directory holding a snapshot written in the
   same second (on a file system with whole-second timestamps) would treat
@@ -169,7 +171,21 @@ none
   `<name>.db.drop-old` directories are removed by the next drop of the
   name, not swept at server start (the review's optional suggestion); the
   `/api drop` of a missing database removes a leftover without the name's
-  busy claim (it only ever touches the `.drop-old` name).
+  busy claim (it only ever touches the `.drop-old` name). (7) Found in the
+  package review, older than this package (durability#9, durability#15,
+  low): a file-level copy (`backup_dir`, which `gbackup` uses for a
+  directory holding `kvstore.kv` without opening it) of a directory with
+  an unreconciled legacy shadow — a snapshot beside `kvstore.kv` left by an
+  interrupted snapshot save, possibly with a `SHADOW.apply` marker — keeps
+  neither the files' mtimes nor the marker (the copy's snapshot files are
+  written before its `kvstore.kv`, so they read as older, and a copied
+  marker would name the source's store file), so the copy opens as the
+  store's state where the source opens as the shadow's. It needs an
+  interrupted snapshot save over an on-disk database followed by a
+  file-level backup before any open. Fix direction, a decision for the
+  layout-replacement redesign: reconcile the source first (open it under
+  its lock) or refuse such a source — `stage_restore` also copies a backup
+  with `backup_dir`, and a restore must not write into the backup.
 
 ## Measured numbers
 
@@ -205,5 +221,12 @@ none
   3) — the next owner (R3 r3-storage-kernel) should keep the extra subject
   triple, which is what lets the VS-tree check see an old tree.
 - Not done (recorded above for the backlog): the full layout-replacement
-  redesign (durability#15 items 1–6). Every id of the package is otherwise
+  redesign (durability#15 items 1–7). Every id of the package is otherwise
   fixed.
+- For r4-cli-config (gbuild's owner later): the incremental disk build's
+  install warnings (the new database is in place, a cleanup step failed)
+  are logged as warnings by the library and `gbuild --disk --incremental`
+  still exits 0, where the bulk path prints "built, but …" and exits 1;
+  `build_disk_from_sources_incremental` returns an `ImportReport`, which
+  has no warnings field, so aligning the exit status needs a signature or
+  report change outside this package.
