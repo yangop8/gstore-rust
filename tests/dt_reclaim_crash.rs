@@ -250,6 +250,7 @@ fn crash_iterations(layout: &str, iterations: u64) {
     let mut rng = Rng(0x5eed ^ layout.len() as u64);
     // Each iteration's operations use their own id range.
     let mut state: BTreeSet<u64> = BTreeSet::new();
+    let mut acked_total = 0usize;
     for it in 0..iterations {
         let start = 1_000_000 * (it + 1);
         let mut child = Command::new(&exe)
@@ -259,24 +260,55 @@ fn crash_iterations(layout: &str, iterations: u64) {
             .env(LAYOUT_ENV, layout)
             .env(START_ENV, start.to_string())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        std::thread::sleep(Duration::from_millis(30 + rng.below(120)));
-        child.kill().unwrap(); // SIGKILL
+        // The child's acknowledgements, as they come (libtest may print its
+        // own `test crash_child ... ` on the first line, before an ACK).
+        let (acks, acks_rx) = std::sync::mpsc::channel::<usize>();
         let out = child.stdout.take().unwrap();
-        // The highest acknowledged group (libtest may print its own
-        // `test crash_child ... ` on the first line, before an ACK).
-        let acked = BufReader::new(out)
-            .lines()
-            .map_while(Result::ok)
-            .filter_map(|l| {
-                let at = l.find("ACK ")?;
-                l[at + 4..].trim().parse::<usize>().ok()
-            })
+        let mut err_pipe = child.stderr.take().unwrap();
+        let errors = std::thread::spawn(move || {
+            let mut err = String::new();
+            let _ = std::io::Read::read_to_string(&mut err_pipe, &mut err);
+            err
+        });
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(out).lines().map_while(Result::ok) {
+                if let Some(n) = line
+                    .find("ACK ")
+                    .and_then(|at| line[at + 4..].trim().parse::<usize>().ok())
+                {
+                    let _ = acks.send(n);
+                }
+            }
+        });
+        // review tests-b#8: the kill used to come 30-150 ms after the
+        // spawn, so a slow start (or a child that failed at its open) acked
+        // nothing and the iteration compared two empty models. Now the kill
+        // waits for the child's first acknowledgement — the database is open
+        // and has taken a write — and then comes at a random moment of the
+        // churn. (The timeout only guards against a hang.)
+        let first = acks_rx.recv_timeout(Duration::from_secs(300));
+        if first.is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let err = errors.join().unwrap_or_default();
+            panic!("{layout} iteration {it}: the child acknowledged nothing: {err}");
+        }
+        std::thread::sleep(Duration::from_millis(rng.below(120)));
+        child.kill().unwrap(); // SIGKILL
+        child.wait().unwrap();
+        reader.join().unwrap();
+        drop(errors.join());
+        // The highest acknowledged group.
+        let acked = first
+            .into_iter()
+            .chain(acks_rx.try_iter())
             .max()
             .map_or(0, |n| n + 1);
-        child.wait().unwrap();
+        assert!(acked >= 1, "{layout} iteration {it}: nothing acknowledged");
+        acked_total += acked;
 
         let mut db = open(layout, &dir);
         db.verify_integrity()
@@ -322,6 +354,11 @@ fn crash_iterations(layout: &str, iterations: u64) {
         db.verify_integrity().unwrap();
         drop(db);
     }
+    // Every iteration crashed a child in the middle of its churn.
+    assert!(
+        acked_total >= iterations as usize,
+        "{layout}: {acked_total} acknowledged groups over {iterations} iterations"
+    );
 }
 
 #[test]
