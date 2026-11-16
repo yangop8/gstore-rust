@@ -114,7 +114,9 @@
   readers, redo replay and incremental restore of odd stored terms, the
   review's LOAD repro, UPDATE vs loader literals, `gexport` → `gbuild` via
   the binaries, `gbuild` exit 3, the IRI()/STRLANG() injection, CONSTRUCT
-  over HTTP and through `gquery`, result serializers, sameTerm vs matching).
+  over HTTP and through `gquery`, result serializers, sameTerm vs matching;
+  plus, with the `rocksdb` feature, `gbuild --rocksdb` exit 3 for the bulk
+  and `--incremental` builds).
   There are also module tests in `model::term`, `parser::ntriples`,
   `parser::nquads`, `parser::rdfa` and `parser::sparql::lexer`. Every test
   fails on the unfixed tree.
