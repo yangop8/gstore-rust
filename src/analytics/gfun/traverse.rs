@@ -148,6 +148,27 @@ pub fn bfs<B, F>(
     dir: Direction,
     order: NbrOrder,
     max_depth: Option<u32>,
+    visit: F,
+) -> ControlFlow<B>
+where
+    F: FnMut(Node, u32) -> ControlFlow<B>,
+{
+    let mut marks = NodeMarks::new(g.num_nodes());
+    bfs_with(g, &mut marks, src, filter, dir, order, max_depth, visit)
+}
+
+/// [`bfs`] over caller-owned marks (cleared first), so a caller running one
+/// BFS per source allocates its `n`-sized visited set once (review
+/// analytics#7).
+#[allow(clippy::too_many_arguments)]
+pub fn bfs_with<B, F>(
+    g: &CsrGraph,
+    marks: &mut NodeMarks,
+    src: Node,
+    filter: &PredFilter,
+    dir: Direction,
+    order: NbrOrder,
+    max_depth: Option<u32>,
     mut visit: F,
 ) -> ControlFlow<B>
 where
@@ -156,7 +177,7 @@ where
     if src as usize >= g.num_nodes() {
         return ControlFlow::Continue(());
     }
-    let mut marks = NodeMarks::new(g.num_nodes());
+    marks.clear();
     let mut queue: std::collections::VecDeque<(Node, u32)> = std::collections::VecDeque::new();
     marks.mark(src);
     queue.push_back((src, 0));

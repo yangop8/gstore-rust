@@ -1,0 +1,580 @@
+//! Data test: the resource limits of gStore's advanced graph functions
+//! (review analytics#8, analytics#11, gap-gfun-fuzz#2, #3, #4, #5, #6).
+//!
+//! * **Mid-run cancellation.** Every long-running metric polls the
+//!   cancellation flag inside its long loops — a giant component, a hub, a
+//!   sweep — not only between outer iterations. The tests raise the flag
+//!   *from inside* a loop (a [`gfun::debug_poll_hook`] that fires at one of
+//!   the function's polls), never before the call, and check that the call
+//!   stops at that very poll.
+//! * **Iteration bound.** `PR` with `tol < 0` and `louvain` with
+//!   `increase < 0` never converge; they stop at the iteration-work bound
+//!   with an error instead of running up to 2^31 sweeps.
+//! * **Output bounds.** `maximumKplex` / `coreTruss` stop at
+//!   `gfun_max_output_bytes` while they build their text (measured with a
+//!   counting allocator); the bound is a per-query budget that every
+//!   graph-function call of the query is charged against, GROUP BY groups
+//!   and `GRAPH` blocks included.
+//!
+//! The poll hook and the allocation counter are process-wide, so every test
+//! here holds [`serial`] for its whole run.
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
+
+use gstore::analytics::csr::{CsrGraph, PredFilter};
+use gstore::analytics::gfun::{self, GArgs, GFnKind, GFunCtx, GFunValue, GNode};
+use gstore::dict::Dictionary;
+use gstore::error::GStoreError;
+use gstore::model::IdTriple;
+use gstore::Database;
+
+// ---------------------------------------------------------------------------
+// shared helpers
+// ---------------------------------------------------------------------------
+
+/// The system allocator, counting the bytes live now and the peak since
+/// [`reset_peak`].
+struct Counting;
+
+static CURRENT: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+fn grew(by: usize) {
+    let now = CURRENT.fetch_add(by, Ordering::SeqCst) + by;
+    PEAK.fetch_max(now, Ordering::SeqCst);
+}
+
+// SAFETY: every method forwards to `System` with the caller's arguments; the
+// counters do not affect allocation.
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let p = System.alloc(layout);
+        if !p.is_null() {
+            grew(layout.size());
+        }
+        p
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        System.dealloc(ptr, layout);
+        CURRENT.fetch_sub(layout.size(), Ordering::SeqCst);
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let p = System.realloc(ptr, layout, new_size);
+        if !p.is_null() {
+            if new_size >= layout.size() {
+                grew(new_size - layout.size());
+            } else {
+                CURRENT.fetch_sub(layout.size() - new_size, Ordering::SeqCst);
+            }
+        }
+        p
+    }
+}
+
+#[global_allocator]
+static ALLOC: Counting = Counting;
+
+/// Start a new peak measurement; returns the bytes live now.
+fn reset_peak() -> usize {
+    let now = CURRENT.load(Ordering::SeqCst);
+    PEAK.store(now, Ordering::SeqCst);
+    now
+}
+
+/// One test at a time (the poll hook and the allocation counter are
+/// process-wide).
+fn serial() -> MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Removes the poll hook when dropped (also when the test fails).
+struct HookGuard;
+
+impl HookGuard {
+    fn install(hook: impl Fn(&'static str) + Send + Sync + 'static) -> HookGuard {
+        gfun::debug_poll_hook(Some(Arc::new(hook)));
+        HookGuard
+    }
+}
+
+impl Drop for HookGuard {
+    fn drop(&mut self) {
+        gfun::debug_poll_hook(None);
+    }
+}
+
+/// A graph over predicate 0 from `(s, o)` entity-id pairs.
+fn graph(edges: impl IntoIterator<Item = (u32, u32)>) -> CsrGraph {
+    CsrGraph::from_id_triples(
+        edges
+            .into_iter()
+            .map(|(s, o)| IdTriple::new(s, 0, o))
+            .collect(),
+    )
+    .unwrap()
+}
+
+/// `0 → 1 → … → n-1`.
+fn chain(n: u32) -> CsrGraph {
+    graph((0..n - 1).map(|i| (i, i + 1)))
+}
+
+fn src(g: &CsrGraph, e: u32) -> Vec<GNode> {
+    vec![GNode::from_node(g, g.node_of(e).unwrap())]
+}
+
+fn args(g: &CsrGraph, f: impl FnOnce(&mut GArgs)) -> GArgs {
+    let _ = g;
+    let mut a = GArgs {
+        preds: PredFilter::from_ids([0]),
+        ..GArgs::default()
+    };
+    f(&mut a);
+    a
+}
+
+/// A watchdog that raises `flag` after `secs` seconds unless dropped first:
+/// a hang guard only (a test that reaches it fails on the `Cancelled` it
+/// causes, never passes because of it).
+struct Watchdog(Option<std::sync::mpsc::Sender<()>>);
+
+impl Watchdog {
+    fn arm(flag: &Arc<AtomicBool>, secs: u64) -> Watchdog {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let flag = Arc::clone(flag);
+        std::thread::spawn(move || {
+            if rx.recv_timeout(Duration::from_secs(secs)).is_err() {
+                flag.store(true, Ordering::SeqCst);
+            }
+        });
+        Watchdog(Some(tx))
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// mid-run cancellation (analytics#8, analytics#11)
+// ---------------------------------------------------------------------------
+
+/// `kind` polls the loop `site` repeatedly while it runs, and a flag raised
+/// at one of those polls (from inside the loop, as a `/cancel` arriving
+/// meanwhile would) stops the call right there, at that poll.
+fn stops_at_the_next_poll(kind: GFnKind, g: &CsrGraph, a: &GArgs, site: &'static str) {
+    let d = Dictionary::new();
+    // 1. Uncancelled: the loop polls more than once.
+    let calls = Arc::new(AtomicUsize::new(0));
+    {
+        let calls = Arc::clone(&calls);
+        let _hook = HookGuard::install(move |s| {
+            if s == site {
+                calls.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        let r = gfun::eval(kind, &GFunCtx::new(g, &d), a);
+        assert!(r.is_ok(), "{kind}: {r:?}");
+    }
+    let polls = calls.load(Ordering::SeqCst);
+    assert!(
+        polls >= 2,
+        "{kind}: the loop `{site}` polled the cancellation flag {polls} time(s)"
+    );
+    // 2. The flag goes up at the first poll of `site`: the call stops there
+    //    (no further poll of any loop runs after it).
+    let flag = Arc::new(AtomicBool::new(false));
+    let after = Arc::new(AtomicUsize::new(0));
+    let r = {
+        let (flag2, after2) = (Arc::clone(&flag), Arc::clone(&after));
+        let _hook = HookGuard::install(move |s| {
+            if flag2.load(Ordering::SeqCst) {
+                after2.fetch_add(1, Ordering::SeqCst);
+            } else if s == site {
+                flag2.store(true, Ordering::SeqCst);
+            }
+        });
+        gfun::eval(kind, &GFunCtx::new(g, &d).with_cancel(&flag), a)
+    };
+    assert!(flag.load(Ordering::SeqCst), "{kind}: `{site}` never polled");
+    assert!(
+        matches!(r, Err(GStoreError::Cancelled)),
+        "{kind}: expected Cancelled, got {r:?}"
+    );
+    assert_eq!(
+        after.load(Ordering::SeqCst),
+        0,
+        "{kind}: kept running past the poll that saw the flag"
+    );
+}
+
+#[test]
+fn wcc_stops_inside_a_giant_component() {
+    let _s = serial();
+    // One component: every poll after the first outer step is inside its BFS.
+    let g = chain(20_000);
+    stops_at_the_next_poll(GFnKind::Wcc, &g, &args(&g, |_| {}), "wcc");
+}
+
+#[test]
+fn pr_stops_inside_a_sweep() {
+    let _s = serial();
+    let g = chain(20_000);
+    let a = args(&g, |a| {
+        a.directed = true;
+        a.alpha = Some(0.85);
+        a.max_iter = Some(3.0);
+        a.tol = Some(1e-9);
+        a.ret_num = Some(1);
+    });
+    stops_at_the_next_poll(GFnKind::Pr, &g, &a, "pr");
+}
+
+#[test]
+fn label_prop_stops_inside_an_iteration() {
+    let _s = serial();
+    let g = chain(20_000);
+    let a = args(&g, |a| a.max_iter = Some(2.0));
+    stops_at_the_next_poll(GFnKind::LabelProp, &g, &a, "labelProp");
+}
+
+#[test]
+fn louvain_stops_inside_a_sweep() {
+    let _s = serial();
+    let g = chain(300);
+    let a = args(&g, |a| {
+        a.directed = true;
+        a.max_iter = Some(2.0);
+        a.increase = Some(0.0);
+    });
+    stops_at_the_next_poll(GFnKind::Louvain, &g, &a, "louvain");
+}
+
+#[test]
+fn triangle_counting_stops_inside_its_vertex_loop() {
+    let _s = serial();
+    let g = chain(20_000);
+    stops_at_the_next_poll(
+        GFnKind::TriangleCounting,
+        &g,
+        &args(&g, |_| {}),
+        "triangleCounting",
+    );
+}
+
+#[test]
+fn closeness_stops_inside_its_bfs() {
+    let _s = serial();
+    let g = chain(20_000);
+    let a = args(&g, |a| a.srcs = src(&g, 0));
+    stops_at_the_next_poll(GFnKind::ClosenessCentrality, &g, &a, "closenessCentrality");
+}
+
+#[test]
+fn betweenness_stops_inside_its_bfs() {
+    let _s = serial();
+    let g = chain(300);
+    let a = args(&g, |a| {
+        a.srcs = src(&g, 150);
+        a.directed = true;
+    });
+    stops_at_the_next_poll(
+        GFnKind::BetweennessCentrality,
+        &g,
+        &a,
+        "betweennessCentrality",
+    );
+}
+
+#[test]
+fn cluster_coeff_stops_inside_its_vertex_loop() {
+    let _s = serial();
+    // a hub with 20 000 leaves: its neighbour set alone is one long step
+    let g = graph((1..=20_000).map(|i| (0, i)));
+    stops_at_the_next_poll(GFnKind::ClusterCoeff, &g, &args(&g, |_| {}), "clusterCoeff");
+    let a = args(&g, |a| a.srcs = src(&g, 0));
+    stops_at_the_next_poll(GFnKind::ClusterCoeff, &g, &a, "clusterCoeff");
+}
+
+#[test]
+fn diameter_and_confidence_stop_inside_their_bfs() {
+    let _s = serial();
+    let g = chain(500);
+    stops_at_the_next_poll(
+        GFnKind::DiameterEstimation,
+        &g,
+        &args(&g, |_| {}),
+        "diameterEstimation",
+    );
+    stops_at_the_next_poll(
+        GFnKind::ConfidenceDegree,
+        &g,
+        &args(&g, |_| {}),
+        "confidenceDegree",
+    );
+}
+
+#[test]
+fn degree_correlation_stops_inside_its_bfs() {
+    let _s = serial();
+    // `k < 0` means 999 hops; a hub with 20 000 leaves is one hop deep
+    let g = graph((1..=20_000).map(|i| (0, i)));
+    let a = args(&g, |a| {
+        a.srcs = src(&g, 0);
+        a.k = Some(-1);
+    });
+    stops_at_the_next_poll(GFnKind::DegreeCorrelation, &g, &a, "degreeCorrelation");
+}
+
+#[test]
+fn jaccard_stops_inside_a_hub_neighbourhood() {
+    let _s = serial();
+    let g = graph((1..=5_000).map(|i| (0, i)));
+    let a = args(&g, |a| {
+        a.srcs = src(&g, 0);
+        a.k = Some(2);
+        a.ret_num = Some(10);
+    });
+    stops_at_the_next_poll(GFnKind::JaccardSimilarity, &g, &a, "jaccard");
+}
+
+/// A pseudo-random simple graph (`n` vertices, edge probability
+/// `p_percent`) over predicate 0.
+fn random_graph(n: u32, p_percent: u64, seed: u64) -> CsrGraph {
+    let mut x = seed;
+    let mut edges = Vec::new();
+    for a in 0..n {
+        for b in a + 1..n {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            if (x >> 33) % 100 < p_percent {
+                edges.push((a, b));
+            }
+        }
+    }
+    graph(edges)
+}
+
+/// `maximumKplex`'s branch-and-bound `Searcher` polls inside its `O(n²)`
+/// initialisation (review gap-gfun-fuzz#3), not only in its search.
+#[test]
+fn kplex_stops_inside_the_searcher_initialisation() {
+    let _s = serial();
+    let g = random_graph(40, 50, 12345);
+    let a = args(&g, |a| a.k = Some(2));
+    stops_at_the_next_poll(GFnKind::MaximumKplex, &g, &a, "kplex-init");
+}
+
+/// The path family's inner loops report through the same hook.
+#[test]
+fn path_functions_stop_inside_their_search() {
+    let _s = serial();
+    let g = chain(20_000);
+    let a = args(&g, |a| {
+        a.srcs = src(&g, 0);
+        a.directed = true;
+    });
+    stops_at_the_next_poll(GFnKind::BfsCount, &g, &a, "paths");
+}
+
+// ---------------------------------------------------------------------------
+// iteration bound (gap-gfun-fuzz#2)
+// ---------------------------------------------------------------------------
+
+fn expect_iteration_bound(r: gstore::error::Result<GFunValue>, kind: GFnKind) {
+    match r {
+        Err(GStoreError::Query(m)) => {
+            assert!(m.contains("iteration bound"), "{kind}: {m}");
+            assert!(m.starts_with(kind.name()), "{kind}: {m}");
+        }
+        other => panic!("{kind}: expected the iteration bound, got {other:?}"),
+    }
+}
+
+#[test]
+fn pr_with_a_negative_tolerance_stops_at_the_iteration_bound() {
+    let _s = serial();
+    let d = Dictionary::new();
+    let g = graph([(0, 1), (1, 2), (2, 0)]);
+    let flag = Arc::new(AtomicBool::new(false));
+    let _dog = Watchdog::arm(&flag, 120);
+    // `maxIter = 2^32` saturates to 2^31 - 1 sweeps; `tol < 0` never converges.
+    let a = args(&g, |a| {
+        a.directed = true;
+        a.alpha = Some(0.85);
+        a.max_iter = Some(4_294_967_296.0);
+        a.tol = Some(-1.0);
+        a.ret_num = Some(3);
+    });
+    let ctx = GFunCtx::new(&g, &d)
+        .with_cancel(&flag)
+        .with_max_iteration_work(1_000_000);
+    expect_iteration_bound(gfun::eval(GFnKind::Pr, &ctx, &a), GFnKind::Pr);
+    // A converging run under the same bound is not affected.
+    let a = args(&g, |a| {
+        a.directed = true;
+        a.alpha = Some(0.85);
+        a.max_iter = Some(1000.0);
+        a.tol = Some(1e-6);
+        a.ret_num = Some(3);
+    });
+    assert!(gfun::eval(GFnKind::Pr, &ctx, &a).is_ok());
+    assert!(!flag.load(Ordering::SeqCst), "the hang guard fired");
+}
+
+#[test]
+fn louvain_with_a_negative_increase_stops_at_the_iteration_bound() {
+    let _s = serial();
+    let d = Dictionary::new();
+    // review gap-gfun-fuzz#2's repro: this graph never stops moving vertices
+    // with increase = -1 (p = 0, q = 1)
+    let g = CsrGraph::from_id_triples(
+        [
+            (2, 0, 0),
+            (2, 1, 0),
+            (1, 0, 1),
+            (2, 1, 2),
+            (0, 1, 1),
+            (1, 1, 0),
+            (2, 0, 1),
+        ]
+        .into_iter()
+        .map(|(s, p, o)| IdTriple::new(s, p, o))
+        .collect(),
+    )
+    .unwrap();
+    let flag = Arc::new(AtomicBool::new(false));
+    let _dog = Watchdog::arm(&flag, 120);
+    let a = GArgs {
+        directed: true,
+        preds: PredFilter::from_ids([0, 1]),
+        max_iter: Some(4_294_967_296.0),
+        increase: Some(-1.0),
+        ..GArgs::default()
+    };
+    let ctx = GFunCtx::new(&g, &d)
+        .with_cancel(&flag)
+        .with_max_iteration_work(1_000_000);
+    expect_iteration_bound(gfun::eval(GFnKind::Louvain, &ctx, &a), GFnKind::Louvain);
+    // The same call with a sane threshold converges under the bound.
+    let a = GArgs {
+        increase: Some(0.0),
+        ..a
+    };
+    assert!(gfun::eval(GFnKind::Louvain, &ctx, &a).is_ok());
+    assert!(!flag.load(Ordering::SeqCst), "the hang guard fired");
+}
+
+#[test]
+fn the_default_iteration_bound_is_documented() {
+    let _s = serial();
+    let g = CsrGraph::empty();
+    let d = Dictionary::new();
+    assert_eq!(
+        GFunCtx::new(&g, &d).max_iteration_work(),
+        gfun::MAX_ITERATION_WORK
+    );
+    assert_eq!(gfun::MAX_ITERATION_WORK, 1 << 34);
+}
+
+// ---------------------------------------------------------------------------
+// output bounds while building (gap-gfun-fuzz#4)
+// ---------------------------------------------------------------------------
+
+/// `maximumKplex`'s fake solution names CSR vertex 0 `2k - 2` times; with a
+/// long IRI that is tens of MB of text. The call must fail at the bound
+/// having allocated about the bound, not the whole text (twice).
+#[test]
+fn kplex_fake_solution_stops_at_the_output_bound_while_built() {
+    let _s = serial();
+    const BOUND: usize = 1 << 20;
+    let long = format!("<http://example.org/{}>", "x".repeat(180));
+    let db = Database::build_from_str("kplex-bound", &format!("{long} <http://p> <http://b> .\n"))
+        .unwrap();
+    let csr = db.csr().unwrap();
+    let ctx = GFunCtx::new(&csr, db.dict()).with_max_output_bytes(BOUND);
+    let a = GArgs {
+        k: Some(65_536), // 131 070 copies of a 200-byte IRI: 26 MB
+        preds: PredFilter::resolve::<&str>(&[], &[], db.dict()),
+        ..GArgs::default()
+    };
+    let base = reset_peak();
+    let r = gfun::eval(GFnKind::MaximumKplex, &ctx, &a);
+    let used = PEAK.load(Ordering::SeqCst) - base;
+    match r {
+        Err(GStoreError::Query(m)) => assert!(m.contains("bytes of output"), "{m}"),
+        other => panic!("expected the output bound, got {other:?}"),
+    }
+    // the kplex vector itself is 512 KB; the text stops near the bound
+    assert!(
+        used < BOUND + (3 << 20),
+        "allocated {used} bytes before failing at a {BOUND}-byte bound"
+    );
+    // Small k still answers (the fake solution of 2k - 2 = 4 copies).
+    let ok = GArgs { k: Some(3), ..a };
+    match gfun::eval(GFnKind::MaximumKplex, &ctx, &ok).unwrap() {
+        GFunValue::Json(t) => assert_eq!(
+            t,
+            format!("{{\"paths\":[{{\"kplex\":[{l},{l},{l},{l}]}}]}}", l = long)
+        ),
+        v => panic!("{v:?}"),
+    }
+}
+
+/// `coreTruss` names (shrunk) vertex 0 once per peeled vertex; the text is
+/// bounded while built too.
+#[test]
+fn core_truss_stops_at_the_output_bound_while_built() {
+    let _s = serial();
+    const BOUND: usize = 16 << 10;
+    // a triangle on a long-named vertex 0, plus 2 000 squares (core 2, no
+    // triangle): coreTruss(2, 1) peels every square vertex
+    let long = format!("<http://example.org/{}>", "y".repeat(2000));
+    let mut nt = format!(
+        "{long} <http://p> <http://t1> .\n<http://t1> <http://p> <http://t2> .\n<http://t2> <http://p> {long} .\n"
+    );
+    for i in 0..2000 {
+        for (a, b) in [(0, 1), (1, 2), (2, 3), (3, 0)] {
+            nt.push_str(&format!(
+                "<http://s{i}_{a}> <http://p> <http://s{i}_{b}> .\n"
+            ));
+        }
+    }
+    let db = Database::build_from_str("core-truss-bound", &nt).unwrap();
+    let csr = db.csr().unwrap();
+    let a = GArgs {
+        nums: vec![2.0, 1.0],
+        preds: PredFilter::resolve::<&str>(&[], &[], db.dict()),
+        ..GArgs::default()
+    };
+    // Unbounded, the text repeats the long name many times.
+    let full = match gfun::eval(GFnKind::CoreTruss, &GFunCtx::new(&csr, db.dict()), &a).unwrap() {
+        GFunValue::Json(t) => t,
+        v => panic!("{v:?}"),
+    };
+    assert!(full.len() > 64 * BOUND, "{} bytes", full.len());
+    let ctx = GFunCtx::new(&csr, db.dict()).with_max_output_bytes(BOUND);
+    let base = reset_peak();
+    let r = gfun::eval(GFnKind::CoreTruss, &ctx, &a);
+    let used = PEAK.load(Ordering::SeqCst) - base;
+    match r {
+        Err(GStoreError::Query(m)) => assert!(m.contains("bytes of output"), "{m}"),
+        other => panic!("expected the output bound, got {other:?}"),
+    }
+    assert!(
+        used < full.len() / 4,
+        "allocated {used} bytes before failing at a {BOUND}-byte bound (full text {} bytes)",
+        full.len()
+    );
+}

@@ -311,7 +311,7 @@ impl<'g> Ppr<'_, 'g> {
         let mut zero_ppr_upper_bound = 1.0;
 
         while delta >= min_delta {
-            self.ctx.check_cancel()?;
+            self.ctx.poll("ppr")?;
             let mut rmax = epsilon * (delta / 3.0 / f64::from(num_pred_edges) / log2pfail).sqrt();
             rmax *= rmax_scale;
             let omega = (2.0 + epsilon) * log2pfail / delta / epsilon / epsilon;
@@ -505,7 +505,7 @@ impl<'g> Ppr<'_, 'g> {
             for _ in 0..num_s_rw {
                 self.walks += 1;
                 if self.walks & 0xfff == 0 {
-                    self.ctx.check_cancel()?;
+                    self.ctx.poll("ppr")?;
                 }
                 let des = self.random_walk(source, alpha);
                 match v2ppr.get(des) {
