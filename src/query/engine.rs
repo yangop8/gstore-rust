@@ -2185,7 +2185,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     // `seq(P, Q)` is a join through a fresh variable and `alt(P, Q)` a union
     // (so both keep every route: review query#9 / sparqlconf#4), while the
     // closures (`*`, `+`, ALP) and `?` and a negated property set produce
-    // each solution once. Reached nodes come out in a fixed order — the
+    // each solution once. A walk keeps the multiset as counts ([`Reached`]:
+    // each node once, with the number of routes to it), so `/` and `|` cost
+    // the distinct nodes of each step, not the routes — which grow as
+    // degree^length, inside a closure too — and only the solutions handed
+    // out are expanded. Reached nodes come out in a fixed order — the
     // stores' sorted lists, followed breadth first — never in a hash set's
     // iteration order, so `LIMIT` / `OFFSET` pages and `ORDER BY` ties are
     // the same on every run (review gap-accel-soundness#1).
@@ -2222,18 +2226,24 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// All `(start, end)` pairs matching `path`, constrained by known
     /// endpoints — a multiset, in a deterministic order.
     fn path_pairs(&self, path: &PathExpr, subj: Option<u32>, obj: Option<u32>) -> Vec<(u32, u32)> {
+        let mut out = Vec::new();
         match (subj, obj) {
             (Some(s), _) => {
-                let ends = self.path_reach(path, s, false);
-                ends.into_iter()
-                    .filter(|e| obj.is_none_or(|o| o == *e))
-                    .map(|e| (s, e))
-                    .collect()
+                let ends = self.path_reach_counted(path, s, false);
+                for (e, k) in ends.nodes {
+                    if obj.is_none_or(|o| o == e) && !self.push_pairs(&mut out, (s, e), k) {
+                        break;
+                    }
+                }
             }
             (None, Some(o)) => {
                 // Walk the path backwards from the object.
-                let starts = self.path_reach(path, o, true);
-                starts.into_iter().map(|s| (s, o)).collect()
+                let starts = self.path_reach_counted(path, o, true);
+                for (s, k) in starts.nodes {
+                    if !self.push_pairs(&mut out, (s, o), k) {
+                        break;
+                    }
+                }
             }
             (None, None) => {
                 // Both ends free: enumerate from every node of the graph
@@ -2242,28 +2252,51 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 nodes.extend(self.store.object_keys());
                 nodes.sort_unstable();
                 nodes.dedup();
-                let mut out = Vec::new();
-                for s in nodes {
-                    for e in self.path_reach(path, s, false) {
-                        out.push((s, e));
+                'starts: for s in nodes {
+                    for (e, k) in self.path_reach_counted(path, s, false).nodes {
+                        if !self.push_pairs(&mut out, (s, e), k) {
+                            break 'starts;
+                        }
                     }
                 }
-                out
             }
         }
-    }
-
-    /// The nodes reached from `start` by following `path` (or, if `reverse`,
-    /// the nodes from which `start` is reached via `path`), once per route
-    /// for `/` and `|` (see the section comment), in a deterministic order.
-    fn path_reach(&self, path: &PathExpr, start: u32, reverse: bool) -> Vec<u32> {
-        let mut out = Vec::new();
-        self.path_reach_into(path, start, reverse, &mut out);
         out
     }
 
-    /// [`path_reach`](Self::path_reach), appending to `out`.
-    fn path_reach_into(&self, path: &PathExpr, start: u32, reverse: bool, out: &mut Vec<u32>) {
+    /// Append `pair` `k` times (a pair reached by `k` routes is `k`
+    /// solutions); `false` once the evaluation is cancelled, which the
+    /// multiplicity of a long `/` or `|` chain makes worth polling for.
+    fn push_pairs(&self, out: &mut Vec<(u32, u32)>, pair: (u32, u32), k: u64) -> bool {
+        for i in 0..k {
+            if i % 4096 == 4095 && self.cancelled() {
+                return false;
+            }
+            out.push(pair);
+        }
+        true
+    }
+
+    /// The nodes reached from `start` by following `path` (or, if `reverse`,
+    /// the nodes from which `start` is reached via `path`), each once, with
+    /// the number of routes to it for `/` and `|` (see the section comment),
+    /// in a deterministic order.
+    fn path_reach_counted(&self, path: &PathExpr, start: u32, reverse: bool) -> Reached {
+        let mut out = Reached::default();
+        self.path_reach_into(path, start, reverse, 1, &mut out);
+        out
+    }
+
+    /// [`path_reach_counted`](Self::path_reach_counted), adding every node
+    /// reached to `out` `k` times (the routes that led to `start`).
+    fn path_reach_into(
+        &self,
+        path: &PathExpr,
+        start: u32,
+        reverse: bool,
+        k: u64,
+        out: &mut Reached,
+    ) {
         // Cooperative cancellation (a deadline or `/cancel`): a path over
         // every node, or a closure, can run long (review robust#5); the
         // Result-returning caller turns the cut-short result into Cancelled.
@@ -2274,48 +2307,52 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             PathExpr::Pred(iri) => {
                 self.note_path_step();
                 if let Some(pid) = self.path_pred_id(iri) {
+                    // A triple pattern: each node once (the triples are a set).
                     if reverse {
-                        out.extend(self.store.s_by_po(pid, start));
+                        out.add_distinct(self.store.s_by_po(pid, start), k);
                     } else {
-                        out.extend(self.store.o_by_sp(start, pid));
+                        out.add_distinct(self.store.o_by_sp(start, pid), k);
                     }
                 }
             }
-            PathExpr::Inverse(inner) => self.path_reach_into(inner, start, !reverse, out),
+            PathExpr::Inverse(inner) => self.path_reach_into(inner, start, !reverse, k, out),
             PathExpr::Seq(a, b) => {
                 // forward: a then b; reverse: b then a (with reverse
-                // traversal). Every intermediate node, with its multiplicity,
-                // is a separate route (a join through a fresh variable).
+                // traversal). A join through a fresh variable: every route
+                // to an intermediate node continues along every route from
+                // it, so their numbers multiply — counted once per distinct
+                // intermediate node, not walked once per route.
                 let (first, second) = if reverse { (b, a) } else { (a, b) };
-                for mid in self.path_reach(first, start, reverse) {
+                for (mid, m) in self.path_reach_counted(first, start, reverse).nodes {
                     if self.cancelled() {
                         break;
                     }
-                    self.path_reach_into(second, mid, reverse, out);
+                    self.path_reach_into(second, mid, reverse, k.saturating_mul(m), out);
                 }
             }
             PathExpr::Alt(a, b) => {
                 // A union: a node reached by both branches comes twice.
-                self.path_reach_into(a, start, reverse, out);
-                self.path_reach_into(b, start, reverse, out);
+                self.path_reach_into(a, start, reverse, k, out);
+                self.path_reach_into(b, start, reverse, k, out);
             }
             PathExpr::ZeroOrOne(inner) => {
                 // A set (§18.4 ZeroOrOnePath): `start` itself, then every
                 // other node one step away, each once.
                 let mut seen = PathSeen::default();
                 seen.insert(start);
-                out.push(start);
-                for n in self.path_reach(inner, start, reverse) {
+                let mut nodes = vec![start];
+                for (n, _) in self.path_reach_counted(inner, start, reverse).nodes {
                     if seen.insert(n) {
-                        out.push(n);
+                        nodes.push(n);
                     }
                 }
+                out.add_distinct(nodes, k);
             }
             PathExpr::ZeroOrMore(inner) => {
-                self.path_closure(inner, start, reverse, true, out);
+                out.add_distinct(self.path_closure(inner, start, reverse, true), k);
             }
             PathExpr::OneOrMore(inner) => {
-                self.path_closure(inner, start, reverse, false, out);
+                out.add_distinct(self.path_closure(inner, start, reverse, false), k);
             }
             PathExpr::NegatedSet(members) => {
                 // §18.2.2.3: `!(p₁|…|pᵢ|^pᵢ₊₁|…|^pₘ)` is
@@ -2335,10 +2372,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     .map(|(iri, _)| iri.as_str())
                     .collect();
                 if !forward.is_empty() || inverse.is_empty() {
-                    self.negated_step(&forward, start, reverse, out);
+                    out.add_distinct(self.negated_step(&forward, start, reverse), k);
                 }
                 if !inverse.is_empty() {
-                    self.negated_step(&inverse, start, !reverse, out);
+                    out.add_distinct(self.negated_step(&inverse, start, !reverse), k);
                 }
             }
         }
@@ -2348,7 +2385,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// backward when `reverse` — over every predicate not in `banned`. The
     /// step is a set (§18.4: `{ μ | ∃ triple(x, p, y), p ∉ S }`), so a node
     /// linked through several such predicates comes once.
-    fn negated_step(&self, banned: &[&str], start: u32, reverse: bool, out: &mut Vec<u32>) {
+    fn negated_step(&self, banned: &[&str], start: u32, reverse: bool) -> Vec<u32> {
         self.note_path_step();
         let banned: Vec<PredId> = banned
             .iter()
@@ -2360,11 +2397,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             self.store.po_by_s(start)
         };
         let mut seen = PathSeen::default();
-        for (p, n) in edges {
-            if !banned.contains(&p) && seen.insert(n) {
-                out.push(n);
-            }
-        }
+        edges
+            .into_iter()
+            .filter(|&(p, n)| !banned.contains(&p) && seen.insert(n))
+            .map(|(_, n)| n)
+            .collect()
     }
 
     /// Transitive closure for `*`/`+` (§18.4 ALP): every node reached from
@@ -2376,8 +2413,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         start: u32,
         reverse: bool,
         reflexive: bool,
-        out: &mut Vec<u32>,
-    ) {
+    ) -> Vec<u32> {
+        let mut out = Vec::new();
         let mut frontier = std::collections::VecDeque::from([start]);
         let mut visited = PathSeen::default();
         if reflexive {
@@ -2387,15 +2424,18 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         while let Some(n) = frontier.pop_front() {
             // One cancellation check per frontier step (review robust#5).
             if self.cancelled() {
-                return;
+                break;
             }
-            for next in self.path_reach(inner, n, reverse) {
+            // The inner path's multiplicities do not matter here: only
+            // which nodes it reaches.
+            for (next, _) in self.path_reach_counted(inner, n, reverse).nodes {
                 if visited.insert(next) {
                     out.push(next);
                     frontier.push_back(next);
                 }
             }
         }
+        out
     }
 
     fn path_pred_id(&self, iri: &str) -> Option<PredId> {
@@ -6318,6 +6358,49 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
 /// The nodes a property-path walk has met: membership only, never iterated
 /// (results keep their discovery order, review gap-accel-soundness#1).
 type PathSeen = HashSet<u32, FxBuildHasher>;
+
+/// The nodes a property-path walk reaches from one node, as a multiset:
+/// each distinct node once, in the order it was first reached, with its
+/// multiplicity — the number of routes to it, saturating (see the property
+/// path section of [`Evaluator`]).
+#[derive(Default)]
+struct Reached {
+    nodes: Vec<(u32, u64)>,
+    /// The position of each node in `nodes`, built when a second batch
+    /// arrives (a single batch of distinct nodes needs none).
+    index: Option<HashMap<u32, usize, FxBuildHasher>>,
+}
+
+impl Reached {
+    /// Add every node of `batch` — distinct nodes — `k` times.
+    fn add_distinct(&mut self, batch: impl IntoIterator<Item = u32>, k: u64) {
+        let Reached { nodes, index } = self;
+        if nodes.is_empty() {
+            nodes.extend(batch.into_iter().map(|n| (n, k)));
+            *index = None;
+            return;
+        }
+        let index = index.get_or_insert_with(|| {
+            nodes
+                .iter()
+                .enumerate()
+                .map(|(i, &(n, _))| (n, i))
+                .collect()
+        });
+        for n in batch {
+            match index.entry(n) {
+                std::collections::hash_map::Entry::Occupied(e) => {
+                    let count = &mut nodes[*e.get()].1;
+                    *count = count.saturating_add(k);
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(nodes.len());
+                    nodes.push((n, k));
+                }
+            }
+        }
+    }
+}
 
 /// Bind a path endpoint (variable or constant) into a binding; false on conflict.
 fn bind_node(b: &mut Binding, pt: &PatternTerm, id: u32, layout: &VarLayout) -> bool {

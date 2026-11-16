@@ -249,3 +249,83 @@ fn counting_over_a_bound_path_on_the_reviews_chain() {
     );
     assert!(stats.path_steps <= 64, "{stats:?}");
 }
+
+// ---- the multiset of `/` and `|` costs the distinct nodes, not the routes ---
+
+/// `n` nodes, each linked to every node (itself too) by `:p`: `k` steps of
+/// `:p` from one node have `n^k` routes but reach only `n` nodes.
+fn clique(n: usize) -> Database {
+    let mut nt = String::new();
+    for i in 0..n {
+        for j in 0..n {
+            nt.push_str(&format!("<http://ex/n{i}> {P} <http://ex/n{j}> .\n"));
+        }
+    }
+    Database::build_from_str("clique", &nt).unwrap()
+}
+
+#[test]
+fn a_sequence_costs_its_distinct_intermediate_nodes_not_its_routes() {
+    // `/` keeps every route (review query#9), but the walk counts the
+    // routes to each intermediate node instead of following each of them:
+    // a sequence of k steps makes about k·n lookups from one node, a
+    // closure over it about k·n², where following every route made n^k
+    // per walk — 69,904 lookups for the closure below on 16 nodes, against
+    // 784 now. The answers keep their multiplicities.
+    let four = format!("{P}/{P}/{P}/{P}");
+    for n in [8usize, 16] {
+        let db = clique(n);
+        let cases = [
+            // A closure only needs the nodes its inner path reaches.
+            (
+                format!("SELECT ?x WHERE {{ <http://ex/n0> ({four})* ?x }}"),
+                n,
+                4 * n * n,
+            ),
+            (
+                format!("SELECT ?x WHERE {{ <http://ex/n0> ({four})+ ?x }}"),
+                n,
+                4 * n * n,
+            ),
+            // `?` likewise.
+            (
+                format!("SELECT ?x WHERE {{ <http://ex/n0> ({four})? ?x }}"),
+                n,
+                4 * n,
+            ),
+            // Routes that lead nowhere cost nothing past their last node.
+            (
+                format!("SELECT ?x WHERE {{ <http://ex/n0> {four}/{Q} ?x }}"),
+                0,
+                5 * n,
+            ),
+            // Every route is a solution: n³ of them over n distinct nodes.
+            (
+                format!("SELECT ?x WHERE {{ <http://ex/n0> {P}/{P}/{P} ?x }}"),
+                n * n * n,
+                3 * n,
+            ),
+            (
+                format!("SELECT ?x WHERE {{ <http://ex/n0> ({P}|{P})/({P}|{P}) ?x }}"),
+                4 * n * n,
+                4 * n,
+            ),
+        ];
+        for (q, expected_rows, max_steps) in &cases {
+            for options in EXECUTORS {
+                let q = if options == TopKOptions::ALL {
+                    format!("{q} LIMIT 100000")
+                } else {
+                    q.clone()
+                };
+                let (rows, stats) = run(&db, &q, options);
+                assert_eq!(rows.len(), *expected_rows, "{q} ({options:?}) on {n} nodes");
+                assert!(
+                    stats.path_steps <= *max_steps as u64,
+                    "{q} ({options:?}): {} path steps on {n} nodes, at most {max_steps} expected",
+                    stats.path_steps
+                );
+            }
+        }
+    }
+}
