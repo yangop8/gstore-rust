@@ -228,7 +228,12 @@ fn relative_references_resolve_per_rfc3986_in_every_format() {
             }
         }
     }
-    assert!(wrong.is_empty(), "{} wrong:\n{}", wrong.len(), wrong.join("\n"));
+    assert!(
+        wrong.is_empty(),
+        "{} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
 }
 
 /// A base without a path (`http://example.org`) and the review's cases.
@@ -238,8 +243,16 @@ fn a_base_without_a_path_and_the_review_cases() {
         ("http://example.org", "foo", "http://example.org/foo"),
         ("http://example.org", "../up", "http://example.org/up"),
         ("http://example.org/a/b", "/abs", "http://example.org/abs"),
-        ("http://example.org/a/b", "?q=1", "http://example.org/a/b?q=1"),
-        ("http://example.org/a/b", "//other.org/x", "http://other.org/x"),
+        (
+            "http://example.org/a/b",
+            "?q=1",
+            "http://example.org/a/b?q=1",
+        ),
+        (
+            "http://example.org/a/b",
+            "//other.org/x",
+            "http://other.org/x",
+        ),
         ("http://example.org/a/b", "../c", "http://example.org/c"),
         ("http://example.org/a/b", "./d", "http://example.org/a/d"),
     ];
@@ -327,7 +340,10 @@ fn resolving_a_long_relative_iri_is_linear_in_its_segments() {
     let small = doc(20_000);
     let large = doc(160_000);
     let ts = turtle::parse_str(&large).unwrap();
-    assert_eq!(ts[0].object, iri(&format!("http://ex/{}x", "b/".repeat(160_000))));
+    assert_eq!(
+        ts[0].object,
+        iri(&format!("http://ex/{}x", "b/".repeat(160_000)))
+    );
     let t_small = fastest(|| {
         turtle::parse_str(&small).unwrap();
     });
@@ -439,7 +455,10 @@ fn an_rdfxml_xml_literal_keeps_its_markup() {
         )
     );
     // Text only: the text, escaped as canonical XML.
-    let doc = rdfxml_doc("", "<ex:xml rdf:parseType=\"Literal\">a &lt; b &amp; c</ex:xml>");
+    let doc = rdfxml_doc(
+        "",
+        "<ex:xml rdf:parseType=\"Literal\">a &lt; b &amp; c</ex:xml>",
+    );
     let ts = rdfxml::parse_str(&doc).unwrap();
     assert_eq!(
         object_of(&ts, "http://ex/xml"),
@@ -550,7 +569,11 @@ fn a_jsonld_node_context_is_scoped_to_its_node() {
     got.sort_by_key(|t| format!("{t:?}"));
     let mut want = vec![
         Triple::new(iri("http://ex/a"), iri("http://other/name"), lit("A")),
-        Triple::new(iri("http://ex/a"), iri("http://ex/child"), iri("http://ex/c")),
+        Triple::new(
+            iri("http://ex/a"),
+            iri("http://ex/child"),
+            iri("http://ex/c"),
+        ),
         Triple::new(iri("http://ex/c"), iri("http://other/name"), lit("C")),
         Triple::new(iri("http://ex/b"), iri("http://ex/name"), lit("B")),
     ];
@@ -607,8 +630,16 @@ fn an_rdfa_prefix_is_scoped_to_its_element() {
                <div prefix=\"a: http://ex/inner/\" about=\"http://ex/s1\" property=\"a:p\">x</div>\
                <div about=\"http://ex/s2\" property=\"a:p\">y</div></body></html>";
     let ts = rdfa::parse_str(doc).unwrap();
-    assert!(ts.contains(&Triple::new(iri("http://ex/s1"), iri("http://ex/inner/p"), lit("x"))));
-    assert!(ts.contains(&Triple::new(iri("http://ex/s2"), iri("http://ex/a/p"), lit("y"))));
+    assert!(ts.contains(&Triple::new(
+        iri("http://ex/s1"),
+        iri("http://ex/inner/p"),
+        lit("x")
+    )));
+    assert!(ts.contains(&Triple::new(
+        iri("http://ex/s2"),
+        iri("http://ex/a/p"),
+        lit("y")
+    )));
 }
 
 // ---- one token is bounded in the streaming readers (parser#5) -----------------
@@ -641,10 +672,17 @@ fn import_capped(
     };
     let mut errors: Vec<(String, SyntaxError)> = Vec::new();
     let mut objects = Vec::new();
-    import_reader(reader, format, "doc", &opts, &mut errors, &mut |b: &mut Vec<Quad>| {
-        objects.extend(b.drain(..).map(|q| q.object));
-        Ok(())
-    })
+    import_reader(
+        reader,
+        format,
+        "doc",
+        &opts,
+        &mut errors,
+        &mut |b: &mut Vec<Quad>| {
+            objects.extend(b.drain(..).map(|q| q.object));
+            Ok(())
+        },
+    )
     .unwrap();
     let errors = errors
         .into_iter()
@@ -667,17 +705,33 @@ fn a_turtle_token_longer_than_the_cap_fails_its_statement_only() {
     let next = "\n<http://ex/s> <http://ex/p> <http://ex/next> .\n";
     for (what, head, fill, tail) in [
         ("short string", "<http://ex/s> <http://ex/p> \"", b'a', next),
-        ("IRI", "<http://ex/s> <http://ex/p> <http://ex/", b'a', ">\n<http://ex/s> <http://ex/p> <http://ex/next> .\n"),
-        ("prefixed name", "@prefix e: <http://ex/> .\n<http://ex/s> <http://ex/p> e:", b'a', next),
+        (
+            "IRI",
+            "<http://ex/s> <http://ex/p> <http://ex/",
+            b'a',
+            ">\n<http://ex/s> <http://ex/p> <http://ex/next> .\n",
+        ),
+        (
+            "prefixed name",
+            "@prefix e: <http://ex/> .\n<http://ex/s> <http://ex/p> e:",
+            b'a',
+            next,
+        ),
         ("number", "<http://ex/s> <http://ex/p> ", b'7', next),
     ] {
         let ((objects, errors), peak) =
             peak_during(|| import_capped(generated(head, fill, n, tail), RdfFormat::Turtle, cap));
         assert_eq!(objects, [iri("http://ex/next")], "{what}: {errors:?}");
         assert_eq!(errors.len(), 1, "{what}: {errors:?}");
-        assert!(errors[0].contains("rdf_max_token_size"), "{what}: {errors:?}");
+        assert!(
+            errors[0].contains("rdf_max_token_size"),
+            "{what}: {errors:?}"
+        );
         eprintln!("measured: turtle {what} of {n} bytes, cap {cap}: peak {peak} bytes");
-        assert!(peak < 4 * MIB, "{what}: held {peak} bytes for a {n}-byte token");
+        assert!(
+            peak < 4 * MIB,
+            "{what}: held {peak} bytes for a {n}-byte token"
+        );
     }
     // An unterminated long string runs to the end of the input: one error,
     // and only the cap's worth of it held.
@@ -692,11 +746,19 @@ fn a_turtle_token_longer_than_the_cap_fails_its_statement_only() {
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert!(errors[0].contains("rdf_max_token_size"), "{errors:?}");
     eprintln!("measured: turtle unterminated long string of {n} bytes, cap {cap}: peak {peak}");
-    assert!(peak < 4 * MIB, "held {peak} bytes for an unterminated long string");
+    assert!(
+        peak < 4 * MIB,
+        "held {peak} bytes for an unterminated long string"
+    );
     // TriG: the same in a graph block.
     let ((objects, errors), _) = peak_during(|| {
         import_capped(
-            generated("<http://ex/g> { <http://ex/s> <http://ex/p> \"", b'a', n, "\"\n<http://ex/s> <http://ex/p> <http://ex/next> }\n"),
+            generated(
+                "<http://ex/g> { <http://ex/s> <http://ex/p> \"",
+                b'a',
+                n,
+                "\"\n<http://ex/s> <http://ex/p> <http://ex/next> }\n",
+            ),
             RdfFormat::TriG,
             cap,
         )
@@ -730,7 +792,12 @@ fn an_nquads_line_is_held_once_and_bounded_by_the_cap() {
     for format in [RdfFormat::NQuads, RdfFormat::NTriples] {
         let ((objects, errors), peak) = peak_during(|| {
             import_capped(
-                generated("<http://ex/s> <http://ex/p> \"", b'a', n, "\" .\n<http://ex/s> <http://ex/p> <http://ex/next> .\n"),
+                generated(
+                    "<http://ex/s> <http://ex/p> \"",
+                    b'a',
+                    n,
+                    "\" .\n<http://ex/s> <http://ex/p> <http://ex/next> .\n",
+                ),
                 format,
                 MIB,
             )

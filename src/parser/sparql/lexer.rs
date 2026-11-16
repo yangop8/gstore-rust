@@ -559,9 +559,7 @@ impl<'a> Lexer<'a> {
             let end = self.pos + run;
             self.lookahead_steps += run;
             let run_text = &self.src[self.pos..end];
-            if !run_text.is_empty()
-                && self.src[end..].starts_with(':')
-                && !run_text.ends_with('.')
+            if !run_text.is_empty() && self.src[end..].starts_with(':') && !run_text.ends_with('.')
             {
                 Some(end)
             } else {

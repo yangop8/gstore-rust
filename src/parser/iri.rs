@@ -261,7 +261,10 @@ mod tests {
     fn no_base_keeps_the_reference_and_a_fragment_of_the_base_is_dropped() {
         assert_eq!(resolve("", "../x"), "../x");
         assert_eq!(resolve("http://ex.org/doc#top", ""), "http://ex.org/doc");
-        assert_eq!(resolve("http://ex.org/doc#top", "#id"), "http://ex.org/doc#id");
+        assert_eq!(
+            resolve("http://ex.org/doc#top", "#id"),
+            "http://ex.org/doc#id"
+        );
         assert_eq!(resolve("http://ex.org", "foo"), "http://ex.org/foo");
         assert_eq!(resolve("http://ex.org", "../up"), "http://ex.org/up");
         assert_eq!(resolve("urn:x", "y"), "urn:y");
