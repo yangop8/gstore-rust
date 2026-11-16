@@ -139,6 +139,15 @@ none
   - review sec#7 (note): session-token requests are not throttled (a token is
     128 random bits, nothing to guess); invalid tokens do not count towards
     the lockout, so expired sessions behind a NAT lock nobody out.
+  - review sec#7 / gapi#5 (remaining): the lockout is asked before the hash
+    and told the outcome after it, so attempts of one account and address
+    sent *concurrently* all pass the check before the first failure is
+    recorded: a burst of up to `thread_num` guesses (bounded by
+    `max_conns_per_ip`) per lock window instead of one. Concurrent PBKDF2
+    verifications are not bounded either (the review's suggestion). Closing
+    it needs an in-flight count per key on every password path (refuse
+    while count + in-flight checks reach the threshold); not in this
+    round's grant.
 
 ## Measured numbers
 
