@@ -15,10 +15,10 @@
 //! operation without a callback has finished, every earlier operation's
 //! callback has been queued (or refused). Timeouts are hang guards only.
 
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -52,27 +52,28 @@ impl Drop for TmpDir {
 }
 
 /// A callback host that accepts every connection and holds it, answering
-/// nothing, until `release` is sent (or dropped).
+/// nothing, until it is dropped.
 struct Stub {
     url: String,
-    release: Option<mpsc::Sender<()>>,
+    addr: std::net::SocketAddr,
+    stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Stub {
     fn start() -> Stub {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/cb", listener.local_addr().unwrap());
-        listener.set_nonblocking(true).unwrap();
-        let (release, latch) = mpsc::channel::<()>();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/cb");
+        let stop = Arc::new(AtomicBool::new(false));
+        let halt = Arc::clone(&stop);
         let thread = thread::spawn(move || {
             let mut held = Vec::new();
-            loop {
-                match latch.recv_timeout(Duration::from_millis(10)) {
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    _ => break,
+            for conn in listener.incoming() {
+                if halt.load(Ordering::SeqCst) {
+                    break;
                 }
-                while let Ok((conn, _)) = listener.accept() {
+                if let Ok(conn) = conn {
                     held.push(conn);
                 }
             }
@@ -80,7 +81,8 @@ impl Stub {
         });
         Stub {
             url,
-            release: Some(release),
+            addr,
+            stop,
             thread: Some(thread),
         }
     }
@@ -88,7 +90,9 @@ impl Stub {
 
 impl Drop for Stub {
     fn drop(&mut self) {
-        drop(self.release.take());
+        self.stop.store(true, Ordering::SeqCst);
+        // Wake the accept loop.
+        let _ = TcpStream::connect(self.addr);
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
