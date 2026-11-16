@@ -406,8 +406,9 @@ struct ServerInner {
     /// Set (under the `db` lock) when the in-memory database has changes that
     /// are not yet saved to [`dir`](Self::dir); cleared by a successful save.
     dirty: AtomicBool,
-    /// Optional HTTP Basic credentials. `None` ⇒ the server is open.
-    auth: Option<(String, String)>,
+    /// Optional HTTP Basic credentials (with their failed-login lockout).
+    /// `None` ⇒ the server is open.
+    auth: Option<SingleAuth>,
     /// The directory the database was loaded from / is persisted to. `None` ⇒
     /// in-memory only (nothing is ever saved).
     dir: Option<PathBuf>,
@@ -424,6 +425,93 @@ struct ServerInner {
     /// graph function may run for as long as its `maxIter` says — stops at
     /// its next check and releases the database for the final save.
     cancel: Arc<AtomicBool>,
+    /// How long one statement may run (`Duration::ZERO`: no limit; see
+    /// [`Server::with_query_timeout`]).
+    query_timeout: Duration,
+    /// The most bytes one serialized answer may take (`0`: no limit; see
+    /// [`Server::with_max_result_bytes`]).
+    max_result_bytes: u64,
+}
+
+/// The single-database server's HTTP Basic credentials and their
+/// failed-login lockout ([`LoginLockout`](crate::gapi::ipfilter::LoginLockout),
+/// review http#6 / sec#7): failures are counted per presented user name and
+/// client address, and while one is locked its requests are answered `429`
+/// (with `Retry-After`) without being compared. Clones share the lockout
+/// (the pre-body hook of [`crate::preauth`] holds one).
+#[derive(Clone)]
+pub(crate) struct SingleAuth {
+    user: String,
+    pass: String,
+    lockout: Arc<crate::gapi::ipfilter::LoginLockout>,
+}
+
+/// How [`SingleAuth::check`] judged a request's credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SingleAuthCheck {
+    /// The credentials match.
+    Valid,
+    /// Missing or wrong (a wrong one was counted).
+    Invalid,
+    /// The presented user is locked out at this address for this long more
+    /// (nothing compared).
+    Locked(Duration),
+}
+
+impl SingleAuth {
+    pub(crate) fn new(user: &str, pass: &str) -> SingleAuth {
+        SingleAuth {
+            user: user.to_string(),
+            pass: pass.to_string(),
+            lockout: Arc::default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lockout_for_tests(&self) -> &crate::gapi::ipfilter::LoginLockout {
+        &self.lockout
+    }
+
+    /// The user name a decoded Basic token (`user:pass` bytes) presents.
+    fn presented_user(decoded: &[u8]) -> String {
+        let user = decoded
+            .iter()
+            .position(|&b| b == b':')
+            .map_or(decoded, |i| &decoded[..i]);
+        String::from_utf8_lossy(user).into_owned()
+    }
+
+    /// Whether the decoded Basic token `decoded` matches — unless its user is
+    /// locked out at `ip` (then `false`, without comparing). Records nothing:
+    /// the pre-body hook's check, which the handler repeats after the body.
+    pub(crate) fn accepts(&self, decoded: &[u8], ip: &str) -> bool {
+        self.lockout
+            .refusal(&Self::presented_user(decoded), ip)
+            .is_none()
+            && ct_eq(decoded, format!("{}:{}", self.user, self.pass).as_bytes())
+    }
+
+    /// Check `req`'s `Authorization: Basic` header from client `ip`, and
+    /// record the outcome: a wrong one counts against its user name at
+    /// `ip`, a valid one clears that count. A request without credentials is
+    /// [`Invalid`](SingleAuthCheck::Invalid) without counting (a browser's
+    /// first request before it prompts).
+    pub(crate) fn check(&self, req: &Request, ip: &str) -> SingleAuthCheck {
+        let Some(decoded) = req.basic_token() else {
+            return SingleAuthCheck::Invalid;
+        };
+        let user = Self::presented_user(&decoded);
+        if let Some(wait) = self.lockout.refusal(&user, ip) {
+            return SingleAuthCheck::Locked(wait);
+        }
+        if ct_eq(&decoded, format!("{}:{}", self.user, self.pass).as_bytes()) {
+            self.lockout.note_success(&user, ip);
+            SingleAuthCheck::Valid
+        } else {
+            self.lockout.note_failure(&user, ip);
+            SingleAuthCheck::Invalid
+        }
+    }
 }
 
 impl Server {
@@ -448,6 +536,8 @@ impl Server {
                 check_point: true,
                 closing: AtomicBool::new(false),
                 cancel: Arc::new(AtomicBool::new(false)),
+                query_timeout: crate::config::DEFAULT_QUERY_TIMEOUT,
+                max_result_bytes: crate::config::DEFAULT_MAX_RESULT_BYTES,
             }),
             listener: Mutex::new(Some(listener)),
             addr,
@@ -525,7 +615,37 @@ impl Server {
         self
     }
 
+    /// Stop a statement that runs longer than `timeout` (`conf.ini`'s
+    /// `query_timeout`; default [`DEFAULT_QUERY_TIMEOUT`](crate::config::DEFAULT_QUERY_TIMEOUT),
+    /// `Duration::ZERO` = no limit): it is cancelled at its next check,
+    /// releasing the database — so an UPDATE queued behind a runaway read
+    /// runs — and answered `503` "query timed out" (review sec#10).
+    pub fn with_query_timeout(mut self, timeout: Duration) -> Server {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.query_timeout = timeout;
+        }
+        self
+    }
+
+    /// Refuse an answer whose serialization passes `bytes` (`conf.ini`'s
+    /// `max_result_bytes`; default
+    /// [`DEFAULT_MAX_RESULT_BYTES`](crate::config::DEFAULT_MAX_RESULT_BYTES),
+    /// `0` = no limit): a buffered answer is replaced by `503` "result too
+    /// large" as soon as it passes the budget; a streamed one
+    /// (`?stream=true`, its status already sent) is cut off there, without
+    /// the closing chunk (review sec#10).
+    pub fn with_max_result_bytes(mut self, bytes: u64) -> Server {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.max_result_bytes = bytes;
+        }
+        self
+    }
+
     /// Require HTTP Basic auth with these credentials on every request.
+    /// Failed attempts are throttled per presented user name and client
+    /// address: after four, that name is locked for the address — 1 s at
+    /// first, doubling with each further failure up to 15 min — and its
+    /// requests are answered `429` without being checked (review http#6).
     ///
     /// ```no_run
     /// # use gstore::{Database, server::Server};
@@ -538,7 +658,7 @@ impl Server {
         // succeeds. (If it were somehow already shared we'd silently keep the
         // open config, but the builder contract prevents that.)
         if let Some(inner) = Arc::get_mut(&mut self.inner) {
-            inner.auth = Some((user.to_string(), pass.to_string()));
+            inner.auth = Some(SingleAuth::new(user, pass));
         }
         self
     }
@@ -2822,17 +2942,33 @@ impl ServerInner {
             return Ok(true);
         }
         // Auth gate: when credentials are configured every request must present
-        // a matching `Authorization: Basic` header.
-        if let Some((user, pass)) = &self.auth {
-            if !req.authorized(user, pass) {
-                write_response_ext(
-                    stream,
-                    401,
-                    "text/plain",
-                    &meta.headers(&[("WWW-Authenticate", "Basic realm=\"gStore\"")]),
-                    b"unauthorized",
-                )?;
-                return Ok(true);
+        // a matching `Authorization: Basic` header; a user name locked out at
+        // the client's address (failed-login lockout) is refused `429`.
+        if let Some(auth) = &self.auth {
+            let ip = crate::http_api::peer_ip(current_peer());
+            match auth.check(&req, &ip) {
+                SingleAuthCheck::Valid => {}
+                SingleAuthCheck::Invalid => {
+                    write_response_ext(
+                        stream,
+                        401,
+                        "text/plain",
+                        &meta.headers(&[("WWW-Authenticate", "Basic realm=\"gStore\"")]),
+                        b"unauthorized",
+                    )?;
+                    return Ok(true);
+                }
+                SingleAuthCheck::Locked(wait) => {
+                    let retry = crate::gapi::ipfilter::retry_after_secs(wait).to_string();
+                    write_response_ext(
+                        stream,
+                        429,
+                        "text/plain",
+                        &meta.headers(&[("Retry-After", retry.as_str())]),
+                        crate::gapi::ipfilter::lockout_msg(wait).as_bytes(),
+                    )?;
+                    return Ok(true);
+                }
             }
         } else if meta.forwarded() {
             // Without credentials the server relies on serving local clients
@@ -2871,9 +3007,14 @@ impl ServerInner {
             } => {
                 write_response_ext(stream, status, &ctype, &meta.headers(&[]), &body).map(|()| true)
             }
-            Reply::Stream(fmt, rs) => {
-                stream_select(stream, fmt, &rs, &meta.cors_headers()).map(|()| false)
-            }
+            Reply::Stream(fmt, rs) => stream_select(
+                stream,
+                fmt,
+                &rs,
+                &meta.cors_headers(),
+                self.max_result_bytes,
+            )
+            .map(|()| false),
         }
     }
 
@@ -2934,25 +3075,43 @@ impl ServerInner {
         }
         let fmt = ResultFormat::negotiate(req.format_param().as_deref(), req.header("accept"));
         let (result, warning) = self.execute(&q);
+        // The result byte budget (review sec#10): serialization stops as
+        // soon as it passes `max_result_bytes`.
+        let limit = self.max_result_bytes;
+        type Budgeted = crate::http_api::CountingWriter<Vec<u8>>;
+        let budgeted = |ctype: &str, write: &dyn Fn(&mut Budgeted) -> io::Result<()>| {
+            let mut out = crate::http_api::CountingWriter::new(Vec::new(), limit);
+            if write(&mut out).is_err() && out.exceeded() {
+                return Reply::plain(
+                    503,
+                    SPARQL_JSON,
+                    &err_json(&crate::http_api::result_too_large_msg(limit)),
+                );
+            }
+            Reply::buffered(200, ctype, out.into_inner())
+        };
         match result {
             Ok(QueryResult::Select(rs)) => {
                 if req.wants_stream() {
                     Reply::Stream(fmt, rs)
                 } else {
-                    let mut buf = Vec::new();
-                    let _ = sparql_results::write_select(fmt, &rs, &mut buf);
-                    Reply::buffered(200, fmt.content_type(), buf)
+                    budgeted(fmt.content_type(), &|w| {
+                        sparql_results::write_select(fmt, &rs, w)
+                    })
                 }
             }
-            Ok(QueryResult::Ask(b)) => {
-                let mut buf = Vec::new();
-                let _ = sparql_results::write_ask(fmt, b, &mut buf);
-                Reply::buffered(200, fmt.content_type(), buf)
-            }
-            Ok(QueryResult::Construct(ts)) => {
-                Reply::buffered(200, "application/n-triples", ntriples_body(&ts))
-            }
+            Ok(QueryResult::Ask(b)) => budgeted(fmt.content_type(), &|w| {
+                sparql_results::write_ask(fmt, b, w)
+            }),
+            Ok(QueryResult::Construct(ts)) => budgeted("application/n-triples", &|w| {
+                crate::http_api::write_ntriples(&ts, w)
+            }),
             Ok(QueryResult::Update { changed }) => update_reply(changed, warning),
+            // A statement stopped by `query_timeout`: a refused request
+            // (SPARQL Protocol), not a query error.
+            Err(e @ crate::GStoreError::Timeout(_)) => {
+                Reply::plain(503, SPARQL_JSON, &err_json(&e.to_string()))
+            }
             Err(e) => Reply::plain(
                 failure_status(&warning),
                 SPARQL_JSON,
@@ -3005,19 +3164,31 @@ impl ServerInner {
     /// commit until reopened), and that is the same not-durable warning — so
     /// a statement whose commit point failed is answered HTTP 500, not as a
     /// query error.
+    ///
+    /// The statement runs under `query_timeout`
+    /// ([`Server::with_query_timeout`], review sec#10): its own cancel flag,
+    /// raised by its deadline or by the server's shutdown flag; one stopped
+    /// by its deadline fails as [`GStoreError::Timeout`](crate::GStoreError::Timeout).
     fn execute(&self, sparql: &str) -> (crate::Result<QueryResult>, Option<String>) {
         let stmt = match Statement::parse(sparql) {
             Ok(stmt) => stmt,
             Err(e) => return (Err(e), None),
         };
-        let cancel = Some(Arc::clone(&self.cancel));
+        let (flag, deadline) = crate::deadline::arm_linked(&self.cancel, self.query_timeout);
+        let timed_out = |r: crate::Result<QueryResult>| match (&r, &deadline) {
+            (Err(crate::GStoreError::Cancelled), Some(d)) if d.fired() => {
+                Err(crate::GStoreError::Timeout(d.timeout()))
+            }
+            _ => r,
+        };
+        let cancel = Some(flag);
         if !stmt.is_update() {
             let db = read_locked(&self.db);
-            return (db.read_as(&stmt, cancel, None), None);
+            return (timed_out(db.read_as(&stmt, cancel, None)), None);
         }
         let mut db = write_locked(&self.db);
         let before = db.mutation_count();
-        let mut result = db.execute_as(stmt, cancel, None);
+        let mut result = timed_out(db.execute_as(stmt, cancel, None));
         let mut warning = None;
         if db.mutation_count() != before {
             self.dirty.store(true, Ordering::SeqCst);
@@ -3204,20 +3375,17 @@ impl Request {
 
     /// True iff the request carries valid `Authorization: Basic` credentials
     /// equal to `user:pass`.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn authorized(&self, user: &str, pass: &str) -> bool {
-        let token = match self
-            .header("authorization")
-            .and_then(|h| strip_basic_prefix(h))
-        {
-            Some(t) => t.trim(),
-            None => return false,
-        };
-        let decoded = match base64_decode(token) {
-            Some(d) => d,
-            None => return false,
-        };
-        let expected = format!("{user}:{pass}");
-        ct_eq(&decoded, expected.as_bytes())
+        self.basic_token()
+            .is_some_and(|decoded| ct_eq(&decoded, format!("{user}:{pass}").as_bytes()))
+    }
+
+    /// The decoded `Authorization: Basic` token (`user:pass` bytes), if the
+    /// request carries a well-formed one.
+    fn basic_token(&self) -> Option<Vec<u8>> {
+        let token = strip_basic_prefix(self.header("authorization")?)?.trim();
+        base64_decode(token)
     }
 
     /// The negotiated result format token from `?format=` (URL or form body).
@@ -3713,6 +3881,7 @@ fn stream_select<W: Write>(
     fmt: ResultFormat,
     rs: &ResultSet,
     extra: &[(&str, &str)],
+    max_result_bytes: u64,
 ) -> std::io::Result<()> {
     let mut header = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nTransfer-Encoding: chunked\r\n",
@@ -3723,9 +3892,13 @@ fn stream_select<W: Write>(
     }
     header.push_str("Connection: close\r\n\r\n");
     stream.write_all(header.as_bytes())?;
-    let mut cw = ChunkedWriter { inner: stream };
-    sparql_results::write_select(fmt, rs, &mut cw)?;
-    cw.finish()
+    // The result byte budget counts the result, not its chunk framing; past
+    // it the write fails and the stream ends without its closing chunk, so
+    // the client sees a truncated answer (review sec#10).
+    let mut counted =
+        crate::http_api::CountingWriter::new(ChunkedWriter { inner: stream }, max_result_bytes);
+    sparql_results::write_select(fmt, rs, &mut counted)?;
+    counted.into_inner().finish()
 }
 
 /// A [`Write`] adapter that frames each write as one HTTP/1.1 transfer chunk.

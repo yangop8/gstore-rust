@@ -60,6 +60,17 @@
 //! entry; under the lock again) — so clients sending bad credentials cannot
 //! serialize everyone else behind their hashes.
 //!
+//! **Setting a password without holding a lock** (review gapi#6 / http#7).
+//! A new password costs one PBKDF2 hash and a `users.db` rewrite (`fsync`).
+//! A server changes passwords and adds users in phases too:
+//! [`NewPassword::hash`] (the hash, no lock), [`UserStore::prepare_add`] /
+//! [`UserStore::prepare_set_password`] (check the change and render the new
+//! file, under the lock), [`PendingWrite::write`] (write and sync it, no
+//! lock) and [`UserStore::apply_write`] (install the change in memory, under
+//! the lock) — [`write_off_lock`] runs them. A save of another change between
+//! the phases is detected (every save bumps a generation), and the change is
+//! then re-prepared, so the file never loses a change another request made.
+//!
 //! A legacy entry may *fail* to verify if the binary was built with a toolchain
 //! whose `DefaultHasher` differs from the one that wrote it. To recover, reset
 //! the password offline with [`UserStore::reset_password_offline`] (for example
@@ -116,7 +127,7 @@ use std::hash::{BuildHasher, Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::query::hash::{
@@ -309,6 +320,7 @@ impl CredentialAttempt {
         let outcome = if self.cached {
             CredentialCheck::Valid
         } else {
+            test_hooks::note_verification(&self.name);
             match &self.stored {
                 Some(hash) => match hash.verify_as(&self.secret, self.form) {
                     Some(true) => CredentialCheck::Valid,
@@ -458,6 +470,7 @@ fn normalize_md5_hex(digest: &str) -> Option<String> {
 impl PasswordHash {
     /// Hash the plaintext `password` in the current format under a fresh salt.
     fn new(password: &str) -> PasswordHash {
+        test_hooks::park_point(password);
         PasswordHash::from_md5_hex(&md5_hex(password))
     }
 
@@ -742,6 +755,154 @@ pub struct UserStore {
     /// persisted.
     verified: Mutex<HashMap<(String, u8), [u8; 32]>>,
     verified_key: HmacSha256,
+    /// Orders the writes of `users.db` (see [`PendingWrite`]).
+    gate: Arc<WriteGate>,
+}
+
+/// Orders the rewrites of one `users.db`: every write holds `lock`, and a
+/// successful one bumps `generation` — so a [`PendingWrite`] prepared at one
+/// generation knows, when it writes, whether another save came in between.
+#[derive(Debug, Default)]
+struct WriteGate {
+    lock: Mutex<()>,
+    generation: AtomicU64,
+}
+
+impl WriteGate {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.lock.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// A new password, already hashed (the deliberately slow PBKDF2): make it
+/// with no lock held, then install it with [`UserStore::prepare_add`] /
+/// [`UserStore::prepare_set_password`] (see the module docs).
+#[derive(Clone)]
+pub struct NewPassword(PasswordHash);
+
+impl std::fmt::Debug for NewPassword {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NewPassword(..)")
+    }
+}
+
+impl NewPassword {
+    /// Hash `password` in the current format under a fresh salt. Refused
+    /// when it is empty. This is the slow part of setting a password: call
+    /// it with no lock held.
+    pub fn hash(password: &str) -> Result<NewPassword, String> {
+        if password.is_empty() {
+            return Err("password must not be empty".into());
+        }
+        Ok(NewPassword(PasswordHash::new(password)))
+    }
+}
+
+/// A user-table change whose `users.db` rewrite runs with no lock held
+/// (see the module docs): from [`UserStore::prepare_add`] /
+/// [`UserStore::prepare_set_password`], written by
+/// [`write`](Self::write), installed by [`UserStore::apply_write`].
+pub struct PendingWrite {
+    change: Change,
+    /// The whole file with the change.
+    text: String,
+    path: PathBuf,
+    /// The generation the file had when the text was rendered.
+    generation: u64,
+    gate: Arc<WriteGate>,
+}
+
+impl std::fmt::Debug for PendingWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingWrite")
+            .field("user", &self.change.user())
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A [`PendingWrite`] whose file was written, to be installed with
+/// [`UserStore::apply_write`].
+pub struct WrittenChange {
+    change: Change,
+    /// The generation of the file this write produced.
+    generation: u64,
+}
+
+impl std::fmt::Debug for WrittenChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WrittenChange")
+            .field("user", &self.change.user())
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
+/// A change [`PendingWrite`] carries.
+#[derive(Clone)]
+enum Change {
+    /// A new user.
+    Add(Box<User>),
+    /// A user's new password.
+    SetPassword { name: String, hash: PasswordHash },
+}
+
+impl Change {
+    fn user(&self) -> &str {
+        match self {
+            Change::Add(u) => &u.name,
+            Change::SetPassword { name, .. } => name,
+        }
+    }
+}
+
+impl PendingWrite {
+    /// Write and sync the new `users.db` — with no lock held but the file's
+    /// own write order. `Ok(None)`: another save came in since the change was
+    /// prepared (the text would drop it), so nothing was written: prepare it
+    /// again. `Err`: the write failed and the file holds its previous
+    /// content (the change is not installed).
+    pub fn write(self) -> Result<Option<WrittenChange>, String> {
+        let _order = self.gate.lock();
+        if self.gate.generation.load(Ordering::SeqCst) != self.generation {
+            return Ok(None);
+        }
+        write_users_file(&self.path, &self.text).map_err(|e| e.to_string())?;
+        let generation = self.gate.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        Ok(Some(WrittenChange {
+            change: self.change,
+            generation,
+        }))
+    }
+}
+
+/// How many times [`write_off_lock`] prepares a change again after another
+/// save overtook it, before it writes under the lock.
+const OFF_LOCK_ATTEMPTS: usize = 4;
+
+/// Make a user-table change with the slow `users.db` write outside the lock
+/// that guards the store: `prepare` checks and renders the change under
+/// `state` (re-run if another save overtakes it), the file is written with
+/// `state` released, and [`UserStore::apply_write`] installs it under
+/// `state` again. `users` picks the store out of the guarded value. Hash
+/// the password ([`NewPassword::hash`]) before, with no lock held.
+pub fn write_off_lock<S>(
+    state: &Mutex<S>,
+    users: impl Fn(&mut S) -> &mut UserStore,
+    prepare: impl Fn(&UserStore) -> Result<PendingWrite, String>,
+) -> Result<(), String> {
+    let lock = || state.lock().unwrap_or_else(|e| e.into_inner());
+    for _ in 0..OFF_LOCK_ATTEMPTS {
+        let pending = prepare(users(&mut lock()))?;
+        if let Some(written) = pending.write()? {
+            return users(&mut lock()).apply_write(written);
+        }
+    }
+    // Overtaken every time: write under the lock, as a plain change does.
+    let mut guard = lock();
+    let store = users(&mut guard);
+    let pending = prepare(store)?;
+    store.apply_locked(pending.change)
 }
 
 impl UserStore {
@@ -770,6 +931,7 @@ impl UserStore {
             ttl: Duration::from_secs(24 * 3600),
             verified: Mutex::new(HashMap::new()),
             verified_key: HmacSha256::new(&key),
+            gate: Arc::default(),
         };
         if store.path.is_file() {
             store.read_file()?;
@@ -883,33 +1045,153 @@ impl UserStore {
     /// and a restart see, so memory must keep it too; it is logged as a
     /// durability warning (the rename may not survive a crash).
     pub fn save(&self) -> io::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        let text = self.render(None);
+        let _order = self.gate.lock();
+        write_users_file(&self.path, &text)?;
+        self.gate.generation.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// The `users.db` text of the table — with `change` applied, if given
+    /// (sorted by name for stable output).
+    fn render(&self, change: Option<&Change>) -> String {
         let mut names: Vec<&String> = self.users.keys().collect();
+        let added = match change {
+            Some(Change::Add(u)) if !self.users.contains_key(&u.name) => Some(u.as_ref()),
+            _ => None,
+        };
+        if let Some(u) = added {
+            names.push(&u.name);
+        }
         names.sort();
         let mut out = String::new();
         for name in names {
-            let u = &self.users[name];
+            let u = match added {
+                Some(a) if &a.name == name => a,
+                _ => &self.users[name],
+            };
             // A legacy entry not yet migrated (its user has not logged in since
             // the upgrade) keeps its two-column form, so it stays readable.
-            let cred = u.password.encode();
+            let cred = match change {
+                Some(Change::SetPassword { name: n, hash }) if n == name => hash.encode(),
+                _ => u.password.encode(),
+            };
             out.push_str(&format!("{}\t{cred}\t{}\n", u.name, u.privilege_str()));
         }
-        // It holds password hashes: created owner-only, and a replacement keeps
-        // whatever mode the operator gave the existing file.
-        match crate::db::fsutil::atomic_replace(&self.path, out.as_bytes(), true) {
-            Ok(None) => Ok(()),
-            Ok(Some(e)) => {
-                crate::gs_warn!(
-                    "{} was replaced, but syncing its directory failed: {e}; the change \
-                     is in effect but may not survive a crash",
-                    self.path.display()
-                );
-                Ok(())
+        out
+    }
+
+    // ---- off-lock changes (see `PendingWrite`) -------------------------------
+
+    /// Prepare adding user `name` with the hashed `password`, the
+    /// `privileges` on every database and, with `on_db`, privileges on one
+    /// database — the checks of [`add`](Self::add) and
+    /// [`grant_on`](Self::grant_on), and the new file. Call it under the lock
+    /// that guards the store; [`write_off_lock`] runs the rest.
+    pub fn prepare_add(
+        &self,
+        name: &str,
+        password: &NewPassword,
+        privileges: BTreeSet<Privilege>,
+        on_db: Option<(&str, &BTreeSet<Privilege>)>,
+    ) -> Result<PendingWrite, String> {
+        validate_name(name)?;
+        if self.users.contains_key(name) {
+            return Err(format!("user '{name}' already exists"));
+        }
+        let mut db_privileges = BTreeMap::new();
+        if let Some((db, privs)) = on_db.filter(|(_, p)| !p.is_empty()) {
+            check_grant(db, privs)?;
+            db_privileges.insert(db.to_string(), privs.clone());
+        }
+        let user = User {
+            name: name.to_string(),
+            password: password.0.clone(),
+            privileges,
+            db_privileges,
+        };
+        Ok(self.pending(Change::Add(Box::new(user))))
+    }
+
+    /// Prepare setting user `name`'s password to the hashed `password` (the
+    /// user must exist) and the new file. Call it under the lock that guards
+    /// the store; [`write_off_lock`] runs the rest.
+    pub fn prepare_set_password(
+        &self,
+        name: &str,
+        password: &NewPassword,
+    ) -> Result<PendingWrite, String> {
+        if !self.users.contains_key(name) {
+            return Err(format!("user '{name}' does not exist"));
+        }
+        Ok(self.pending(Change::SetPassword {
+            name: name.to_string(),
+            hash: password.0.clone(),
+        }))
+    }
+
+    fn pending(&self, change: Change) -> PendingWrite {
+        PendingWrite {
+            text: self.render(Some(&change)),
+            change,
+            path: self.path.clone(),
+            generation: self.gate.generation.load(Ordering::SeqCst),
+            gate: Arc::clone(&self.gate),
+        }
+    }
+
+    /// Install a written change in memory (under the lock that guards the
+    /// store). When another save came in after the write (its file lacks
+    /// this change), the change is checked again and saved now; if the user
+    /// was dropped (or, for a new user, created) meanwhile, that save's file
+    /// already reflects it and the change is refused.
+    pub fn apply_write(&mut self, written: WrittenChange) -> Result<(), String> {
+        if self.gate.generation.load(Ordering::SeqCst) == written.generation {
+            // The file is exactly this table plus the change.
+            self.install(written.change);
+            return Ok(());
+        }
+        self.apply_locked(written.change)
+    }
+
+    /// Check `change` against the table as it is, then save the table with
+    /// it and install it (nothing changes when the save fails).
+    fn apply_locked(&mut self, change: Change) -> Result<(), String> {
+        let name = change.user();
+        match &change {
+            Change::Add(_) if self.users.contains_key(name) => {
+                return Err(format!("user '{name}' already exists"));
             }
-            Err(crate::error::GStoreError::Io(io)) => Err(io),
-            Err(other) => Err(io::Error::other(other.to_string())),
+            Change::SetPassword { .. } if !self.users.contains_key(name) => {
+                return Err(format!("user '{name}' does not exist"));
+            }
+            _ => {}
+        }
+        let text = self.render(Some(&change));
+        {
+            let _order = self.gate.lock();
+            write_users_file(&self.path, &text).map_err(|e| e.to_string())?;
+            self.gate.generation.fetch_add(1, Ordering::SeqCst);
+        }
+        self.install(change);
+        Ok(())
+    }
+
+    /// Put an already persisted change into memory.
+    fn install(&mut self, change: Change) {
+        match change {
+            Change::Add(u) => {
+                self.forget_verified(&u.name);
+                self.users.insert(u.name.clone(), *u);
+            }
+            Change::SetPassword { name, hash } => {
+                if let Some(u) = self.users.get_mut(&name) {
+                    u.password = hash;
+                }
+                self.forget_verified(&name);
+                // A changed password revokes the user's live sessions.
+                self.end_sessions_of(&name);
+            }
         }
     }
 
@@ -1456,6 +1738,31 @@ impl UserStore {
     }
 }
 
+/// Replace `users.db` at `path` with `text`, atomically (temp file,
+/// `fsync`, rename, directory `fsync`). `Err`: the file holds its previous
+/// content. A replacement whose directory could not be synced afterwards is
+/// `Ok` (the file holds the new text) and logged as a durability warning.
+fn write_users_file(path: &Path, text: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    // It holds password hashes: created owner-only, and a replacement keeps
+    // whatever mode the operator gave the existing file.
+    match crate::db::fsutil::atomic_replace(path, text.as_bytes(), true) {
+        Ok(None) => Ok(()),
+        Ok(Some(e)) => {
+            crate::gs_warn!(
+                "{} was replaced, but syncing its directory failed: {e}; the change is in \
+                 effect but may not survive a crash",
+                path.display()
+            );
+            Ok(())
+        }
+        Err(crate::error::GStoreError::Io(io)) => Err(io),
+        Err(other) => Err(io::Error::other(other.to_string())),
+    }
+}
+
 // --- password hashing & token generation -------------------------------------
 
 /// The **legacy** (pre-versioning) password hash, kept only to verify and
@@ -1551,6 +1858,163 @@ fn validate_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Hooks that let tests observe and pace the password hashing of a running
+/// server (they cost one relaxed atomic load each when unused). Not a stable
+/// API.
+#[doc(hidden)]
+pub mod test_hooks {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
+    use std::time::{Duration, Instant};
+
+    static COUNTING: AtomicBool = AtomicBool::new(false);
+    static PARKING: AtomicBool = AtomicBool::new(false);
+
+    fn counts() -> MutexGuard<'static, HashMap<String, u64>> {
+        static COUNTS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+        COUNTS
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Per parked password: whether a hash of it is parked.
+    struct Parks {
+        map: Mutex<HashMap<String, bool>>,
+        changed: Condvar,
+    }
+
+    fn parks() -> &'static Parks {
+        static PARKS: OnceLock<Parks> = OnceLock::new();
+        PARKS.get_or_init(|| Parks {
+            map: Mutex::default(),
+            changed: Condvar::new(),
+        })
+    }
+
+    /// Counts the password verifications — the slow PBKDF2 of a credential
+    /// check, or the equal work burnt for an unknown user — of one user name
+    /// while it lives (see [`count_verifications`]).
+    pub struct VerificationCounter {
+        name: String,
+    }
+
+    impl VerificationCounter {
+        /// The verifications counted so far.
+        pub fn count(&self) -> u64 {
+            counts().get(&self.name).copied().unwrap_or(0)
+        }
+    }
+
+    impl Drop for VerificationCounter {
+        fn drop(&mut self) {
+            let mut c = counts();
+            c.remove(&self.name);
+            if c.is_empty() {
+                COUNTING.store(false, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Start counting the password verifications of user name `name`.
+    pub fn count_verifications(name: &str) -> VerificationCounter {
+        counts().insert(name.to_string(), 0);
+        COUNTING.store(true, Ordering::Relaxed);
+        VerificationCounter {
+            name: name.to_string(),
+        }
+    }
+
+    pub(super) fn note_verification(name: &str) {
+        if COUNTING.load(Ordering::Relaxed) {
+            if let Some(n) = counts().get_mut(name) {
+                *n += 1;
+            }
+        }
+    }
+
+    /// Parks the hashing of one new password (every hash of a new plaintext
+    /// password: [`super::NewPassword::hash`], [`super::UserStore::add`],
+    /// [`super::UserStore::set_password`], …) until
+    /// [`release`](Self::release)d (or dropped).
+    pub struct HashPark {
+        password: String,
+    }
+
+    impl HashPark {
+        /// Wait until a hash of the password is parked; `false` if none was
+        /// within `timeout` (a hang guard).
+        pub fn wait_parked(&self, timeout: Duration) -> bool {
+            let p = parks();
+            let deadline = Instant::now() + timeout;
+            let mut map = p.map.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if map.get(&self.password).copied().unwrap_or(false) {
+                    return true;
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    return false;
+                }
+                map = p
+                    .changed
+                    .wait_timeout(map, deadline - now)
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0;
+            }
+        }
+
+        /// Let the parked hash (and later ones of the password) run.
+        pub fn release(self) {
+            drop(self);
+        }
+    }
+
+    impl Drop for HashPark {
+        fn drop(&mut self) {
+            let p = parks();
+            let mut map = p.map.lock().unwrap_or_else(|e| e.into_inner());
+            map.remove(&self.password);
+            if map.is_empty() {
+                PARKING.store(false, Ordering::Relaxed);
+            }
+            p.changed.notify_all();
+        }
+    }
+
+    /// Park every hash of new password `password` until the returned guard
+    /// is released (use a password no other test uses).
+    pub fn park_hash_of(password: &str) -> HashPark {
+        let p = parks();
+        p.map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(password.to_string(), false);
+        PARKING.store(true, Ordering::Relaxed);
+        HashPark {
+            password: password.to_string(),
+        }
+    }
+
+    pub(super) fn park_point(password: &str) {
+        if !PARKING.load(Ordering::Relaxed) {
+            return;
+        }
+        let p = parks();
+        let mut map = p.map.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(parked) = map.get_mut(password) else {
+            return;
+        };
+        *parked = true;
+        p.changed.notify_all();
+        // Released when the guard drops its entry.
+        while map.contains_key(password) {
+            map = p.changed.wait(map).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1559,6 +2023,116 @@ mod tests {
         let mut p = std::env::temp_dir();
         p.push(format!("gstore_users_{}_{}.db", name, new_token()));
         p
+    }
+
+    /// Removes a store file (and the temp file of an interrupted write),
+    /// also when the test fails.
+    struct RemoveFile(PathBuf);
+
+    impl Drop for RemoveFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    /// review gapi#6 / http#7: a change prepared before another save is not
+    /// written over that save (its file would drop the other change): the
+    /// write reports it overtaken, and `write_off_lock` prepares it again.
+    #[test]
+    fn a_pending_write_overtaken_by_another_save_is_prepared_again() {
+        let path = tmp("overtaken");
+        let _cleanup = RemoveFile(path.clone());
+        let mut store = UserStore::open(&path, "rootpw").unwrap();
+        store.add("alice", "old", BTreeSet::new()).unwrap();
+        store.add("bob", "bobpw", BTreeSet::new()).unwrap();
+        let hashed = NewPassword::hash("new").unwrap();
+        let pending = store.prepare_set_password("alice", &hashed).unwrap();
+        // Another change is saved in between.
+        store
+            .grant("bob", &BTreeSet::from([Privilege::Query]))
+            .unwrap();
+        assert!(pending.write().unwrap().is_none(), "overtaken: not written");
+        let on_disk = UserStore::open(&path, "unused").unwrap();
+        assert!(on_disk.verify("alice", "old") && on_disk.has_priv("bob", Privilege::Query));
+
+        let state = Mutex::new(store);
+        write_off_lock(
+            &state,
+            |s| s,
+            |users| users.prepare_set_password("alice", &hashed),
+        )
+        .unwrap();
+        let store = state.into_inner().unwrap();
+        assert!(store.verify("alice", "new") && !store.verify("alice", "old"));
+        let on_disk = UserStore::open(&path, "unused").unwrap();
+        assert!(on_disk.verify("alice", "new"), "the change is on disk");
+        assert!(
+            on_disk.has_priv("bob", Privilege::Query),
+            "so is the change saved in between"
+        );
+    }
+
+    /// A save between the off-lock write and the install wrote a file
+    /// without the change: installing it saves again, so the file holds both.
+    #[test]
+    fn a_change_installed_after_another_save_is_saved_again() {
+        let path = tmp("merged");
+        let _cleanup = RemoveFile(path.clone());
+        let mut store = UserStore::open(&path, "rootpw").unwrap();
+        store.add("alice", "old", BTreeSet::new()).unwrap();
+        store.add("bob", "bobpw", BTreeSet::new()).unwrap();
+        let token = store.login("alice", "old").unwrap();
+        let hashed = NewPassword::hash("new").unwrap();
+        let written = store
+            .prepare_set_password("alice", &hashed)
+            .unwrap()
+            .write()
+            .unwrap()
+            .expect("not overtaken");
+        store
+            .grant("bob", &BTreeSet::from([Privilege::Query]))
+            .unwrap();
+        store.apply_write(written).unwrap();
+        assert!(store.verify("alice", "new"));
+        assert_eq!(store.session_user(&token), None, "sessions revoked");
+        let on_disk = UserStore::open(&path, "unused").unwrap();
+        assert!(on_disk.verify("alice", "new") && on_disk.has_priv("bob", Privilege::Query));
+    }
+
+    /// A new user prepared off-lock is refused at install time when the name
+    /// was taken meanwhile; one whose name is free is added with its
+    /// per-database privileges in one save.
+    #[test]
+    fn an_off_lock_add_checks_the_name_again() {
+        let path = tmp("add");
+        let _cleanup = RemoveFile(path.clone());
+        let mut store = UserStore::open(&path, "rootpw").unwrap();
+        let hashed = NewPassword::hash("pw").unwrap();
+        let privs = BTreeSet::from([Privilege::Query]);
+        let written = store
+            .prepare_add("carol", &hashed, BTreeSet::new(), Some(("lubm", &privs)))
+            .unwrap()
+            .write()
+            .unwrap()
+            .unwrap();
+        store.add("carol", "other", BTreeSet::new()).unwrap();
+        assert!(store.apply_write(written).is_err(), "the name was taken");
+        assert!(store.verify("carol", "other"));
+
+        let state = Mutex::new(store);
+        write_off_lock(
+            &state,
+            |s| s,
+            |users| users.prepare_add("dave", &hashed, BTreeSet::new(), Some(("lubm", &privs))),
+        )
+        .unwrap();
+        let on_disk = UserStore::open(&path, "unused").unwrap();
+        assert!(on_disk.verify("dave", "pw"));
+        assert!(on_disk.has_priv_on("dave", Privilege::Query, "lubm"));
+        assert!(
+            NewPassword::hash("").is_err(),
+            "an empty password is refused"
+        );
     }
 
     /// A save whose file was replaced but whose directory sync failed after

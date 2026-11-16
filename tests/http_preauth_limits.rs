@@ -398,7 +398,31 @@ fn a_session_token_from_a_locked_out_address_gets_no_upload_cap() {
     // the lockout for a session token too, not only for a password — a
     // locked-out address is answered `403` by every REST handler, so it must
     // not get to send the upload cap's worth of body first.
-    let api = start_api("tokenlock", small_caps());
+    // review gapi#5 / sec#7: an address locked out of every request is
+    // upstream's lockout, the upstream_login_lockout switch now (the
+    // default locks an account's password checks only, see
+    // tests/login_lockout.rs).
+    let root = TmpDir::new("tokenlock");
+    let mut config = GStoreConfig::default();
+    config.ip_deny_path = None;
+    config.upstream_login_lockout = true;
+    let server = Arc::new(
+        ApiServer::bind(root.path(), PW, "127.0.0.1:0")
+            .unwrap()
+            .with_config(config)
+            .with_http_options(small_caps()),
+    );
+    let addr = server.local_addr().unwrap();
+    let s2 = Arc::clone(&server);
+    let serving = thread::spawn(move || {
+        s2.serve_forever();
+    });
+    let api = Api {
+        server,
+        addr,
+        serving: Some(serving),
+        _root: root,
+    };
     let token = login_token(api.addr);
     let upload = || {
         send_head(

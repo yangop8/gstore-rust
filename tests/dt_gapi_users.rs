@@ -992,7 +992,13 @@ fn deny_and_allow_lists_block_with_1101() {
 
 #[test]
 fn five_failed_logins_lock_the_address_until_a_successful_login() {
-    let (_srv, addr, _root) = start("lockout");
+    // review gapi#5: upstream's per-address lockout is the
+    // upstream_login_lockout switch now (the default lockout, per account
+    // and address, is tests/login_lockout.rs's).
+    let root = tmp_root("lockout");
+    let mut config = GStoreConfig::default();
+    config.upstream_login_lockout = true;
+    let (_srv, addr) = start_with(&root, config);
     let bad = || {
         api(
             &addr,

@@ -231,8 +231,13 @@ pub const KNOWN_KEYS: &[(&str, &str)] = &[
     ("server", "max_user_num"),
     ("server", "deamon"),
     ("server", "max_output_size"),
+    ("server", "query_timeout"),
+    ("server", "max_result_bytes"),
     ("server", "ip_allow_path"),
     ("server", "ip_deny_path"),
+    ("server", "upstream_login_lockout"),
+    ("server", "login_lockout_failures"),
+    ("server", "login_lockout_max_seconds"),
     ("system", "min_memory"),
     ("system", "min_million_disk"),
     ("system", "min_million_memory"),
@@ -322,6 +327,12 @@ fn section_of(key: &str) -> Option<&'static str> {
 /// install shares: `gserver` refuses to expose a root that still uses it.
 pub const DEFAULT_ROOT_PASSWORD: &str = "123456";
 
+/// The default [`GStoreConfig::query_timeout`]: one hour.
+pub const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(3600);
+
+/// The default [`GStoreConfig::max_result_bytes`]: 1 GiB.
+pub const DEFAULT_MAX_RESULT_BYTES: u64 = 1 << 30;
+
 /// gStore's server configuration: every key of upstream's `conf/conf.ini`
 /// (plus a few Rust-only HTTP knobs), typed, with upstream's defaults.
 ///
@@ -356,11 +367,39 @@ pub struct GStoreConfig {
     pub deamon: bool,
     /// Maximum number of result rows returned by a query (default `100000`).
     pub max_output_size: usize,
+    /// *(Rust extension)* How long one SPARQL statement may run (default
+    /// 1 h; `conf.ini`: seconds, fractions allowed, `0` = no limit). A
+    /// statement still running then is stopped at its next cancellation
+    /// check — releasing the database it holds, so a writer queued behind a
+    /// long read is not blocked for good — and answered as timed out (REST
+    /// `503`, `/api` `1005`).
+    pub query_timeout: Duration,
+    /// *(Rust extension)* The most bytes one serialized query answer may
+    /// take (default 1 GiB; `0` = no limit). Serialization stops as soon as
+    /// it passes the budget, and the request is answered "result too large"
+    /// (REST `503`; a streamed `?stream=true` answer is cut off) — ask for
+    /// less, or page with LIMIT / OFFSET.
+    pub max_result_bytes: u64,
     /// IP allow-list file; when set it takes precedence over the deny list
     /// (default unset).
     pub ip_allow_path: Option<PathBuf>,
     /// IP deny-list file (default `conf/ipDeny.config`).
     pub ip_deny_path: Option<PathBuf>,
+    /// *(Rust extension, upstream-compat switch)* Upstream's failed-login
+    /// lockout: counted per address, every operation but `login` /
+    /// `testConnect` (and REST `/login`) refused from an address with more
+    /// than four failures until a successful login or a restart (default off:
+    /// counted per account and address, every password check refused while
+    /// locked, with an expiring back-off; see `crate::gapi::ipfilter`).
+    pub upstream_login_lockout: bool,
+    /// *(Rust extension)* Failed logins of one account from one address that
+    /// are let through before the account is locked for that address
+    /// (default `4`, upstream's count).
+    pub login_lockout_failures: u32,
+    /// *(Rust extension)* The longest lock of the default lockout, in seconds
+    /// (default `900`): the first lock lasts one second, each further failure
+    /// doubles it up to this.
+    pub login_lockout_max_seconds: u64,
     /// *(Rust extension)* Address the HTTP listener binds (default
     /// `127.0.0.1`; upstream binds every interface — set `0.0.0.0` for that).
     pub listen_addr: String,
@@ -668,8 +707,13 @@ impl Default for GStoreConfig {
             max_user_num: 1000,
             deamon: false,
             max_output_size: 100_000,
+            query_timeout: DEFAULT_QUERY_TIMEOUT,
+            max_result_bytes: DEFAULT_MAX_RESULT_BYTES,
             ip_allow_path: None,
             ip_deny_path: Some(PathBuf::from("conf/ipDeny.config")),
+            upstream_login_lockout: false,
+            login_lockout_failures: crate::gapi::ipfilter::MAX_AUTH_FAILURES,
+            login_lockout_max_seconds: 900,
             listen_addr: "127.0.0.1".to_string(),
             keep_alive_timeout: 60,
             min_body_rate: crate::server::DEFAULT_MIN_BODY_RATE,
@@ -894,8 +938,27 @@ impl GStoreConfig {
             "max_output_size" => {
                 self.max_output_size = parse_num(v).ok_or_else(|| bad("an integer"))?
             }
+            "query_timeout" => {
+                self.query_timeout =
+                    parse_seconds(v).ok_or_else(|| bad("seconds (fractions allowed; 0 = off)"))?
+            }
+            "max_result_bytes" => {
+                self.max_result_bytes =
+                    parse_num(v).ok_or_else(|| bad("a size in bytes (0 = no limit)"))?
+            }
             "ip_allow_path" => self.ip_allow_path = parse_opt_path(v),
             "ip_deny_path" => self.ip_deny_path = parse_opt_path(v),
+            "upstream_login_lockout" => {
+                self.upstream_login_lockout = parse_switch(v).ok_or_else(|| bad("on or off"))?
+            }
+            "login_lockout_failures" => {
+                self.login_lockout_failures = parse_num(v).ok_or_else(|| bad("an integer"))?
+            }
+            "login_lockout_max_seconds" => {
+                self.login_lockout_max_seconds = parse_num(v)
+                    .filter(|n: &u64| *n >= 1)
+                    .ok_or_else(|| bad("a positive number of seconds"))?
+            }
             "listen_addr" => {
                 if v.is_empty() || v.contains(char::is_whitespace) {
                     return Err(bad("a host name or IP address"));
@@ -1172,8 +1235,13 @@ impl GStoreConfig {
             "max_user_num" => self.max_user_num.to_string(),
             "deamon" => switch(self.deamon),
             "max_output_size" => self.max_output_size.to_string(),
+            "query_timeout" => seconds(self.query_timeout),
+            "max_result_bytes" => self.max_result_bytes.to_string(),
             "ip_allow_path" => opt_path(&self.ip_allow_path),
             "ip_deny_path" => opt_path(&self.ip_deny_path),
+            "upstream_login_lockout" => switch(self.upstream_login_lockout),
+            "login_lockout_failures" => self.login_lockout_failures.to_string(),
+            "login_lockout_max_seconds" => self.login_lockout_max_seconds.to_string(),
             "listen_addr" => self.listen_addr.clone(),
             "keep_alive_timeout" => self.keep_alive_timeout.to_string(),
             "min_body_rate" => self.min_body_rate.to_string(),
@@ -1380,6 +1448,15 @@ impl GStoreConfig {
                     .to_string(),
             );
         }
+        if self.upstream_login_lockout {
+            out.push(
+                "upstream-compat: upstream_login_lockout=on (failed logins lock out an address \
+                 until a successful login or a restart, but login and testConnect keep \
+                 checking passwords from it: unlimited guessing, and behind a proxy anyone \
+                 locks out every client)"
+                    .to_string(),
+            );
+        }
         out
     }
 
@@ -1540,6 +1617,26 @@ fn parse_num<T: std::str::FromStr>(v: &str) -> Option<T> {
     v.parse::<T>().ok()
 }
 
+/// A duration in seconds, fractions allowed (`30`, `0.5`); `0` is zero.
+fn parse_seconds(v: &str) -> Option<Duration> {
+    let secs = v.parse::<f64>().ok()?;
+    (secs.is_finite() && secs >= 0.0)
+        .then(|| Duration::try_from_secs_f64(secs).ok())
+        .flatten()
+}
+
+/// A duration as [`parse_seconds`] reads it: whole seconds as an integer,
+/// otherwise with the fraction (to the nanosecond, trailing zeros dropped —
+/// a sub-millisecond timeout must not read back as `0`, which is "off").
+fn seconds(d: Duration) -> String {
+    if d.subsec_nanos() == 0 {
+        d.as_secs().to_string()
+    } else {
+        let s = format!("{}.{:09}", d.as_secs(), d.subsec_nanos());
+        s.trim_end_matches('0').to_string()
+    }
+}
+
 /// `on`/`off` switches (upstream compares with `"on"`; the log modes with
 /// `"1"`). Both spellings, plus `true`/`false`/`yes`/`no`, are accepted for
 /// every switch.
@@ -1659,6 +1756,26 @@ upload_allow_extensions = "nt|ttl|n3|rdf|txt"
 # allow compress package
 upload_allow_compress_packages = "zip"
 "#;
+
+    /// `query_timeout` reads back as it was set — also below a millisecond,
+    /// which used to print as `0.` and so read back as `0`, "no limit".
+    #[test]
+    fn query_timeout_values_round_trip() {
+        for (set, shown) in [
+            ("2.5", "2.5"),
+            ("0.0005", "0.0005"),
+            ("1.125", "1.125"),
+            ("60", "60"),
+            ("0", "0"),
+        ] {
+            let mut c = GStoreConfig::default();
+            c.set("query_timeout", set).unwrap();
+            assert_eq!(c.value("query_timeout").as_deref(), Some(shown), "{set}");
+            let mut again = GStoreConfig::default();
+            again.set("query_timeout", shown).unwrap();
+            assert_eq!(again.query_timeout, c.query_timeout, "{set}");
+        }
+    }
 
     #[test]
     fn ini_sections_comments_trimming_and_quotes() {
@@ -1914,6 +2031,9 @@ upload_allow_compress_packages = "zip"
         let text = "[server]\nport=9100\ntcp_port=9200\nthread_num=4\nmax_database_num=5\n\
                     min_body_rate=0\nmax_conns_per_ip=5\n\
                     max_user_num=6\ndeamon=on\nmax_output_size=7\nip_allow_path=allow.txt\n\
+                    query_timeout=2.5\nmax_result_bytes=4096\n\
+                    upstream_login_lockout=on\nlogin_lockout_failures=3\n\
+                    login_lockout_max_seconds=60\n\
                     ip_deny_path=off\nlisten_addr=0.0.0.0\nkeep_alive_timeout=0\nkeep_alive_max=3\n\
                     queue_size=0\ncors=off\ncors_allow_origin=https://a.example|http://b.example:81\n\
                     allowed_hosts=gs.example, gs2.example\nallow_get_update=on\n\
@@ -1954,6 +2074,16 @@ upload_allow_compress_packages = "zip"
             (5, 6, 7)
         );
         assert!(c.deamon);
+        assert_eq!(
+            (c.query_timeout, c.max_result_bytes),
+            (Duration::from_millis(2500), 4096)
+        );
+        assert_eq!(c.value("query_timeout").as_deref(), Some("2.5"));
+        assert!(c.upstream_login_lockout);
+        assert_eq!(
+            (c.login_lockout_failures, c.login_lockout_max_seconds),
+            (3, 60)
+        );
         assert_eq!(c.ip_allow_path, Some(PathBuf::from("allow.txt")));
         assert_eq!(c.ip_deny_path, None, "`off` disables the deny list");
         assert_eq!(c.listen_addr, "0.0.0.0");

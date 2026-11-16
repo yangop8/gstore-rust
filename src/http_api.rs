@@ -239,7 +239,7 @@ use crate::gapi::ipfilter::IpFilter;
 use crate::gapi::tasks::{TaskConfig, TaskManager};
 use crate::gapi::GapiConfig;
 use crate::http_users::{
-    CheckedCredentials, CredentialCheck, PasswordForm, Privilege, UserStore, ROOT_USER,
+    CheckedCredentials, CredentialCheck, NewPassword, PasswordForm, Privilege, UserStore, ROOT_USER,
 };
 use crate::kvstore::{DiskReadView, DiskSource, ViewError};
 use crate::model::{Term, Triple};
@@ -2092,6 +2092,13 @@ pub(crate) enum OpErrorKind {
     /// failed part-way and whose applied part could not be saved) — REST
     /// `500`, `/api` `1005`; the message starts with [`NOT_DURABLE`].
     Persist,
+    /// The statement ran past `query_timeout` and was stopped (review
+    /// sec#10) — REST `503` (the SPARQL Protocol's refused query) with a
+    /// `{"error":…}` body, `/api` `1005`.
+    Timeout,
+    /// The serialized answer passed `max_result_bytes` (review sec#10) —
+    /// REST `503` with a `{"error":…}` body, `/api` `1005`.
+    ResultTooLarge,
 }
 
 impl OpError {
@@ -2109,6 +2116,7 @@ impl OpError {
             OpErrorKind::TxnEnded | OpErrorKind::Conflict => 409,
             OpErrorKind::NotOwner => 403,
             OpErrorKind::ShuttingDown => 503,
+            OpErrorKind::Timeout | OpErrorKind::ResultTooLarge => 503,
             OpErrorKind::Query => 400,
             OpErrorKind::Failed | OpErrorKind::Persist => 500,
         }
@@ -2118,10 +2126,24 @@ impl OpError {
     /// failed SPARQL statement the SPARQL endpoints' `{"error":…}` body.
     fn rest(&self) -> Resp {
         match self.kind {
-            OpErrorKind::Query => Resp::new(400, SPARQL_JSON, err_json(&self.msg)),
+            OpErrorKind::Query | OpErrorKind::Timeout | OpErrorKind::ResultTooLarge => {
+                Resp::new(self.http(), SPARQL_JSON, err_json(&self.msg))
+            }
             _ => Resp::fail(self.http(), &self.msg),
         }
     }
+}
+
+/// The [`OpErrorKind::Timeout`] error of a job whose deadline `d` stopped it
+/// (`e`: what the stopped job reported — for an UPDATE stopped part-way,
+/// which operations stayed applied).
+fn timed_out_err(e: OpError, d: &crate::deadline::Deadline) -> OpError {
+    let msg = if e.msg.contains("applied") {
+        format!("{} ({})", d.message(), e.msg)
+    } else {
+        d.message()
+    };
+    OpError::new(OpErrorKind::Timeout, msg)
 }
 
 /// What a [`QueryJob`] produced.
@@ -3578,8 +3600,11 @@ impl ApiInner {
             return (Resp::from(resp), user_disp);
         }
         // The IP checks of the `/api` layer hold for every endpoint on this
-        // listener: the allow / deny lists, and the failed-login lockout for
-        // everything but `/login` (as `/api` exempts its `login`).
+        // listener: the allow / deny lists, and — under
+        // `upstream_login_lockout` — upstream's per-address lockout for
+        // everything but `/login` (as `/api` exempts its `login`). The
+        // default lockout refuses a locked account's password check instead
+        // (`/login`'s and Basic credentials' below), before the hash runs.
         let ip = peer_ip(peer);
         if !self.ipfilter.permits(&ip) {
             return (
@@ -3646,13 +3671,21 @@ impl ApiInner {
         // Basic credentials are checked with the state lock held only to look
         // the user up: the deliberately slow password hash runs with no lock
         // held, so a client sending bad credentials (no account needed) cannot
-        // stall every other request — `/cancel` included — behind it.
-        let basic = parse_basic_auth(req).map(|(u, p)| {
-            let attempt = locked(&self.state)
-                .users
-                .begin_check(&u, &p, PasswordForm::Plain);
-            (u, attempt.verify())
-        });
+        // stall every other request — `/cancel` included — behind it. An
+        // account the lockout refuses at this address is answered `429`
+        // before any hash runs (review http#6 / sec#7).
+        let basic = match parse_basic_auth(req) {
+            None => None,
+            Some((u, p)) => {
+                if let Some(wait) = self.ipfilter.auth_refusal(&u, &ip) {
+                    return (lockout_refused(wait), "-".to_string());
+                }
+                let attempt = locked(&self.state)
+                    .users
+                    .begin_check(&u, &p, PasswordForm::Plain);
+                Some((u, attempt.verify()))
+            }
+        };
         // Short critical section: count the request, resolve the caller, route.
         // An endpoint with slow work (parsing, a query, I/O) returns
         // `Dispatch::Deferred` so it runs below with the `ApiState` lock
@@ -3691,19 +3724,32 @@ impl ApiInner {
             }) => Some(OpError::new(OpErrorKind::Persist, w.clone())),
             _ => None,
         };
+        // A read is rendered before it is logged: an answer over the result
+        // byte budget is logged as the failure it is answered as.
+        let rendered = match &out {
+            Ok(JobOutput::Read(result)) => Some(render_result_within(
+                fmt,
+                result,
+                self.config().max_result_bytes,
+            )),
+            _ => None,
+        };
         qlog.finish(
             self,
-            match (&out, &not_durable) {
-                (_, Some(e)) => Err(e),
-                (Ok(JobOutput::Read(result)), None) => Ok(answer_count(result)),
-                (Ok(JobOutput::Updated { changed, .. }), None) => Ok(*changed),
-                (Err(e), None) => Err(e),
+            match (&out, &not_durable, &rendered) {
+                (_, Some(e), _) => Err(e),
+                (_, None, Some(Err(e))) => Err(e),
+                (Ok(JobOutput::Read(result)), None, _) => Ok(answer_count(result)),
+                (Ok(JobOutput::Updated { changed, .. }), None, _) => Ok(*changed),
+                (Err(e), None, _) => Err(e),
             },
         );
-        match out {
-            Ok(JobOutput::Read(result)) => render_result(fmt, &result),
-            Ok(JobOutput::Updated { changed, warning }) => update_resp(changed, &warning),
-            Err(e) => e.rest(),
+        match (out, rendered) {
+            (_, Some(Ok(resp))) => resp,
+            (_, Some(Err(e))) => e.rest(),
+            (Ok(JobOutput::Updated { changed, warning }), None) => update_resp(changed, &warning),
+            (Ok(JobOutput::Read(result)), None) => render_result(fmt, &result),
+            (Err(e), None) => e.rest(),
         }
     }
 
@@ -3717,11 +3763,25 @@ impl ApiInner {
     /// (released from the db lock first, so it does not stall the owner's
     /// `/tquery`s). A write that changed data marks the database dirty and is
     /// saved before the lock is released under the check_point policy.
+    ///
+    /// The statement runs under `query_timeout` (review sec#10, robust#5): a
+    /// deadline raises the job's cancel flag — the one `/cancel` raises —
+    /// once its time is up, the evaluator stops at its next cancellation
+    /// check and releases the database (a writer queued behind a runaway
+    /// read is no longer blocked for good), and the job fails as
+    /// [`OpErrorKind::Timeout`].
     pub(crate) fn run_query_job(&self, job: QueryJob) -> Result<JobOutput, OpError> {
         // Ends the task (also on a panic) once the job — and so its db lock —
         // is done.
         let mut task = TaskGuard::new(self, job.task_id);
+        let deadline = crate::deadline::arm(&job.cancel, self.config().query_timeout);
         let out = self.run_query_job_locked(job);
+        let out = match (out, &deadline) {
+            (Err(e), Some(d)) if d.fired() && e.kind != OpErrorKind::Persist => {
+                Err(timed_out_err(e, d))
+            }
+            (out, _) => out,
+        };
         task.set_ok(out.is_ok());
         out
     }
@@ -3891,14 +3951,15 @@ impl ApiInner {
         basic: Option<(String, CheckedCredentials)>,
     ) -> Option<String> {
         if let Some((u, checked)) = basic {
+            let ip = peer_ip(crate::server::current_peer());
             // Also migrates a legacy password hash on first successful use,
             // so Basic-auth-only clients get upgraded like `/login` users.
             if st.users.finish_check(checked) == CredentialCheck::Valid {
+                self.ipfilter.note_auth_success(&u, &ip);
                 return Some(u);
             }
-            // Counts towards the address's lockout, as a failed `/api` login.
-            self.ipfilter
-                .note_failure(&peer_ip(crate::server::current_peer()));
+            // Counts towards the lockout, as a failed `/api` login.
+            self.ipfilter.note_auth_failure(&u, &ip);
         }
         if let Some(tok) = req.bearer_or_session_token() {
             if let Some(u) = st.users.session_user(&tok) {
@@ -4055,13 +4116,19 @@ impl ApiInner {
         }
 
         let resp = match (method, path) {
-            ("POST", "/user/create") => self.guarded(st, &user, "usermanage", |s, st| {
-                s.handle_user_create(st, req)
-            }),
+            // The privilege check stays here, under the state lock; the
+            // password hash and the users.db write run deferred, with no
+            // lock held (review http#7).
+            ("POST", "/user/create") => {
+                if !crate::sysdb::allowed(&st.users, &user, "usermanage", None) {
+                    return Dispatch::Done(self.forbidden());
+                }
+                return self.handle_user_create(st, req);
+            }
             ("POST", "/user/drop") => {
                 self.guarded(st, &user, "usermanage", |s, st| s.handle_user_drop(st, req))
             }
-            ("POST", "/user/password") => self.handle_user_password(st, req, &user),
+            ("POST", "/user/password") => return self.handle_user_password(st, req, &user),
             ("POST", "/user/grant") => self.guarded(st, &user, "userprivilegemanage", |s, st| {
                 s.handle_user_grant(st, req, true)
             }),
@@ -4117,20 +4184,25 @@ impl ApiInner {
             return Dispatch::Done(Resp::fail(400, "missing username or password"));
         };
         Dispatch::Deferred(Box::new(move |inner| {
+            let ip = peer_ip(crate::server::current_peer());
+            // A locked account is refused before the slow hash (review
+            // http#6): guessing through `/login` gets no further.
+            if let Some(wait) = inner.ipfilter.auth_refusal(&username, &ip) {
+                return lockout_refused(wait);
+            }
             let attempt =
                 locked(&inner.state)
                     .users
                     .begin_check(&username, &password, PasswordForm::Plain);
             let checked = attempt.verify();
-            let ip = peer_ip(crate::server::current_peer());
             let mut st = locked(&inner.state);
             if st.users.finish_check(checked) != CredentialCheck::Valid {
-                inner.ipfilter.note_failure(&ip);
+                inner.ipfilter.note_auth_failure(&username, &ip);
                 return Resp::fail(401, "invalid username or password");
             }
-            // As `/api`'s `login`: a successful login clears the address's
-            // failed-login count.
-            inner.ipfilter.reset(&ip);
+            // As `/api`'s `login`: a successful login clears the account's
+            // failed-login count at this address (upstream: the address's).
+            inner.ipfilter.note_login_success(&username, &ip);
             let token = st.users.start_session(&username);
             let priv_str = st
                 .users
@@ -6564,22 +6636,30 @@ impl ApiInner {
 
     // ---- user management --------------------------------------------------
 
-    fn handle_user_create(&self, st: &mut ApiState, req: &Request) -> Resp {
+    /// `/user/create` (the caller's `usermanage` privilege is checked by
+    /// [`dispatch`](Self::dispatch)). The request is checked here, under the
+    /// state lock; the password hash and the users.db write run deferred
+    /// with no lock held (review http#7), and the user is created only if
+    /// the name is still free then.
+    fn handle_user_create(&self, st: &mut ApiState, req: &Request) -> Dispatch {
         let (Some(name), Some(password)) = (
             req.param("op_username").or_else(|| req.param("username")),
             req.param("op_password").or_else(|| req.param("password")),
         ) else {
-            return Resp::fail(400, "missing op_username or op_password");
+            return Dispatch::Done(Resp::fail(400, "missing op_username or op_password"));
         };
         let privileges = req.param("privileges").unwrap_or_default();
         let Some(privs) = Privilege::parse_list(&privileges) else {
-            return Resp::fail(400, "invalid privileges (use names or codes 1..8)");
+            return Dispatch::Done(Resp::fail(
+                400,
+                "invalid privileges (use names or codes 1..8)",
+            ));
         };
         // With a `db_name` the privileges are granted on that database only;
         // without, on every database.
         let db = match grant_db_param(req) {
             Ok(db) => db,
-            Err(r) => return r,
+            Err(r) => return Dispatch::Done(r),
         };
         let (global, on_db) = match db {
             Some(db) => (BTreeSet::new(), Some((db, privs))),
@@ -6587,21 +6667,30 @@ impl ApiInner {
         };
         // The system user (`/shutdown`, `/restart`) is not a stored user.
         if name == self.config().system_username {
-            return Resp::fail(
+            return Dispatch::Done(Resp::fail(
                 400,
                 &format!("'{name}' is the system user's name (system_username)"),
+            ));
+        }
+        if st.users.exists(&name) {
+            return Dispatch::Done(Resp::fail(400, &format!("user '{name}' already exists")));
+        }
+        Dispatch::Deferred(Box::new(move |inner| {
+            let hashed = match NewPassword::hash(&password) {
+                Ok(h) => h,
+                Err(e) => return Resp::fail(400, &e),
+            };
+            let on_db = on_db.as_ref().map(|(db, p)| (db.as_str(), p));
+            let created = crate::http_users::write_off_lock(
+                &inner.state,
+                |st| &mut st.users,
+                |users| users.prepare_add(&name, &hashed, global.clone(), on_db),
             );
-        }
-        if let Err(e) = st.users.add(&name, &password, global) {
-            return Resp::fail(400, &e);
-        }
-        if let Some((db, privs)) = on_db.filter(|(_, p)| !p.is_empty()) {
-            if let Err(e) = st.users.grant_on(&name, &db, &privs) {
-                let _ = st.users.drop_user(&name);
-                return Resp::fail(400, &e);
+            match created {
+                Ok(()) => Resp::ok(&format!("user '{name}' created")),
+                Err(e) => Resp::fail(400, &e),
             }
-        }
-        Resp::ok(&format!("user '{name}' created"))
+        }))
     }
 
     fn handle_user_drop(&self, st: &mut ApiState, req: &Request) -> Resp {
@@ -6628,26 +6717,44 @@ impl ApiInner {
         }
     }
 
-    fn handle_user_password(&self, st: &mut ApiState, req: &Request, user: &str) -> Resp {
+    /// `/user/password`: whether the caller may change the target's
+    /// password is decided here, under the state lock; the password hash
+    /// and the users.db write run deferred with no lock held (review
+    /// http#7), and the password is set only if the user still exists then.
+    fn handle_user_password(&self, st: &mut ApiState, req: &Request, user: &str) -> Dispatch {
         let Some(target) = req
             .param("username")
             .or_else(|| req.param("op_username"))
             .or_else(|| Some(user.to_string()))
         else {
-            return Resp::fail(400, "missing username");
+            return Dispatch::Done(Resp::fail(400, "missing username"));
         };
         let Some(password) = req.param("op_password").or_else(|| req.param("password")) else {
-            return Resp::fail(400, "missing op_password");
+            return Dispatch::Done(Resp::fail(400, "missing op_password"));
         };
         // A user may change their own password; only admins may change others'.
         let is_admin = st.users.is_superuser(user);
         if target != user && !is_admin {
-            return self.forbidden();
+            return Dispatch::Done(self.forbidden());
         }
-        match st.users.set_password(&target, &password) {
-            Ok(()) => Resp::ok(&format!("password for '{target}' changed")),
-            Err(e) => Resp::fail(400, &e),
+        if !st.users.exists(&target) {
+            return Dispatch::Done(Resp::fail(400, &format!("user '{target}' does not exist")));
         }
+        Dispatch::Deferred(Box::new(move |inner| {
+            let hashed = match NewPassword::hash(&password) {
+                Ok(h) => h,
+                Err(e) => return Resp::fail(400, &e),
+            };
+            let changed = crate::http_users::write_off_lock(
+                &inner.state,
+                |st| &mut st.users,
+                |users| users.prepare_set_password(&target, &hashed),
+            );
+            match changed {
+                Ok(()) => Resp::ok(&format!("password for '{target}' changed")),
+                Err(e) => Resp::fail(400, &e),
+            }
+        }))
     }
 
     fn handle_user_grant(&self, st: &mut ApiState, req: &Request, grant: bool) -> Resp {
@@ -7233,22 +7340,122 @@ fn presents_default_root_password(req: &Request) -> bool {
         && req.param("password").as_deref() == Some(default)
 }
 
+/// The answer to a password check the failed-login lockout refuses
+/// (`crate::gapi::ipfilter`): `429 Too Many Requests` with `Retry-After`.
+fn lockout_refused(wait: Duration) -> Resp {
+    let mut r = Resp::fail(429, &crate::gapi::ipfilter::lockout_msg(wait));
+    r.extra.push((
+        "Retry-After".to_string(),
+        crate::gapi::ipfilter::retry_after_secs(wait).to_string(),
+    ));
+    r
+}
+
+/// The message of an answer larger than `max_result_bytes` (`limit`).
+pub(crate) fn result_too_large_msg(limit: u64) -> String {
+    format!(
+        "result too large: the answer exceeds max_result_bytes ({limit} bytes); ask for less \
+         (project fewer variables, add a LIMIT and page with OFFSET) or raise max_result_bytes"
+    )
+}
+
+/// A [`Write`] adapter that counts the bytes it passes on and fails the
+/// write that would take them past `limit` (`0`: no limit) — the result
+/// byte budget (`max_result_bytes`, review sec#10). Serialization stops at
+/// that write, so no more than `limit` bytes of an oversized answer are
+/// ever produced; [`exceeded`](Self::exceeded) tells the failure from an
+/// I/O error of `inner`. Used around every result serializer of both
+/// servers (REST answers here, the single-database server's buffered and
+/// streamed ones).
+pub(crate) struct CountingWriter<W> {
+    inner: W,
+    written: u64,
+    limit: u64,
+    exceeded: bool,
+}
+
+impl<W: Write> CountingWriter<W> {
+    /// Count what goes to `inner`, at most `limit` bytes (`0`: no limit).
+    pub(crate) fn new(inner: W, limit: u64) -> CountingWriter<W> {
+        CountingWriter {
+            inner,
+            written: 0,
+            limit,
+            exceeded: false,
+        }
+    }
+
+    /// Whether a write was refused for passing the limit.
+    pub(crate) fn exceeded(&self) -> bool {
+        self.exceeded
+    }
+
+    /// The wrapped writer.
+    pub(crate) fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.limit != 0 && self.written.saturating_add(buf.len() as u64) > self.limit {
+            self.exceeded = true;
+            return Err(std::io::Error::other(result_too_large_msg(self.limit)));
+        }
+        let n = self.inner.write(buf)?;
+        self.written += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Write `triples` as N-Triples ([`ntriples_body`], a slice at a time) to
+/// `out`, stopping at the first failed write (a [`CountingWriter`]'s budget).
+pub(crate) fn write_ntriples<W: Write>(
+    triples: &[crate::model::Triple],
+    out: &mut W,
+) -> std::io::Result<()> {
+    for chunk in triples.chunks(256) {
+        out.write_all(&ntriples_body(chunk))?;
+    }
+    Ok(())
+}
+
 /// Render a [`QueryResult`] into an HTTP response using the negotiated format.
 fn render_result(fmt: ResultFormat, result: &QueryResult) -> Resp {
-    match result {
-        QueryResult::Select(rs) => {
-            let mut buf = Vec::new();
-            let _ = sparql_results::write_select(fmt, rs, &mut buf);
-            Resp::new(200, fmt.content_type(), buf)
-        }
-        QueryResult::Ask(b) => {
-            let mut buf = Vec::new();
-            let _ = sparql_results::write_ask(fmt, *b, &mut buf);
-            Resp::new(200, fmt.content_type(), buf)
-        }
-        QueryResult::Construct(ts) => Resp::new(200, "application/n-triples", ntriples_body(ts)),
-        QueryResult::Update { changed } => update_resp(*changed, &None),
+    render_result_within(fmt, result, 0).unwrap_or_else(|e| e.rest())
+}
+
+/// [`render_result`] within the result byte budget `limit`
+/// (`max_result_bytes`; `0`: none): an answer that would pass it is
+/// [`OpErrorKind::ResultTooLarge`], found as soon as its serialization
+/// passes the budget (a [`CountingWriter`]), never after the whole of it.
+fn render_result_within(
+    fmt: ResultFormat,
+    result: &QueryResult,
+    limit: u64,
+) -> Result<Resp, OpError> {
+    let too_large = || OpError::new(OpErrorKind::ResultTooLarge, result_too_large_msg(limit));
+    let mut out = CountingWriter::new(Vec::new(), limit);
+    let (ctype, written) = match result {
+        QueryResult::Select(rs) => (
+            fmt.content_type(),
+            sparql_results::write_select(fmt, rs, &mut out),
+        ),
+        QueryResult::Ask(b) => (
+            fmt.content_type(),
+            sparql_results::write_ask(fmt, *b, &mut out),
+        ),
+        QueryResult::Construct(ts) => ("application/n-triples", write_ntriples(ts, &mut out)),
+        QueryResult::Update { changed } => return Ok(update_resp(*changed, &None)),
+    };
+    if written.is_err() && out.exceeded() {
+        return Err(too_large());
     }
+    Ok(Resp::new(200, ctype, out.into_inner()))
 }
 
 /// The error message of an UPDATE that failed after applying part of its
@@ -7476,6 +7683,41 @@ fn new_system_password() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// review sec#10: the result byte budget stops a serializer at the
+    /// write that passes it — an oversized answer is never produced whole.
+    #[test]
+    fn the_counting_writer_stops_an_oversized_answer_at_the_budget() {
+        let mut rs = crate::query::ResultSet::new(vec!["s".to_string()]);
+        for i in 0..10_000 {
+            rs.rows.push(vec![Some(format!("<http://ex/{i}>"))]);
+        }
+        let mut whole = Vec::new();
+        sparql_results::write_select(ResultFormat::Json, &rs, &mut whole).unwrap();
+        assert!(whole.len() > 200_000);
+        let mut out = CountingWriter::new(Vec::new(), 4096);
+        let r = sparql_results::write_select(ResultFormat::Json, &rs, &mut out);
+        assert!(r.is_err() && out.exceeded());
+        assert!(out.into_inner().len() <= 4096, "no more than the budget");
+        // Within the budget (or with none) the bytes are those of the answer.
+        let mut out = CountingWriter::new(Vec::new(), 0);
+        sparql_results::write_select(ResultFormat::Json, &rs, &mut out).unwrap();
+        assert!(!out.exceeded());
+        assert_eq!(out.into_inner(), whole);
+        let small = QueryResult::Ask(true);
+        assert_eq!(
+            render_result_within(ResultFormat::Json, &small, 4096)
+                .unwrap()
+                .status,
+            200
+        );
+        let big = QueryResult::Select(rs);
+        let Err(e) = render_result_within(ResultFormat::Json, &big, 4096) else {
+            panic!("an oversized answer was rendered");
+        };
+        assert_eq!(e.kind, OpErrorKind::ResultTooLarge);
+        assert_eq!(e.rest().status, 503);
+    }
 
     #[test]
     fn detects_update_statements() {
@@ -8044,8 +8286,15 @@ mod tests {
                             r#"{"operation":"testConnect","username":"nobody","password":"x"}"#,
                         )),
                     };
-                    // 403: the address got locked out (failed logins).
-                    assert!(s == 401 || s == 200 || s == 403, "unexpected status {s}");
+                    // 429: the account got locked out at this address
+                    // (failed logins; review http#6: the lockout covers
+                    // `/login` and Basic credentials, and answers 429 with
+                    // Retry-After — upstream's per-address 403 is the
+                    // upstream_login_lockout switch).
+                    assert!(
+                        s == 401 || s == 200 || s == 403 || s == 429,
+                        "unexpected status {s}"
+                    );
                     n += 1;
                 }
                 n
@@ -8062,11 +8311,12 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_micros(500));
         }
-        // Authenticated requests are still served meanwhile (refused, 403,
-        // once the failed logins from this same address locked it out).
+        // Authenticated requests are still served meanwhile (refused, 429,
+        // once the failed logins from this same address locked root out —
+        // review http#6).
         let root = basic("root", "root");
         let (s, _) = split_status_body(&raw_request(&addr, "GET", "/tasklist", Some(&root), ""));
-        assert!(s == 200 || s == 403, "{s}");
+        assert!(s == 200 || s == 429, "{s}");
         stop.store(true, Ordering::Relaxed);
         let attempts: usize = attackers.into_iter().map(|h| h.join().unwrap()).sum();
         assert!(attempts > 0);

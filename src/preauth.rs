@@ -54,8 +54,8 @@ use crate::gapi::auth::{self, PreAuth};
 use crate::gapi::params::parse_form;
 use crate::http_api::{peer_ip, ApiInner};
 use crate::server::{
-    base64_decode, browser_refusal, ct_eq, current_peer, ip_is_loopback, locked,
-    strip_basic_prefix, BadRequest, HttpOptions, FORWARDING_HEADERS,
+    base64_decode, browser_refusal, current_peer, ip_is_loopback, locked, strip_basic_prefix,
+    BadRequest, HttpOptions, SingleAuth, FORWARDING_HEADERS,
 };
 
 /// The default [`HttpOptions::preauth_max_body`]: 64 MiB.
@@ -421,7 +421,7 @@ impl<R: BufRead> BufRead for Budgeted<'_, R> {
 /// fresh budget (observable under `addr`), with [`single_db_hook`].
 pub(crate) fn single_db_ingest(
     opts: &HttpOptions,
-    auth: &Option<(String, String)>,
+    auth: &Option<SingleAuth>,
     addr: SocketAddr,
 ) -> Arc<Ingest> {
     let ingest = Arc::new(Ingest::new(
@@ -447,14 +447,16 @@ pub(crate) fn api_ingest(
 
 /// The single-database server's hook: `POST /update` and `POST /sparql`
 /// carry payloads; with Basic credentials configured (`auth`) a request is
-/// authenticated by a matching `Authorization: Basic` header, without any
+/// authenticated by a matching `Authorization: Basic` header (a user name
+/// locked out at the client's address is not compared: the handler answers
+/// it `429` after the body, which is held to the pre-auth cap), without any
 /// every client is (the open server serves everyone) — except a request the
 /// server refuses after its body anyway (`ServerInner::handle`): one the
 /// browser policy of `opts` refuses (a foreign `Host` or `Origin`), and, on
 /// the open server, one a reverse proxy on this machine forwards (unless
 /// [`HttpOptions::trust_proxy_headers`]). Those are held to the
 /// pre-authentication cap.
-pub(crate) fn single_db_hook(auth: Option<(String, String)>, opts: HttpOptions) -> PreBodyHook {
+pub(crate) fn single_db_hook(auth: Option<SingleAuth>, opts: HttpOptions) -> PreBodyHook {
     Box::new(move |head| {
         let payload_route =
             head.method == "POST" && matches!(head.route_path(), "/update" | "/sparql");
@@ -463,8 +465,8 @@ pub(crate) fn single_db_hook(auth: Option<(String, String)>, opts: HttpOptions) 
         }
         let authenticated = match &auth {
             None => !forwarded_by_untrusted_proxy(head, opts.trust_proxy_headers),
-            Some((user, pass)) => basic_credentials(head)
-                .is_some_and(|decoded| ct_eq(&decoded, format!("{user}:{pass}").as_bytes())),
+            Some(auth) => basic_credentials(head)
+                .is_some_and(|decoded| auth.accepts(&decoded, &peer_ip(current_peer()))),
         };
         if authenticated {
             Admission::Upload
@@ -885,7 +887,7 @@ mod tests {
             open(&head("POST", "/status", None, &[])),
             Admission::PreAuth
         );
-        let guarded = single_db_hook(Some(("u".into(), "p".into())), HttpOptions::default());
+        let guarded = single_db_hook(Some(SingleAuth::new("u", "p")), HttpOptions::default());
         assert_eq!(
             guarded(&head("POST", "/sparql", None, &basic)),
             Admission::Upload
@@ -894,9 +896,21 @@ mod tests {
             guarded(&head("POST", "/sparql", None, &[])),
             Admission::PreAuth
         );
-        let wrong = single_db_hook(Some(("u".into(), "x".into())), HttpOptions::default());
+        let wrong = single_db_hook(Some(SingleAuth::new("u", "x")), HttpOptions::default());
         assert_eq!(
             wrong(&head("POST", "/update", None, &basic)),
+            Admission::PreAuth
+        );
+        // review http#6: a user locked out at the client's address is not
+        // compared — the body stays at the pre-auth cap and the handler
+        // answers 429.
+        let auth = SingleAuth::new("u", "p");
+        for _ in 0..=crate::gapi::ipfilter::MAX_AUTH_FAILURES {
+            auth.lockout_for_tests().note_failure("u", "unknown");
+        }
+        let locked = single_db_hook(Some(auth), HttpOptions::default());
+        assert_eq!(
+            locked(&head("POST", "/update", None, &basic)),
             Admission::PreAuth
         );
     }

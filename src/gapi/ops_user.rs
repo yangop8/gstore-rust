@@ -9,13 +9,19 @@
 //! `userpassword` is reserved to `root` by the dispatcher's privilege check
 //! (upstream's `check_privilege`); `userpassword` changes the caller's own
 //! password. `root` can be neither deleted nor have its privileges changed.
+//!
+//! A new password is hashed, and `users.db` rewritten, with the server's
+//! state lock released (review gapi#6): the checks run under the lock, then
+//! [`NewPassword::hash`] and [`write_off_lock`] — which installs the change
+//! only if it still applies (the user still exists, or the name is still
+//! free).
 
 use std::collections::BTreeSet;
 
 use super::envelope::{GResp, Status};
 use super::params::Params;
 use super::{apilog, check_db_name, ipfilter, Ctx, OpSpec, Registry};
-use crate::http_users::{Privilege, ROOT_USER};
+use crate::http_users::{write_off_lock, NewPassword, Privilege, ROOT_USER};
 use crate::json::Json;
 use crate::sysdb::{privilege_list, PRIVILEGE_FIELDS};
 
@@ -110,7 +116,8 @@ fn usermanage(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     let mut st = ctx.state();
     match kind.as_str() {
         "1" => {
-            if st.users.count() >= max_users {
+            let full = |users: &crate::http_users::UserStore| users.count() >= max_users;
+            if full(&st.users) {
                 return GResp::error(
                     Status::OperationConditionsAreNotSatisfied,
                     "The total number of users more than max_user_num.",
@@ -130,7 +137,23 @@ fn usermanage(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
                     ),
                 );
             }
-            match st.users.add(&op_username, &op_password, BTreeSet::new()) {
+            // The hash and the users.db write run with no lock held.
+            drop(st);
+            let added = NewPassword::hash(&op_password).and_then(|hashed| {
+                write_off_lock(
+                    &ctx.inner.state,
+                    |st| &mut st.users,
+                    |users| {
+                        if full(users) {
+                            return Err(
+                                "The total number of users more than max_user_num.".to_string()
+                            );
+                        }
+                        users.prepare_add(&op_username, &hashed, BTreeSet::new(), None)
+                    },
+                )
+            });
+            match added {
                 Ok(()) => GResp::success("Add user done."),
                 Err(e) => GResp::error(Status::ParamIsIllegal, format!("add user failed: {e}")),
             }
@@ -176,7 +199,8 @@ fn usermanage(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
                     "Username not exist, change password failed.",
                 );
             }
-            match st.users.set_password(&op_username, &op_password) {
+            drop(st);
+            match set_password_off_lock(ctx, &op_username, &op_password) {
                 Ok(()) => GResp::success("Change password done."),
                 Err(e) => GResp::error(
                     Status::OperationFailed,
@@ -306,17 +330,27 @@ fn userpassword(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         );
     }
     let user = ctx.user().to_string();
-    let mut st = ctx.state();
-    if !st.users.exists(&user) {
+    if !ctx.state().users.exists(&user) {
         return GResp::error(Status::ParamIsIllegal, "Username does not exist.");
     }
-    match st.users.set_password(&user, &op_password) {
+    match set_password_off_lock(ctx, &user, &op_password) {
         Ok(()) => GResp::success("Change password done."),
         Err(e) => GResp::error(
             Status::OperationFailed,
             format!("Change password fail: {e}"),
         ),
     }
+}
+
+/// Set `name`'s password with the hash and the users.db write outside the
+/// state lock (review gapi#6); refused if the user no longer exists then.
+fn set_password_off_lock(ctx: &Ctx<'_>, name: &str, password: &str) -> Result<(), String> {
+    let hashed = NewPassword::hash(password)?;
+    write_off_lock(
+        &ctx.inner.state,
+        |st| &mut st.users,
+        |users| users.prepare_set_password(name, &hashed),
+    )
 }
 
 #[cfg(test)]

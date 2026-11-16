@@ -30,6 +30,10 @@ pub enum GStoreError {
     /// A read query was cooperatively cancelled (its cancel flag was set) and
     /// aborted at a pattern/phase boundary before completing.
     Cancelled,
+    /// A statement ran longer than its time limit (`query_timeout`) and was
+    /// stopped (review sec#10): the time it was given. Servers answer it
+    /// as a refused request (REST `503`), not as a query error.
+    Timeout(std::time::Duration),
     /// The on-disk store failed while committing a page batch (or an earlier
     /// write left it inconsistent with the session) and refuses every further
     /// write until the database is reopened: its write-ahead log holds the
@@ -51,6 +55,7 @@ impl fmt::Display for GStoreError {
             GStoreError::Database(msg) => write!(f, "database error: {msg}"),
             GStoreError::Conflict(msg) => write!(f, "transaction conflict: {msg}"),
             GStoreError::Cancelled => write!(f, "query cancelled"),
+            GStoreError::Timeout(after) => f.write_str(&crate::deadline::timeout_message(*after)),
             GStoreError::StorageFailed(msg) => write!(
                 f,
                 "storage failed: {msg}; nothing more is written until the database is reopened"
@@ -75,6 +80,7 @@ impl GStoreError {
             GStoreError::Database(m) => GStoreError::Database(m.clone()),
             GStoreError::Conflict(m) => GStoreError::Conflict(m.clone()),
             GStoreError::Cancelled => GStoreError::Cancelled,
+            GStoreError::Timeout(after) => GStoreError::Timeout(*after),
             GStoreError::StorageFailed(m) => GStoreError::StorageFailed(m.clone()),
         }
     }

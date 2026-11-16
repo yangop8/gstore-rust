@@ -146,25 +146,25 @@ fn query(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     let outcome = ctx.inner.run_query_job(job);
     let query_time = started.elapsed().as_millis().to_string();
     let thread_id = thread_id();
+    // Every answer from here on — a failure included — is recorded in the
+    // query log with its status (review gapi#8).
     let resp = match outcome {
-        Err(e) => return query_error(e),
+        Err(e) => query_error(e),
         Ok(JobOutput::Updated { changed, warning }) => {
             update_response(changed, warning, &query_time, &thread_id)
         }
         Ok(JobOutput::Read(QueryResult::Update { changed })) => {
             update_response(changed, None, &query_time, &thread_id)
         }
-        Ok(JobOutput::Read(result)) => {
-            let Some(format) = format else {
-                return GResp::error(Status::OperationFailed, "Unknown result format.");
-            };
-            let rs = result_table(result);
-            let pfn = pfn.as_ref();
-            match read_response(ctx, &db, &rs, format, limit, &query_time, &thread_id, pfn) {
-                Ok(r) => r,
-                Err(r) => return r,
+        Ok(JobOutput::Read(result)) => match format {
+            None => GResp::error(Status::OperationFailed, "Unknown result format."),
+            Some(format) => {
+                let rs = result_table(result);
+                let pfn = pfn.as_ref();
+                read_response(ctx, &db, &rs, format, limit, &query_time, &thread_id, pfn)
+                    .unwrap_or_else(|r| r)
             }
-        }
+        },
     };
     query_log.finish(ctx, &resp);
     resp.with_header("Cache-Control", "no-cache")
@@ -215,6 +215,31 @@ fn result_table(result: QueryResult) -> ResultSet {
     }
 }
 
+/// The JSON scaffolding counted per cell of an answer on top of its
+/// variable name and value: `{"x":{"type":"literal","value":""}}`, its
+/// separators and the escapes a value may need.
+const CELL_OVERHEAD: u64 = 48;
+
+/// Whether the first `shown` rows of `rs` (all of them for `None`) would serialize
+/// to more than `budget` bytes, by the size of their cells (each row's
+/// variable names and values plus [`CELL_OVERHEAD`]) — stopping at the
+/// first row past the budget.
+fn result_bytes_exceed(rs: &ResultSet, shown: Option<usize>, budget: u64) -> bool {
+    let mut total: u64 = 0;
+    for row in rs.rows.iter().take(shown.unwrap_or(usize::MAX)) {
+        for (var, cell) in rs.vars.iter().zip(row) {
+            if let Some(v) = cell {
+                total += (var.len() + v.len()) as u64 + CELL_OVERHEAD;
+            }
+        }
+        total += 4;
+        if total > budget {
+            return true;
+        }
+    }
+    false
+}
+
 /// The `OutputLimit` of a result with `ans_num` answers for a query whose
 /// `LIMIT` is `limit` (upstream `ApiHandler::query`): the `LIMIT` (or `-1`),
 /// lowered to `max` when there are more than `max` answers.
@@ -241,6 +266,18 @@ fn read_response(
     let ans_num = rs.rows.len();
     let out_limit = output_limit(ans_num, limit, ctx.config.max_output_size);
     let shown = usize::try_from(out_limit).ok();
+    // The result byte budget (`max_result_bytes`, review sec#10) of an
+    // answer carried in the response: its cells are summed up before the
+    // JSON document is built, which is never built past the budget.
+    if matches!(format, OutFormat::Json | OutFormat::NTriple) {
+        let budget = ctx.inner.config().max_result_bytes;
+        if budget != 0 && result_bytes_exceed(rs, shown, budget) {
+            return Err(query_error(OpError::new(
+                OpErrorKind::ResultTooLarge,
+                crate::http_api::result_too_large_msg(budget),
+            )));
+        }
+    }
     // A PFN result replaces the JSON document (upstream `ResultSet::to_JSON`).
     let json = |shown| match pfn.and_then(|p| p.results_json(rs, shown)) {
         Some(body) => body,
@@ -707,6 +744,11 @@ fn query_error(e: OpError) -> GResp {
         // An update that failed part-way and whose applied part could not be
         // saved: `"applied in memory but not durable: …"` (review durability#2).
         OpErrorKind::Persist => GResp::error(Status::OperationFailed, e.msg),
+        // `query_timeout` stopped it, or its answer passed
+        // `max_result_bytes` (review sec#10).
+        OpErrorKind::Timeout | OpErrorKind::ResultTooLarge => {
+            GResp::error(Status::OperationFailed, format!("Query fail: {}", e.msg))
+        }
         _ => GResp::error(Status::OperationFailed, e.msg),
     }
 }
