@@ -4198,12 +4198,15 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 // legacy gstore-rust node/string similarity is `rs:SIMILARITY`.
                 let av = self.eval_value(args.first()?, b, l)?;
                 let cv = self.eval_value(args.get(1)?, b, l)?;
-                Some(Value::Double(
-                    crate::analytics::gfun::metrics::jaro_similarity(
+                // Two long literals cost O(|a|·|b|) per row: cancellable
+                // (review analytics#5).
+                Some(Value::Double(self.legacy_ok(
+                    crate::analytics::gfun::metrics::jaro_similarity_cancellable(
                         &value_to_term(&av).dict_key(),
                         &value_to_term(&cv).dict_key(),
+                        self.cancel.as_deref(),
                     ),
-                ))
+                )?))
             }
 
             // ---- numeric -------------------------------------------------

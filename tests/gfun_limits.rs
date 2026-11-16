@@ -953,3 +953,64 @@ fn legacy_cycle_boolean_is_memoised_per_query() {
     assert!(one > 0);
     assert_eq!(one, many, "the cycle test ran again for later rows");
 }
+
+// ---------------------------------------------------------------------------
+// smaller costs (analytics#5, analytics#9)
+// ---------------------------------------------------------------------------
+
+/// WCC's (and PPR's, the path family's) `unordered_map` order emulation
+/// keeps no per-key index beside the simulated list: about 12 bytes per key
+/// plus the bucket array (it was ~54 live, ~72 at the peak).
+#[test]
+fn unordered_order_emulation_costs_little_per_key() {
+    use gstore::analytics::gfun::cxx::CxxUnorderedOrder;
+    let _s = serial();
+    const KEYS: usize = 1_000_000;
+    let base = reset_peak();
+    let mut m = CxxUnorderedOrder::new();
+    for k in 0..KEYS as i64 {
+        m.insert(k);
+    }
+    let peak = PEAK.load(Ordering::SeqCst) - base;
+    assert_eq!(m.len(), KEYS);
+    let per_key = peak as f64 / KEYS as f64;
+    assert!(per_key < 40.0, "{per_key:.1} bytes per key at the peak");
+}
+
+/// `SIMILARITY` of two long literals polls the cancel flag inside its match
+/// loop (one row used to run its O(|a|·|b|) comparison unpolled).
+#[test]
+fn similarity_of_long_literals_stops_at_a_mid_run_cancel() {
+    let _s = serial();
+    let mut db = Database::build_from_str("similarity-cancel", "").unwrap();
+    let q = format!(
+        "SELECT ?s WHERE {{ BIND(SIMILARITY(\"{}\", \"{}\") AS ?s) }}",
+        "a".repeat(20_000),
+        "b".repeat(20_000)
+    );
+    let flag = Arc::new(AtomicBool::new(false));
+    let after = Arc::new(AtomicUsize::new(0));
+    let r = {
+        let (flag2, after2) = (Arc::clone(&flag), Arc::clone(&after));
+        let _hook = HookGuard::install(move |s| {
+            if s != "similarity" {
+                return;
+            }
+            if flag2.load(Ordering::SeqCst) {
+                after2.fetch_add(1, Ordering::SeqCst);
+            } else {
+                flag2.store(true, Ordering::SeqCst);
+            }
+        });
+        db.query_cancellable(&q, Arc::clone(&flag))
+    };
+    assert!(flag.load(Ordering::SeqCst), "never polled");
+    assert!(matches!(r, Err(GStoreError::Cancelled)), "{r:?}");
+    assert_eq!(after.load(Ordering::SeqCst), 0);
+    // Uncancelled, the value is upstream's (no common character: 0).
+    let rs = db.select(&q).unwrap();
+    assert!(
+        rs.rows[0][0].as_deref().unwrap().starts_with("\"0"),
+        "{rs:?}"
+    );
+}

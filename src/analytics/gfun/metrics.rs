@@ -2020,26 +2020,59 @@ fn vertex_list_unquoted(ctx: &GFunCtx<'_>, kind: GFnKind, key: &str, vs: &[i32])
 /// a match takes the first unmatched `t[j]` in the window; transpositions are
 /// counted between the match *ranks* and halved with integer division. All
 /// arithmetic is in `f32` (as upstream), widened to `f64` at the end.
+///
+/// Cost: the containment test is a linear substring search and the match
+/// loop only visits each `s[i]`'s window `[i - w, i + w]` of `t` (upstream
+/// scans all of `t` and skips the rest; same result). The window is about
+/// `|t|` wide, so the work stays `O(|s| · |t|)` — see
+/// [`jaro_similarity_cancellable`] for a cancellable form.
 pub fn jaro_similarity(a: &str, b: &str) -> f64 {
-    f64::from(jaro_f32(a.as_bytes(), b.as_bytes()))
+    match jaro_f32(a.as_bytes(), b.as_bytes(), None) {
+        Ok(x) => f64::from(x),
+        Err(_) => unreachable!("no cancellation flag"),
+    }
 }
 
-fn jaro_f32(s: &[u8], t: &[u8]) -> f32 {
+/// [`jaro_similarity`] that polls `cancel` every few thousand character
+/// comparisons (review analytics#5: two long literals cost `O(|s| · |t|)`
+/// per row), failing with [`GStoreError::Cancelled`] once it is raised.
+pub fn jaro_similarity_cancellable(
+    a: &str,
+    b: &str,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<f64> {
+    Ok(f64::from(jaro_f32(a.as_bytes(), b.as_bytes(), cancel)?))
+}
+
+fn jaro_f32(s: &[u8], t: &[u8], cancel: Option<&std::sync::atomic::AtomicBool>) -> Result<f32> {
     if s == t {
-        return 1.0;
+        return Ok(1.0);
     }
     let (s_len, t_len) = (s.len() as i64, t.len() as i64);
     if s_len == 0 || t_len == 0 {
-        return 0.0;
+        return Ok(0.0);
     }
     if s_len < t_len {
-        return jaro_f32(t, s);
+        return jaro_f32(t, s, cancel);
     }
-    if s.windows(t.len()).any(|w| w == t) {
+    if memchr::memmem::find(s, t).is_some() {
         // Upstream: `((float)t_len/(float)s_len + (float)t_len/(float)t_len + 1)/3`;
         // `x / x` is exactly 1.0 in IEEE arithmetic for the non-zero `t_len`.
-        return (t_len as f32 / s_len as f32 + 1.0 + 1.0) / 3.0;
+        return Ok((t_len as f32 / s_len as f32 + 1.0 + 1.0) / 3.0);
     }
+    let poll = |work: &mut usize| -> Result<()> {
+        if *work >= 4096 {
+            *work = 0;
+            if let Some(c) = cancel {
+                super::run_poll_hook("similarity");
+                if c.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(GStoreError::Cancelled);
+                }
+            }
+        }
+        Ok(())
+    };
+    let mut work = 0usize;
     let match_dt = t_len / 2 - 1;
     let mut sv = vec![-1i64; s.len()];
     let mut tv = vec![-1i64; t.len()];
@@ -2048,10 +2081,12 @@ fn jaro_f32(s: &[u8], t: &[u8]) -> f32 {
         if i - match_dt > t_len {
             break;
         }
-        for j in 0..t_len {
-            if j < i - match_dt || j > i + match_dt {
-                continue;
-            }
+        // upstream: `for j in 0..t_len`, skipping `j < i - w || j > i + w`
+        let lo = (i - match_dt).max(0);
+        let hi = (i + match_dt).min(t_len - 1);
+        work += 1 + (hi - lo + 1).max(0) as usize;
+        poll(&mut work)?;
+        for j in lo..=hi {
             if s[i as usize] == t[j as usize] && tv[j as usize] == -1 {
                 sv[i as usize] = m;
                 tv[j as usize] = m;
@@ -2061,13 +2096,13 @@ fn jaro_f32(s: &[u8], t: &[u8]) -> f32 {
         }
     }
     if m == 0 {
-        return 0.0;
+        return Ok(0.0);
     }
     let sm: Vec<i64> = sv.into_iter().filter(|&x| x != -1).collect();
     let tm: Vec<i64> = tv.into_iter().filter(|&x| x != -1).collect();
     let num = sm.iter().zip(&tm).filter(|(x, y)| x != y).count() as i64 / 2;
     let mf = m as f32;
-    (mf / s_len as f32 + mf / t_len as f32 + (mf - num as f32) / mf) / 3.0
+    Ok((mf / s_len as f32 + mf / t_len as f32 + (mf - num as f32) / mf) / 3.0)
 }
 
 #[cfg(test)]
@@ -2150,5 +2185,82 @@ mod tests {
             assert_eq!(jaro_similarity(a, b), f64::from(want), "{a:?} vs {b:?}");
             assert_eq!(jaro_similarity(b, a), f64::from(want), "symmetric {a:?}");
         }
+    }
+
+    /// The windowed match loop and the linear containment test give
+    /// upstream's full-scan results exactly (review analytics#5).
+    #[test]
+    fn jaro_window_matches_the_full_scan() {
+        fn upstream(s: &[u8], t: &[u8]) -> f32 {
+            if s == t {
+                return 1.0;
+            }
+            let (s_len, t_len) = (s.len() as i64, t.len() as i64);
+            if s_len == 0 || t_len == 0 {
+                return 0.0;
+            }
+            if s_len < t_len {
+                return upstream(t, s);
+            }
+            if s.windows(t.len()).any(|w| w == t) {
+                return (t_len as f32 / s_len as f32 + 1.0 + 1.0) / 3.0;
+            }
+            let match_dt = t_len / 2 - 1;
+            let mut sv = vec![-1i64; s.len()];
+            let mut tv = vec![-1i64; t.len()];
+            let mut m: i64 = 0;
+            for i in 0..s_len {
+                if i - match_dt > t_len {
+                    break;
+                }
+                for j in 0..t_len {
+                    if j < i - match_dt || j > i + match_dt {
+                        continue;
+                    }
+                    if s[i as usize] == t[j as usize] && tv[j as usize] == -1 {
+                        sv[i as usize] = m;
+                        tv[j as usize] = m;
+                        m += 1;
+                        break;
+                    }
+                }
+            }
+            if m == 0 {
+                return 0.0;
+            }
+            let sm: Vec<i64> = sv.into_iter().filter(|&x| x != -1).collect();
+            let tm: Vec<i64> = tv.into_iter().filter(|&x| x != -1).collect();
+            let num = sm.iter().zip(&tm).filter(|(x, y)| x != y).count() as i64 / 2;
+            let mf = m as f32;
+            (mf / s_len as f32 + mf / t_len as f32 + (mf - num as f32) / mf) / 3.0
+        }
+        let mut rng = GlibcRand::new(11);
+        for _ in 0..3000 {
+            let len = |r: &mut GlibcRand| (r.rand() % 12) as usize;
+            let (ls, lt) = (len(&mut rng), len(&mut rng));
+            let alpha = 1 + (rng.rand() % 4) as u8;
+            let s: Vec<u8> = (0..ls).map(|_| b'a' + (rng.rand() as u8 % alpha)).collect();
+            let t: Vec<u8> = (0..lt).map(|_| b'a' + (rng.rand() as u8 % alpha)).collect();
+            assert_eq!(
+                jaro_f32(&s, &t, None).unwrap().to_bits(),
+                upstream(&s, &t).to_bits(),
+                "{s:?} {t:?}"
+            );
+        }
+    }
+
+    /// Two long literals: the comparison polls the flag.
+    #[test]
+    fn jaro_polls_cancellation() {
+        let a = "a".repeat(20_000);
+        let b = "b".repeat(20_000);
+        let flag = std::sync::atomic::AtomicBool::new(true);
+        assert!(matches!(
+            jaro_similarity_cancellable(&a, &b, Some(&flag)),
+            Err(GStoreError::Cancelled)
+        ));
+        assert_eq!(jaro_similarity_cancellable(&a, &b, None).unwrap(), 0.0);
+        // short strings finish before the first poll
+        assert!(jaro_similarity_cancellable("MARTHA", "MARHTA", Some(&flag)).is_ok());
     }
 }

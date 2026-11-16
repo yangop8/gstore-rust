@@ -22,8 +22,6 @@
 //! the unit tests were produced by small C++ programs); the algorithms have
 //! been stable in libstdc++ since GCC 5 (2015).
 
-use std::collections::HashMap;
-
 // ---------------------------------------------------------------------------
 // unordered_map iteration order
 // ---------------------------------------------------------------------------
@@ -305,7 +303,11 @@ const PRIMES: [u64; 255] = [
 /// Only insertion is modelled (no erase): upstream's order-relevant maps are
 /// insert-only. Inserting an existing key is a no-op, like `m[key]` on a
 /// present key. The simulation is `O(1)` amortised per insert, like the real
-/// container (it keeps the real singly-linked node list and bucket array).
+/// container (it keeps the real singly-linked node list and bucket array),
+/// and it looks keys up the way the real container does — along their
+/// bucket's run of the list — so it needs no index beside the list: about
+/// 12 bytes per key plus the bucket array (a per-key `HashMap` index cost
+/// another ~36; review analytics#9).
 ///
 /// Mechanics (libstdc++ `_Hashtable`): a new node is linked right after its
 /// bucket's "before" node, or — if its bucket is empty — at the very front of
@@ -337,7 +339,6 @@ pub struct CxxUnorderedOrder {
     /// or `NIL` when empty.
     buckets: Vec<u32>,
     next_resize: u64,
-    index: HashMap<u64, u32>,
 }
 
 impl Default for CxxUnorderedOrder {
@@ -355,7 +356,6 @@ impl CxxUnorderedOrder {
             head: NIL,
             buckets: vec![NIL],
             next_resize: 0,
-            index: HashMap::new(),
         }
     }
 
@@ -386,14 +386,37 @@ impl CxxUnorderedOrder {
 
     /// Whether `key` was inserted.
     pub fn contains(&self, key: i64) -> bool {
-        self.index.contains_key(&(key as u64))
+        self.find(key as u64)
+    }
+
+    /// `_M_find_before_node`: walk the bucket of `code` (its nodes are
+    /// consecutive in the list, starting after the bucket's "before" node).
+    fn find(&self, code: u64) -> bool {
+        let n = self.buckets.len() as u64;
+        let bkt = (code % n) as usize;
+        let before = self.buckets[bkt];
+        if before == NIL {
+            return false;
+        }
+        let mut p = self.next_of(before);
+        while p != NIL {
+            let c = self.codes[p as usize];
+            if c == code {
+                return true;
+            }
+            if c % n != bkt as u64 {
+                return false;
+            }
+            p = self.next[p as usize];
+        }
+        false
     }
 
     /// Insert `key` (an upstream `int`, sign-extended like `size_t(int)`).
     /// Returns `true` if it was new.
     pub fn insert(&mut self, key: i64) -> bool {
         let code = key as u64;
-        if self.index.contains_key(&code) {
+        if self.find(code) {
             return false;
         }
         let bkt_count = self.buckets.len() as u64;
@@ -419,7 +442,6 @@ impl CxxUnorderedOrder {
             }
             self.buckets[bkt] = BEFORE_BEGIN;
         }
-        self.index.insert(code, node);
         true
     }
 
@@ -1211,5 +1233,38 @@ mod tests {
         assert_eq!(r0.rand(), 1804289383);
         let u = GlibcRand::new(7).rand_unit();
         assert!((0.0..=1.0).contains(&u));
+    }
+
+    /// Lookups walk the key's bucket run like libstdc++ does: `insert` /
+    /// `contains` agree with a set on many key patterns, across rehashes,
+    /// with colliding keys and with `-1` (review analytics#9 dropped the
+    /// per-key `HashMap` index).
+    #[test]
+    fn unordered_lookup_follows_the_bucket_runs() {
+        let mut rng = GlibcRand::new(5);
+        for pattern in 0..6 {
+            let mut m = CxxUnorderedOrder::new();
+            let mut set = std::collections::HashSet::new();
+            for i in 0..5000i64 {
+                let k = match pattern {
+                    0 => i,
+                    1 => i * 13,                       // collides in 13 buckets
+                    2 => i64::from(rng.rand() % 3000), // repeats
+                    3 => (i % 50) * 9973,              // few, spread
+                    4 => -(i % 7) - 1,                 // negative keys
+                    _ => i64::from(rng.rand()) * i64::from(rng.rand() % 3),
+                };
+                let probe = i64::from(rng.rand() % 6000);
+                assert_eq!(m.contains(probe), set.contains(&probe), "pattern {pattern}");
+                assert_eq!(m.insert(k), set.insert(k), "pattern {pattern}, key {k}");
+                assert!(m.contains(k));
+            }
+            assert_eq!(m.len(), set.len());
+            let mut keys = m.keys();
+            keys.sort_unstable();
+            let mut want: Vec<i64> = set.into_iter().collect();
+            want.sort_unstable();
+            assert_eq!(keys, want, "pattern {pattern}");
+        }
     }
 }
