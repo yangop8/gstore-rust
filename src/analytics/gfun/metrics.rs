@@ -45,8 +45,9 @@
 //! Every long loop polls the cancellation flag ([`GFunCtx::poll`]), inside
 //! a component's BFS or a hub's neighbourhood too: a weighted ticker charges
 //! each vertex expansion with its degree and polls every 4096 units (review
-//! analytics#8). `PR`, `louvain` and `labelProp` charge every sweep against
-//! [`GFunCtx::max_iteration_work`] (default
+//! analytics#8). `PR`, `louvain` and `labelProp` charge every sweep beyond
+//! the first [`FREE_ITERATION_SWEEPS`](super::FREE_ITERATION_SWEEPS)
+//! against [`GFunCtx::max_iteration_work`] (default
 //! [`MAX_ITERATION_WORK`](super::MAX_ITERATION_WORK)) and fail with a query
 //! error when it is spent before they converge — upstream runs up to 2^31
 //! sweeps for `tol < 0` / `increase < 0` (review gap-gfun-fuzz#2). The

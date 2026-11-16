@@ -19,15 +19,18 @@ Behaviour changes first:
   (gap-gfun-fuzz#2). `PR` with `tol < 0` and `louvain` with `increase < 0`
   never converge and ran up to 2^31 sweeps (≈45 minutes on a 3-vertex
   graph, hours on real data) until an operator cancelled them. Every sweep
-  is now charged with the vertices, edges and community comparisons it
-  visits against `gfun::MAX_ITERATION_WORK` = 2^34 steps (the first 64
-  sweeps are free, so a huge graph still runs that many); when it is spent
-  before convergence the call fails with `<function>: not converged within
-  the iteration bound of 17179869184 steps (…); lower maxIter or use a
-  positive tol` (`… a non-negative increase` for louvain). Upstream's
-  parameters stay accepted and converging calls are unaffected; the bound
-  is a documented constant (no configuration key). Library users can set
-  it per call with `GFunCtx::with_max_iteration_work`.
+  beyond the first `gfun::FREE_ITERATION_SWEEPS` = 1024 is now charged
+  with the vertices, edges and community comparisons it visits against
+  `gfun::MAX_ITERATION_WORK` = 2^34 steps; when it is spent before
+  convergence the call fails with `<function>: not converged within the
+  iteration bound of 17179869184 steps (…); lower maxIter or use a
+  positive tol` (`… a non-negative increase` for louvain). The free
+  sweeps keep every ordinary `maxIter` (up to 1024) running to the end on
+  a graph of any size — one `PR` sweep over 10^8 edges is already ~10^8
+  steps (the review raised the allowance from 64, which failed such
+  converging runs after 65 sweeps). Upstream's parameters stay accepted;
+  the bound is a documented constant (no configuration key). Library
+  users can set it per call with `GFunCtx::with_max_iteration_work`.
 - **Graph functions stop at `/cancel` from inside their long loops**
   (analytics#8). WCC polled only between components, triangle counting /
   clusterCoeff / labelProp per 1024 vertices whatever their degree,
@@ -81,6 +84,7 @@ Behaviour changes first:
   (analytics#10 / design#15). Outputs are unchanged.
 
 New library API (additions only): `gfun::MAX_ITERATION_WORK`,
+`gfun::FREE_ITERATION_SWEEPS`,
 `GFunCtx::with_max_iteration_work` / `max_iteration_work` / `poll`,
 `gfun::metrics::jaro_similarity_cancellable`, `analytics::Interrupt`,
 `GraphView::from_csr`, `GraphView::closeness_of`, `GraphView::contains`,
@@ -112,7 +116,8 @@ objects), now cancellably — review analytics#4.
   whole query — all calls together, each GROUP BY group and GRAPH block
   included — not one call. Iterative functions stop at a documented work
   bound (`gfun::MAX_ITERATION_WORK`, 2^34 vertex/edge/community visits,
-  first 64 sweeps free) with an error; mention `tol < 0` / `increase < 0`
+  the first 1024 sweeps free, so `maxIter <= 1024` always runs to the end)
+  with an error; mention `tol < 0` / `increase < 0` with a huge `maxIter`
   as the typical cause. Every function polls `/cancel` inside its loops.
 - **README.md: reproduced upstream quirks of the advanced graph functions
   (analytics#2).** These answers are wrong by design (gStore 1.4

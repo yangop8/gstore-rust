@@ -519,6 +519,41 @@ fn the_default_iteration_bound_is_documented() {
         gfun::MAX_ITERATION_WORK
     );
     assert_eq!(gfun::MAX_ITERATION_WORK, 1 << 34);
+    assert_eq!(gfun::FREE_ITERATION_SWEEPS, 1024);
+}
+
+/// An ordinary `maxIter` — up to [`gfun::FREE_ITERATION_SWEEPS`] sweeps —
+/// runs every sweep it asks for, whatever the bound: on a graph with 10^8
+/// edges one `PR` sweep is about 10^8 steps, so charging from the 65th
+/// sweep on failed converging runs with a normal `maxIter` there. Simulated
+/// with a bound of one step; only the sweeps beyond the free ones are
+/// charged.
+#[test]
+fn ordinary_iteration_counts_are_never_charged() {
+    let _s = serial();
+    let d = Dictionary::new();
+    let g = graph([(0, 1), (1, 2), (2, 0), (2, 3)]);
+    let ctx = GFunCtx::new(&g, &d).with_max_iteration_work(1);
+    let free = f64::from(gfun::FREE_ITERATION_SWEEPS);
+    // `PR` sweeps up to `maxIter + 1` times; `tol < 0` never stops early.
+    let pr = |max_iter: f64| {
+        args(&g, |a| {
+            a.directed = true;
+            a.alpha = Some(0.85);
+            a.max_iter = Some(max_iter);
+            a.tol = Some(-1.0);
+            a.ret_num = Some(4);
+        })
+    };
+    // `maxIter = 1000`: 1001 sweeps, none charged.
+    let r = gfun::eval(GFnKind::Pr, &ctx, &pr(1000.0));
+    assert!(r.is_ok(), "{r:?}");
+    let lp = args(&g, |a| a.max_iter = Some(1000.0));
+    let r = gfun::eval(GFnKind::LabelProp, &ctx, &lp);
+    assert!(r.is_ok(), "{r:?}");
+    // The free allowance ends exactly there: one sweep beyond it is charged.
+    assert!(gfun::eval(GFnKind::Pr, &ctx, &pr(free - 1.0)).is_ok());
+    expect_iteration_bound(gfun::eval(GFnKind::Pr, &ctx, &pr(free)), GFnKind::Pr);
 }
 
 // ---------------------------------------------------------------------------

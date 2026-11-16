@@ -659,10 +659,19 @@ pub enum GFunValue {
 /// (`tol < 0` never converges, `increase < 0` keeps moving vertices); a call
 /// that reaches the bound before it converges fails with a
 /// [`GStoreError::Query`] naming it instead of running for hours (review
-/// gap-gfun-fuzz#2). Converging calls and ordinary `maxIter` values never
-/// get near it: `2^34` steps are tens of seconds to minutes of CPU. The first
-/// 64 sweeps of a call are never charged.
+/// gap-gfun-fuzz#2). `2^34` steps are tens of seconds to minutes of CPU.
+/// The first [`FREE_ITERATION_SWEEPS`] sweeps of a call are never charged,
+/// so an ordinary `maxIter` (up to 1024) runs to the end on a graph of any
+/// size, whatever `tol` / `increase` say; only a call that keeps sweeping
+/// beyond them is bounded.
 pub const MAX_ITERATION_WORK: u64 = 1 << 34;
+
+/// The sweeps of an iterative graph function that are never charged against
+/// [`MAX_ITERATION_WORK`]: a call asking for at most this many sweeps
+/// (`maxIter`) always runs them all, as upstream does — on a graph with
+/// 10^8 edges one `PR` sweep alone costs about 10^8 steps, so a smaller
+/// free allowance would fail ordinary converging runs there.
+pub const FREE_ITERATION_SWEEPS: u32 = 1024;
 
 /// The test hook of [`debug_poll_hook`].
 type PollHook = Arc<dyn Fn(&'static str) + Send + Sync>;
@@ -856,9 +865,9 @@ pub(crate) struct IterationBudget {
 }
 
 impl IterationBudget {
-    /// Sweeps that are never charged, so a graph too large for even a few
-    /// sweeps within the bound still runs that many.
-    pub(crate) const FREE_SWEEPS: u32 = 64;
+    /// Sweeps that are never charged ([`FREE_ITERATION_SWEEPS`]), so an
+    /// ordinary `maxIter` runs to the end on a graph of any size.
+    pub(crate) const FREE_SWEEPS: u32 = FREE_ITERATION_SWEEPS;
 
     pub(crate) fn new(ctx: &GFunCtx<'_>, kind: GFnKind) -> IterationBudget {
         IterationBudget {
