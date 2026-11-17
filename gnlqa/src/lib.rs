@@ -29,7 +29,7 @@ pub mod lang;
 pub mod link;
 pub mod llm;
 pub mod mcp;
-mod net;
+pub mod net;
 pub mod pipeline;
 pub mod repair;
 pub mod schema;
@@ -48,7 +48,8 @@ pub use eval::{
 };
 pub use generate::{generate_candidates, parse_candidates};
 pub use graphrag::{
-    answer_from_subgraph, is_dont_know, render_subgraph, retrieve_subgraph, RetrievalCfg, Triple,
+    answer_from_subgraph, is_dont_know, render_subgraph, retrieve_subgraph, try_retrieve_subgraph,
+    RetrievalCfg, Triple,
 };
 pub use ground::{explain, gather_citations, Citation};
 pub use http_server::{HttpAuth, HttpLimits, HttpServer};
@@ -66,6 +67,7 @@ pub use lang::{
 pub use link::{local_name, Candidate, LinkKind, Linker};
 pub use llm::{AnthropicClient, LlmClient, LlmRequest, Message, MockLlm, OpenAiClient, Role};
 pub use mcp::McpServer;
+pub use net::RetryPolicy;
 pub use pipeline::{Answer, AskEngine, Provenance};
 pub use repair::{solve_with_repair, RepairOutcome};
 pub use schema::{entity_has_predicate, EntitySchema, PredicateSchema, SchemaContext};

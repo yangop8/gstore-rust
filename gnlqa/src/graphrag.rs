@@ -114,8 +114,79 @@ fn pair_terms(ans: &SparqlAnswer, a: &str, b: &str) -> Vec<(RdfTerm, RdfTerm)> {
 
 /// Retrieve a bounded subgraph around `seeds` (IRI strings) by BFS over incoming
 /// and outgoing edges. Best-effort: a failing per-node query is skipped, not
-/// fatal. Non-IRI seeds are ignored. The result is de-duplicated and capped.
+/// fatal (the failures are logged; review cluster-nlqa#16). Non-IRI seeds are
+/// ignored. The result is de-duplicated and capped. See
+/// [`try_retrieve_subgraph`] for a variant that reports an outage.
 pub fn retrieve_subgraph(kb: &dyn KbClient, seeds: &[String], cfg: RetrievalCfg) -> Vec<Triple> {
+    let (triples, fatal) = retrieve(kb, seeds, cfg);
+    if let Some(e) = fatal {
+        eprintln!("gnlqa: subgraph retrieval stopped early: {e}");
+    }
+    triples
+}
+
+/// Like [`retrieve_subgraph`], but a KB outage or an exhausted request
+/// budget ([`Error::is_fatal`](crate::error::Error::is_fatal)) stops the
+/// retrieval and is returned, instead of yielding a silently partial (often
+/// empty) subgraph.
+pub fn try_retrieve_subgraph(
+    kb: &dyn KbClient,
+    seeds: &[String],
+    cfg: RetrievalCfg,
+) -> crate::error::Result<Vec<Triple>> {
+    match retrieve(kb, seeds, cfg) {
+        (_, Some(e)) => Err(e),
+        (triples, None) => Ok(triples),
+    }
+}
+
+/// The BFS behind both retrieval functions: the triples found, plus the fatal
+/// error that stopped it early, if any. Non-fatal per-node failures are
+/// skipped and counted in one log line.
+fn retrieve(
+    kb: &dyn KbClient,
+    seeds: &[String],
+    cfg: RetrievalCfg,
+) -> (Vec<Triple>, Option<crate::error::Error>) {
+    let mut skipped = 0usize;
+    let mut last_skip: Option<String> = None;
+    let mut fatal = None;
+    let mut run = |q: String| -> Option<SparqlAnswer> {
+        if fatal.is_some() {
+            return None; // stop querying once the KB is down or the budget spent
+        }
+        match kb.query(&q) {
+            Ok(ans) => Some(ans),
+            Err(e) if e.is_fatal() => {
+                fatal = Some(e);
+                None
+            }
+            Err(e) => {
+                skipped += 1;
+                last_skip = Some(e.to_string());
+                None
+            }
+        }
+    };
+    let triples = bfs(seeds, cfg, &mut run);
+    if skipped > 0 {
+        eprintln!(
+            "gnlqa: subgraph retrieval skipped {skipped} failed neighbourhood quer{} (last: {})",
+            if skipped == 1 { "y" } else { "ies" },
+            last_skip.unwrap_or_default()
+        );
+    }
+    (triples, fatal)
+}
+
+/// Breadth-first expansion; `run` executes one query (`None` = failed). Stops
+/// as soon as `run` reports a fatal error (it then returns `None` for every
+/// call, and the frontier drains without results).
+fn bfs(
+    seeds: &[String],
+    cfg: RetrievalCfg,
+    run: &mut dyn FnMut(String) -> Option<SparqlAnswer>,
+) -> Vec<Triple> {
     let mut triples: Vec<Triple> = Vec::new();
     let mut seen: HashSet<(String, String, String)> = HashSet::new();
     let mut visited: HashSet<String> = HashSet::new();
@@ -145,7 +216,7 @@ pub fn retrieve_subgraph(kb: &dyn KbClient, seeds: &[String], cfg: RetrievalCfg)
             }
 
             // Outgoing edges: node is the subject.
-            if let Ok(ans) = kb.query(&out_query(&node, cfg.per_node)) {
+            if let Some(ans) = run(out_query(&node, cfg.per_node)) {
                 for (p, o) in pair_terms(&ans, "p", "o") {
                     if triples.len() >= cfg.total {
                         break 'hops;
@@ -164,7 +235,7 @@ pub fn retrieve_subgraph(kb: &dyn KbClient, seeds: &[String], cfg: RetrievalCfg)
                 }
             }
             // Incoming edges: node is the object.
-            if let Ok(ans) = kb.query(&in_query(&node, cfg.per_node)) {
+            if let Some(ans) = run(in_query(&node, cfg.per_node)) {
                 for (s, p) in pair_terms(&ans, "s", "p") {
                     if triples.len() >= cfg.total {
                         break 'hops;

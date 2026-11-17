@@ -15,6 +15,7 @@ use crate::error::{Error, Result};
 use crate::secret::Secret;
 
 use super::{LlmClient, LlmRequest};
+use crate::net::RetryPolicy;
 
 /// A minimum token budget. Reasoning models (e.g. deepseek-v4-pro) spend
 /// completion tokens on hidden reasoning *before* the visible answer, so a small
@@ -32,6 +33,8 @@ pub struct OpenAiClient {
     /// Minimum `max_tokens` floored onto every request (never below
     /// [`MIN_MAX_TOKENS`]). Raised via `GNLQA_MAX_TOKENS` for reasoning models.
     max_tokens_floor: u32,
+    /// Retries of transient provider failures (429/5xx; review cluster-nlqa#16).
+    retry: RetryPolicy,
 }
 
 impl OpenAiClient {
@@ -47,7 +50,15 @@ impl OpenAiClient {
             default_model: default_model.into(),
             timeout: Duration::from_secs(60),
             max_tokens_floor: MIN_MAX_TOKENS,
+            retry: RetryPolicy::default(),
         }
+    }
+
+    /// How transient provider failures (429, 5xx) are retried (default: 3
+    /// retries with exponential back-off honouring `Retry-After`).
+    pub fn with_retry(mut self, retry: RetryPolicy) -> OpenAiClient {
+        self.retry = retry;
+        self
     }
 
     /// Override the per-request network timeout (builder-style).
@@ -76,6 +87,7 @@ impl OpenAiClient {
             default_model: cfg.model.clone(),
             timeout: Duration::from_secs(cfg.timeout_secs),
             max_tokens_floor: cfg.max_tokens.max(MIN_MAX_TOKENS),
+            retry: cfg.retry_policy(),
         })
     }
 
@@ -127,22 +139,29 @@ impl LlmClient for OpenAiClient {
         let body = self.request_body(req);
         // No redirects: the key must only reach the configured base URL
         // (review cluster-nlqa#15).
-        let resp = crate::net::agent()
-            .post(&url)
-            .set(
-                "Authorization",
-                &format!("Bearer {}", self.api_key.expose()),
-            )
-            .set("content-type", "application/json")
-            .timeout(self.timeout)
-            .send_json(body)
-            .map_err(|e| match e {
-                ureq::Error::Status(code, resp) => {
-                    let body = resp.into_string().unwrap_or_default();
-                    Error::Http(format!("HTTP {code}: {body}"))
-                }
-                other => Error::Http(other.to_string()),
-            })?;
+        let agent = crate::net::agent();
+        let bearer = format!("Bearer {}", self.api_key.expose());
+        let resp = crate::net::send_with_retry(
+            &self.retry,
+            "the OpenAI-compatible API",
+            crate::net::PROVIDER_RETRYABLE,
+            || {
+                agent
+                    .post(&url)
+                    .set("Authorization", &bearer)
+                    .set("content-type", "application/json")
+                    // never wait past the current request's time budget
+                    .timeout(crate::budget::cap_timeout(self.timeout))
+                    .send_json(body.clone())
+            },
+        )
+        .map_err(|e| match e {
+            ureq::Error::Status(code, resp) => {
+                let body = resp.into_string().unwrap_or_default();
+                Error::Http(format!("HTTP {code}: {body}"))
+            }
+            other => Error::Http(other.to_string()),
+        })?;
         let resp = crate::net::refuse_redirect(resp, "the OpenAI-compatible API endpoint")?;
         let v: Value = resp.into_json().map_err(|e| Error::Json(e.to_string()))?;
         OpenAiClient::extract_text(&v)

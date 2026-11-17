@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::budget::CostLimits;
 use crate::http_server::{HttpAuth, HttpLimits};
+use crate::net::RetryPolicy;
 use crate::secret::Secret;
 
 /// gNLQA runtime configuration. Secret fields are [`Secret`] so they never leak
@@ -68,6 +69,9 @@ pub struct Config {
     /// Wall-clock budget per `serve`/`mcp` request in seconds
     /// (`GNLQA_REQUEST_TIMEOUT_SECS`; 0 = none).
     pub request_timeout_secs: u64,
+    /// Retries of a transient LLM / gStore / embedding failure (429, 5xx)
+    /// with exponential back-off (`GNLQA_RETRIES`; 0 = no retry).
+    pub retries: u32,
 }
 
 impl Config {
@@ -135,6 +139,15 @@ impl Config {
                 get("GNLQA_REQUEST_TIMEOUT_SECS"),
                 crate::http_server::DEFAULT_REQUEST_TIMEOUT_SECS,
             ),
+            retries: parse_or(get("GNLQA_RETRIES"), RetryPolicy::default().max_retries),
+        }
+    }
+
+    /// The retry policy of the outbound HTTP clients.
+    pub fn retry_policy(&self) -> RetryPolicy {
+        RetryPolicy {
+            max_retries: self.retries,
+            ..RetryPolicy::default()
         }
     }
 
@@ -234,6 +247,7 @@ impl Default for Config {
             max_llm_calls: crate::http_server::DEFAULT_MAX_LLM_CALLS,
             max_kb_rows: crate::http_server::DEFAULT_MAX_KB_ROWS,
             request_timeout_secs: crate::http_server::DEFAULT_REQUEST_TIMEOUT_SECS,
+            retries: RetryPolicy::default().max_retries,
         }
     }
 }

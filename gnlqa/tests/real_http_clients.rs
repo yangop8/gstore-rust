@@ -77,3 +77,123 @@ fn embedding_key_never_follows_a_redirect() {
     let e = HttpEmbedder::new(origin.url("/embeddings"), KEY, "m", 2);
     assert_redirect_refused(e.embed(&["x".to_string()]), &collector);
 }
+
+// ---- review cluster-nlqa#16: transient provider failures are retried ----
+
+const ANTHROPIC_OK: &str = r#"{"content":[{"type":"text","text":"ok"}]}"#;
+const OPENAI_OK: &str = r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#;
+
+#[test]
+fn anthropic_retries_a_rate_limit_then_succeeds() {
+    let stub = Stub::start(vec![
+        Scripted::json(429, r#"{"type":"error"}"#).header("Retry-After", "0"),
+        Scripted::json(529, r#"{"type":"overloaded"}"#).header("Retry-After", "0"),
+        Scripted::json(200, ANTHROPIC_OK),
+    ]);
+    let client = AnthropicClient::new(KEY, stub.url(""), "m");
+    let out = client.complete(&LlmRequest::prompt("hi")).unwrap();
+    assert_eq!(out, "ok");
+    assert_eq!(stub.recorded().len(), 3, "two retries, then success");
+}
+
+#[test]
+fn openai_gives_up_after_a_bounded_number_of_retries() {
+    let stub = Stub::start(vec![
+        Scripted::json(503, r#"{"error":"down"}"#).header("Retry-After", "0")
+    ]);
+    let client = OpenAiClient::new(KEY, stub.url("/v1"), "m");
+    let err = client.complete(&LlmRequest::prompt("hi")).unwrap_err();
+    assert!(
+        matches!(err, Error::Http(ref m) if m.contains("503")),
+        "{err:?}"
+    );
+    assert_eq!(
+        stub.recorded().len(),
+        1 + gnlqa::RetryPolicy::default().max_retries as usize
+    );
+}
+
+#[test]
+fn a_client_error_status_is_not_retried() {
+    let stub = Stub::start(vec![Scripted::json(400, r#"{"error":"bad request"}"#)]);
+    let client = OpenAiClient::new(KEY, stub.url("/v1"), "m");
+    assert!(client.complete(&LlmRequest::prompt("hi")).is_err());
+    assert_eq!(stub.recorded().len(), 1);
+}
+
+#[test]
+fn retry_back_off_doubles_without_retry_after() {
+    let stub = Stub::start(vec![
+        Scripted::json(502, "{}"),
+        Scripted::json(200, ANTHROPIC_OK),
+    ]);
+    let client = AnthropicClient::new(KEY, stub.url(""), "m").with_retry(gnlqa::RetryPolicy {
+        max_retries: 1,
+        base_backoff: std::time::Duration::from_millis(1),
+        max_backoff: std::time::Duration::from_millis(5),
+    });
+    assert_eq!(client.complete(&LlmRequest::prompt("hi")).unwrap(), "ok");
+    assert_eq!(stub.recorded().len(), 2);
+}
+
+#[test]
+fn a_retry_wait_never_outlasts_the_request_budget() {
+    let stub = Stub::start(vec![
+        Scripted::json(429, "{}").header("Retry-After", "30"),
+        Scripted::json(200, ANTHROPIC_OK),
+    ]);
+    let client = AnthropicClient::new(KEY, stub.url(""), "m");
+    let limits = gnlqa::CostLimits {
+        timeout: Some(std::time::Duration::from_secs(10)),
+        ..gnlqa::CostLimits::unlimited()
+    };
+    let r = gnlqa::budget::with_limits(limits, || client.complete(&LlmRequest::prompt("hi")));
+    assert!(
+        matches!(r, Err(Error::Http(ref m)) if m.contains("429")),
+        "{r:?}"
+    );
+    assert_eq!(
+        stub.recorded().len(),
+        1,
+        "no 30 s wait inside a 10 s budget"
+    );
+}
+
+#[test]
+fn gstore_retries_overload_but_not_query_failures() {
+    let rows = r#"{"head":{"vars":["s"]},"results":{"bindings":[{"s":{"type":"uri","value":"http://ex/a"}}]}}"#;
+    let stub = Stub::start(vec![
+        Scripted::json(503, "busy").header("Retry-After", "0"),
+        Scripted::new(
+            200,
+            "application/sparql-results+json",
+            rows.as_bytes().to_vec(),
+        ),
+    ]);
+    let kb = GStoreClient::new(stub.url("/sparql"));
+    assert_eq!(
+        kb.query("SELECT ?s WHERE { ?s ?p ?o }")
+            .unwrap()
+            .row_count(),
+        1
+    );
+    assert_eq!(stub.recorded().len(), 2);
+
+    // a 500 is gStore's answer to a failing query: no retry, repairable error
+    let failing = Stub::start(vec![Scripted::json(500, "evaluation failed")]);
+    let kb = GStoreClient::new(failing.url("/sparql"));
+    let err = kb.query("SELECT ?s WHERE { ?s ?p ?o }").unwrap_err();
+    assert!(matches!(err, Error::GStore(_)), "{err:?}");
+    assert_eq!(failing.recorded().len(), 1);
+}
+
+#[test]
+fn embeddings_retry_a_rate_limit() {
+    let stub = Stub::start(vec![
+        Scripted::json(429, "{}").header("Retry-After", "0"),
+        Scripted::json(200, r#"{"data":[{"embedding":[1.0,0.0],"index":0}]}"#),
+    ]);
+    let e = HttpEmbedder::new(stub.url("/embeddings"), KEY, "m", 2);
+    assert_eq!(e.embed(&["x".to_string()]).unwrap(), vec![vec![1.0, 0.0]]);
+    assert_eq!(stub.recorded().len(), 2);
+}

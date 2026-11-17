@@ -36,6 +36,7 @@ GSTORE_ENDPOINT=http://127.0.0.1:9000/sparql
 # GNLQA_CACHE=256            # answer-cache capacity (0 disables)
 # GNLQA_CACHE_TTL_SECS=0     # cache entry lifetime (0 = no expiry; set it if the KB changes under a long-running server)
 # GNLQA_MAX_TOKENS=1024      # minimum completion-token budget per request (raise for reasoning models)
+# GNLQA_RETRIES=3            # retries of a transient LLM/gStore failure (429, 5xx) with back-off (0 = none)
 
 # ---- gnlqa serve / mcp (HTTP authentication and per-request limits) ----
 # `gnlqa serve` refuses to start without a client token; clients send

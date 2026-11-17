@@ -288,7 +288,8 @@ CLI 打 `[provided by …]`,HTTP `/ask` 返回 `provenance` 字段,MCP `ask_kg` 
 - **凭据只发往配置的主机**:gStore / Anthropic / OpenAI 兼容 / embedding 客户端都使用不跟随重定向的 ureq agent(ureq 默认会跟随重定向并保留除 `Authorization`/`Cookie` 外的所有头——Anthropic 的 `x-api-key` 会被带到重定向目标),3xx 视为错误;凭据经明文 `http://` 发往非回环主机时启动告警(`Config::security_warnings`)。
 - **缓存旋钮**:`GNLQA_CACHE`(容量,0 关闭)与 `GNLQA_CACHE_TTL_SECS`(条目 TTL,0 不过期)。长时间运行的 serve/mcp 若 KB 会被外部改动,设 TTL 可限定陈旧;chat 的 `:reset` 也会清空引擎缓存。
 - **token 下限**:`GNLQA_MAX_TOKENS` 作为每次请求的 `max_tokens` **下限**接到两个后端(OpenAI 兼容后端不低于 `MIN_MAX_TOKENS`),给推理型模型足够预算以免答案为空。
-- **异常兜底**:`GNLQA_LLM_PROVIDER` 规范化(trim/小写/别名),未知值**告警并回退** anthropic;`GNLQA_MODE` 未知值告警回退 auto;**空/空白配置值按缺失处理**(包括设为空串的环境变量,不会遮蔽文件里的有效值);不可解析的数值告警回退默认;缺 key 启动告警 + 调用时优雅 `Err`;KB 启动不可达则降级为无 linker;推理模型空 content 视为失败以便降级;**KB 中途不可达**(传输层错误)会快速失败并把"endpoint unreachable"透传给调用方,而不是伪装成"无候选产生答案"或空烧修复轮次。
+- **异常兜底**:`GNLQA_LLM_PROVIDER` 规范化(trim/小写/别名),未知值**告警并回退** anthropic;`GNLQA_MODE` 未知值告警回退 auto;**空/空白配置值按缺失处理**(包括设为空串的环境变量,不会遮蔽文件里的有效值);不可解析的数值告警回退默认;缺 key 启动告警 + 调用时优雅 `Err`;KB 启动不可达时**记录失败并在之后的请求中重建 linker**(至多每分钟一次,`SolveEngine::with_linker_builder`;review cluster-nlqa#16);推理模型空 content 视为失败以便降级;**KB 中途不可达**(传输层错误)会快速失败并把"endpoint unreachable"透传给调用方,而不是伪装成"无候选产生答案"或空烧修复轮次。
+- **重试与失败上报**(review cluster-nlqa#16):LLM / embedding 客户端对 429、5xx、529 做有界重试(默认 3 次,`GNLQA_RETRIES`),指数退避并遵守 `Retry-After`,等待不超过请求剩余时间预算;gStore 客户端只重试 429/502/503/504(500 是确定性的查询失败)。重试后仍失败的 provider/KB 故障(`Error::Http`)及预算耗尽(`Error::Limit`)在意图识别、修复、GraphRAG 兜底与子图检索中都**立即终止请求**并返回该错误;意图 JSON 格式错误、引用收集失败、解释生成失败仍降级处理,但都会在 stderr 记录。
 
 ### 12.5 进度日志
 交互式(CLI 单问 / chat)默认开启阶段日志(stderr),明确当前在"问模型"还是"查 gStore"(`understanding…(model)` / `gathering schema…(gStore)` / `generating SPARQL…(model)` / `querying gStore…` …),给用户一个显式的等待目标;serve/mcp/eval 默认关闭。

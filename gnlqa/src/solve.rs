@@ -5,7 +5,7 @@
 
 use crate::error::{Error, Result};
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::generate::generate_candidates;
@@ -162,7 +162,10 @@ impl Mode {
 pub struct SolveEngine {
     llm: Box<dyn LlmClient>,
     kb: Box<dyn KbClient>,
-    linker: Option<Linker>,
+    linker: OnceLock<Linker>,
+    /// How to (re)build the linker when it is missing (see
+    /// [`with_linker_builder`](Self::with_linker_builder)).
+    linker_source: Option<LinkerSource>,
     candidates: usize,
     max_rounds: usize,
     sample: usize,
@@ -183,6 +186,16 @@ pub struct SolveEngine {
     default_mode: Mode,
 }
 
+/// A deferred linker build that is retried until it succeeds (review
+/// cluster-nlqa#16: a KB that is unreachable at startup no longer leaves the
+/// engine without a linker for its whole life, silently).
+struct LinkerSource {
+    build: Box<dyn Fn() -> Result<Linker> + Send + Sync>,
+    retry_every: Duration,
+    /// When the last failed attempt started; the mutex also serializes builds.
+    last_failure: Mutex<Option<Instant>>,
+}
+
 /// Heuristic confidence for a GraphRAG answer: plausible-from-context, but not
 /// KB-verified the way a SELECT result is. Kept below the structured-answer band.
 const RAG_CONFIDENCE: f32 = 0.5;
@@ -199,7 +212,8 @@ impl SolveEngine {
             // cluster-nlqa#13); with no budget installed this is a pass-through.
             llm: Box::new(crate::budget::MeteredLlm(llm)),
             kb: Box::new(crate::budget::MeteredKb(kb)),
-            linker: None,
+            linker: OnceLock::new(),
+            linker_source: None,
             candidates: 4,
             max_rounds: 2,
             sample: 30,
@@ -324,8 +338,32 @@ impl SolveEngine {
         self
     }
     pub fn with_linker(mut self, linker: Linker) -> SolveEngine {
-        self.linker = Some(linker);
+        self.linker = OnceLock::from(linker);
         self
+    }
+
+    /// Build the linker lazily with `build`: on first use and, after a
+    /// failure, again on a later request once `retry_every` has passed. Each
+    /// failure is logged. The build runs outside any request budget (it
+    /// serves every later request) and at most one runs at a time; requests
+    /// that arrive meanwhile proceed without a linker.
+    pub fn with_linker_builder(
+        mut self,
+        retry_every: Duration,
+        build: impl Fn() -> Result<Linker> + Send + Sync + 'static,
+    ) -> SolveEngine {
+        self.linker_source = Some(LinkerSource {
+            build: Box::new(build),
+            retry_every,
+            last_failure: Mutex::new(None),
+        });
+        self
+    }
+
+    /// Try to make the linker available now (e.g. at server start, so the
+    /// first request does not pay for the build). Returns whether it is.
+    pub fn prepare_linker(&self) -> bool {
+        self.linker().is_some()
     }
     pub fn with_model(mut self, model: impl Into<String>) -> SolveEngine {
         self.model = Some(model.into());
@@ -353,9 +391,39 @@ impl SolveEngine {
     pub fn kb(&self) -> &dyn KbClient {
         self.kb.as_ref()
     }
-    /// The configured entity linker, if any.
+    /// The entity linker, if one is configured or a deferred build (see
+    /// [`with_linker_builder`](Self::with_linker_builder)) has succeeded —
+    /// this call may run that build.
     pub fn linker(&self) -> Option<&Linker> {
-        self.linker.as_ref()
+        if let Some(l) = self.linker.get() {
+            return Some(l);
+        }
+        let src = self.linker_source.as_ref()?;
+        // One build at a time; a concurrent caller goes on without a linker.
+        let mut last = src.last_failure.try_lock().ok()?;
+        if let Some(l) = self.linker.get() {
+            return Some(l); // built while we waited for the lock
+        }
+        if last.is_some_and(|t| t.elapsed() < src.retry_every) {
+            return None;
+        }
+        let started = Instant::now();
+        match crate::budget::unmetered(|| (src.build)()) {
+            Ok(l) => {
+                let _ = self.linker.set(l);
+                *last = None;
+                self.linker.get()
+            }
+            Err(e) => {
+                *last = Some(started);
+                eprintln!(
+                    "gnlqa: warning: building the entity linker failed (answers are not \
+                     grounded in the KB vocabulary until it succeeds; retrying after {} s): {e}",
+                    src.retry_every.as_secs()
+                );
+                None
+            }
+        }
     }
     /// The analytics retrieval configuration.
     pub fn analytics_cfg(&self) -> crate::analytics::AnalyticsCfg {
@@ -426,11 +494,21 @@ impl SolveEngine {
             return self.answer_direct(question);
         }
         // 1) Understand. Intent is a cheap classification → run it on the fast
-        // model. A parse failure shouldn't kill the query — degrade.
+        // model. A malformed reply shouldn't kill the query — degrade, but say
+        // so. A provider outage (after the client's retries) or an exhausted
+        // budget ends the request instead: generating ungrounded SPARQL with
+        // more calls to the same failing provider cannot help (review
+        // cluster-nlqa#16).
         self.note("understanding question… (model)");
         let intent_model = self.fast_model.clone().or_else(|| self.model.clone());
-        let intent = extract_intent(self.llm.as_ref(), question, intent_model.as_deref())
-            .unwrap_or_default();
+        let intent = match extract_intent(self.llm.as_ref(), question, intent_model.as_deref()) {
+            Ok(i) => i,
+            Err(e) if e.is_fatal() => return Err(e),
+            Err(e) => {
+                eprintln!("gnlqa: intent extraction failed, continuing without one: {e}");
+                QuestionIntent::default()
+            }
+        };
         // Resolve the answer language (LLM tag → script fallback → English) so
         // LLM-generated answers come back in the user's language.
         let lang = crate::lang::resolve_lang(&intent.lang, question);
@@ -448,7 +526,7 @@ impl SolveEngine {
         // mentions — not two disambiguation candidates of the same one (which the
         // flat `ent_uris` list would make seeds[0]/seeds[1] on a link_k > 1 run).
         let mut analytics_seeds: Vec<String> = Vec::new();
-        if let Some(linker) = &self.linker {
+        if let Some(linker) = self.linker() {
             for m in &intent.mentions {
                 let cands = linker.link_mention(m, self.link_k)?;
                 if !cands.is_empty() {
@@ -513,7 +591,7 @@ impl SolveEngine {
             }
             self.note("retrieving subgraph & composing answer… (gStore + model)");
             if !ent_uris.is_empty() {
-                if let Some(ans) = self.graphrag_answer(question, &ent_uris, model, &lang) {
+                if let Some(ans) = self.graphrag_answer(question, &ent_uris, model, &lang)? {
                     return Ok(ans);
                 }
             }
@@ -612,7 +690,7 @@ impl SolveEngine {
             && RAG_CONFIDENCE >= self.abstain_below
         {
             self.note("no direct result — trying GraphRAG… (gStore + model)");
-            if let Some(ans) = self.graphrag_answer(question, &ent_uris, model, &lang) {
+            if let Some(ans) = self.graphrag_answer(question, &ent_uris, model, &lang)? {
                 return Ok(ans);
             }
         }
@@ -631,8 +709,16 @@ impl SolveEngine {
                 }
 
                 let text = render_answer(&o.answer, &values);
+                // Citations are supporting evidence, not the answer: a failure
+                // (or an exhausted budget) drops them, but not silently.
                 let citations = if self.cite {
-                    gather_citations(self.kb.as_ref(), &o.answer, 5, 10, 30).unwrap_or_default()
+                    match gather_citations(self.kb.as_ref(), &o.answer, 5, 10, 30) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("gnlqa: gathering citations failed, answering without: {e}");
+                            Vec::new()
+                        }
+                    }
                 } else {
                     Vec::new()
                 };
@@ -705,33 +791,43 @@ impl SolveEngine {
     }
 
     /// Retrieve a subgraph around `seeds` and let the LLM answer from it. Returns
-    /// `None` when nothing was retrieved or the model declined ("I don't know"),
-    /// so the caller can fall through to the honest structured result/error.
+    /// `Ok(None)` when nothing was retrieved or the model declined ("I don't
+    /// know") or failed in a recoverable way (logged), so the caller can fall
+    /// through to the honest structured result/error. A KB/LLM outage or an
+    /// exhausted budget is returned as the error it is (review
+    /// cluster-nlqa#16), not reported as "no candidate produced an answer".
     fn graphrag_answer(
         &self,
         question: &str,
         seeds: &[String],
         model: Option<&str>,
         lang: &str,
-    ) -> Option<Answer> {
+    ) -> Result<Option<Answer>> {
         use crate::graphrag::{
-            answer_from_subgraph, is_dont_know, render_subgraph, retrieve_subgraph,
+            answer_from_subgraph, is_dont_know, render_subgraph, try_retrieve_subgraph,
         };
-        let triples = retrieve_subgraph(self.kb.as_ref(), seeds, self.rag);
+        let triples = try_retrieve_subgraph(self.kb.as_ref(), seeds, self.rag)?;
         if triples.is_empty() {
-            return None;
+            return Ok(None);
         }
         let subgraph = render_subgraph(&triples);
-        let raw = answer_from_subgraph(self.llm.as_ref(), question, &subgraph, model, lang).ok()?;
+        let raw = match answer_from_subgraph(self.llm.as_ref(), question, &subgraph, model, lang) {
+            Ok(raw) => raw,
+            Err(e) if e.is_fatal() => return Err(e),
+            Err(e) => {
+                eprintln!("gnlqa: GraphRAG answer failed: {e}");
+                return Ok(None);
+            }
+        };
         if is_dont_know(&raw) {
-            return None;
+            return Ok(None);
         }
         let citations = if self.cite {
             triples.iter().take(30).map(|t| t.to_citation()).collect()
         } else {
             Vec::new()
         };
-        Some(Answer {
+        Ok(Some(Answer {
             text: raw.trim().to_string(),
             values: Vec::new(),
             sparql: None, // GraphRAG has no single query to expose
@@ -741,7 +837,7 @@ impl SolveEngine {
             confidence: RAG_CONFIDENCE,
             abstained: false,
             provenance: Provenance::GraphRag,
-        })
+        }))
     }
 }
 

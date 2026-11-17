@@ -20,6 +20,9 @@ use gnlqa::{
     SolveEngine,
 };
 
+/// How long after a failed linker build the next request may try again.
+const LINKER_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Build the engine. `mode` is the default answering mode (so `GNLQA_MODE` applies
 /// on every surface, not just chat); `progress` turns on stage logging (for
 /// interactive use; off for serve/mcp/eval).
@@ -38,7 +41,8 @@ fn build_engine(cfg: &Config, mode: Mode, progress: bool) -> SolveEngine {
                 cfg.model.clone(),
             )
             .with_timeout(timeout)
-            .with_max_tokens(cfg.max_tokens),
+            .with_max_tokens(cfg.max_tokens)
+            .with_retry(cfg.retry_policy()),
         )
     } else {
         Box::new(
@@ -51,31 +55,33 @@ fn build_engine(cfg: &Config, mode: Mode, progress: bool) -> SolveEngine {
                 cfg.model.clone(),
             )
             .with_timeout(timeout)
-            .with_max_tokens(cfg.max_tokens),
+            .with_max_tokens(cfg.max_tokens)
+            .with_retry(cfg.retry_policy()),
         )
     };
     // Build a linker from the KB so generation is grounded in the store's ACTUAL
     // vocabulary — without it the LLM guesses URIs (e.g. DBpedia) and misses.
     // HashEmbedder is offline (no embedding API needed); swap for HttpEmbedder
-    // for stronger semantic linking. Best-effort: if the KB is unreachable at
-    // startup, degrade to no linker.
-    let linker = Linker::build_from_kb(
-        &GStoreClient::from_config(cfg),
-        Box::new(HashEmbedder::new(256)),
-        0.0,
-        Some(10_000),
-    )
-    .ok();
-    let mut engine = SolveEngine::new(llm, Box::new(GStoreClient::from_config(cfg)))
+    // for stronger semantic linking. If the KB is unreachable at startup the
+    // failure is logged and the build is retried on a later request (review
+    // cluster-nlqa#16) instead of running without a linker for good.
+    let linker_cfg = cfg.clone();
+    let engine = SolveEngine::new(llm, Box::new(GStoreClient::from_config(cfg)))
         .with_model(cfg.model.clone())
         .with_fast_model(cfg.fast_model.clone())
         .with_mode(mode)
         .with_cache(cfg.cache_capacity)
         .with_cache_ttl(cfg.cache_ttl_secs)
-        .with_progress(progress);
-    if let Some(l) = linker {
-        engine = engine.with_linker(l);
-    }
+        .with_progress(progress)
+        .with_linker_builder(LINKER_RETRY, move || {
+            Linker::build_from_kb(
+                &GStoreClient::from_config(&linker_cfg),
+                Box::new(HashEmbedder::new(256)),
+                0.0,
+                Some(10_000),
+            )
+        });
+    engine.prepare_linker();
     engine
 }
 

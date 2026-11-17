@@ -200,6 +200,9 @@ pub struct GStoreClient {
     endpoint: String,
     auth_header: Option<Secret>,
     timeout: Duration,
+    /// Retries of transient endpoint failures (429/502/503/504; review
+    /// cluster-nlqa#16).
+    retry: crate::net::RetryPolicy,
 }
 
 impl GStoreClient {
@@ -208,7 +211,14 @@ impl GStoreClient {
             endpoint: endpoint.into(),
             auth_header: None,
             timeout: Duration::from_secs(60),
+            retry: crate::net::RetryPolicy::default(),
         }
+    }
+
+    /// How transient endpoint failures (429, 502, 503, 504) are retried.
+    pub fn with_retry(mut self, retry: crate::net::RetryPolicy) -> GStoreClient {
+        self.retry = retry;
+        self
     }
 
     pub fn with_timeout(mut self, t: Duration) -> GStoreClient {
@@ -229,6 +239,7 @@ impl GStoreClient {
             endpoint: cfg.gstore_endpoint.clone(),
             auth_header,
             timeout: Duration::from_secs(cfg.timeout_secs),
+            retry: cfg.retry_policy(),
         }
     }
 
@@ -237,15 +248,26 @@ impl GStoreClient {
     pub fn query(&self, sparql: &str) -> Result<SparqlAnswer> {
         // No redirects: the Basic credential must only reach the configured
         // endpoint (review cluster-nlqa#15).
-        let mut req = crate::net::agent()
-            .post(&self.endpoint)
-            .set("Content-Type", "application/sparql-query")
-            .set("Accept", "application/sparql-results+json")
-            .timeout(self.timeout);
-        if let Some(auth) = &self.auth_header {
-            req = req.set("Authorization", auth.expose());
-        }
-        let resp = req.send_string(sparql).map_err(|e| match e {
+        let agent = crate::net::agent();
+        let send = || {
+            let mut req = agent
+                .post(&self.endpoint)
+                .set("Content-Type", "application/sparql-query")
+                .set("Accept", "application/sparql-results+json")
+                // never wait past the current request's time budget
+                .timeout(crate::budget::cap_timeout(self.timeout));
+            if let Some(auth) = &self.auth_header {
+                req = req.set("Authorization", auth.expose());
+            }
+            req.send_string(sparql)
+        };
+        let resp = crate::net::send_with_retry(
+            &self.retry,
+            "the gStore endpoint",
+            crate::net::KB_RETRYABLE,
+            send,
+        )
+        .map_err(|e| match e {
             // An HTTP status (4xx/5xx) is a *query/server* error — repairable, so
             // keep it as `GStore`. A transport failure (connection refused, DNS,
             // TLS, timeout) means the endpoint is unreachable — a distinct
