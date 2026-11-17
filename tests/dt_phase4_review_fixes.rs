@@ -242,6 +242,24 @@ fn a_cancelled_execute_leaves_the_rule_as_it_was() {
     let one = t0.elapsed();
     db.reason_compile("R").unwrap();
     let q = "SELECT * WHERE { ?s <Rule:R> ?o }";
+    // review tests-b#5: the sweep below accepts both outcomes and never
+    // required a cancellation to happen (on a fast machine every factor
+    // took the Ok arm; with execute ignoring its flag the test still
+    // passed). A flag raised before the call must cancel the execute, every
+    // time — the deterministic case of the property this test is named for.
+    let cancelled = Arc::new(AtomicBool::new(true));
+    let mut store = RuleStore::dir(&dir);
+    let e = manage::execute(&mut db, &mut store, "R", Some(cancelled))
+        .expect_err("an execute whose cancel flag is raised must be cancelled")
+        .to_string();
+    assert!(e.to_lowercase().contains("cancel"), "not a cancellation: {e}");
+    assert_eq!(count(&mut db, q), 0, "{e}");
+    assert_eq!(status(&mut db, "R"), "已编译");
+    // Not "executed": compile is not refused.
+    db.reason_compile("R").unwrap();
+    // A cancel arriving at some point while execute runs: whichever way it
+    // ends, the rule is consistent (timing only varies where it lands; the
+    // outcome is checked, not the order).
     for factor in [0.3, 0.6, 0.9, 1.2, 1.5, 2.0, 3.0] {
         let cancel = Arc::new(AtomicBool::new(false));
         let c2 = Arc::clone(&cancel);
@@ -255,6 +273,11 @@ fn a_cancelled_execute_leaves_the_rule_as_it_was() {
         h.join().unwrap();
         match r {
             Err(e) => {
+                // review tests-b#5: an error here must be the cancellation.
+                assert!(
+                    e.to_string().to_lowercase().contains("cancel"),
+                    "{factor}: not a cancellation: {e}"
+                );
                 assert_eq!(count(&mut db, q), 0, "{factor}: {e}");
                 assert_eq!(status(&mut db, "R"), "已编译");
                 // Not "executed": compile is not refused.
