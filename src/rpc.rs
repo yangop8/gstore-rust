@@ -233,11 +233,11 @@ pub(crate) fn encode_reply_within(resp: &Response, limit: usize) -> Vec<u8> {
 // Primitive byte (de)serialization helpers — std only, big-endian.
 // ---------------------------------------------------------------------------
 
-fn put_u32(buf: &mut Vec<u8>, v: u32) {
+pub(crate) fn put_u32(buf: &mut Vec<u8>, v: u32) {
     buf.extend_from_slice(&v.to_be_bytes());
 }
 
-fn put_u64(buf: &mut Vec<u8>, v: u64) {
+pub(crate) fn put_u64(buf: &mut Vec<u8>, v: u64) {
     buf.extend_from_slice(&v.to_be_bytes());
 }
 
@@ -301,8 +301,9 @@ fn put_op(buf: &mut Vec<u8>, op: &LogOp) {
     }
 }
 
-/// Encode a slice of [`LogEntry`] as a `u32` count then each `term` + op.
-fn put_entries(buf: &mut Vec<u8>, entries: &[LogEntry]) {
+/// Encode a slice of [`LogEntry`] as a `u32` count then each `term` + op
+/// (also the entry encoding of a durable `ClusterNode`'s Raft journal).
+pub(crate) fn put_entries(buf: &mut Vec<u8>, entries: &[LogEntry]) {
     put_u32(buf, entries.len() as u32);
     for e in entries {
         put_u64(buf, e.term);
@@ -312,7 +313,7 @@ fn put_entries(buf: &mut Vec<u8>, entries: &[LogEntry]) {
 
 /// Encode a slice of [`IdTriple`] (snapshot payload) as a `u32` count then each
 /// `(sub, pred, obj)`.
-fn put_triples(buf: &mut Vec<u8>, triples: &[IdTriple]) {
+pub(crate) fn put_triples(buf: &mut Vec<u8>, triples: &[IdTriple]) {
     put_u32(buf, triples.len() as u32);
     for t in triples {
         put_u32(buf, t.sub);
@@ -323,15 +324,21 @@ fn put_triples(buf: &mut Vec<u8>, triples: &[IdTriple]) {
 
 /// A forward cursor over a byte buffer, returning [`io::Error`] of kind
 /// [`io::ErrorKind::InvalidData`] on truncation — so a malformed frame is a
-/// clean error rather than a panic.
-struct Reader<'a> {
+/// clean error rather than a panic. Also reads a durable `ClusterNode`'s Raft
+/// journal records, which reuse these encodings.
+pub(crate) struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
 }
 
 impl<'a> Reader<'a> {
-    fn new(buf: &'a [u8]) -> Reader<'a> {
+    pub(crate) fn new(buf: &'a [u8]) -> Reader<'a> {
         Reader { buf, pos: 0 }
+    }
+
+    /// Bytes not consumed yet.
+    pub(crate) fn remaining(&self) -> usize {
+        self.buf.len() - self.pos
     }
 
     fn take(&mut self, n: usize) -> io::Result<&'a [u8]> {
@@ -346,16 +353,16 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn u8(&mut self) -> io::Result<u8> {
+    pub(crate) fn u8(&mut self) -> io::Result<u8> {
         Ok(self.take(1)?[0])
     }
 
-    fn u32(&mut self) -> io::Result<u32> {
+    pub(crate) fn u32(&mut self) -> io::Result<u32> {
         let b = self.take(4)?;
         Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
     }
 
-    fn u64(&mut self) -> io::Result<u64> {
+    pub(crate) fn u64(&mut self) -> io::Result<u64> {
         let b = self.take(8)?;
         Ok(u64::from_be_bytes([
             b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
@@ -417,7 +424,7 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn entries(&mut self) -> io::Result<Vec<LogEntry>> {
+    pub(crate) fn entries(&mut self) -> io::Result<Vec<LogEntry>> {
         let n = self.u32()? as usize;
         let mut out = Vec::with_capacity(n.min(1024));
         for _ in 0..n {
@@ -428,7 +435,7 @@ impl<'a> Reader<'a> {
         Ok(out)
     }
 
-    fn triples(&mut self) -> io::Result<Vec<IdTriple>> {
+    pub(crate) fn triples(&mut self) -> io::Result<Vec<IdTriple>> {
         let n = self.u32()? as usize;
         let mut out = Vec::with_capacity(n.min(1024));
         for _ in 0..n {

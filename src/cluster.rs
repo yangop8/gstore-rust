@@ -2116,6 +2116,38 @@ pub struct RaftState {
 
     /// Pending store-reset from a freshly installed snapshot.
     pending_reset: Option<Vec<IdTriple>>,
+
+    // Durability bookkeeping for a persistent transport (review
+    // cluster-nlqa#11): what changed since the last `take_durable_delta`.
+    /// `(current_term, voted_for)` as last handed out for persisting.
+    durable_hard: (u64, Option<NodeId>),
+    /// Lowest log index appended or overwritten since then.
+    log_dirty_from: Option<u64>,
+    /// The snapshot base moved (install or compaction) since then.
+    snapshot_dirty: bool,
+}
+
+/// What a durable transport must write before anything a [`RaftState`] step
+/// produced — a reply, an outgoing message, a commit — may be seen: the hard
+/// state if it changed, and the log suffix that changed (after the snapshot
+/// when a snapshot replaced the log prefix). See
+/// [`ClusterNode::bind_persistent`].
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DurableDelta {
+    /// New `(current_term, voted_for)`.
+    hard: Option<(u64, Option<NodeId>)>,
+    /// New snapshot `(base_index, base_term, triples)`; the log restarts after
+    /// `base_index`.
+    snapshot: Option<(u64, u64, Vec<IdTriple>)>,
+    /// `(from, entries)`: the log from index `from` on is now exactly
+    /// `entries` (everything at or after `from` before is replaced).
+    entries: Option<(u64, Vec<LogEntry>)>,
+}
+
+impl DurableDelta {
+    fn is_empty(&self) -> bool {
+        self.hard.is_none() && self.snapshot.is_none() && self.entries.is_none()
+    }
 }
 
 impl RaftState {
@@ -2149,9 +2181,58 @@ impl RaftState {
             cfg_heartbeat: cfg.heartbeat_timeout.max(1),
             rng: seed,
             pending_reset: None,
+            durable_hard: (0, None),
+            log_dirty_from: None,
+            snapshot_dirty: false,
         };
         s.reset_election_timeout();
         s
+    }
+
+    /// Reload the durable state a persistent transport recovered (its term,
+    /// vote, snapshot and log). The commit index is volatile in Raft, so it
+    /// restarts at the snapshot base; the entries after it are applied again
+    /// once a leader re-confirms them.
+    fn restore(&mut self, rec: RecoveredState) {
+        self.current_term = rec.term;
+        self.voted_for = rec.voted_for;
+        self.durable_hard = (rec.term, rec.voted_for);
+        self.base_index = rec.base_index;
+        self.base_term = rec.base_term;
+        self.log = rec.log;
+        if rec.base_index > 0 {
+            self.snapshot = rec.snapshot.clone();
+            self.pending_reset = Some(rec.snapshot);
+            self.commit_index = rec.base_index;
+            self.last_applied = rec.base_index;
+        }
+    }
+
+    /// Note that the log changed from `index` on.
+    fn log_changed_from(&mut self, index: u64) {
+        self.log_dirty_from = Some(self.log_dirty_from.map_or(index, |d| d.min(index)));
+    }
+
+    /// Hand out — and forget — what changed in the durable state since the
+    /// last call (see [`DurableDelta`]).
+    fn take_durable_delta(&mut self) -> DurableDelta {
+        let mut d = DurableDelta::default();
+        let hard = (self.current_term, self.voted_for);
+        if hard != self.durable_hard {
+            d.hard = Some(hard);
+            self.durable_hard = hard;
+        }
+        if self.snapshot_dirty {
+            d.snapshot = Some((self.base_index, self.base_term, self.snapshot.clone()));
+            d.entries = Some((self.base_index + 1, self.log.clone()));
+        } else if let Some(from) = self.log_dirty_from {
+            let from = from.max(self.base_index + 1);
+            let start = ((from - self.base_index - 1) as usize).min(self.log.len());
+            d.entries = Some((from, self.log[start..].to_vec()));
+        }
+        self.snapshot_dirty = false;
+        self.log_dirty_from = None;
+        d
     }
 
     // --- read-only accessors -------------------------------------------------
@@ -2339,6 +2420,7 @@ impl RaftState {
         // leader's log byte-identical to its followers' in the common case.
         if self.last_log_index() > self.commit_index {
             self.log.push(LogEntry::new(self.current_term, LogOp::Noop));
+            self.log_changed_from(self.last_log_index());
         }
         let nli = self.last_log_index() + 1;
         self.next_index.clear();
@@ -2349,6 +2431,12 @@ impl RaftState {
             self.match_index.insert(p, 0);
         }
         self.heartbeat_elapsed = 0;
+        if self.peers.is_empty() {
+            // A single node is its own quorum: the no-op above commits at
+            // once, and with it the log a restarted durable node recovered
+            // (review cluster-nlqa#11) — not only at the next client write.
+            self.advance_commit();
+        }
         self.replicate()
     }
 
@@ -2479,9 +2567,11 @@ impl RaftState {
                     let pos = (index - self.base_index - 1) as usize;
                     self.log.truncate(pos);
                     self.log.push(*entry);
+                    self.log_changed_from(index);
                 }
             } else {
                 self.log.push(*entry);
+                self.log_changed_from(index);
             }
         }
 
@@ -2534,6 +2624,7 @@ impl RaftState {
             self.base_index = last_included_index;
             self.base_term = last_included_term;
             self.log.clear();
+            self.snapshot_dirty = true;
             self.snapshot = triples.clone();
             self.pending_reset = Some(triples);
             self.commit_index = last_included_index;
@@ -2673,6 +2764,7 @@ impl RaftState {
         }
         self.log.push(LogEntry::new(self.current_term, op));
         let idx = self.last_log_index();
+        self.log_changed_from(idx);
         if self.peers.is_empty() {
             self.advance_commit();
         }
@@ -2770,6 +2862,7 @@ impl RaftState {
         self.base_index = up_to_index;
         self.base_term = new_base_term;
         self.snapshot = triples;
+        self.snapshot_dirty = true;
     }
 
     /// The fate of the entry this node appended at `index` during `term`:
@@ -2835,6 +2928,221 @@ impl std::fmt::Display for ProposeError {
 
 impl std::error::Error for ProposeError {}
 
+/// The durable Raft state a [`RaftJournal`] recovered: what
+/// [`RaftState::restore`] reloads.
+#[derive(Debug, Default)]
+struct RecoveredState {
+    term: u64,
+    voted_for: Option<NodeId>,
+    base_index: u64,
+    base_term: u64,
+    snapshot: Vec<IdTriple>,
+    log: Vec<LogEntry>,
+}
+
+/// The durable Raft state of one persistent [`ClusterNode`] (review
+/// cluster-nlqa#11): an append-only journal, `raft.journal` in the node's state
+/// directory, of the changes [`RaftState::take_durable_delta`] hands out —
+/// term and vote, log suffixes, snapshots. Every batch is written and
+/// `fsync`ed before the node answers or sends anything that depends on it, so
+/// a restarted replica remembers the vote it gave in its term and the entries
+/// it acknowledged; without that it could vote a second time in one term (two
+/// leaders of one term) or help elect a leader that lacks committed entries.
+///
+/// Layout: an 8-byte magic and the owning node id, then records of `u32` BE
+/// payload length, `u32` BE CRC-32 of the payload, payload. Payload tag 1 is
+/// the hard state (`u64` term, `u8` has-vote, `u64` vote), 2 a snapshot
+/// (`u64` base index, `u64` base term, triples), 3 a log suffix (`u64` first
+/// index, entries; it replaces everything from that index on). Entries and
+/// triples use the [`crate::rpc`] encodings. A torn record at the tail (a
+/// crash mid-append, never acknowledged) is cut off on open.
+#[derive(Debug)]
+struct RaftJournal {
+    file: std::fs::File,
+}
+
+impl RaftJournal {
+    /// The journal's file name inside the state directory.
+    const FILE: &'static str = "raft.journal";
+    const MAGIC: &'static [u8; 8] = b"GSRAFTJ1";
+    const HEADER_LEN: usize = 16;
+
+    /// Open (creating it if needed) the journal of node `id` in `dir` and
+    /// replay it. Refuses a journal written by another node id.
+    fn open(dir: &std::path::Path, id: NodeId) -> io::Result<(RaftJournal, RecoveredState)> {
+        use std::io::{Read as _, Write as _};
+        std::fs::create_dir_all(dir)?;
+        let path = dir.join(Self::FILE);
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(&path)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        if bytes.len() < Self::HEADER_LEN {
+            // New (or created but never completed): start a fresh journal.
+            file.set_len(0)?;
+            let mut header = Self::MAGIC.to_vec();
+            rpc::put_u64(&mut header, id);
+            file.write_all(&header)?;
+            file.sync_all()?;
+            sync_parent_dir(dir)?;
+            return Ok((RaftJournal { file }, RecoveredState::default()));
+        }
+        let mut r = rpc::Reader::new(&bytes[8..Self::HEADER_LEN]);
+        if &bytes[..8] != Self::MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} is not a raft journal", path.display()),
+            ));
+        }
+        let owner = r.u64()?;
+        if owner != id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{} belongs to node {owner}, not node {id}: a state directory serves one node",
+                    path.display()
+                ),
+            ));
+        }
+        let mut state = RecoveredState::default();
+        let mut at = Self::HEADER_LEN;
+        while let Some((payload, next)) = Self::record_at(&bytes, at) {
+            if Self::replay(&mut state, payload).is_err() {
+                break; // a record that does not decode ends the journal too
+            }
+            at = next;
+        }
+        if at < bytes.len() {
+            // A torn (or damaged) tail: it was never acknowledged — every
+            // record is synced before the node acts on it — so drop it.
+            file.set_len(at as u64)?;
+            file.sync_all()?;
+        }
+        Ok((RaftJournal { file }, state))
+    }
+
+    /// The well-formed record starting at `at`: its payload and the offset of
+    /// the next record. `None` at the end, or at a torn or corrupt record.
+    fn record_at(bytes: &[u8], at: usize) -> Option<(&[u8], usize)> {
+        let head = bytes.get(at..at.checked_add(8)?)?;
+        let len = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
+        let crc = u32::from_be_bytes([head[4], head[5], head[6], head[7]]);
+        let end = (at + 8).checked_add(len)?;
+        let payload = bytes.get(at + 8..end)?;
+        (crc32(payload) == crc).then_some((payload, end))
+    }
+
+    /// Apply one record to the recovered state.
+    fn replay(state: &mut RecoveredState, payload: &[u8]) -> io::Result<()> {
+        let mut r = rpc::Reader::new(payload);
+        match r.u8()? {
+            1 => {
+                state.term = r.u64()?;
+                let has_vote = r.u8()? != 0;
+                let vote = r.u64()?;
+                state.voted_for = has_vote.then_some(vote);
+            }
+            2 => {
+                state.base_index = r.u64()?;
+                state.base_term = r.u64()?;
+                state.snapshot = r.triples()?;
+                state.log.clear();
+            }
+            3 => {
+                let from = r.u64()?;
+                let entries = r.entries()?;
+                let keep = from.saturating_sub(state.base_index + 1);
+                if keep > state.log.len() as u64 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "raft journal: a log suffix starts past the end of the log",
+                    ));
+                }
+                state.log.truncate(keep as usize);
+                for (i, e) in entries.into_iter().enumerate() {
+                    if from + i as u64 > state.base_index {
+                        state.log.push(e);
+                    }
+                }
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "raft journal: unknown record",
+                ))
+            }
+        }
+        if r.remaining() != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "raft journal: trailing bytes in a record",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Append `delta` as one batch of records and `fsync` it.
+    fn append(&mut self, delta: &DurableDelta) -> io::Result<()> {
+        use std::io::Write as _;
+        let mut batch = Vec::new();
+        let mut record = |payload: Vec<u8>| {
+            batch.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            batch.extend_from_slice(&crc32(&payload).to_be_bytes());
+            batch.extend_from_slice(&payload);
+        };
+        if let Some((term, vote)) = delta.hard {
+            let mut p = vec![1u8];
+            rpc::put_u64(&mut p, term);
+            p.push(u8::from(vote.is_some()));
+            rpc::put_u64(&mut p, vote.unwrap_or(0));
+            record(p);
+        }
+        if let Some((base_index, base_term, triples)) = &delta.snapshot {
+            let mut p = vec![2u8];
+            rpc::put_u64(&mut p, *base_index);
+            rpc::put_u64(&mut p, *base_term);
+            rpc::put_triples(&mut p, triples);
+            record(p);
+        }
+        if let Some((from, entries)) = &delta.entries {
+            let mut p = vec![3u8];
+            rpc::put_u64(&mut p, *from);
+            rpc::put_entries(&mut p, entries);
+            record(p);
+        }
+        if batch.is_empty() {
+            return Ok(());
+        }
+        self.file.write_all(&batch)?;
+        self.file.sync_data()
+    }
+}
+
+/// `fsync` directory `dir`, so a file just created in it survives a crash. A
+/// no-op off unix, where a directory cannot be opened for syncing.
+fn sync_parent_dir(dir: &std::path::Path) -> io::Result<()> {
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
+/// The CRC-32 (IEEE, reflected) of `data` — the raft journal's record check.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &b in data {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg());
+        }
+    }
+    !crc
+}
+
 /// The outbound replication channel to one peer: a single-slot mailbox holding
 /// the **newest** Raft message for that peer, drained by that peer's dedicated
 /// sender thread.
@@ -2887,6 +3195,12 @@ pub struct ClusterNode {
     /// How long a [`Request::ClientWrite`] waits for its entry to commit before
     /// answering "not confirmed".
     commit_timeout: Mutex<Duration>,
+    /// The durable Raft state of a node bound with
+    /// [`ClusterNode::bind_persistent`]; `None` keeps it in memory only.
+    journal: Option<Mutex<RaftJournal>>,
+    /// Set once the journal could not be written: the node has stopped for
+    /// good (fail-stop) and [`ClusterNode::revive`] does not restart it.
+    durable_failed: AtomicBool,
 }
 
 impl ClusterNode {
@@ -2904,12 +3218,64 @@ impl ClusterNode {
 
     /// Bind node `id` with cluster peers `peer_ids` (their addresses are set
     /// later via [`ClusterNode::set_peer_addr`]) and a starting `store`.
+    ///
+    /// The node keeps its Raft term, vote and log **in memory only**: it must
+    /// never be restarted under the same id, or it could vote a second time in
+    /// a term it already voted in (two leaders of one term) and help elect a
+    /// leader that lacks committed entries. Use
+    /// [`ClusterNode::bind_persistent`] for a replica that may restart.
     pub fn bind<A: ToSocketAddrs>(
         id: NodeId,
         peer_ids: Vec<NodeId>,
         store: TripleStore,
         addr: A,
         cfg: RaftConfig,
+    ) -> io::Result<Arc<ClusterNode>> {
+        let state = RaftState::new(id, peer_ids.clone(), &cfg);
+        Self::bind_with(id, &peer_ids, state, store, addr, cfg, None)
+    }
+
+    /// Bind a node whose Raft term, vote and log are **durable** in
+    /// `state_dir` (created if missing; one directory per node id): every
+    /// change is appended to the directory's journal and `fsync`ed before the
+    /// node answers a vote or append, sends a message, or counts its own entry
+    /// toward a commit (review cluster-nlqa#11). On a restart from the same
+    /// directory the node resumes with the term and vote it had — so it cannot
+    /// vote twice in one term — and with its log; the triple store starts empty
+    /// and is rebuilt as a leader re-confirms the log's entries.
+    ///
+    /// A state directory written by a different node id is refused. If the
+    /// journal cannot be written the node stops for good (fail-stop): it never
+    /// answers from state that a restart would forget.
+    pub fn bind_persistent<A: ToSocketAddrs>(
+        id: NodeId,
+        peer_ids: Vec<NodeId>,
+        state_dir: &std::path::Path,
+        addr: A,
+        cfg: RaftConfig,
+    ) -> io::Result<Arc<ClusterNode>> {
+        let (journal, recovered) = RaftJournal::open(state_dir, id)?;
+        let mut state = RaftState::new(id, peer_ids.clone(), &cfg);
+        state.restore(recovered);
+        Self::bind_with(
+            id,
+            &peer_ids,
+            state,
+            TripleStore::new(),
+            addr,
+            cfg,
+            Some(journal),
+        )
+    }
+
+    fn bind_with<A: ToSocketAddrs>(
+        id: NodeId,
+        peer_ids: &[NodeId],
+        state: RaftState,
+        store: TripleStore,
+        addr: A,
+        cfg: RaftConfig,
+        journal: Option<RaftJournal>,
     ) -> io::Result<Arc<ClusterNode>> {
         let listener = TcpListener::bind(addr)?;
         let tick_interval = cfg.tick_interval;
@@ -2918,7 +3284,6 @@ impl ClusterNode {
             .filter(|&&p| p != id)
             .map(|&p| (p, Arc::new(PeerLink::default())))
             .collect();
-        let state = RaftState::new(id, peer_ids, &cfg);
         Ok(Arc::new(ClusterNode {
             id,
             state: Arc::new(Mutex::new(state)),
@@ -2933,7 +3298,54 @@ impl ClusterNode {
             tick_interval,
             io_timeout: Duration::from_millis(300),
             commit_timeout: Mutex::new(Self::DEFAULT_COMMIT_TIMEOUT),
+            journal: journal.map(Mutex::new),
+            durable_failed: AtomicBool::new(false),
         }))
+    }
+
+    /// Make the Raft state machine's latest step durable before anything it
+    /// produced — a reply, an outgoing message, a commit counting this node —
+    /// can be seen; the caller holds the state lock, so journal order is state
+    /// order. A no-op for an in-memory node. If the journal cannot be written
+    /// the node stops for good and the error is returned.
+    fn persist(&self, st: &mut RaftState) -> io::Result<()> {
+        let Some(journal) = &self.journal else {
+            return Ok(());
+        };
+        let delta = st.take_durable_delta();
+        if delta.is_empty() {
+            return Ok(());
+        }
+        let written = journal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .append(&delta);
+        if let Err(e) = &written {
+            self.durable_failed.store(true, Ordering::SeqCst);
+            self.alive.store(false, Ordering::SeqCst);
+            crate::gs_error!(
+                "cluster node {}: the raft journal could not be written ({e}); the node stops",
+                self.id
+            );
+        }
+        written
+    }
+
+    /// Feed an inbound Raft RPC to the state machine and answer it — only
+    /// once the state it answers from is durable.
+    fn handle_raft(&self, msg: RaftMsg) -> Response {
+        let reply = {
+            let mut st = self.state.lock().unwrap();
+            let reply = st.handle(msg);
+            self.persist(&mut st).map(|()| reply)
+        };
+        match reply {
+            Ok(reply) => {
+                self.apply_actions();
+                reply_to_response(reply)
+            }
+            Err(e) => Response::Error(format!("raft state could not be made durable: {e}")),
+        }
     }
 
     /// Bound how long a [`Request::ClientWrite`] served by this node waits for
@@ -3060,10 +3472,14 @@ impl ClusterNode {
     fn submit(&self, op: LogOp) -> std::result::Result<(u64, u64), ProposeError> {
         let (idx, term) = {
             let mut st = self.state.lock().unwrap();
-            match st.propose(op) {
-                Some(i) => (i, st.current_term()),
-                None => return Err(ProposeError::NotLeader(st.leader_id())),
+            let Some(i) = st.propose(op) else {
+                return Err(ProposeError::NotLeader(st.leader_id()));
+            };
+            // Durable before it is replicated or counted toward a commit.
+            if self.persist(&mut st).is_err() {
+                return Err(ProposeError::NotCommitted(None));
             }
+            (i, st.current_term())
         };
         let outs = { self.state.lock().unwrap().replicate_now() };
         self.route(outs);
@@ -3088,6 +3504,9 @@ impl ClusterNode {
     /// Bring a killed node back: resume ticking/serving and reset its election
     /// timer.
     pub fn revive(&self) {
+        if self.durable_failed.load(Ordering::SeqCst) {
+            return; // stopped because its journal failed: stays down
+        }
         self.state.lock().unwrap().note_revived();
         self.alive.store(true, Ordering::SeqCst);
     }
@@ -3177,16 +3596,12 @@ impl ClusterNode {
                 candidate_id,
                 last_log_index,
                 last_log_term,
-            } => {
-                let reply = self.state.lock().unwrap().handle(RaftMsg::RequestVote {
-                    term,
-                    candidate_id,
-                    last_log_index,
-                    last_log_term,
-                });
-                self.apply_actions();
-                reply_to_response(reply)
-            }
+            } => self.handle_raft(RaftMsg::RequestVote {
+                term,
+                candidate_id,
+                last_log_index,
+                last_log_term,
+            }),
             Request::AppendEntries {
                 term,
                 leader_id,
@@ -3194,35 +3609,27 @@ impl ClusterNode {
                 prev_log_term,
                 leader_commit,
                 entries,
-            } => {
-                let reply = self.state.lock().unwrap().handle(RaftMsg::AppendEntries {
-                    term,
-                    leader_id,
-                    prev_log_index,
-                    prev_log_term,
-                    leader_commit,
-                    entries,
-                });
-                self.apply_actions();
-                reply_to_response(reply)
-            }
+            } => self.handle_raft(RaftMsg::AppendEntries {
+                term,
+                leader_id,
+                prev_log_index,
+                prev_log_term,
+                leader_commit,
+                entries,
+            }),
             Request::InstallSnapshot {
                 term,
                 leader_id,
                 last_included_index,
                 last_included_term,
                 triples,
-            } => {
-                let reply = self.state.lock().unwrap().handle(RaftMsg::InstallSnapshot {
-                    term,
-                    leader_id,
-                    last_included_index,
-                    last_included_term,
-                    triples,
-                });
-                self.apply_actions();
-                reply_to_response(reply)
-            }
+            } => self.handle_raft(RaftMsg::InstallSnapshot {
+                term,
+                leader_id,
+                last_included_index,
+                last_included_term,
+                triples,
+            }),
             Request::ClientWrite { op } => self.client_write_response(op),
             // On a cluster node, a routed insert goes through the replicated
             // log, and answers as [`RemoteShard::insert`] expects: `Bool` (was
@@ -3323,7 +3730,15 @@ impl ClusterNode {
             if !self.alive.load(Ordering::SeqCst) {
                 continue;
             }
-            let outs = { self.state.lock().unwrap().tick() };
+            let outs = {
+                let mut st = self.state.lock().unwrap();
+                let outs = st.tick();
+                // A new term and our own vote are durable before we campaign.
+                match self.persist(&mut st) {
+                    Ok(()) => outs,
+                    Err(_) => continue,
+                }
+            };
             self.route(outs);
             self.apply_actions();
         }
@@ -3375,7 +3790,14 @@ impl ClusterNode {
             if !self.alive.load(Ordering::SeqCst) {
                 continue; // crashed while waiting for the reply
             }
-            let more = self.state.lock().unwrap().handle_reply(peer, reply);
+            let more = {
+                let mut st = self.state.lock().unwrap();
+                let more = st.handle_reply(peer, reply);
+                match self.persist(&mut st) {
+                    Ok(()) => more,
+                    Err(_) => continue,
+                }
+            };
             self.apply_actions();
             self.route(more);
         }
@@ -7467,5 +7889,188 @@ mod review_fix_tests {
         c.settle(5);
         assert_eq!(c.try_triple_count().unwrap(), 6);
         assert!(!c.try_exists(100, 1, 1).unwrap());
+    }
+
+    // ----- review cluster-nlqa#11: durable term, vote and log -----------------
+
+    /// A unique scratch directory, removed when dropped (also on failure).
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> TempDir {
+            use std::sync::atomic::AtomicUsize;
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "gstore_cluster_review_{}_{}_{tag}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            TempDir(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn vote(node: &ClusterNode, term: u64, candidate: NodeId) -> Response {
+        node.handle_request(Request::RequestVote {
+            term,
+            candidate_id: candidate,
+            last_log_index: 0,
+            last_log_term: 0,
+        })
+    }
+
+    /// The double vote the reviewer reproduced: a replica that voted in term
+    /// 5 and restarts must not vote for another candidate in term 5. With
+    /// [`ClusterNode::bind_persistent`] the vote survives the restart; the
+    /// in-memory [`ClusterNode::bind`] shows the hazard it closes.
+    #[test]
+    fn a_persistent_replica_keeps_its_vote_across_a_restart() {
+        let dir = TempDir::new("vote");
+        let cfg = RaftConfig::default();
+        let node = ClusterNode::bind_persistent(2, vec![0, 1], &dir.0, "127.0.0.1:0", cfg.clone())
+            .unwrap();
+        assert_eq!(
+            vote(&node, 5, 0),
+            Response::Vote {
+                term: 5,
+                granted: true
+            }
+        );
+        drop(node); // never started: no threads hold it
+
+        let node = ClusterNode::bind_persistent(2, vec![0, 1], &dir.0, "127.0.0.1:0", cfg.clone())
+            .unwrap();
+        assert_eq!(node.current_term(), 5, "the term survived");
+        assert_eq!(
+            vote(&node, 5, 1),
+            Response::Vote {
+                term: 5,
+                granted: false
+            },
+            "no second vote in term 5"
+        );
+        assert_eq!(
+            vote(&node, 5, 0),
+            Response::Vote {
+                term: 5,
+                granted: true
+            }
+        );
+
+        // An in-memory replica restarted the same way votes twice.
+        let fresh =
+            ClusterNode::bind(2, vec![0, 1], TripleStore::new(), "127.0.0.1:0", cfg).unwrap();
+        assert_eq!(
+            vote(&fresh, 5, 1),
+            Response::Vote {
+                term: 5,
+                granted: true
+            }
+        );
+    }
+
+    /// The log is durable too: entries a replica acknowledged — including a
+    /// conflicting suffix it later replaced — come back exactly after a
+    /// restart, and a restarted single-node cluster re-commits them and
+    /// rebuilds its store.
+    #[test]
+    fn a_persistent_replica_recovers_its_log_and_rebuilds_its_store() {
+        let dir = TempDir::new("log");
+        let cfg = RaftConfig::default();
+        let follower =
+            ClusterNode::bind_persistent(1, vec![0], &dir.0, "127.0.0.1:0", cfg.clone()).unwrap();
+        let append = |term, prev_log_index, prev_log_term, entries| {
+            follower.handle_request(Request::AppendEntries {
+                term,
+                leader_id: 0,
+                prev_log_index,
+                prev_log_term,
+                leader_commit: 0,
+                entries,
+            })
+        };
+        let e = |term, s| LogEntry::new(term, LogOp::Insert(t(s, 1, 1)));
+        assert!(matches!(
+            append(1, 0, 0, vec![e(1, 1), e(1, 2), e(1, 3)]),
+            Response::AppendAck { success: true, .. }
+        ));
+        // A new leader of term 2 overwrites index 3 onwards.
+        assert!(matches!(
+            append(2, 2, 1, vec![e(2, 30), e(2, 40)]),
+            Response::AppendAck { success: true, .. }
+        ));
+        let expected = follower.state.lock().unwrap().log.clone();
+        assert_eq!(expected, vec![e(1, 1), e(1, 2), e(2, 30), e(2, 40)]);
+        drop(follower);
+
+        // Restarted alone (as a single-node cluster) it elects itself,
+        // re-commits the recovered log and rebuilds the store from it.
+        let node = ClusterNode::bind_persistent(1, vec![], &dir.0, "127.0.0.1:0", cfg).unwrap();
+        assert_eq!(node.state.lock().unwrap().log, expected, "the log survived");
+        assert_eq!(node.current_term(), 2);
+        let live = LiveNode(node);
+        let _ = live.0.start();
+        live.wait_leader();
+        let start = Instant::now();
+        while live.0.store_triple_count() < 4 {
+            assert!(start.elapsed() < HANG_GUARD, "store not rebuilt");
+            thread::sleep(Duration::from_millis(2));
+        }
+        for s in [1, 2, 30, 40] {
+            assert!(live.0.store_contains(t(s, 1, 1)));
+        }
+        assert!(
+            !live.0.store_contains(t(3, 1, 1)),
+            "the replaced entry is gone"
+        );
+    }
+
+    /// A torn record at the journal's tail (a crash mid-append) is cut off,
+    /// and a state directory of another node id is refused.
+    #[test]
+    fn the_raft_journal_drops_a_torn_tail_and_refuses_a_foreign_node() {
+        use std::io::Write;
+        let dir = TempDir::new("journal");
+        let cfg = RaftConfig::default();
+        let node =
+            ClusterNode::bind_persistent(3, vec![4], &dir.0, "127.0.0.1:0", cfg.clone()).unwrap();
+        assert!(matches!(
+            vote(&node, 7, 4),
+            Response::Vote { granted: true, .. }
+        ));
+        drop(node);
+        let path = dir.0.join(RaftJournal::FILE);
+        let intact = std::fs::metadata(&path).unwrap().len();
+        // Half of a record: a length prefix announcing 50 bytes, 3 present.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(&[0, 0, 0, 50, 1, 2, 3, 4, 9, 9, 9]).unwrap();
+        drop(f);
+
+        let node =
+            ClusterNode::bind_persistent(3, vec![4], &dir.0, "127.0.0.1:0", cfg.clone()).unwrap();
+        assert_eq!(node.current_term(), 7);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            intact,
+            "torn tail cut"
+        );
+        assert!(matches!(
+            vote(&node, 7, 5),
+            Response::Vote { granted: false, .. }
+        ));
+        drop(node);
+
+        let err = ClusterNode::bind_persistent(9, vec![4], &dir.0, "127.0.0.1:0", cfg)
+            .expect_err("node 3's state directory");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
     }
 }
