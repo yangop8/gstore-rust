@@ -646,12 +646,11 @@ fn wrong_password_and_unreachable_server() {
     let r = run(cmd, "");
     assert_eq!(r.code, 1, "{r:?}");
     assert!(r.out.starts_with("login failed: "), "{r:?}");
-    // Nothing listening.
-    let free = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap();
-    let mut cmd = gconsole(&free, &cwd);
+    // Nothing listening: port 0, which nothing can listen on (review
+    // tests-a#7: a port bound and freed again could be taken meanwhile by
+    // another test's server, which gconsole would then talk to).
+    let nothing: SocketAddr = ([127, 0, 0, 1], 0).into();
+    let mut cmd = gconsole(&nothing, &cwd);
     cmd.args(["-u", "root", "-p", PASSWORD]);
     let r = run(cmd, "showdbs;\n");
     assert_eq!(r.code, 1, "{r:?}");
@@ -659,7 +658,7 @@ fn wrong_password_and_unreachable_server() {
         r.out, "Could not connect to server. Please check server status\n",
         "{r:?}"
     );
-    assert!(r.err.contains(&format!("{}", free.port())), "{r:?}");
+    assert!(r.err.contains("cannot connect to 127.0.0.1:0"), "{r:?}");
     // Bad options.
     let mut cmd = gconsole(&srv.addr, &cwd);
     cmd.arg("--bogus");
@@ -948,36 +947,24 @@ impl Drop for Gserver {
 }
 
 impl Gserver {
+    /// review tests-a#7: gserver binds a port of its own choosing (`-p 0`)
+    /// and the test learns it from gserver's own announcement — no port
+    /// picked and freed beforehand (another test's server could take it
+    /// meanwhile), and no readiness check that any listener would pass.
     fn start(dir: &Path, conf_extra: &str) -> Gserver {
-        let port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
         fs::create_dir_all(dir.join("conf")).unwrap();
         fs::write(
             dir.join("conf/conf.ini"),
             format!(
-                "[server]\nport={port}\nthread_num=4\n[system]\ndb_home=./dbhome/\n\
+                "[server]\nthread_num=4\n[system]\ndb_home=./dbhome/\n\
                  root_password={GSERVER_PASSWORD}\n{conf_extra}"
             ),
         )
         .unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_gserver"))
-            .current_dir(dir)
-            .args(["--load-dir", &path_str(&data("small"))])
-            .env_remove("GSTORE_GSERVER_BACKGROUND")
-            .env_remove("GSTORE_GSERVER_SUPERVISOR")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let srv = Gserver { child, port };
-        wait_for("gserver", || {
-            TcpStream::connect(("127.0.0.1", port)).is_ok()
-        });
-        srv
+        let data_dir = path_str(&data("small"));
+        let (child, port) =
+            spawn_gserver(dir, &["--load-dir", &data_dir, "-p", "0"]).expect("gserver started");
+        Gserver { child, port }
     }
 
     /// Run a gconsole stdin script as root, from `cwd`.
@@ -987,6 +974,77 @@ impl Gserver {
         cmd.args(["-u", "root", "-p", GSERVER_PASSWORD]);
         run(cmd, stdin)
     }
+}
+
+/// Start `gserver` in `dir` with `args` and wait until it announces the
+/// address it serves on (its own stdout, so whatever answers there is this
+/// server): the child and its port. `None` when it exited first — e.g.
+/// because its port was taken. Its output keeps being drained until it
+/// exits.
+fn spawn_gserver(dir: &Path, args: &[&str]) -> Option<(Child, u16)> {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_gserver"))
+        .current_dir(dir)
+        .args(args)
+        .env_remove("GSTORE_GSERVER_BACKGROUND")
+        .env_remove("GSTORE_GSERVER_SUPERVISOR")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let out = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(out).lines() {
+            let Ok(line) = line else { break };
+            if let Some(port) = announced_port(&line) {
+                let _ = tx.send(port);
+            }
+        }
+    });
+    // The timeout is only a hang guard; an exit ends the wait at once.
+    match rx.recv_timeout(Duration::from_secs(120)) {
+        Ok(port) => Some((child, port)),
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            None
+        }
+    }
+}
+
+/// review tests-a#7: the readiness check of the gserver binaries started
+/// here is gserver's own announcement, not a connection to the port: a
+/// port another listener holds is not taken for a ready gserver (gserver
+/// exits, and the caller learns it at once).
+#[test]
+fn a_gserver_is_ready_when_it_says_so_not_when_its_port_answers() {
+    let dir = scratch("gc_ready");
+    let _dir = DirGuard(dir.clone());
+    let taken = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = taken.local_addr().unwrap().port();
+    fs::create_dir_all(dir.join("conf")).unwrap();
+    fs::write(
+        dir.join("conf/conf.ini"),
+        format!(
+            "[server]\nport={port}\nthread_num=4\n[system]\ndb_home=./dbhome/\n\
+             root_password={GSERVER_PASSWORD}\n"
+        ),
+    )
+    .unwrap();
+    assert!(
+        TcpStream::connect(("127.0.0.1", port)).is_ok(),
+        "the old check would have taken this for gserver"
+    );
+    assert!(spawn_gserver(&dir, &[]).is_none());
+    drop(taken);
+}
+
+/// The port of gserver's startup line `… on http://127.0.0.1:PORT …`.
+fn announced_port(line: &str) -> Option<u16> {
+    let (_, rest) = line.split_once(" on http://")?;
+    let addr = rest.split_whitespace().next()?;
+    addr.parse::<SocketAddr>().ok().map(|a| a.port())
 }
 
 /// Whether `hay` holds `lines` in this order (each found after the end of
@@ -2562,22 +2620,6 @@ fn tls_needs_the_tls_feature() {
 fn gconsole_finds_gserver_through_conf_ini() {
     let dir = scratch("gc_readme");
     let _dir = DirGuard(dir.clone());
-    let port = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    fs::create_dir_all(dir.join("conf")).unwrap();
-    fs::write(
-        dir.join("conf/conf.ini"),
-        // review sec#8 / infra#3: an explicit root password (gserver refuses
-        // the default one).
-        format!(
-            "[server]\nport={port}\nthread_num=4\n[system]\ndb_home=./dbhome/\n\
-             root_password={GSERVER_PASSWORD}\n"
-        ),
-    )
-    .unwrap();
     let data_dir = path_str(&data("small"));
     struct Kill(Child);
     impl Drop for Kill {
@@ -2586,21 +2628,36 @@ fn gconsole_finds_gserver_through_conf_ini() {
             let _ = self.0.wait();
         }
     }
-    let server = Kill(
-        Command::new(env!("CARGO_BIN_EXE_gserver"))
-            .current_dir(&dir)
-            .args(["--load-dir", &data_dir])
-            .env_remove("GSTORE_GSERVER_BACKGROUND")
-            .env_remove("GSTORE_GSERVER_SUPERVISOR")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
-    wait_for("gserver", || {
-        TcpStream::connect(("127.0.0.1", port)).is_ok()
-    });
+    // review tests-a#7: both read the port from conf.ini, so it is chosen
+    // beforehand; gserver must then say it serves on it (its own stdout —
+    // not merely some listener on that port), and when the port was taken
+    // meanwhile gserver exits and another one is tried.
+    let mut server = None;
+    for _ in 0..10 {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        fs::create_dir_all(dir.join("conf")).unwrap();
+        fs::write(
+            dir.join("conf/conf.ini"),
+            // review sec#8 / infra#3: an explicit root password (gserver
+            // refuses the default one).
+            format!(
+                "[server]\nport={port}\nthread_num=4\n[system]\ndb_home=./dbhome/\n\
+                 root_password={GSERVER_PASSWORD}\n"
+            ),
+        )
+        .unwrap();
+        if let Some((child, announced)) = spawn_gserver(&dir, &["--load-dir", &data_dir]) {
+            let child = Kill(child);
+            assert_eq!(announced, port, "gserver serves conf.ini's port");
+            server = Some(child);
+            break;
+        }
+    }
+    let server = server.expect("gserver started on a free port");
     // No --port: gconsole reads it from ./conf/conf.ini, like upstream.
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_gconsole"));
     cmd.current_dir(&dir)
