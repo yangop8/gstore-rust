@@ -203,9 +203,18 @@ pub fn validate_sparql(sparql: &str) -> Result<()> {
 /// (`INSERT`/`DELETE`/`DROP`/`LOAD`/`CLEAR`/…), which would mutate the store. Any
 /// generated or self-repaired candidate must pass this before it is executed, so
 /// an adversarial/hallucinated `DELETE WHERE { ?s ?p ?o }` can never run.
+///
+/// A `SERVICE` clause (federation) is refused as well, wherever it appears
+/// — nested groups, `OPTIONAL`, `EXISTS`, sub-`SELECT`s, projection and
+/// `HAVING` / `ORDER BY` expressions (review cluster-nlqa#23): question
+/// answering never needs it, and it would make the store fetch an
+/// LLM-chosen or prompt-injected URL (SSRF), so the guard does not depend on
+/// the gStore server's own outbound policy.
 pub fn validate_readonly_sparql(sparql: &str) -> Result<()> {
     use gstore::parser::sparql::ast::Query;
     match gstore::parser::sparql::parse(sparql).map_err(|e| Error::Sparql(e.to_string()))? {
+        Query::Select(s) if select_uses_service(&s) => Err(service_refused()),
+        Query::Ask(a) if pattern_uses_service(&a.pattern) => Err(service_refused()),
         Query::Select(_) | Query::Ask(_) => Ok(()),
         Query::Construct(_) | Query::Describe(_) => Err(Error::Sparql(
             "only SELECT/ASK queries are allowed for question answering".into(),
@@ -213,6 +222,71 @@ pub fn validate_readonly_sparql(sparql: &str) -> Result<()> {
         Query::Update(_) => Err(Error::Sparql(
             "refusing to execute a SPARQL UPDATE — question answering is read-only".into(),
         )),
+    }
+}
+
+fn service_refused() -> Error {
+    Error::Sparql(
+        "refusing a SERVICE (federated) query — question answering only reads the configured \
+         store"
+            .into(),
+    )
+}
+
+/// Whether a SELECT (pattern, projection, grouping, HAVING, ORDER BY) contains
+/// a `SERVICE` pattern anywhere.
+fn select_uses_service(s: &gstore::parser::sparql::ast::SelectQuery) -> bool {
+    use gstore::parser::sparql::ast::{Projection, SelectItem};
+    pattern_uses_service(&s.pattern)
+        || match &s.projection {
+            Projection::All => false,
+            Projection::Items(items) => items.iter().any(|i| match i {
+                SelectItem::Var(_) => false,
+                SelectItem::Expr(e, _) => expr_uses_service(e),
+            }),
+        }
+        || s.group_by.iter().any(expr_uses_service)
+        || s.having.iter().any(expr_uses_service)
+        || s.order_by.iter().any(|o| expr_uses_service(&o.expr))
+}
+
+/// Whether a graph pattern contains a `SERVICE` pattern anywhere (the match
+/// is exhaustive, so a new pattern kind must be classified here).
+fn pattern_uses_service(p: &gstore::parser::sparql::ast::GraphPattern) -> bool {
+    use gstore::parser::sparql::ast::GraphPattern as G;
+    match p {
+        G::Service { .. } => true,
+        G::Empty | G::Bgp(_) | G::Path(_) | G::Values(_, _) => false,
+        G::Join(a, b) | G::Union(a, b) | G::Minus(a, b) => {
+            pattern_uses_service(a) || pattern_uses_service(b)
+        }
+        G::LeftJoin(a, b, filters) => {
+            pattern_uses_service(a)
+                || pattern_uses_service(b)
+                || filters.iter().any(expr_uses_service)
+        }
+        G::Filter(filters, inner) => {
+            filters.iter().any(expr_uses_service) || pattern_uses_service(inner)
+        }
+        G::Extend(inner, _, e) => pattern_uses_service(inner) || expr_uses_service(e),
+        G::SubSelect(s) => select_uses_service(s),
+        G::Graph(_, inner) => pattern_uses_service(inner),
+    }
+}
+
+/// Whether an expression contains an `EXISTS { … SERVICE … }`.
+fn expr_uses_service(e: &gstore::parser::sparql::ast::Expr) -> bool {
+    use gstore::parser::sparql::ast::Expr as E;
+    match e {
+        E::Exists(_, p) => pattern_uses_service(p),
+        E::Var(_) | E::Const(_) | E::GraphFn { .. } | E::Pfn { .. } => false,
+        E::Or(a, b) | E::And(a, b) | E::Compare(_, a, b) | E::Arith(_, a, b) => {
+            expr_uses_service(a) || expr_uses_service(b)
+        }
+        E::Not(a) | E::Unary(_, a) => expr_uses_service(a),
+        E::In { expr, list, .. } => expr_uses_service(expr) || list.iter().any(expr_uses_service),
+        E::Builtin(_, args) | E::IriCall { args, .. } => args.iter().any(expr_uses_service),
+        E::Aggregate { arg, .. } => arg.as_deref().is_some_and(expr_uses_service),
     }
 }
 

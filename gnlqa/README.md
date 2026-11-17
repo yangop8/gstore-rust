@@ -227,7 +227,10 @@ also bounds request size and connection count and applies read/write timeouts.
 Failures *inside* a correctly-invoked tool are returned as `isError` content;
 protocol faults (unknown tool, malformed params) are JSON-RPC `-32602` errors.
 `run_sparql` enforces a read-only gate (SELECT/ASK only — UPDATE/DELETE/DROP/LOAD
-are rejected before reaching the store), so an injected mutation can't run.
+are rejected before reaching the store), so an injected mutation can't run. The
+same gate (shared by generation and self-repair) also refuses any `SERVICE`
+clause, wherever it is nested, so neither the LLM nor an MCP client can make the
+store fetch an arbitrary URL.
 
 **Result size.** A SELECT result is parsed up to 100 000 rows (`MAX_RESULT_ROWS`)
 and 32 MiB. A larger result is never passed off as complete: the question-answering
