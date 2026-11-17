@@ -214,7 +214,7 @@ fn key_term(s: &str) -> Option<Term> {
 #[path = "topk.rs"]
 mod topk;
 use topk::PreparedBgp;
-pub use topk::{DpbMode, EvalStats, TopKOptions};
+pub use topk::{force_streaming_on_this_thread, DpbMode, EvalStats, TopKOptions};
 
 // The hash index of OPTIONAL, MINUS and the joins over maybe-unbound
 // variables, shared by both executors (review sparqlconf#2 / query#10).

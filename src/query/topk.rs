@@ -192,6 +192,33 @@ impl Default for TopKOptions {
     }
 }
 
+thread_local! {
+    /// See [`force_streaming_on_this_thread`].
+    static FORCE_STREAMING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Make every SELECT and CONSTRUCT (sub-SELECTs included) evaluated on this
+/// thread take the streaming fast paths as if it had an unbounded `LIMIT`
+/// (`true`), or only those with a `LIMIT` (`false`, the default) — under
+/// [`TopKOptions`] that allow them; [`TopKOptions::NONE`] still evaluates
+/// in full. A test hook for the executor differential suite
+/// (`tests/executor_differential.rs`, review query#17 / design#10): it runs
+/// the streaming executor on queries as written, without appending a
+/// `LIMIT` to their text. Returns the previous setting.
+#[doc(hidden)]
+pub fn force_streaming_on_this_thread(on: bool) -> bool {
+    FORCE_STREAMING.with(|f| f.replace(on))
+}
+
+/// The `LIMIT` a query without one streams under
+/// [`force_streaming_on_this_thread`]: unbounded.
+fn forced_limit() -> Option<usize> {
+    FORCE_STREAMING
+        .try_with(std::cell::Cell::get)
+        .unwrap_or(false)
+        .then_some(usize::MAX)
+}
+
 /// Work counters of an [`Evaluator`] ([`Evaluator::stats`]), summed over
 /// every query it evaluated (and the `GRAPH` blocks inside them).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -964,7 +991,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         layout: &VarLayout,
         result_vars: &[String],
     ) -> Result<Option<Vec<Vec<Option<u32>>>>> {
-        let Some(limit) = q.limit else {
+        let Some(limit) = q.limit.or_else(forced_limit) else {
             return Ok(None);
         };
         let k = q.offset.unwrap_or(0).saturating_add(limit);
@@ -1047,7 +1074,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         c: &ConstructQuery,
         layout: &VarLayout,
     ) -> Result<Option<Vec<Binding>>> {
-        let Some(limit) = c.limit else {
+        let Some(limit) = c.limit.or_else(forced_limit) else {
             return Ok(None);
         };
         let k = c.offset.unwrap_or(0).saturating_add(limit);
