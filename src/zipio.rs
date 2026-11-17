@@ -688,6 +688,44 @@ impl ScratchDir {
         Ok(ScratchDir { path })
     }
 
+    /// Create a new, empty directory named `<prefix>-<pid>-<random>`
+    /// **exclusively** — an existing directory is never reused or removed,
+    /// whoever made it — and private to this user (mode `0700` on Unix).
+    /// The name cannot be predicted, so no other process can prepare it or
+    /// pick it for its own scratch work (review bulkcli#6: a fixed name was
+    /// taken over — wiped and refilled — by a concurrent tool). `prefix`'s
+    /// parent must exist.
+    pub fn create_unique(prefix: &Path) -> io::Result<ScratchDir> {
+        use std::hash::BuildHasher;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let mut attempt = 0u32;
+        loop {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            // `RandomState` keys come from the operating system's randomness.
+            let nonce = std::collections::hash_map::RandomState::new().hash_one((
+                nanos,
+                SEQ.fetch_add(1, Ordering::Relaxed),
+                std::process::id(),
+            ));
+            let mut name = prefix.as_os_str().to_owned();
+            name.push(format!("-{}-{nonce:016x}", std::process::id()));
+            let path = PathBuf::from(name);
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            match builder.create(&path) {
+                Ok(()) => return Ok(ScratchDir { path }),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && attempt < 16 => {
+                    attempt += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// Adopt an already created directory.
     pub fn adopt(path: PathBuf) -> ScratchDir {
         ScratchDir { path }

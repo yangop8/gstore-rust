@@ -39,8 +39,9 @@
 //! A local `.zip` source (upstream 1.3's `gbuild -f x.zip`; feature `zip`)
 //! is unpacked — refusing unsafe entry names, under the default zip limits
 //! (10 GiB, 10000 entries; `--unzip-max-size BYTES` / `--unzip-max-entries
-//! N` change them, `0` = no limit) — into a scratch directory beside the
-//! database (`<db_name>.db.unzip-tmp-N`, removed when `gbuild` ends) and
+//! N` change them, `0` = no limit) — into a new scratch directory beside the
+//! database (`<db_name>.db.unzip-tmp-<pid>-<random>`, created exclusively
+//! once the database directory is claimed, removed when `gbuild` ends) and
 //! read like a directory source.
 //!
 //! `--disk` builds the indexes **in bulk** ([`gstore::bulk`]): the input is
@@ -74,9 +75,17 @@
 //! [`gstore::parser::import`]), and the build goes on. `--strict` stops at the
 //! first such statement instead (exit status 1, nothing built).
 //!
-//! A build that fails removes the database directory it created (upstream's
-//! `Util::remove_path` of a failed build), so the same `gbuild` can simply be
-//! run again; a failed `--force` rebuild leaves the directory as it was. A
+//! `gbuild` claims the database directory (its inter-process lock) before
+//! it writes anything into or beside it — the parse error log, a zip
+//! package's scratch directory — and keeps the claim until it ends: another
+//! process building, loading or dropping the same database meanwhile is
+//! refused, and `gbuild` fails at once (status 1) when another process holds
+//! the directory. A build that fails removes the database directory it
+//! created (upstream's `Util::remove_path` of a failed build) — under that
+//! claim, and only while it holds no database — so the same `gbuild` can
+//! simply be run again; a failed `--force` rebuild leaves the directory as
+//! it was. A build that succeeded keeps its database even when its summary
+//! cannot be printed (a full disk behind standard output: status 1). A
 //! bulk build whose install put the new database in place but could not
 //! finish cleaning up (an old layout, the staging area) says so — "built,
 //! but …" — and exits with status 1; the new database is the one served.
@@ -90,12 +99,15 @@
 #[path = "common/cli.rs"]
 mod cli;
 
+use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
 use gstore::bulk::{BulkInput, BulkOptions, BulkReport, BulkTarget};
 use gstore::config::GStoreConfig;
+use gstore::db::dirlock::BuildGuard;
 use gstore::parser::import::{self, ImportOptions, ImportReport, ParseErrorLog, Source};
 use gstore::zipio::ZipLimits;
 use gstore::{db_dir_for, Database};
@@ -331,13 +343,31 @@ fn main() -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
+    // Claim the directory before anything is written into or beside it —
+    // the parse error log, a zip package's scratch directory — and hold the
+    // claim through the build (review bulkcli#2, #6): another process
+    // building, loading or dropping the same database is refused from here
+    // on (the builds below nest in this claim), and a failed build removes
+    // the directory only while it holds it.
+    let claim = match fs::create_dir_all(&dir)
+        .map_err(gstore::GStoreError::from)
+        .and_then(|()| BuildGuard::lock(Path::new(&dir)))
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("gbuild: cannot build '{dir}': {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     // A failed build removes what it created; one over an existing
     // database (`--force`) leaves the directory as it is.
     let mut created = CreatedDir {
         path: (!existed).then(|| PathBuf::from(&dir)),
+        claim: Some(claim),
     };
+    let mut out = Summary::default();
     if paths.is_empty() {
-        gstore::outln!("will build an empty database");
+        out.line(format_args!("will build an empty database"));
     }
     // Zip packages are unpacked first and read as directories; the scratch
     // directories go when `_unpacked` is dropped, whatever the outcome.
@@ -362,7 +392,8 @@ fn main() -> ExitCode {
     };
 
     let started = Instant::now();
-    // A fresh build starts a fresh parse error log.
+    // A fresh build starts a fresh parse error log (under the claim: never
+    // another build's log).
     let log_path = Path::new(&dir).join(import::PARSE_ERROR_LOG);
     let _ = std::fs::remove_file(&log_path);
     let mut log = match ParseErrorLog::open(&log_path) {
@@ -373,12 +404,25 @@ fn main() -> ExitCode {
         }
     };
     if rocksdb && (incremental || !cfg!(feature = "rocksdb")) {
-        let Some(report) = build_rocksdb(name, &dir, &sources, &opts, &mut log, started) else {
+        let Some(report) = build_rocksdb(name, &dir, &sources, &opts, &mut log) else {
             return ExitCode::FAILURE;
         };
+        // Built: whatever happens from here on, the database stays (review
+        // bulkcli#3: a failed summary print removed it).
         created.keep();
         if existed && drop_old_rules(&dir) != ExitCode::SUCCESS {
             return ExitCode::FAILURE;
+        }
+        match Database::open(&dir) {
+            Ok(db) => print_stats(&mut out, name, &dir, &db, started, "RocksDB"),
+            Err(e) => {
+                eprintln!("built, but failed to reopen: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        print_report(&mut out, &report, log.path());
+        if let Some(code) = out.failed(&dir) {
+            return code;
         }
         return built_exit(&report, log.path());
     }
@@ -401,7 +445,9 @@ fn main() -> ExitCode {
         );
         match built {
             Ok(r) => {
-                print_bulk(name, &dir, &r, target, started);
+                // Installed: kept before anything is printed (bulkcli#3).
+                created.keep();
+                print_bulk(&mut out, name, &dir, &r, target, started);
                 bulk_installed = true;
                 for w in &r.warnings {
                     eprintln!(
@@ -427,9 +473,10 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+        created.keep();
         // Reopen to report stats.
         match Database::open(&dir) {
-            Ok(db) => print_stats(name, &dir, &db, started, "on-disk B+ tree"),
+            Ok(db) => print_stats(&mut out, name, &dir, &db, started, "on-disk B+ tree"),
             Err(e) => {
                 eprintln!("built, but failed to reopen: {e}");
                 return ExitCode::FAILURE;
@@ -449,11 +496,11 @@ fn main() -> ExitCode {
             eprintln!("failed to save database to {dir}: {e}");
             return ExitCode::FAILURE;
         }
-        print_stats(name, &dir, &db, started, "in-memory");
+        created.keep();
+        print_stats(&mut out, name, &dir, &db, started, "in-memory");
         report
     };
-    print_report(&report, &log_path);
-    created.keep();
+    print_report(&mut out, &report, &log_path);
     if cleanup_incomplete {
         return ExitCode::FAILURE;
     }
@@ -462,7 +509,40 @@ fn main() -> ExitCode {
     if existed && !bulk_installed && drop_old_rules(&dir) != ExitCode::SUCCESS {
         return ExitCode::FAILURE;
     }
+    if let Some(code) = out.failed(&dir) {
+        return code;
+    }
     built_exit(&report, &log_path)
+}
+
+/// gbuild's standard output: the summary of a build, written line by line;
+/// a write error (other than a reader gone away, which ends the output
+/// quietly) is remembered instead of panicking, so a full disk or a failing
+/// terminal never unwinds into the cleanup of a database that was built
+/// (review bulkcli#3).
+#[derive(Default)]
+struct Summary {
+    error: Option<std::io::Error>,
+}
+
+impl Summary {
+    fn line(&mut self, args: std::fmt::Arguments<'_>) {
+        if self.error.is_some() || gstore::stdout::is_closed() {
+            return;
+        }
+        let r = writeln!(std::io::stdout().lock(), "{args}");
+        if let Err(e) = gstore::stdout::quiet_broken_pipe(r) {
+            self.error = Some(e);
+        }
+    }
+
+    /// The exit status when the summary of a database built in `dir`
+    /// could not be printed (reported on standard error), else `None`.
+    fn failed(&self, dir: &str) -> Option<ExitCode> {
+        let e = self.error.as_ref()?;
+        eprintln!("gbuild: built '{dir}', but its summary could not be printed: {e}");
+        Some(ExitCode::FAILURE)
+    }
 }
 
 /// The exit status of a build that completed: 0, or [`SKIPPED`] when the
@@ -504,9 +584,14 @@ fn drop_old_rules(dir: &str) -> ExitCode {
 }
 
 /// The database directory a build created, removed when dropped unless the
-/// build succeeded ([`CreatedDir::keep`]).
+/// build succeeded ([`CreatedDir::keep`]) — only under the build's claim on
+/// it, taken before anything was written there, and only while it holds no
+/// database (review bulkcli#2: the cleanup used to remove the directory
+/// without its lock, deleting another process's build). The claim is
+/// released after the cleanup.
 struct CreatedDir {
     path: Option<PathBuf>,
+    claim: Option<(BuildGuard, gstore::db::dirlock::DirLock)>,
 }
 
 impl CreatedDir {
@@ -517,15 +602,18 @@ impl CreatedDir {
 
 impl Drop for CreatedDir {
     fn drop(&mut self) {
-        if let Some(p) = self.path.take() {
-            let _ = std::fs::remove_dir_all(p);
+        if let (Some(p), Some(_)) = (self.path.take(), &self.claim) {
+            if Database::storage_kind(&p).is_none() {
+                let _ = std::fs::remove_dir_all(p);
+            }
         }
+        self.claim = None;
     }
 }
 
 /// Build a RocksDB-backed database (each file parsed by its extension). Gated on
-/// the `rocksdb` feature. The import report of a build that completed;
-/// `None` (the error printed) when it failed.
+/// the `rocksdb` feature. The import report of a build that completed (the
+/// store closed again); `None` (the error printed) when it failed.
 #[cfg(feature = "rocksdb")]
 fn build_rocksdb(
     name: &str,
@@ -533,29 +621,18 @@ fn build_rocksdb(
     sources: &[Source],
     opts: &ImportOptions,
     log: &mut ParseErrorLog,
-    started: Instant,
 ) -> Option<ImportReport> {
     // Close the freshly built store before reopening it (RocksDB takes a lock).
-    let report =
-        match Database::build_rocksdb_from_sources(name.to_string(), dir, sources, opts, log) {
-            Ok((db, report)) => {
-                drop(db);
-                report
-            }
-            Err(e) => {
-                eprintln!("rocksdb build failed: {e}");
-                return None;
-            }
-        };
-    match Database::open(dir) {
-        Ok(db) => print_stats(name, dir, &db, started, "RocksDB"),
+    match Database::build_rocksdb_from_sources(name.to_string(), dir, sources, opts, log) {
+        Ok((db, report)) => {
+            drop(db);
+            Some(report)
+        }
         Err(e) => {
-            eprintln!("built, but failed to reopen: {e}");
-            return None;
+            eprintln!("rocksdb build failed: {e}");
+            None
         }
     }
-    print_report(&report, log.path());
-    Some(report)
 }
 
 #[cfg(not(feature = "rocksdb"))]
@@ -565,7 +642,6 @@ fn build_rocksdb(
     _sources: &[Source],
     _opts: &ImportOptions,
     _log: &mut ParseErrorLog,
-    _started: Instant,
 ) -> Option<ImportReport> {
     eprintln!("gbuild: --rocksdb requires building with `--features rocksdb`");
     None
@@ -579,46 +655,67 @@ fn holds_data(path: &Path) -> bool {
     }
 }
 
-fn print_stats(name: &str, dir: &str, db: &Database, started: Instant, backend: &str) {
-    gstore::outln!("Built database '{name}' in {dir} ({backend})");
-    gstore::outln!(
+fn print_stats(
+    out: &mut Summary,
+    name: &str,
+    dir: &str,
+    db: &Database,
+    started: Instant,
+    backend: &str,
+) {
+    out.line(format_args!("Built database '{name}' in {dir} ({backend})"));
+    out.line(format_args!(
         "  triples={}  entities={}  literals={}  predicates={}",
         db.triple_num(),
         db.entity_num(),
         db.literal_num(),
         db.predicate_num()
-    );
+    ));
     let quads: u64 = db.named_graphs().values().map(|g| g.triple_count()).sum();
     if quads > 0 {
-        gstore::outln!(
+        out.line(format_args!(
             "  named graphs={}  named-graph quads={quads}",
             db.named_graphs().len()
-        );
+        ));
     }
-    gstore::outln!("  took {:.3}s", started.elapsed().as_secs_f64());
+    out.line(format_args!(
+        "  took {:.3}s",
+        started.elapsed().as_secs_f64()
+    ));
 }
 
-fn print_bulk(name: &str, dir: &str, r: &BulkReport, target: BulkTarget, started: Instant) {
+fn print_bulk(
+    out: &mut Summary,
+    name: &str,
+    dir: &str,
+    r: &BulkReport,
+    target: BulkTarget,
+    started: Instant,
+) {
     let backend = match target {
         BulkTarget::Disk => "on-disk B+ tree",
         BulkTarget::RocksDb => "RocksDB",
     };
-    gstore::outln!("Built database '{name}' in {dir} ({backend}, bulk build)");
-    gstore::outln!("{}", r.summary_for(target));
-    gstore::outln!("  took {:.3}s", started.elapsed().as_secs_f64());
+    out.line(format_args!(
+        "Built database '{name}' in {dir} ({backend}, bulk build)"
+    ));
+    out.line(format_args!("{}", r.summary_for(target)));
+    out.line(format_args!(
+        "  took {:.3}s",
+        started.elapsed().as_secs_f64()
+    ));
 }
 
-fn print_report(report: &ImportReport, log: &Path) {
-    gstore::outln!(
+fn print_report(out: &mut Summary, report: &ImportReport, log: &Path) {
+    out.line(format_args!(
         "  read {} statement(s) from {} source(s)",
-        report.statements,
-        report.documents
-    );
+        report.statements, report.documents
+    ));
     if report.failed > 0 {
-        gstore::outln!(
+        out.line(format_args!(
             "  RDF parse error num {}; see {}",
             report.failed,
             log.display()
-        );
+        ));
     }
 }

@@ -278,9 +278,15 @@ pub fn zip_error(e: impl std::fmt::Display) -> String {
 /// of `gbuild` / `gadd` / `gsub`) under `limits` into a scratch directory
 /// beside the database directory `dir`, replacing the path by that
 /// directory, which is then read like any directory source; the scratch
-/// directories, removed when dropped. Every entry is accepted (as upstream);
-/// the directory walk reads the RDF files among them. Without the `zip`
-/// feature a package is an error naming it — never parsed as RDF.
+/// directories, removed when dropped. Each is a new directory with an
+/// unpredictable name (`<dir>.unzip-tmp-<pid>-<random>`), created
+/// exclusively ([`ScratchDir::create_unique`](gstore::zipio::ScratchDir::create_unique)):
+/// another tool's scratch directory is never reused or wiped (review
+/// bulkcli#6). The tools call this only once they hold the database's
+/// directory (`gbuild` its build claim, `gadd` / `gsub` the open database).
+/// Every entry is accepted (as upstream); the directory walk reads the RDF
+/// files among them. Without the `zip` feature a package is an error naming
+/// it — never parsed as RDF.
 pub fn unpack_packages(
     dir: &str,
     paths: &mut [String],
@@ -288,7 +294,7 @@ pub fn unpack_packages(
 ) -> Result<Vec<gstore::zipio::ScratchDir>, String> {
     use gstore::zipio::{self, ScratchDir};
     let mut unpacked = Vec::new();
-    for (i, p) in paths.iter_mut().enumerate() {
+    for p in paths.iter_mut() {
         let path = Path::new(p.as_str());
         if gstore::parser::import::is_url(p) || !path.is_file() || !zipio::is_zip_name(path) {
             continue;
@@ -296,7 +302,7 @@ pub fn unpack_packages(
         if !zipio::AVAILABLE {
             return Err(format!("cannot read '{p}': {}", zipio::FEATURE_MISSING));
         }
-        let scratch = ScratchDir::fresh(PathBuf::from(format!("{dir}.unzip-tmp-{i}")))
+        let scratch = ScratchDir::create_unique(Path::new(&format!("{dir}.unzip-tmp")))
             .map_err(|e| format!("cannot unpack '{p}': {e}"))?;
         zipio::unpack(path, scratch.path(), limits, &|_| true)
             .map_err(|e| format!("cannot unpack '{p}': {}", zip_error(e)))?;

@@ -1,9 +1,11 @@
 //! The staged, crash-safe install of a bulk build.
 //!
-//! The build holds the directory's [`DirLock`] (another process holding the
-//! directory makes it fail, and so does a database of this process that has
-//! it open) and a [`BuildGuard`] (another bulk build of this process makes
-//! it fail), and writes everything into `<dir>/.bulk-tmp/`, which no
+//! The build claims the directory with [`BuildGuard::lock`], which takes
+//! its [`DirLock`] in the same step (another process holding the directory
+//! makes it fail, and so do a database of this process that has it open and
+//! another bulk build of this process; while the claim lives no other thread
+//! of this process can open it), and writes everything into
+//! `<dir>/.bulk-tmp/`, which no
 //! layout detection looks at. A stale `.bulk-tmp/` from a crashed build is
 //! removed first. Once both files are complete and `fsync`ed, the install
 //! runs; after each step a crash leaves a directory that an unmodified
@@ -44,7 +46,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::db::dirlock::{BuildGuard, DirLock};
+use crate::db::dirlock::BuildGuard;
 use crate::db::fsutil::{remove_dir_if_exists, remove_file_if_exists, sync_dir};
 use crate::db::persist::remove_other_layouts;
 use crate::db::StorageKind;
@@ -185,17 +187,13 @@ pub(crate) fn build_disk(
 ) -> Result<BulkReport> {
     let started = Instant::now();
     fs::create_dir_all(dir)?;
-    let _guard = BuildGuard::enter(dir)?;
-    if DirLock::held_here(dir) {
-        // A database of this process has the directory open: replacing its
-        // files under it would strand its later writes (and a WAL of the
-        // old store could replay into the new one).
-        return Err(GStoreError::Database(format!(
-            "database directory '{}' is open in this process; close it before rebuilding it",
-            dir.display()
-        )));
-    }
-    let _lock = DirLock::acquire(dir)?;
+    // The claim and the lock in one step (review bulkcli#13): refused while
+    // a database of this process has the directory open (replacing its
+    // files under it would strand its later writes, and a WAL of the old
+    // store could replay into the new one), while another build of this
+    // process rebuilds it, or while another process holds it — and while
+    // the claim lives no other thread of this process opens it.
+    let (_guard, _lock) = BuildGuard::lock(dir)?;
     // `Database::open` takes the directory lock for the RocksDB layout too,
     // but an older binary does not (it relies on RocksDB's own
     // `rocksdb/LOCK`): the lock above cannot see it serving the store.
