@@ -286,19 +286,32 @@ fn main() {
                 );
                 std::process::exit(2);
             }
+            let refuse_non_loopback = || -> ! {
+                eprintln!(
+                    "error: GNLQA_HTTP_ALLOW_UNAUTHENTICATED=on only serves loopback clients; \
+                     refusing to bind the non-loopback address {addr} (set GNLQA_HTTP_TOKEN \
+                     instead)"
+                );
+                std::process::exit(2);
+            };
+            // Refuse before building the engine (which contacts the KB).
+            if matches!(auth, HttpAuth::LoopbackOnly) {
+                let all_loopback = std::net::ToSocketAddrs::to_socket_addrs(addr.as_str())
+                    .map(|mut it| it.all(|a| a.ip().is_loopback()))
+                    .unwrap_or(false);
+                if !all_loopback {
+                    refuse_non_loopback();
+                }
+            }
             let engine = Arc::new(build_engine(&cfg, mode, false));
             match HttpServer::bind(engine, &addr) {
                 Ok(server) => {
                     let server = server.with_auth(auth).with_limits(cfg.http_limits());
                     if matches!(server.auth(), HttpAuth::LoopbackOnly) {
+                        // and check the address actually bound
                         let local = server.local_addr().map(|a| a.ip().is_loopback());
                         if !matches!(local, Ok(true)) {
-                            eprintln!(
-                                "error: GNLQA_HTTP_ALLOW_UNAUTHENTICATED=on only serves loopback \
-                                 clients; refusing to bind the non-loopback address {addr} \
-                                 (set GNLQA_HTTP_TOKEN instead)"
-                            );
-                            std::process::exit(2);
+                            refuse_non_loopback();
                         }
                         eprintln!(
                             "gnlqa: warning: GNLQA_HTTP_ALLOW_UNAUTHENTICATED=on — answering \
