@@ -323,16 +323,76 @@ pub fn unpack_packages(
 /// truncated its result file before the database was even opened, and
 /// `gexport` wrote in place, leaving a partial file behind on a write
 /// error).
+///
+/// The destinations the tools used to write through keep working as they
+/// did ([`create`](Self::create)): a symbolic link to a file stays a link
+/// (the file it names is replaced), a replaced file keeps its permission
+/// bits and, where allowed, its owner, a file the user may not write is
+/// refused, and a destination that is not a regular file — a FIFO, a
+/// device such as `/dev/null`, a dangling link — is written in place,
+/// opened only when the output is ready (renaming over it would replace the
+/// FIFO or the device with a regular file).
 pub struct OutputFile {
+    /// Where the output goes (a symbolic link resolved to the file it
+    /// names).
     dest: PathBuf,
-    tmp: PathBuf,
+    /// The temporary file renamed over `dest`; `None` when the output is
+    /// written into `dest` itself.
+    tmp: Option<PathBuf>,
+    /// The open file (in place: opened by the first [`writer`](Self::writer)).
     file: Option<std::io::BufWriter<std::fs::File>>,
+    /// Whether [`finish`](Self::finish) closed the file.
+    finished: bool,
     committed: bool,
 }
 
 impl OutputFile {
-    /// Create the temporary file for `dest` (whose directory must exist).
+    /// The output file for `dest`: a temporary file beside it
+    /// ([`beside`](Self::beside)) when `dest` is a regular file (through
+    /// symbolic links: beside the file they name, whose permission bits and
+    /// owner the temporary file takes, and which must be writable, as an
+    /// in-place write needs) or does not exist; `dest` itself, written in
+    /// place, when it is something else (a FIFO, a device, a dangling
+    /// link). A directory is an error.
     pub fn create(dest: &Path) -> std::io::Result<OutputFile> {
+        use std::fs;
+        match fs::metadata(dest) {
+            Ok(meta) if meta.is_file() => {
+                let target = fs::canonicalize(dest)?;
+                // Opened without truncation, so nothing changes: a file the
+                // user may not write is refused as the in-place write
+                // refused it (renaming over it would replace it anyway).
+                fs::OpenOptions::new().write(true).open(&target)?;
+                match OutputFile::beside(&target) {
+                    Ok(out) => {
+                        out.keep_attributes(&meta);
+                        Ok(out)
+                    }
+                    // A writable file in a directory where no file can be
+                    // created: written in place, as before (still only once
+                    // the output is ready).
+                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                        Ok(OutputFile::in_place(&target))
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            Ok(meta) if meta.is_dir() => Err(std::io::Error::new(
+                std::io::ErrorKind::IsADirectory,
+                "is a directory",
+            )),
+            Ok(_) => Ok(OutputFile::in_place(dest)),
+            // A dangling symbolic link: written through, as before.
+            Err(_) if fs::symlink_metadata(dest).is_ok() => Ok(OutputFile::in_place(dest)),
+            // A new file (or a path that cannot be reached, which the
+            // creation of the temporary file reports).
+            Err(_) => OutputFile::beside(dest),
+        }
+    }
+
+    /// A temporary file beside `dest` (whose directory must exist), renamed
+    /// over `dest` on [`commit`](Self::commit) — whatever `dest` is.
+    pub fn beside(dest: &Path) -> std::io::Result<OutputFile> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let mut attempt = 0;
@@ -352,8 +412,9 @@ impl OutputFile {
                 Ok(f) => {
                     return Ok(OutputFile {
                         dest: dest.to_path_buf(),
-                        tmp,
+                        tmp: Some(tmp),
                         file: Some(std::io::BufWriter::new(f)),
+                        finished: false,
                         committed: false,
                     })
                 }
@@ -365,43 +426,89 @@ impl OutputFile {
         }
     }
 
-    /// Where the content is written until [`commit`](Self::commit).
-    pub fn tmp_path(&self) -> &Path {
-        &self.tmp
+    /// `dest` itself, opened (created or truncated) by the first
+    /// [`writer`](Self::writer).
+    fn in_place(dest: &Path) -> OutputFile {
+        OutputFile {
+            dest: dest.to_path_buf(),
+            tmp: None,
+            file: None,
+            finished: false,
+            committed: false,
+        }
     }
 
-    /// The writer of the temporary file (an error once it was
-    /// [`finish`](Self::finish)ed).
+    /// Give the temporary file the permission bits and, where this process
+    /// may, the owner of the file it replaces (best effort: a failure keeps
+    /// the defaults).
+    fn keep_attributes(&self, meta: &std::fs::Metadata) {
+        let Some(w) = &self.file else { return };
+        let f = w.get_ref();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            // Before the mode: a change of owner may clear set-id bits.
+            let _ = std::os::unix::fs::fchown(f, Some(meta.uid()), Some(meta.gid()));
+        }
+        let _ = f.set_permissions(meta.permissions());
+    }
+
+    /// The file the content is written to until [`commit`](Self::commit):
+    /// the temporary file, or the destination written in place.
+    pub fn path(&self) -> &Path {
+        self.tmp.as_deref().unwrap_or(&self.dest)
+    }
+
+    /// The writer (an error once the file was [`finish`](Self::finish)ed);
+    /// a destination written in place is opened by the first call.
     pub fn writer(&mut self) -> std::io::Result<&mut std::io::BufWriter<std::fs::File>> {
-        self.file
-            .as_mut()
-            .ok_or_else(|| std::io::Error::other("the output file is closed"))
+        if self.finished {
+            return Err(std::io::Error::other("the output file is closed"));
+        }
+        let file = match self.file.take() {
+            Some(f) => f,
+            None => std::io::BufWriter::new(std::fs::File::create(&self.dest)?),
+        };
+        Ok(self.file.insert(file))
     }
 
-    /// Flush the temporary file, sync it to disk and close it (it stays
-    /// under its temporary name, removed on drop unless committed).
+    /// Flush the file and close it; a temporary file is synced to disk
+    /// first and stays under its temporary name (removed on drop unless
+    /// committed). A destination written in place is opened (emptied) even
+    /// when nothing was written, and is not synced (a FIFO or a device
+    /// cannot be).
     pub fn finish(&mut self) -> std::io::Result<()> {
+        if self.finished {
+            return Ok(());
+        }
+        self.writer()?;
+        self.finished = true;
         if let Some(w) = self.file.take() {
             let f = w.into_inner().map_err(|e| e.into_error())?;
-            f.sync_all()?;
+            if self.tmp.is_some() {
+                f.sync_all()?;
+            }
         }
         Ok(())
     }
 
     /// Finish the file and rename it over the destination (then sync the
-    /// directory, best effort).
+    /// directory, best effort); a destination written in place is only
+    /// finished.
     pub fn commit(mut self) -> std::io::Result<()> {
         self.finish()?;
-        std::fs::rename(&self.tmp, &self.dest)?;
-        self.committed = true;
-        let parent = self
-            .dest
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        if let Ok(d) = std::fs::File::open(parent) {
-            let _ = d.sync_all();
+        if let Some(tmp) = &self.tmp {
+            std::fs::rename(tmp, &self.dest)?;
+            let parent = self
+                .dest
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            if let Ok(d) = std::fs::File::open(parent) {
+                let _ = d.sync_all();
+            }
         }
+        self.committed = true;
         Ok(())
     }
 }
@@ -410,7 +517,9 @@ impl Drop for OutputFile {
     fn drop(&mut self) {
         if !self.committed {
             drop(self.file.take());
-            let _ = std::fs::remove_file(&self.tmp);
+            if let Some(tmp) = &self.tmp {
+                let _ = std::fs::remove_file(tmp);
+            }
         }
     }
 }

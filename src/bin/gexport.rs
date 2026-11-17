@@ -30,7 +30,9 @@
 //! The output is written under a temporary name beside its destination and
 //! renamed into place once complete and synced: an export that fails (a
 //! full disk, a write error) leaves no partial file, and an existing file of
-//! that name as it was.
+//! that name as it was. A symbolic link stays a link (the file it names is
+//! replaced, keeping its permission bits); a FIFO or a device is written in
+//! place.
 
 #[path = "common/cli.rs"]
 mod cli;
@@ -258,7 +260,15 @@ fn main() -> ExitCode {
     } else {
         (base, None)
     };
-    let mut out = match cli::OutputFile::create(&dest) {
+    // A zip's export file is always a temporary file beside the archive
+    // (packed from there, never committed); a plain export goes where its
+    // destination is (a link's file, a FIFO or a device written in place).
+    let created = if archive.is_some() {
+        cli::OutputFile::beside(&dest)
+    } else {
+        cli::OutputFile::create(&dest)
+    };
+    let mut out = match created {
         Ok(f) => f,
         Err(e) => {
             eprintln!("cannot create '{}': {e}", dest.display());
@@ -282,7 +292,7 @@ fn main() -> ExitCode {
     let written = match archive {
         Some((archive, entry)) => {
             // `out` (the export file) is removed when it goes out of scope.
-            if let Err(e) = zipio::pack_file(out.tmp_path(), &archive, &entry) {
+            if let Err(e) = zipio::pack_file(out.path(), &archive, &entry) {
                 eprintln!("gexport: export compress fail: {e}");
                 return ExitCode::FAILURE;
             }

@@ -738,6 +738,107 @@ fn a_failed_zipped_gexport_leaves_no_temporary_file() {
     assert_eq!(leftovers(&base.0, "out."), vec!["out.zip".to_string()]);
 }
 
+/// The destinations `gquery -f` and `gexport` wrote through before
+/// bulkcli#10/#11 (as upstream does) still work with the
+/// temporary-file-and-rename output: a symbolic link keeps pointing at the
+/// file it names, which receives the output; a FIFO is written into, never
+/// replaced by a regular file (nor, run as root, a device such as
+/// `/dev/null`); a replaced file keeps its permission bits (a private
+/// result stays private); a read-only file is refused as before. The first
+/// version of the fix renamed its temporary file over the link, the FIFO
+/// and the device, and gave the result the default mode.
+#[cfg(unix)]
+#[test]
+fn query_and_export_outputs_keep_the_kind_and_mode_of_their_destination() {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    let base = TmpDir::new("output_kinds");
+    fs::write(base.0.join("new.nt"), NEW).unwrap();
+    let out = run("gbuild", &["t1", "new.nt"], &base.0);
+    assert!(out.status.success(), "{}", text(&out));
+    const Q: &str = "SELECT ?o WHERE { ?s ?p ?o }";
+    let is_link = |p: &Path| fs::symlink_metadata(p).unwrap().file_type().is_symlink();
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+
+    // A symbolic link: the file it names gets the output, the link stays.
+    for (tool_name, args, real, link) in [
+        (
+            "gquery",
+            vec!["t1", "-f", "link.txt", "-e", Q],
+            "real.txt",
+            "link.txt",
+        ),
+        ("gexport", vec!["t1", "link.nt"], "real.nt", "link.nt"),
+    ] {
+        fs::write(base.0.join(real), "old\n").unwrap();
+        std::os::unix::fs::symlink(real, base.0.join(link)).unwrap();
+        let out = run(tool_name, &args, &base.0);
+        assert!(out.status.success(), "{args:?}: {}", text(&out));
+        assert!(
+            is_link(&base.0.join(link)),
+            "{args:?}: the link was replaced"
+        );
+        let got = fs::read_to_string(base.0.join(real)).unwrap();
+        assert!(
+            got.contains("new1") && got.contains("new2"),
+            "{args:?}: {got}"
+        );
+    }
+
+    // A replaced file keeps its permission bits (0604: no common umask
+    // gives it to a new file).
+    for (tool_name, args, file) in [
+        (
+            "gquery",
+            vec!["t1", "-f", "private.txt", "-e", Q],
+            "private.txt",
+        ),
+        ("gexport", vec!["t1", "private.nt"], "private.nt"),
+    ] {
+        let p = base.0.join(file);
+        fs::write(&p, "old\n").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o604)).unwrap();
+        let out = run(tool_name, &args, &base.0);
+        assert!(out.status.success(), "{args:?}: {}", text(&out));
+        assert_eq!(mode(&p), 0o604, "{args:?}");
+        assert!(fs::read_to_string(&p).unwrap().contains("new1"), "{args:?}");
+    }
+
+    // A read-only file is refused, as the in-place write refused it (an
+    // unprivileged user only: root may write it anyway, then and now).
+    let ro = base.0.join("ro.txt");
+    fs::write(&ro, "old\n").unwrap();
+    fs::set_permissions(&ro, fs::Permissions::from_mode(0o444)).unwrap();
+    if fs::OpenOptions::new().write(true).open(&ro).is_err() {
+        let out = run("gquery", &["t1", "-f", "ro.txt", "-e", Q], &base.0);
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+        assert_eq!(fs::read_to_string(&ro).unwrap(), "old\n");
+    }
+
+    // A FIFO is written into: a reader on it receives the result.
+    let fifo = base.0.join("pipe.txt");
+    mkfifo(&fifo);
+    let (tx, rx) = mpsc::channel();
+    let reader = fifo.clone();
+    // Blocks in its open until gquery opens the FIFO for writing.
+    thread::spawn(move || {
+        let _ = tx.send(fs::read_to_string(&reader));
+    });
+    let out = run("gquery", &["t1", "-f", "pipe.txt", "-e", Q], &base.0);
+    assert!(out.status.success(), "{}", text(&out));
+    // Checked before waiting: a replaced FIFO would leave the reader
+    // blocked for good (on the unlinked FIFO; the thread is then leaked).
+    assert!(
+        fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo(),
+        "the FIFO was replaced by a regular file"
+    );
+    let got = rx
+        .recv_timeout(HANG_GUARD)
+        .expect("the reader got the result");
+    let got = got.unwrap();
+    assert!(got.contains("new1") && got.contains("new2"), "{got}");
+    assert!(leftovers(&base.0, ".part-").is_empty());
+}
+
 // ---- gserver's exit status (bulkcli#18) ---------------------------------------
 
 /// Review bulkcli#18: gserver answered invalid arguments with exit status 1

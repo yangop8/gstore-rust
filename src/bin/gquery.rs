@@ -14,7 +14,9 @@
 //! `-f`/`--resultfile FILE` writes the result to `FILE` instead of standard
 //! output (the counts still go to standard error) — under a temporary name
 //! beside it, renamed over `FILE` once complete: a query that fails leaves
-//! an existing `FILE` as it was.
+//! an existing `FILE` as it was. A symbolic link stays a link (the file it
+//! names is replaced, keeping its permission bits); a FIFO or a device
+//! (`/dev/null`) is written in place once the result is ready.
 //!
 //! Exit status: 0 answered, 1 failed, 2 invalid arguments; `-h`/`--help`.
 
