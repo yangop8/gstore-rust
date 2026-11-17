@@ -2462,7 +2462,7 @@ fn backup(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
             // Upstream replaces a backup of the same second.
             let _ = fs::remove_dir_all(&dest);
             // `Database::backup` carries the reasoning rules of the directory
-            // it is served from (`DbSlot::handle`), as upstream's
+            // it is served from (`DbSlot::prepare`), as upstream's
             // whole-directory copy does. Marked as a backup in progress
             // first: one a crash stops is never restored (round-3 review).
             fs::create_dir_all(&dest)

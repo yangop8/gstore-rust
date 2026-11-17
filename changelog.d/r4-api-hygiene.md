@@ -224,6 +224,10 @@ none
     named `DbSlot::handle` (the `ApiState::query_settings` field doc and
     `ApiInner::apply_query_settings`' doc) now name `PreparedSlot::serve`,
     since `DbSlot::handle` is test-only now.
+  - Two code comments that named `DbSlot::handle` as where a served
+    database learns its reasoning home now name `DbSlot::prepare`: one in
+    `src/gapi/ops_db.rs` `backup()` and one in `src/gapi/ops_reason.rs`
+    `file_store()` (one comment line each).
 - design#17 part 3 (consolidating round-named test files) and the
   remaining duplicates of gapi#15/design#13 are backlog entries (Docs
   notes), not done.
