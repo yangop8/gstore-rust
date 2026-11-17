@@ -474,7 +474,10 @@ pub(super) struct DiskTreeStats {
 /// one [`DiskTree::build_sorted`] (and so [`DiskTree::build`]) writes for the
 /// same entries — the same pages in the same order under the same version-1
 /// header — but written directly, without the page cache and its WAL, then
-/// `fsync`ed once. An existing file at `path` is replaced.
+/// `fsync`ed once. An existing file at `path` is replaced, with its
+/// write-ahead log, as [`DiskTree::build_sorted`] replaces it (round-4 review
+/// of disk#5: this writer truncated the file in place and left `<path>.wal`,
+/// whose stale batch the next open replayed into the new file).
 pub(super) fn write_sorted_stream<I>(path: &Path, entries: I) -> Result<DiskTreeStats>
 where
     I: IntoIterator<Item = Result<(EntityLiteralId, Signature)>>,
@@ -482,6 +485,7 @@ where
     use crate::kvstore::format;
     use std::io::{BufWriter, Seek, SeekFrom, Write};
 
+    Pager::remove_with_wal(path)?;
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -1179,6 +1183,29 @@ mod validation_tests {
                 .unwrap()
                 .entity_count(),
             10
+        );
+        // Round-4 review of disk#5: the streaming writer behind the public
+        // `VsTree::write_disk_sorted` truncated the file in place and left
+        // the log beside it; the next open replayed the stale batch into the
+        // new file (an empty tree).
+        {
+            use crate::kvstore::pager::failpoints;
+            let _fp = failpoints::fail_wal_delete();
+            assert!(DiskTree::build(&path, entries(5000)).is_err());
+        }
+        assert!(wal.exists(), "the build left its complete log");
+        let mut sorted = entries(10);
+        sort_entries(&mut sorted);
+        let (n, pages) =
+            super::super::VsTree::write_disk_sorted(&path, sorted.into_iter().map(Ok)).unwrap();
+        assert_eq!((n, pages), (10, 2));
+        assert!(!wal.exists(), "the stale log outlived the streaming write");
+        assert_eq!(
+            super::super::VsTree::open_disk(&path)
+                .unwrap()
+                .entity_count(),
+            10,
+            "the stale batch was replayed into the streamed file"
         );
     }
 
