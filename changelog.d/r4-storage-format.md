@@ -235,7 +235,24 @@ none
   candidates from a five-page file; a complete stale log, against the code
   before disk#5 — the new 10-entity file was 679,936 bytes instead of
   8,192; an overflow record of
-  `u32::MAX` bytes — `Ok(..)` after following the chain.
+  `u32::MAX` bytes — `Ok(..)` after following the chain. The bench smoke
+  gate was not rerun for these additions: the node checks run only when a
+  scan reads `vstree.kv` (`VsPolicy::Tree`; the default `Auto` never does),
+  a union of at most 32 signatures per node read, and the overflow bound
+  only on a `compact`ed store's overflow records. After the review commits
+  (4 vCPUs shared with three other worktrees): `cargo +1.99.1 fmt --all
+  --check` clean; `cargo clippy --workspace --all-targets -D warnings`
+  clean; `cargo test --workspace --no-fail-fast` 2,943 passed / 0 failed /
+  9 ignored (181 test binaries) with `GSTORE_DISK_QUERY_MODE=memory` and
+  the same with `=stream`; with `--features rocksdb` (shared rocks target,
+  under its lock) `cargo clippy -p gstore --all-targets -D warnings` clean
+  and `cargo test -p gstore --no-fail-fast` 2,804 passed / 0 failed / 9
+  ignored (169 binaries); `CARGO="cargo +1.99.1" scripts/compat-fixtures.sh
+  --offline --work …` OK end to end (fresh and checked-in fixtures, old
+  `gquery` reads the current snapshot and version-1 databases and refuses
+  version 2 with "not a gStore KV file", old `restore_incremental` fails
+  with "unknown redo.log op 'C'"), and its scratch worktree and work
+  directory were removed.
 
 ## Requests/Not yet
 
