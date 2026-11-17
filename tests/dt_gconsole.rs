@@ -1330,7 +1330,10 @@ fn the_local_mode_saves_acknowledged_updates_when_it_leaves_a_database() {
         assert_eq!(r.code, 0, "{how}: {r:?}");
         assert!(r.out.contains("[updated 1 triple(s)]"), "{how}: {r:?}");
         assert_eq!(triples_in(&kept), 2, "{how}: the insert is kept: {r:?}");
-        assert!(r.out.contains("saved to "), "{how}: the save is reported: {r:?}");
+        assert!(
+            r.out.contains("saved to "),
+            "{how}: the save is reported: {r:?}"
+        );
         fs::remove_dir_all(&kept).unwrap();
     }
     // Nothing changed: nothing is written.
@@ -1346,6 +1349,47 @@ fn the_local_mode_saves_acknowledged_updates_when_it_leaves_a_database() {
     let r = run(cmd, insert);
     assert_eq!(r.code, 0, "{r:?}");
     assert_eq!(triples_in(&cwd.join("fresh.db")), 1, "{r:?}");
+}
+
+/// review ext#9: `gconsole --local` ends a statement by the remote
+/// console's rule — at a `;` outside `{…}` groups, string literals and
+/// `<IRI>`s — not at any line ending in `;`: a multi-line SELECT with a
+/// predicate-object list, a long literal whose first line ends in `;`, two
+/// statements on one line and a multi-operation update sharing its prologue
+/// all run, and a script's final statement may lack its `;`.
+#[test]
+fn the_local_mode_ends_statements_like_the_remote_console() {
+    let cwd = scratch("gc_local_statements");
+    let _cwd = DirGuard(cwd.clone());
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_gconsole"));
+    cmd.current_dir(&cwd).args(["--local", "memdb"]);
+    let r = run(
+        cmd,
+        "insert data { <http://s> <http://p> \"a\" . <http://s> <http://q> \"b\" };\n\
+         select ?s ?z where { ?s <http://p> ?o ;\n\
+         <http://q> ?z };\n\
+         insert data { <http://s> <http://r> \"\"\"line one;\n\
+         line two\"\"\" };\n\
+         ask { <http://s> <http://r> \"line one;\\nline two\" };\n\
+         select (1 as ?first) {}; select (2 as ?second) {};\n\
+         prefix ex: <http://ex/> insert data { ex:a ex:p ex:b } ; insert data { ex:c ex:p ex:d };\n\
+         select (count(*) as ?n) where { ?x <http://ex/p> ?y }",
+    );
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.err.is_empty(), "no statement failed: {r:?}");
+    assert!(r.out.contains("\"b\""), "the multi-line SELECT ran: {r:?}");
+    assert!(
+        r.out.contains("true"),
+        "the long literal kept its ';': {r:?}"
+    );
+    assert!(
+        r.out.contains("?first") && r.out.contains("?second"),
+        "{r:?}"
+    );
+    assert!(
+        r.out.contains("\"2\"^^"),
+        "both operations of the update, and the final statement without ';': {r:?}"
+    );
 }
 
 /// `create` / `batchinsert` / `batchremove` against a real server whose

@@ -18,8 +18,13 @@
 //! `quit` stays in the console (a second `quit` leaves without saving); at
 //! the end of the input the failure is reported (exit code 1).
 //!
-//! Type a SPARQL statement terminated by `;` to run it. Commands (with or
-//! without a final `;`): `help`, `stats`, `save`, `load <name>`,
+//! Type a SPARQL statement terminated by `;` to run it; it may span lines,
+//! and a `;` inside a `{…}` group, a string literal, an `<IRI>` or a `#`
+//! comment does not end it (the remote console's rule, see
+//! [`super::syntax`]); a script's final statement may lack its `;`.
+//! Consecutive update operations completed on one line (`op ; op;`) run as
+//! one request. Commands (on a line of their own, with or without a final
+//! `;`): `help`, `stats`, `save`, `load <name>`,
 //! `import <file|dir|url>` (any RDF format the loaders read, chosen by the
 //! extension; N-Quads / TriG keep their named graphs), `quit` / `exit`.
 //! `load <iri> …` / `load silent …`, in any case, is SPARQL's `LOAD`, not
@@ -31,6 +36,7 @@
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
+use super::syntax::{self, Next};
 use crate::parser::import::{self, ImportOptions};
 use crate::{db_dir_for, Database, QueryResult, StorageKind};
 
@@ -176,16 +182,13 @@ pub fn run(target: &str) -> i32 {
 
         buffer.push_str(&line);
         buffer.push('\n');
-
-        // A query is complete when a line ends with ';'.
-        if trimmed.ends_with(';') {
-            let query = buffer.trim().trim_end_matches(';').to_string();
-            buffer.clear();
-            if !run_query(&mut db, &query) {
-                failures += 1;
-            }
-        }
+        failures += run_statements(&mut db, &mut buffer, false);
         print_prompt(&buffer);
+    }
+    // A script's final statement may lack its `;` (a person's unfinished
+    // one is dropped), as in the remote console.
+    if !interactive {
+        failures += run_statements(&mut db, &mut buffer, true);
     }
     // The end of the input: the updates are kept, whatever the layout.
     if !save_if_unsaved(&db, &mut saved_at) {
@@ -238,6 +241,37 @@ fn save(db: &Database, saved_at: &mut u64) -> bool {
 /// them, review ext#5); `true` when nothing is left unsaved.
 fn save_if_unsaved(db: &Database, saved_at: &mut u64) -> bool {
     !unsaved(db, *saved_at) || save(db, saved_at)
+}
+
+/// Run the statements `buffer` completes and remove them from it, leaving
+/// the start of an unfinished one; with `at_eof` a final statement without
+/// `;` is complete too. A statement ends as in the remote console
+/// ([`syntax::next_sparql_statement`]: at a `;` outside `{…}` groups,
+/// string literals, `<IRI>`s and `#` comments, review ext#9), and the
+/// consecutive update operations completed together (`op ; op;` on a line)
+/// run as one request, sharing their prologue as SPARQL 1.1 Update reads
+/// them ([`syntax::group_updates`]). Returns how many failed.
+fn run_statements(db: &mut Database, buffer: &mut String, at_eof: bool) -> usize {
+    let mut statements = Vec::new();
+    loop {
+        match syntax::next_sparql_statement(buffer, at_eof) {
+            Next::Statement { text, consumed } => {
+                statements.push(text);
+                buffer.drain(..consumed);
+            }
+            Next::Blank { consumed } => {
+                buffer.drain(..consumed);
+                if buffer.is_empty() {
+                    break;
+                }
+            }
+            Next::Incomplete => break,
+        }
+    }
+    syntax::group_updates(statements)
+        .iter()
+        .filter(|query| !run_query(db, query))
+        .count()
 }
 
 /// Whether the text after `load ` is SPARQL's `LOAD [SILENT] <iri> …`
