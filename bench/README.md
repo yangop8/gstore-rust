@@ -136,9 +136,19 @@ code 2):
 5. **update** (last, it writes) — `singles` single-triple `INSERT DATA`
    statements and their `DELETE DATA` (median, p95; each must change exactly
    one triple); the update chunk (a disjoint department) inserted with one
-   `INSERT DATA` (`triple_num` must grow by exactly its unique triples) and
-   deleted again; every query re-run (answers must be unchanged); a
-   checkpoint; a reopen (the triple count must match). Dictionary growth is
+   `INSERT DATA` (`triple_num` must grow by exactly its unique triples), a
+   checkpoint and a reopen with it inserted (the original count plus the
+   chunk's), the chunk's `DELETE DATA` (it must remove every chunk triple,
+   and the count must be the original again); every query re-run (answers
+   must be unchanged); a checkpoint; a reopen (the original count); every
+   query re-run on the reopened database (answers must be unchanged).
+   Before review infra#9 every write was undone before the only checkpoint
+   and the answers were not re-checked after the reopen, so a checkpoint
+   that lost pending inserts and deletes alike passed; `--inject
+   lose-writes:update` (a checkpoint that restores the database as the phase
+   found it) now fails `exact.update_round_trip`. The first checkpoint and
+   reopen are recorded as `grown_checkpoint_ms` / `grown_reopen_ms`;
+   `checkpoint_ms` / `reopen_ms` remain the final ones. Dictionary growth is
    reported only.
 6. **mixed** (it writes too) — readers plus a paced writer on the bundled
    servers, per endpoint (`/sparql`, `/api`) and `check_point` setting (off,

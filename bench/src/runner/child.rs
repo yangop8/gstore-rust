@@ -64,7 +64,9 @@ pub struct ChildRequest {
     /// The query phase's answers, which the update phase must reproduce.
     #[serde(default)]
     pub expected: Expected,
-    /// Test hook: `crash:<phase>` aborts, `timeout:<phase>` hangs.
+    /// Test hook: `crash:<phase>` aborts, `timeout:<phase>` hangs,
+    /// `lose-writes:update` makes the update phase's checkpoints lose every
+    /// pending write.
     #[serde(default)]
     pub inject: Option<String>,
     /// Shrink the calibration (tests).
@@ -165,6 +167,7 @@ fn run(req: &ChildRequest) -> Result<serde_json::Value, String> {
                 chunk,
                 req.chunk_triples,
                 &req.expected,
+                req.inject.as_deref() == Some("lose-writes:update"),
             )?)
         }
         other => Err(format!("unknown phase '{other}'")),

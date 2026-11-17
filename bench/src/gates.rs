@@ -410,6 +410,21 @@ fn self_check_section(s: &Section<'_>, out: &mut Vec<GateOutcome>) {
             if !u.reopen_ok {
                 why.push(format!("reopened triple_num {}", u.reopen_triple_num));
             }
+            if u.grown_reopen_ok == Some(false) {
+                why.push(format!(
+                    "lost writes: reopened with the chunk inserted, triple_num {} and {} of \
+                     {} chunk triples to delete",
+                    u.grown_reopen_triple_num.unwrap_or(0),
+                    u.chunk_deleted_after_reopen.unwrap_or(0),
+                    u.chunk_triples
+                ));
+            }
+            if u.answers_after_reopen_ok == Some(false) {
+                why.push(format!(
+                    "answers changed after the reopen: {}",
+                    u.reopen_mismatched.join(",")
+                ));
+            }
             out.push(GateOutcome::exact(
                 "exact.update_round_trip",
                 format!("{pre}{b}"),

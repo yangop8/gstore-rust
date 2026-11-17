@@ -225,9 +225,99 @@ fn update_ok(r: QueryResult) -> Result<usize, String> {
     }
 }
 
-/// The update phase: `singles` single-triple inserts and their deletes, the
-/// chunk inserted and deleted, the answers re-checked, a checkpoint and a
-/// reopen.
+/// Copy the directory tree `from` to `to` (which must not exist).
+fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(to).map_err(|e| format!("{}: {e}", to.display()))?;
+    let rd = std::fs::read_dir(from).map_err(|e| format!("{}: {e}", from.display()))?;
+    for e in rd {
+        let e = e.map_err(|e| format!("{}: {e}", from.display()))?;
+        let (src, dst) = (e.path(), to.join(e.file_name()));
+        if e.file_type().map_err(|x| x.to_string())?.is_dir() {
+            copy_dir(&src, &dst)?;
+        } else {
+            std::fs::copy(&src, &dst).map_err(|x| format!("{}: {x}", src.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// The test hook `--inject lose-writes:update`: a copy of the database as
+/// the update phase found it, which every "checkpoint" restores instead of
+/// saving — a checkpoint that loses every pending write.
+struct LoseWrites {
+    copy: std::path::PathBuf,
+}
+
+impl LoseWrites {
+    fn new(dir: &Path) -> Result<LoseWrites, String> {
+        let mut name = dir.file_name().unwrap_or_default().to_os_string();
+        name.push(".lose-writes");
+        let copy = dir.with_file_name(name);
+        let _ = std::fs::remove_dir_all(&copy);
+        copy_dir(dir, &copy)?;
+        Ok(LoseWrites { copy })
+    }
+
+    fn restore(&self, dir: &Path) -> Result<(), String> {
+        std::fs::remove_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        copy_dir(&self.copy, dir)
+    }
+}
+
+impl Drop for LoseWrites {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.copy);
+    }
+}
+
+/// Checkpoint `db`, close it and open `dir` again: (checkpoint ms, the
+/// reopened database, reopen ms).
+fn checkpoint_and_reopen(
+    db: Database,
+    dir: &Path,
+    lose: Option<&LoseWrites>,
+) -> Result<(f64, Database, f64), String> {
+    let t = Instant::now();
+    match lose {
+        None => {
+            db.checkpoint().map_err(|e| format!("checkpoint: {e}"))?;
+            drop(db);
+        }
+        Some(l) => {
+            drop(db);
+            l.restore(dir)?;
+        }
+    }
+    let checkpoint_ms = ms(t);
+    let (db, reopen_ms) = open_db(dir)?;
+    Ok((checkpoint_ms, db, reopen_ms))
+}
+
+/// The queries of `w` whose answers differ from `expected`.
+fn mismatched(db: &mut Database, w: &dyn Workload, expected: &Expected, tag: &str) -> Result<Vec<String>, String> {
+    let mut v = Vec::new();
+    for q in w.queries() {
+        let (_, rows, h) = run_query(db, &q, tag)?;
+        match expected.iter().find(|(n, _, _)| *n == q.name) {
+            Some((_, r0, h0)) if *r0 == rows && *h0 == hex(h) => {}
+            Some(_) => v.push(q.name.clone()),
+            None => {}
+        }
+    }
+    Ok(v)
+}
+
+/// The update phase: `singles` single-triple inserts and their deletes;
+/// the chunk inserted, a checkpoint and a reopen with it inserted (the
+/// original count plus the chunk's, and its delete must remove every chunk
+/// triple); the answers re-checked; a checkpoint and a reopen after the
+/// delete (the original count), and the answers checked again on the
+/// reopened database (review infra#9: every write used to be undone before
+/// the only checkpoint, and the answers were not re-checked after the
+/// reopen, so lost writes or a corrupted index went unseen).
+///
+/// `lose_writes` (the test hook `--inject lose-writes:update`) makes every
+/// checkpoint restore the database as the phase found it instead.
 pub fn update_phase(
     dir: &Path,
     w: &dyn Workload,
@@ -235,7 +325,13 @@ pub fn update_phase(
     chunk: &Path,
     chunk_triples: u64,
     expected: &Expected,
+    lose_writes: bool,
 ) -> Result<UpdateResult, String> {
+    let lose = if lose_writes {
+        Some(LoseWrites::new(dir)?)
+    } else {
+        None
+    };
     let (mut db, _) = open_db(dir)?;
     db.set_query_cache_size(0);
     let original = db.triple_num();
@@ -275,32 +371,31 @@ pub fn update_phase(
     let chunk_insert_ms = ms(t);
     update_ok(r)?;
     let grown = db.triple_num();
+
+    // Persist the chunk and read it back.
+    let (grown_checkpoint_ms, mut db, grown_reopen_ms) =
+        checkpoint_and_reopen(db, dir, lose.as_ref())?;
+    db.set_query_cache_size(0);
+    let grown_reopen_triple_num = db.triple_num();
+
     let t = Instant::now();
     let r = db
         .query(&format!("DELETE DATA {{\n{body}}}"))
         .map_err(|e| format!("chunk delete: {e}"))?;
     let chunk_delete_ms = ms(t);
-    update_ok(r)?;
+    let deleted = update_ok(r)? as u64;
     let shrunk = db.triple_num();
     let chunk_delta_ok = grown == original + chunk_triples && shrunk == original;
+    let grown_reopen_ok =
+        grown_reopen_triple_num == original + chunk_triples && deleted == chunk_triples;
 
-    let mut mismatched = Vec::new();
-    for q in w.queries() {
-        let (_, rows, h) = run_query(&mut db, &q, "update check")?;
-        match expected.iter().find(|(n, _, _)| *n == q.name) {
-            Some((_, r0, h0)) if *r0 == rows && *h0 == hex(h) => {}
-            Some(_) => mismatched.push(q.name.clone()),
-            None => {}
-        }
-    }
+    let before_reopen = mismatched(&mut db, w, expected, "update check")?;
     let entities_after = db.entity_num() as u64;
     let literals_after = db.literal_num() as u64;
-    let t = Instant::now();
-    db.checkpoint().map_err(|e| format!("checkpoint: {e}"))?;
-    let checkpoint_ms = ms(t);
-    drop(db);
-    let (db, reopen_ms) = open_db(dir)?;
+    let (checkpoint_ms, mut db, reopen_ms) = checkpoint_and_reopen(db, dir, lose.as_ref())?;
+    db.set_query_cache_size(0);
     let reopen_triple_num = db.triple_num();
+    let after_reopen = mismatched(&mut db, w, expected, "reopen check")?;
     Ok(UpdateResult {
         singles,
         single_insert_median_ms: (!ins.is_empty()).then(|| median(&ins)),
@@ -312,12 +407,19 @@ pub fn update_phase(
         chunk_insert_ms,
         chunk_delete_ms,
         chunk_delta_ok,
-        answers_unchanged: mismatched.is_empty(),
-        mismatched,
+        answers_unchanged: before_reopen.is_empty(),
+        mismatched: before_reopen,
         checkpoint_ms,
         reopen_ms,
         reopen_triple_num,
         reopen_ok: reopen_triple_num == original,
+        grown_checkpoint_ms: Some(grown_checkpoint_ms),
+        grown_reopen_ms: Some(grown_reopen_ms),
+        grown_reopen_triple_num: Some(grown_reopen_triple_num),
+        chunk_deleted_after_reopen: Some(deleted),
+        grown_reopen_ok: Some(grown_reopen_ok),
+        answers_after_reopen_ok: Some(after_reopen.is_empty()),
+        reopen_mismatched: after_reopen,
         entities_before,
         entities_after,
         literals_before,
