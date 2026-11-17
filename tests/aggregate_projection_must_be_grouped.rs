@@ -73,10 +73,18 @@ fn run_everywhere(q: &str) -> Vec<(String, gstore::Result<QueryResult>)> {
 fn rejected(q: &str, var: &str) {
     for (run, r) in run_everywhere(q) {
         match r {
-            Err(GStoreError::Query(msg)) => assert!(
-                msg.contains(&format!("?{var} is not grouped")) && msg.contains("§11.4"),
-                "[{run}] {q}: unexpected message {msg:?}"
-            ),
+            Err(GStoreError::Query(msg)) => {
+                assert!(
+                    msg.contains(&format!("?{var} is not grouped")) && msg.contains("§11.4"),
+                    "[{run}] {q}: unexpected message {msg:?}"
+                );
+                // One sentence: the source's line breaks must not leak runs
+                // of indentation into the message a client sees.
+                assert!(
+                    !msg.contains("  ") && msg.contains("of the WHERE pattern, or use it"),
+                    "[{run}] {q}: garbled message {msg:?}"
+                );
+            }
             other => panic!("[{run}] {q}: expected a query error, got {other:?}"),
         }
     }

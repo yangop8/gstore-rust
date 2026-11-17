@@ -2603,7 +2603,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     "a GROUP BY query"
                 };
                 return Err(GStoreError::Query(format!(
-                    "?{v} is not grouped: {what} may project a variable of the WHERE                      pattern, or use it in a SELECT expression, only as a GROUP BY key or                      inside an aggregate (SPARQL 1.1 §11.4); group by ?{v} or project                      (SAMPLE(?{v}) AS ?…)"
+                    "?{v} is not grouped: {what} may project a variable of the WHERE \
+                     pattern, or use it in a SELECT expression, only as a GROUP BY key or \
+                     inside an aggregate (SPARQL 1.1 §11.4); group by ?{v} or project \
+                     (SAMPLE(?{v}) AS ?…)"
                 )));
             }
             if let SelectItem::Expr(_, alias) = it {
