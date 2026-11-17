@@ -26,13 +26,43 @@ fn query(digits: usize) -> String {
     )
 }
 
+/// The CPU time this thread has used (Linux; wall time elsewhere): what
+/// an evaluation costs whatever else the machine runs — wall time also
+/// counts the time the thread waits for a CPU, which on a busy machine hits
+/// a long run far more than a short one.
+fn thread_cpu_time() -> Duration {
+    #[cfg(target_os = "linux")]
+    {
+        #[repr(C)]
+        struct Timespec {
+            tv_sec: std::ffi::c_long,
+            tv_nsec: std::ffi::c_long,
+        }
+        extern "C" {
+            fn clock_gettime(clock: i32, tp: *mut Timespec) -> i32;
+        }
+        const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
+        let mut ts = Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a valid, writable timespec.
+        if unsafe { clock_gettime(CLOCK_THREAD_CPUTIME_ID, &mut ts) } == 0 {
+            return Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32);
+        }
+    }
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed()
+}
+
 /// Evaluate `q` against a fresh evaluator (no result cache), timing the
-/// evaluation only (the query text is parsed outside the clock).
+/// evaluation only (the query text is parsed outside the clock) as the CPU
+/// time of this thread.
 fn run(db: &Database, q: &str, digits: usize) -> Duration {
     let parsed = gstore::parser::sparql::parse(q).expect("parse");
-    let t = Instant::now();
+    let t = thread_cpu_time();
     let r = Evaluator::new(db.dict(), db.store()).evaluate(&parsed);
-    let elapsed = t.elapsed();
+    let elapsed = thread_cpu_time().saturating_sub(t);
     match r {
         Ok(QueryResult::Select(rs)) => {
             assert_eq!(rs.rows.len(), 1);
@@ -49,27 +79,36 @@ fn run(db: &Database, q: &str, digits: usize) -> Duration {
 }
 
 /// D9 (a doubling test, timed because the parser has no work counter):
-/// four times the digits cost about four times as long. The small and the
-/// large run alternate, best of three each, so a change of the machine's
-/// load hits both alike; the bound (8×, plus 50 ms for a scheduler slice)
-/// leaves a linear parser room and still fails a quadratic one by twice
-/// (200,000 digits 0.43 s against 6.5 s for 800,000 before the fix).
+/// four times the digits cost about four times as long. The CPU time of
+/// the evaluating thread is measured, the small and the large run
+/// alternate, best of three each, so a change of the machine's load hits
+/// both alike, and a miss is measured again (up to three times) before it
+/// fails; the bound (8×, plus 50 ms) leaves a linear parser room and still
+/// fails a quadratic one by twice (200,000 digits 0.43 s against 6.5 s for
+/// 800,000 before the fix).
 #[test]
 fn a_long_digit_run_after_a_dollar_costs_linear_time() {
     let db = Database::build_from_str("replace", "<http://ex/s> <http://ex/p> \"a\" .\n")
         .expect("build the test database");
     let (n_small, n_large) = (200_000, 800_000);
     let (q_small, q_large) = (query(n_small), query(n_large));
-    let (mut small, mut large) = (Duration::MAX, Duration::MAX);
-    for _ in 0..3 {
-        small = small.min(run(&db, &q_small, n_small));
-        large = large.min(run(&db, &q_large, n_large));
+    let mut miss = String::new();
+    for attempt in 0..3 {
+        let (mut small, mut large) = (Duration::MAX, Duration::MAX);
+        for _ in 0..3 {
+            small = small.min(run(&db, &q_small, n_small));
+            large = large.min(run(&db, &q_large, n_large));
+        }
+        if large <= small * 8 + Duration::from_millis(50) {
+            return;
+        }
+        miss = format!(
+            "4x the digits took {:.1}x as long ({small:?} -> {large:?} CPU time, attempt {attempt})",
+            large.as_secs_f64() / small.as_secs_f64().max(1e-9)
+        );
+        eprintln!("{miss}");
     }
-    assert!(
-        large <= small * 8 + Duration::from_millis(50),
-        "4x the digits took {:.1}x as long ({small:?} -> {large:?})",
-        large.as_secs_f64() / small.as_secs_f64().max(1e-9)
-    );
+    panic!("{miss}");
 }
 
 /// The references a long run resolves to keep §5.6.3's answers: a run of

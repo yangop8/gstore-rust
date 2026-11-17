@@ -39,6 +39,23 @@ use super::{Binding, FxBuildHasher};
 /// rows together; a part without an index past that is scanned.
 pub(super) const PARTIAL_INDEX_FACTOR: usize = 4;
 
+thread_local! {
+    /// The rows the dropped [`RowIndex`]es of this thread looked at (see
+    /// [`rows_visited_on_this_thread`]).
+    static VISITED: Cell<u64> = const { Cell::new(0) };
+}
+
+/// How many rows the [`RowIndex`]es of this thread looked at, counted when
+/// each is dropped: one per candidate handed out, plus the rows a partial
+/// lookup scanned or indexed. The evaluator reports the part its
+/// evaluation added as `EvalStats::join_probe_rows`, a work counter that
+/// stays about the operators' output where a nested loop would count
+/// |left| × |right| (round-3 review: the scaling tests of these operators
+/// timed them, and failed on a busy machine).
+pub(super) fn rows_visited_on_this_thread() -> u64 {
+    VISITED.try_with(Cell::get).unwrap_or(0)
+}
+
 /// Row indices of the right operand, ascending.
 type Rows = Vec<usize>;
 /// Key values (one per key variable, in key order) → the rows holding them.
@@ -72,10 +89,13 @@ impl Group {
         values: &[u32],
         held: &Cell<usize>,
         cap: usize,
+        visited: &Cell<u64>,
     ) -> Rows {
         if let Some(found) = self.partial.borrow().get(part) {
             return found.get(values).cloned().unwrap_or_default();
         }
+        // Scanned or indexed: every row of the group is looked at.
+        visited.set(visited.get() + self.rows.len() as u64);
         let entries = held.get().saturating_add(self.rows.len());
         if entries > cap {
             return self
@@ -116,6 +136,17 @@ pub(super) struct RowIndex {
     /// together, and the most they may ([`PARTIAL_INDEX_FACTOR`] × rows).
     partial_held: Cell<usize>,
     partial_cap: usize,
+    /// The rows looked at so far (see [`rows_visited_on_this_thread`]).
+    visited: Cell<u64>,
+}
+
+impl Drop for RowIndex {
+    fn drop(&mut self) {
+        let n = self.visited.get();
+        if n > 0 {
+            let _ = VISITED.try_with(|v| v.set(v.get().wrapping_add(n)));
+        }
+    }
 }
 
 impl RowIndex {
@@ -160,6 +191,7 @@ impl RowIndex {
             groups,
             partial_held: Cell::new(0),
             partial_cap: PARTIAL_INDEX_FACTOR.saturating_mul(rows.len()),
+            visited: Cell::new(0),
         }
     }
 
@@ -208,6 +240,10 @@ impl RowIndex {
         f: &mut impl FnMut(usize) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
         let bound = g.key.iter().filter(|&&v| l[v].is_some()).count();
+        let mut f = |ri: usize| {
+            self.visited.set(self.visited.get() + 1);
+            f(ri)
+        };
         if bound == 0 {
             // No shared variable bound on both sides: every row agrees.
             for &ri in &g.rows {
@@ -223,7 +259,14 @@ impl RowIndex {
         } else {
             let part: Vec<usize> = g.key.iter().copied().filter(|&v| l[v].is_some()).collect();
             let values: Vec<u32> = part.iter().map(|&v| l[v].unwrap_or(u32::MAX)).collect();
-            for ri in g.partial_lookup(rows, &part, &values, &self.partial_held, self.partial_cap) {
+            for ri in g.partial_lookup(
+                rows,
+                &part,
+                &values,
+                &self.partial_held,
+                self.partial_cap,
+                &self.visited,
+            ) {
                 f(ri)?;
             }
         }

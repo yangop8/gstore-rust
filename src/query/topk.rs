@@ -215,6 +215,31 @@ pub struct EvalStats {
     /// node it expands, per step of its inner path) — the work a path
     /// pattern costs.
     pub path_steps: u64,
+    /// Rows of the hashed operand of an OPTIONAL, MINUS or join (its
+    /// `RowIndex`) looked at for left solutions: one per candidate handed
+    /// out, plus the rows a lookup on part of the shared variables scanned
+    /// or indexed — about the operators' output, where comparing every
+    /// left solution with every right one would count |left| × |right|.
+    /// Counted for the evaluation calls ([`Evaluator::evaluate`],
+    /// [`Evaluator::eval_update_modify`]) that ran them.
+    pub join_probe_rows: u64,
+}
+
+/// Adds the rows the `RowIndex`es of this thread looked at while it lived
+/// to an evaluator's [`EvalStats::join_probe_rows`]
+/// ([`Evaluator::count_join_probes`]).
+pub(super) struct JoinProbeCount {
+    stats: Rc<std::cell::Cell<EvalStats>>,
+    start: u64,
+}
+
+impl Drop for JoinProbeCount {
+    fn drop(&mut self) {
+        let n = probe::rows_visited_on_this_thread().wrapping_sub(self.start);
+        let mut s = self.stats.get();
+        s.join_probe_rows = s.join_probe_rows.wrapping_add(n);
+        self.stats.set(s);
+    }
 }
 
 /// What a streaming consumer tells the producer: go on, or stop.
@@ -269,6 +294,16 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         let mut s = self.stats.get();
         f(&mut s);
         self.stats.set(s);
+    }
+
+    /// Count the rows the operators' `RowIndex`es look at while the
+    /// returned guard lives into [`EvalStats::join_probe_rows`] (they are
+    /// counted per thread, when each index is dropped).
+    pub(super) fn count_join_probes(&self) -> JoinProbeCount {
+        JoinProbeCount {
+            stats: Rc::clone(&self.stats),
+            start: probe::rows_visited_on_this_thread(),
+        }
     }
 
     /// Count `n` BGP solutions produced by a triple-pattern extension.

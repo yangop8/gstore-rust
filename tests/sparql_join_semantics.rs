@@ -218,20 +218,60 @@ fn join_data(n: usize) -> Data {
     Data::new(&quads)
 }
 
-/// The fastest of `runs` evaluations of `q` (an aggregate, so it never
-/// streams; or with a LIMIT, so it does), checking the count.
-fn best_time(data: &Data, q: &str, opts: TopKOptions, runs: usize) -> Duration {
+/// The CPU time this thread has used: what an evaluation costs, whatever
+/// else the machine runs (wall time also counts the time the thread waits
+/// for a CPU, which on a busy machine hits a long run far more than a short
+/// one; round-3 review). Wall time where no per-thread clock is at hand.
+fn thread_cpu_time() -> Duration {
+    #[cfg(target_os = "linux")]
+    {
+        #[repr(C)]
+        struct Timespec {
+            tv_sec: std::ffi::c_long,
+            tv_nsec: std::ffi::c_long,
+        }
+        extern "C" {
+            fn clock_gettime(clock: i32, tp: *mut Timespec) -> i32;
+        }
+        const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
+        let mut ts = Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a valid, writable timespec.
+        if unsafe { clock_gettime(CLOCK_THREAD_CPUTIME_ID, &mut ts) } == 0 {
+            return Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32);
+        }
+    }
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed()
+}
+
+/// The CPU time ([`thread_cpu_time`]) of one evaluation of `q` (an
+/// aggregate, so it never streams; or with a LIMIT, so it does), checking
+/// it succeeds.
+fn cpu_time(
+    data: &Data,
+    query: &gstore::parser::sparql::ast::Query,
+    opts: TopKOptions,
+) -> Duration {
+    let ev = data.evaluator(opts);
+    let t = thread_cpu_time();
+    let r = ev.evaluate(query);
+    let took = thread_cpu_time().saturating_sub(t);
+    assert!(r.is_ok(), "{r:?}");
+    took
+}
+
+/// The rows the hashed operands of OPTIONAL, MINUS and joins looked at in
+/// one evaluation of `q` (`EvalStats::join_probe_rows`), checking it
+/// succeeds.
+fn probe_rows(data: &Data, q: &str, opts: TopKOptions) -> u64 {
     let query = parse(&format!("{PREFIX}{q}")).unwrap();
-    (0..runs)
-        .map(|_| {
-            let t = Instant::now();
-            let r = data.evaluator(opts).evaluate(&query);
-            let took = t.elapsed();
-            assert!(r.is_ok(), "{q}: {r:?}");
-            took
-        })
-        .min()
-        .unwrap()
+    let ev = data.evaluator(opts);
+    let r = ev.evaluate(&query);
+    assert!(r.is_ok(), "{q}: {r:?}");
+    ev.stats().join_probe_rows
 }
 
 /// OPTIONAL, MINUS and a join after an OPTIONAL (whose shared variable is
@@ -241,11 +281,20 @@ fn best_time(data: &Data, q: &str, opts: TopKOptions, runs: usize) -> Duration {
 /// sparqlconf#2: 12-16 s for 20,000 x 10,000 rows against 0.06 s with
 /// LIMIT; the streaming MINUS scanned too; query#10: the cross product
 /// after one unbound row, and the streaming `Probe`'s scan of an operand
-/// whose key some row leaves unbound). Elapsed time is the measure (the
-/// operators have no work counter; the unit tests of `src/query/probe.rs`
-/// count probe visits); the bounds are generous ratios over 8x the data
-/// (linear ~8x, quadratic ~64x), and a miss is measured again before it
-/// fails, so a busy machine does not fail the test.
+/// whose key some row leaves unbound).
+///
+/// Round-3 review: this test timed the evaluations by wall clock, small
+/// size and large size one after the other, and failed under CPU
+/// contention (a ~2 ms run fits in one scheduler slice, a ~25 ms one is
+/// preempted: 3 of 11 runs of the binary failed with four busy loops on
+/// four CPUs). The work is now the primary measure, deterministic: the
+/// rows the operators' hashed operands looked at
+/// (`EvalStats::join_probe_rows`) must be at least the matches (the
+/// operators go through the index) and at most a few per data row, 8x for
+/// 8x the data, in both executors. The time is still checked, as the CPU
+/// time of the evaluating thread, small and large measured alternately,
+/// with the same generous ratios over 8x the data (linear ~8x, quadratic
+/// ~64x), and a miss is measured again before it fails.
 #[test]
 fn optional_minus_and_unbound_joins_scale_linearly() {
     let (small, large) = (2_500, 20_000);
@@ -288,14 +337,55 @@ fn optional_minus_and_unbound_joins_scale_linearly() {
         // n - 1 nicks.
         assert_eq!(count(data, queries[2].1), int(2 * (n - 1)));
     }
+    // The work, in both executors: deterministic.
+    for (what, full, streamed) in queries {
+        for (exec, q, opts) in [
+            ("full", full, TopKOptions::NONE),
+            ("streamed", streamed, TopKOptions::ALL),
+        ] {
+            let at_small = probe_rows(&datasets[0], q, opts);
+            let at_large = probe_rows(&datasets[1], q, opts);
+            eprintln!(
+                "{what} ({exec}): {at_small} rows looked at for {small}, {at_large} for {large}"
+            );
+            // At least the matches: every :q row (OPTIONAL, MINUS) or
+            // every name (the join) is found through the index.
+            assert!(
+                at_small >= small as u64 / 2 && at_large >= large as u64 / 2,
+                "{what} ({exec}): the operator did not go through its index \
+                 ({at_small}, {at_large} rows looked at)"
+            );
+            // Linear: a few rows per data row (the join after OPTIONAL
+            // looks at about 3n: n - 1 names, n - 1 nicks for the named
+            // rows and n - 1 for the unnamed one), 8x for 8x the data —
+            // comparing every left solution with every right one looks at
+            // n²/2 and more.
+            assert!(
+                at_large <= 4 * large as u64 && at_large <= at_small * 9,
+                "{what} ({exec}): not linear: {at_small} rows looked at for {small}, \
+                 {at_large} for {large}"
+            );
+        }
+    }
+    // The time (CPU time of this thread), as a second measure.
     let mut quadratic = Vec::new();
     for (what, full, streamed) in queries {
+        let (full, streamed) = (
+            parse(&format!("{PREFIX}{full}")).unwrap(),
+            parse(&format!("{PREFIX}{streamed}")).unwrap(),
+        );
         for attempt in 0..3 {
             let runs = 1 + attempt;
-            let t_small = best_time(&datasets[0], full, TopKOptions::NONE, runs);
-            let t_large = best_time(&datasets[1], full, TopKOptions::NONE, runs);
-            let s_small = best_time(&datasets[0], streamed, TopKOptions::ALL, runs);
-            let s_large = best_time(&datasets[1], streamed, TopKOptions::ALL, runs);
+            // Small and large alternate, so a change of the machine's state
+            // affects both.
+            let mut t = [Duration::MAX; 4];
+            for _ in 0..runs {
+                t[0] = t[0].min(cpu_time(&datasets[0], &full, TopKOptions::NONE));
+                t[1] = t[1].min(cpu_time(&datasets[1], &full, TopKOptions::NONE));
+                t[2] = t[2].min(cpu_time(&datasets[0], &streamed, TopKOptions::ALL));
+                t[3] = t[3].min(cpu_time(&datasets[1], &streamed, TopKOptions::ALL));
+            }
+            let [t_small, t_large, s_small, s_large] = t;
             // Linear: ~8x for 8x the data (quadratic: ~64x), in both
             // executors (review: the streaming MINUS and the streaming
             // Probe were quadratic too). The constant covers timer noise on

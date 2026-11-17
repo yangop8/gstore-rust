@@ -111,16 +111,79 @@ fn subjects(ts: &[Triple]) -> Vec<String> {
         .collect()
 }
 
-/// The fastest of three runs of `f`.
-fn fastest(mut f: impl FnMut()) -> Duration {
-    (0..3)
-        .map(|_| {
-            let t = Instant::now();
-            f();
-            t.elapsed()
-        })
-        .min()
-        .unwrap()
+/// The CPU time this thread has used (Linux; wall time elsewhere).
+///
+/// Round-3 review: the scaling assertions below compared wall times of a
+/// small input (about 1.6 ms, inside one scheduler slice) and a large one
+/// (25-40 ms, preempted on a busy machine), each the fastest of three runs
+/// measured one size after the other, and failed under CPU contention (7
+/// of 8 runs of the binary with four busy loops on four CPUs). They now
+/// compare the CPU time of the parsing thread, small and large measured
+/// alternately, and measure a miss again before they fail
+/// ([`assert_scales`]).
+fn thread_cpu_time() -> Duration {
+    #[cfg(target_os = "linux")]
+    {
+        #[repr(C)]
+        struct Timespec {
+            tv_sec: std::ffi::c_long,
+            tv_nsec: std::ffi::c_long,
+        }
+        extern "C" {
+            fn clock_gettime(clock: i32, tp: *mut Timespec) -> i32;
+        }
+        const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
+        let mut ts = Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a valid, writable timespec.
+        if unsafe { clock_gettime(CLOCK_THREAD_CPUTIME_ID, &mut ts) } == 0 {
+            return Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32);
+        }
+    }
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed()
+}
+
+/// The CPU time one run of `f` takes ([`thread_cpu_time`]).
+fn cpu_time(f: &mut impl FnMut()) -> Duration {
+    let t = thread_cpu_time();
+    f();
+    thread_cpu_time().saturating_sub(t)
+}
+
+/// Assert that `large` costs less than `bound` times what `small` costs, or
+/// less than `floor` (timer noise on tiny runs): the CPU time of each, the
+/// least of three runs taken alternately (small, large, small, …), so a
+/// change of the machine's state hits both; a miss is measured again, up to
+/// three times, before the assertion fails with `what` ("8x the
+/// segments", …) and the times. A real complexity regression misses every
+/// time (a quadratic cost is the square of the size ratio).
+fn assert_scales(
+    what: &str,
+    bound: f64,
+    floor: Duration,
+    mut small: impl FnMut(),
+    mut large: impl FnMut(),
+) {
+    let mut miss = String::new();
+    for attempt in 0..3 {
+        let (mut t_small, mut t_large) = (Duration::MAX, Duration::MAX);
+        for _ in 0..3 {
+            t_small = t_small.min(cpu_time(&mut small));
+            t_large = t_large.min(cpu_time(&mut large));
+        }
+        let ratio = t_large.as_secs_f64() / t_small.as_secs_f64().max(1e-6);
+        if ratio < bound || t_large < floor {
+            return;
+        }
+        miss = format!(
+            "{what} took {ratio:.1}x as long ({t_small:?} -> {t_large:?} CPU time, attempt {attempt})"
+        );
+        eprintln!("{miss}");
+    }
+    panic!("{miss}");
 }
 
 // ---- RFC 3986 reference resolution in every format (parser#4) ----------------
@@ -346,16 +409,16 @@ fn resolving_a_long_relative_iri_is_linear_in_its_segments() {
         ts[0].object,
         iri(&format!("http://ex/{}x", "b/".repeat(160_000)))
     );
-    let t_small = fastest(|| {
-        turtle::parse_str(&small).unwrap();
-    });
-    let t_large = fastest(|| {
-        turtle::parse_str(&large).unwrap();
-    });
-    let ratio = t_large.as_secs_f64() / t_small.as_secs_f64().max(1e-6);
-    assert!(
-        ratio < 24.0 || t_large < Duration::from_millis(50),
-        "8x the segments took {ratio:.1}x as long ({t_small:?} -> {t_large:?})"
+    assert_scales(
+        "8x the segments",
+        24.0,
+        Duration::from_millis(50),
+        || {
+            turtle::parse_str(&small).unwrap();
+        },
+        || {
+            turtle::parse_str(&large).unwrap();
+        },
     );
 }
 
@@ -564,16 +627,16 @@ fn rdfxml_elements_share_the_namespace_bindings() {
     let small = doc(10);
     let large = doc(1000);
     assert_eq!(rdfxml::parse_str(&large).unwrap().len(), elements);
-    let t_small = fastest(|| {
-        rdfxml::parse_str(&small).unwrap();
-    });
-    let t_large = fastest(|| {
-        rdfxml::parse_str(&large).unwrap();
-    });
-    let ratio = t_large.as_secs_f64() / t_small.as_secs_f64().max(1e-6);
-    assert!(
-        ratio < 4.0 || t_large < Duration::from_millis(30),
-        "100x the namespace declarations took {ratio:.1}x as long ({t_small:?} -> {t_large:?})"
+    assert_scales(
+        "100x the namespace declarations",
+        4.0,
+        Duration::from_millis(30),
+        || {
+            rdfxml::parse_str(&small).unwrap();
+        },
+        || {
+            rdfxml::parse_str(&large).unwrap();
+        },
     );
 }
 
@@ -652,16 +715,16 @@ fn jsonld_node_objects_share_the_active_context() {
     let small = jsonld_with_terms(250, nodes);
     let large = jsonld_with_terms(4000, nodes);
     assert_eq!(jsonld::parse_str(&large).unwrap().len(), nodes);
-    let t_small = fastest(|| {
-        jsonld::parse_str(&small).unwrap();
-    });
-    let t_large = fastest(|| {
-        jsonld::parse_str(&large).unwrap();
-    });
-    let ratio = t_large.as_secs_f64() / t_small.as_secs_f64().max(1e-6);
-    assert!(
-        ratio < 4.0 || t_large < Duration::from_millis(30),
-        "16x the context terms took {ratio:.1}x as long ({t_small:?} -> {t_large:?})"
+    assert_scales(
+        "16x the context terms",
+        4.0,
+        Duration::from_millis(30),
+        || {
+            jsonld::parse_str(&small).unwrap();
+        },
+        || {
+            jsonld::parse_str(&large).unwrap();
+        },
     );
 }
 
@@ -720,16 +783,16 @@ fn rdfa_elements_share_the_prefix_map() {
             .count(),
         elements
     );
-    let t_small = fastest(|| {
-        rdfa::parse_str(&small).unwrap();
-    });
-    let t_large = fastest(|| {
-        rdfa::parse_str(&large).unwrap();
-    });
-    let ratio = t_large.as_secs_f64() / t_small.as_secs_f64().max(1e-6);
-    assert!(
-        ratio < 4.0 || t_large < Duration::from_millis(30),
-        "100x the prefixes took {ratio:.1}x as long ({t_small:?} -> {t_large:?})"
+    assert_scales(
+        "100x the prefixes",
+        4.0,
+        Duration::from_millis(30),
+        || {
+            rdfa::parse_str(&small).unwrap();
+        },
+        || {
+            rdfa::parse_str(&large).unwrap();
+        },
     );
 }
 
@@ -785,16 +848,16 @@ fn jsonld_node_contexts_and_context_arrays_add_layers_not_copies() {
         let small = doc(250, node);
         let large = doc(4000, node);
         assert_eq!(jsonld::parse_str(&large).unwrap().len(), triples, "{node}");
-        let t_small = fastest(|| {
-            jsonld::parse_str(&small).unwrap();
-        });
-        let t_large = fastest(|| {
-            jsonld::parse_str(&large).unwrap();
-        });
-        let ratio = t_large.as_secs_f64() / t_small.as_secs_f64().max(1e-6);
-        assert!(
-            ratio < 4.0 || t_large < Duration::from_millis(30),
-            "{node}: 16x the context terms took {ratio:.1}x as long ({t_small:?} -> {t_large:?})"
+        assert_scales(
+            &format!("{node}: 16x the context terms"),
+            4.0,
+            Duration::from_millis(30),
+            || {
+                jsonld::parse_str(&small).unwrap();
+            },
+            || {
+                jsonld::parse_str(&large).unwrap();
+            },
         );
     }
     let array = |members: usize| {
@@ -816,16 +879,16 @@ fn jsonld_node_contexts_and_context_arrays_add_layers_not_copies() {
             Triple::new(iri("http://ex/s"), iri("http://ex/t7999"), lit("b")),
         ]
     );
-    let t_small = fastest(|| {
-        jsonld::parse_str(&small).unwrap();
-    });
-    let t_large = fastest(|| {
-        jsonld::parse_str(&large).unwrap();
-    });
-    let ratio = t_large.as_secs_f64() / t_small.as_secs_f64().max(1e-6);
-    assert!(
-        ratio < 8.0 || t_large < Duration::from_millis(30),
-        "4x the context array members took {ratio:.1}x as long ({t_small:?} -> {t_large:?})"
+    assert_scales(
+        "4x the context array members",
+        8.0,
+        Duration::from_millis(30),
+        || {
+            jsonld::parse_str(&small).unwrap();
+        },
+        || {
+            jsonld::parse_str(&large).unwrap();
+        },
     );
 }
 
@@ -896,16 +959,16 @@ fn rdfa_elements_declaring_a_prefix_add_a_layer_not_a_copy() {
             .count(),
         elements
     );
-    let t_small = fastest(|| {
-        rdfa::parse_str(&small).unwrap();
-    });
-    let t_large = fastest(|| {
-        rdfa::parse_str(&large).unwrap();
-    });
-    let ratio = t_large.as_secs_f64() / t_small.as_secs_f64().max(1e-6);
-    assert!(
-        ratio < 4.0 || t_large < Duration::from_millis(30),
-        "100x the prefixes took {ratio:.1}x as long ({t_small:?} -> {t_large:?})"
+    assert_scales(
+        "100x the prefixes",
+        4.0,
+        Duration::from_millis(30),
+        || {
+            rdfa::parse_str(&small).unwrap();
+        },
+        || {
+            rdfa::parse_str(&large).unwrap();
+        },
     );
 }
 

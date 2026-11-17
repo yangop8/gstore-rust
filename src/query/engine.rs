@@ -1192,6 +1192,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// Evaluate a read query (SELECT / ASK / CONSTRUCT). Updates are handled in
     /// the db layer.
     pub fn evaluate(&self, query: &Query) -> Result<QueryResult> {
+        let _probes = self.count_join_probes();
         self.ctx.begin_execution();
         self.check_cancel()?;
         self.check_calls(query)?;
@@ -1375,6 +1376,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         insert: &[QuadPattern],
         pattern: &GraphPattern,
     ) -> Result<(Vec<(Option<String>, Triple)>, Vec<(Option<String>, Triple)>)> {
+        let _probes = self.count_join_probes();
         self.ctx.begin_execution();
         self.check_pattern_calls(pattern)?;
         let layout = VarLayout::build(pattern);
