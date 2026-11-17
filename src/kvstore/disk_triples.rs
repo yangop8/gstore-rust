@@ -780,6 +780,13 @@ impl DiskTriples {
         self.store.wal_batches()
     }
 
+    /// Flushes of the store's file whose write-ahead log's name was made
+    /// durable ([`Pager::durable_wal_batches`](super::Pager::durable_wal_batches)):
+    /// the next open replays such a batch even when its flush failed later.
+    pub fn durable_wal_batches(&self) -> u64 {
+        self.store.durable_wal_batches()
+    }
+
     /// Count `n` applied changes towards [`unsynced_writes`](Self::unsynced_writes).
     fn applied(&self, n: u64) {
         self.unsynced.fetch_add(n, Ordering::SeqCst);

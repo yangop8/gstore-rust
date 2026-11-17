@@ -1430,6 +1430,12 @@ impl DiskStore {
         self.read_pager().wal_batches()
     }
 
+    /// The pager's [`durable_wal_batches`](Pager::durable_wal_batches):
+    /// flushes of this file whose write-ahead log's name was made durable.
+    pub fn durable_wal_batches(&self) -> u64 {
+        self.read_pager().durable_wal_batches()
+    }
+
     /// Persist counters and flush all dirty pages (see [`commit`](Self::commit)).
     pub fn flush(&mut self) -> Result<()> {
         self.check_writable()?;

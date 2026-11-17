@@ -326,6 +326,9 @@ pub struct Pager {
     /// Flushes whose write-ahead log got its name (see
     /// [`wal_batches`](Self::wal_batches)); counted under a shared guard.
     wal_batches: AtomicU64,
+    /// Flushes whose write-ahead log's name was made durable (see
+    /// [`durable_wal_batches`](Self::durable_wal_batches)).
+    durable_wal_batches: AtomicU64,
     /// The file's entry in this process's advisory locks (see
     /// [`lock_file`]), given back when the pager is dropped.
     lock: FileKey,
@@ -381,6 +384,7 @@ impl Pager {
             write_gen: 0,
             failed: Arc::new(OnceLock::new()),
             wal_batches: AtomicU64::new(0),
+            durable_wal_batches: AtomicU64::new(0),
             commit_lock: Mutex::new(()),
             lock,
             #[cfg(test)]
@@ -436,6 +440,19 @@ impl Pager {
     /// of a large operation outgrew it).
     pub fn wal_batches(&self) -> u64 {
         self.wal_batches.load(Ordering::Acquire)
+    }
+
+    /// How many flushes since the open made their write-ahead log's name
+    /// durable (the directory fsync after the rename succeeded): from that
+    /// step on the next open replays the batch even after a crash, so a
+    /// flush that failed later — applying the batch, the file's fsync,
+    /// removing the log — still commits its whole batch at the next open.
+    /// A caller compares it with [`wal_batches`](Self::wal_batches) around
+    /// a failed commit to tell "replayed by the next open" from "unknown"
+    /// (round-3 review: the redo and update logs follow the commits a
+    /// reopen keeps).
+    pub fn durable_wal_batches(&self) -> u64 {
+        self.durable_wal_batches.load(Ordering::Acquire)
     }
 
     /// The write-ahead log of the paged file at `path`: `<path>.wal`. The one
@@ -898,6 +915,7 @@ impl Pager {
     /// removal durable.
     fn apply_committed(&self, batch: &[(PageId, Arc<Page>)]) -> Result<()> {
         sync_parent_dir(&self.wal_path)?;
+        self.durable_wal_batches.fetch_add(1, Ordering::AcqRel);
         for (i, (id, data)) in batch.iter().enumerate() {
             #[cfg(test)]
             failpoints::apply(i)?;

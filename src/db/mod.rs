@@ -54,6 +54,8 @@ pub use open_options::{
 };
 pub use statement::Statement;
 
+#[cfg(all(test, feature = "rocksdb"))]
+mod commit_fate_tests;
 #[cfg(test)]
 mod concurrency_tests;
 
@@ -388,6 +390,13 @@ pub struct Database {
     /// successive incrementals chain contiguously. Atomic because both backup
     /// methods take `&self` (they run under [`persist_lock`](Self::persist_lock)).
     backup_offset: AtomicU64,
+    /// Why the redo and update logs may not match the database since a
+    /// commit point failed with an outcome nobody can tell (see
+    /// [`CommitFate::InDoubt`]): [`backup_incremental`](Self::backup_incremental)
+    /// refuses until a full [`backup`](Self::backup) clears it. Session
+    /// state, like [`backup_offset`](Self::backup_offset): a reopened
+    /// database starts a new chain with a full backup anyway.
+    logs_in_doubt: Mutex<Option<String>>,
     /// User-defined forward-chaining reasoning rules (the crate's textual
     /// `body => head` rules, see [`crate::reason::RuleSet`]).
     rules: crate::reason::RuleSet,
@@ -597,7 +606,12 @@ pub enum CommitFailure {
     /// written before the failure); on RocksDB either the write-ahead log
     /// could not be synced, or the journal of a commit that failed could not
     /// be replayed yet (writes are refused until it is, and the next open
-    /// replays it: the transaction is then undone).
+    /// replays it: the transaction is then undone). Its redo and
+    /// update-log records follow what a reopen keeps: appended when the
+    /// store's write-ahead log holds the whole transaction (the next open
+    /// replays it), else left out with the logs marked in doubt —
+    /// [`Database::backup_incremental`] then refuses until a full
+    /// [`Database::backup`].
     NotDurable(GStoreError),
     /// The transaction is committed and durable, but a step after its
     /// commit point failed (its records could not be appended to the redo
@@ -625,6 +639,35 @@ impl CommitFailure {
             | CommitFailure::CommittedWithError(e) => e,
         }
     }
+}
+
+/// The on-disk store's write-ahead-log counts at one moment
+/// ([`Database::wal_mark`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WalMark {
+    /// Flushes that named their write-ahead log.
+    wal: u64,
+    /// Flushes whose log's name was made durable.
+    durable: u64,
+}
+
+/// What a commit point left of the commit it closed — what the redo and
+/// update logs record (round-3 review: they follow what a reopen keeps).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommitFate {
+    /// The commit point succeeded: the records are appended.
+    Durable,
+    /// It failed before anything of the commit reached the store: the
+    /// records are dropped (a transaction is rolled back).
+    NotApplied,
+    /// It failed after the commit's whole batch got a durable
+    /// write-ahead-log name: the next open replays it, so the records are
+    /// appended.
+    Replayed,
+    /// Anything else: a part (or all) of the commit may survive a reopen.
+    /// The records are dropped and the logs marked in doubt, so
+    /// [`Database::backup_incremental`] refuses until a full backup.
+    InDoubt,
 }
 
 impl std::fmt::Display for CommitFailure {
@@ -741,6 +784,7 @@ impl Database {
             redo_writer: Mutex::new(logs::LogWriter::default()),
             redo_hold: false,
             backup_offset: AtomicU64::new(0),
+            logs_in_doubt: Mutex::new(None),
             rules: crate::reason::RuleSet::new(),
             reason_home: crate::reason::store::RuleHome::default(),
             functions: FunctionRegistry::new(),
@@ -1996,7 +2040,7 @@ impl Database {
         }
         // On-disk stores: a new write-ahead log from here on means the
         // commit may survive (in part) whatever happens next.
-        let batches = self.wal_batches();
+        let start = self.wal_mark();
         // Stream mode: apply the overlay (named-graph operations, removals,
         // additions) under the store's writer gate.
         let mut overlay_failure = None;
@@ -2016,7 +2060,7 @@ impl Database {
         let minted = self.dict.take_allocations();
         self.dict.track_allocations(false);
         if let Some(e) = overlay_failure {
-            return Err(self.failed_commit(log, minted, e, batches, false));
+            return Err(self.failed_commit(log, minted, e, start, None));
         }
         // Materialize: apply the queued write-through to the on-disk store.
         self.disk_commit_pending();
@@ -2052,8 +2096,15 @@ impl Database {
                 self.persist_frees(dead, false)
             }
         };
-        if let Err(e) = self.commit_point() {
-            return Err(self.failed_commit(log, minted, e, batches, rocks));
+        let point = if rocks {
+            // The journal is gone (committed there): a failed sync leaves
+            // the transaction applied with an unknown outcome.
+            self.commit_point().map_err(|e| (e, CommitFate::InDoubt))
+        } else {
+            self.commit_point_fate(start)
+        };
+        if let Err((e, fate)) = point {
+            return Err(self.failed_commit(log, minted, e, start, Some(fate)));
         }
         // Committed and durable.
         if !retire.is_empty() {
@@ -2080,30 +2131,48 @@ impl Database {
 
     /// The commit point of a closing transaction failed with `e`: roll it
     /// back when nothing of it can have reached the store, else keep it
-    /// applied and report it as not durable. `batches` is
-    /// [`wal_batches`](Self::wal_batches) before the commit; `journal_gone`
-    /// when a RocksDB journal was already deleted (committed there).
+    /// applied and report it as not durable. `start` is the
+    /// [`wal_mark`](Self::wal_mark) before the commit; `fate` what the
+    /// failed commit point left ([`commit_point_fate`](Self::commit_point_fate);
+    /// `None` when the commit failed before it, applying a Stream-mode
+    /// store's overlay).
+    ///
+    /// The logs follow what a reopen keeps (round-3 review): a transaction
+    /// whose whole batch the store's write-ahead log holds — the next open
+    /// replays it — is appended to the redo and update logs; one whose
+    /// outcome is unknown (a part may survive; RocksDB: its journal was
+    /// deleted, committing it, but the log sync failed) is left out and
+    /// the logs are marked in doubt.
     fn failed_commit(
         &mut self,
         log: Vec<UndoOp>,
         minted: Vec<crate::dict::TermId>,
         e: GStoreError,
-        batches: u64,
-        journal_gone: bool,
+        start: WalMark,
+        fate: Option<CommitFate>,
     ) -> CommitFailure {
-        if journal_gone || self.wal_batches() != batches {
-            // Applied: its redo and update-log records stay unwritten (it
-            // is not known to be durable) and its frees are not made
-            // (nothing references them less than before the failure would
-            // justify). Committed records still owed to the logs are not
-            // its own: they stay owed (review db#2).
-            self.redo_pending.clear();
-            self.update_pending.clear();
-            self.reclaim.clear();
-            self.run_deferred_rebuild();
-            return CommitFailure::NotDurable(e);
+        let fate = fate.unwrap_or_else(|| self.failed_point_fate(start, None));
+        if fate == CommitFate::NotApplied {
+            return self.undo_failed_commit(log, minted, e, RocksUndo::Rollback);
         }
-        self.undo_failed_commit(log, minted, e, RocksUndo::Rollback)
+        // Applied: its frees are not made (nothing references them less
+        // than before the failure would justify). Committed records still
+        // owed to the logs are not its own: they stay owed (review db#2).
+        self.reclaim.clear();
+        let e = match fate {
+            CommitFate::Replayed => match self.log_commit() {
+                Ok(()) => e,
+                Err(le) => GStoreError::Database(format!("{e}; in addition, {le}")),
+            },
+            _ => {
+                self.redo_pending.clear();
+                self.update_pending.clear();
+                self.note_logs_in_doubt(&e);
+                e
+            }
+        };
+        self.run_deferred_rebuild();
+        CommitFailure::NotDurable(e)
     }
 
     /// Undo a transaction whose commit failed with `e` (see
@@ -2129,14 +2198,77 @@ impl Database {
         }
     }
 
-    /// Flushes of the on-disk store's file that got as far as naming their
-    /// write-ahead log (both modes; `0` for the other layouts).
-    fn wal_batches(&self) -> u64 {
-        let sink = self
-            .disk_guard()
-            .as_ref()
-            .map_or(0, |s| s.store.wal_batches());
-        sink + self.store.as_disk().map_or(0, |dt| dt.wal_batches())
+    /// The on-disk store's flushes that got as far as naming their
+    /// write-ahead log, and those whose name was made durable (both modes;
+    /// zeros for the other layouts): taken before a commit, they tell what
+    /// a failed commit point left ([`failed_point_fate`](Self::failed_point_fate)).
+    fn wal_mark(&self) -> WalMark {
+        let (mut wal, mut durable) = self.disk_guard().as_ref().map_or((0, 0), |s| {
+            (s.store.wal_batches(), s.store.durable_wal_batches())
+        });
+        if let Some(dt) = self.store.as_disk() {
+            wal += dt.wal_batches();
+            durable += dt.durable_wal_batches();
+        }
+        WalMark { wal, durable }
+    }
+
+    /// Whether this database has an on-disk (`kvstore.kv`) store: the one
+    /// layout whose failed commit points [`wal_mark`](Self::wal_mark) can
+    /// tell apart.
+    fn has_paged_store(&self) -> bool {
+        self.disk_guard().is_some() || self.store.as_disk().is_some()
+    }
+
+    /// Run a commit point (outside a transaction, or a transaction's own)
+    /// and say what it left of the commit begun at `start` (see
+    /// [`CommitFate`]).
+    fn commit_point_fate(
+        &self,
+        start: WalMark,
+    ) -> std::result::Result<(), (GStoreError, CommitFate)> {
+        let healthy = self.storage_failure().is_none();
+        let pre = self.wal_mark();
+        let (res, only_flush) = self.commit_point_report();
+        res.map_err(|e| {
+            let fate = self.failed_point_fate(start, Some((pre, healthy && only_flush)));
+            (e, fate)
+        })
+    }
+
+    /// What a failed commit left of the commit begun at `start`: nothing
+    /// (no write-ahead log got a name since), all of it (the commit point's
+    /// own flush failed after its log's name was durable, the store was
+    /// healthy before it and nothing else failed — `point`: the mark before
+    /// the commit point and whether those hold), or an unknown part.
+    fn failed_point_fate(&self, start: WalMark, point: Option<(WalMark, bool)>) -> CommitFate {
+        if !self.has_paged_store() {
+            return CommitFate::InDoubt;
+        }
+        let now = self.wal_mark();
+        if now.wal == start.wal {
+            return CommitFate::NotApplied;
+        }
+        match point {
+            Some((pre, true))
+                if now.wal > pre.wal && now.wal - pre.wal == now.durable - pre.durable =>
+            {
+                CommitFate::Replayed
+            }
+            _ => CommitFate::InDoubt,
+        }
+    }
+
+    /// Mark the logs in doubt after a commit point failed with `e` (see
+    /// [`logs_in_doubt`](Self::logs_in_doubt)); the first reason is kept.
+    fn note_logs_in_doubt(&self, e: &GStoreError) {
+        if self.redo_log.is_none() && self.update_log.is_none() {
+            return;
+        }
+        let mut slot = self.logs_in_doubt.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.is_none() {
+            *slot = Some(e.to_string());
+        }
     }
 
     /// Roll back the active transaction, undoing every triple mutation made
@@ -2721,7 +2853,15 @@ impl Database {
         }));
         done.unwrap_or_else(|panic| {
             if self.redo_hold {
-                let _ = self.end_statement_logs(None);
+                // No commit point ran: what it applied stays, and is logged
+                // as before unless the store broke (then nothing of it is
+                // known to survive a reopen).
+                let fate = if self.storage_failure().is_some() {
+                    CommitFate::InDoubt
+                } else {
+                    CommitFate::Durable
+                };
+                let _ = self.end_statement_logs(None, fate);
             }
             std::panic::resume_unwind(panic)
         })
@@ -2739,6 +2879,7 @@ impl Database {
         journaled: bool,
     ) -> Result<QueryResult> {
         let before = self.mutations;
+        let start = self.wal_mark();
         let mut changed = 0;
         // The request's redo records are appended together at its end,
         // after its commit point (review durability#6, db#8).
@@ -2764,10 +2905,10 @@ impl Database {
             match applied {
                 Ok(n) => changed += n,
                 Err(e) => {
-                    let e = self.failed_update(e, before, journaled);
+                    let (e, fate) = self.failed_update(e, before, start, journaled);
                     // The part applied before the failure stays (committed,
                     // outside a transaction): its redo records are logged.
-                    return Err(match self.end_statement_logs(None) {
+                    return Err(match self.end_statement_logs(None, fate) {
                         Ok(()) => e,
                         Err(le) => GStoreError::Database(format!("{e}; in addition, {le}")),
                     });
@@ -2778,18 +2919,27 @@ impl Database {
         // its write-through is made durable before it is acknowledged
         // (RocksDB: its journal is deleted first, with the ids it freed).
         let point = if journaled {
+            // RocksDB: a journal that could not be deleted is undone by the
+            // next open (unless a later write deletes it), a failed log
+            // sync may or may not keep the request: either way its
+            // outcome is unknown.
             let ended = self.end_update_statement(before);
             let point = self.commit_point();
-            ended.and(point)
+            ended.and(point).map_err(|e| (e, CommitFate::InDoubt))
         } else if self.txn.is_none() {
-            self.commit_point()
+            self.commit_point_fate(start)
         } else {
             Ok(())
         };
+        let (point, fate) = match point {
+            Ok(()) => (Ok(()), CommitFate::Durable),
+            Err((e, fate)) => (Err(e), fate),
+        };
         // Then its redo records and its update-log record (inside a
         // transaction: at the commit), never before the commit point
-        // (review durability#6).
-        let logged = self.end_statement_logs(Some((sparql, changed)));
+        // (review durability#6), and only when the commit survives a
+        // reopen (round-3 review).
+        let logged = self.end_statement_logs(Some((sparql, changed)), fate);
         point?;
         logged.map_err(|e| {
             GStoreError::Database(format!("the update is applied and committed, but {e}"))
@@ -2826,21 +2976,37 @@ impl Database {
     /// the update started at. A RocksDB statement's journal (`journaled`) is
     /// deleted first, with the ids the statement freed: from then on a crash
     /// no longer undoes the applied part.
-    fn failed_update(&mut self, e: GStoreError, before: u64, journaled: bool) -> GStoreError {
+    fn failed_update(
+        &mut self,
+        e: GStoreError,
+        before: u64,
+        start: WalMark,
+        journaled: bool,
+    ) -> (GStoreError, CommitFate) {
         let ended = if journaled {
             self.end_update_statement(before)
         } else {
             Ok(())
         };
         if self.txn.is_some() || (self.mutations == before && !journaled) {
-            return e;
+            return (e, CommitFate::Durable);
         }
-        match ended.and_then(|()| self.commit_point()) {
-            Ok(()) => e,
-            Err(pe) => GStoreError::Database(format!(
-                "{e}; in addition, the part of the update applied before the failure could not \
-                 be persisted: {pe}"
-            )),
+        let point = if journaled {
+            ended
+                .and_then(|()| self.commit_point())
+                .map_err(|pe| (pe, CommitFate::InDoubt))
+        } else {
+            self.commit_point_fate(start)
+        };
+        match point {
+            Ok(()) => (e, CommitFate::Durable),
+            Err((pe, fate)) => (
+                GStoreError::Database(format!(
+                    "{e}; in addition, the part of the update applied before the failure could \
+                     not be persisted: {pe}"
+                )),
+                fate,
+            ),
         }
     }
 
@@ -3551,6 +3717,9 @@ impl Database {
         let off = self.redo_log_len()?;
         write_backup_offset(&backup_dir.join(BACKUP_OFFSET_FILE), off)?;
         self.backup_offset.store(off, Ordering::SeqCst);
+        // A new chain starts here: what the logs held before no longer
+        // matters to it.
+        *self.logs_in_doubt.lock().unwrap_or_else(|p| p.into_inner()) = None;
         Ok(())
     }
 
@@ -3638,6 +3807,18 @@ impl Database {
         self.backup_reason_rules(out_dir)?;
         fs::create_dir_all(out_dir.join(crate::reason::rules::RULE_DIR))?;
         let _persist = self.persist_guard();
+        if let Some(why) = self
+            .logs_in_doubt
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+        {
+            return Err(GStoreError::Database(format!(
+                "backup_incremental: the redo log may not match the database since a commit \
+                 point failed with an unknown outcome ({why}); take a full backup to start a \
+                 new chain"
+            )));
+        }
         let base = self.backup_offset.load(Ordering::SeqCst);
         let (end, slice) = {
             let mut writer = self.redo_writer_lock();
@@ -4104,13 +4285,19 @@ impl Database {
     /// many triples it changed, `None` when it failed part-way), after its
     /// commit point. Inside a transaction its update-log record waits for
     /// the commit (its redo records already do). Outside one its records
-    /// are appended — unless the on-disk store is broken (its commit point
-    /// failed): then nothing since the last successful commit point is
-    /// known to be durable, and nothing is logged (as for a transaction
-    /// whose commit is not durable). Any other failed commit point (a
-    /// RocksDB write error reported there) left the request applied, so it
-    /// is logged.
-    fn end_statement_logs(&mut self, update: Option<(&str, usize)>) -> Result<()> {
+    /// follow `fate`, what the commit point left (round-3 review: the logs
+    /// follow what a reopen keeps, on every layout and for transactions
+    /// alike): appended when it succeeded or when the store's write-ahead
+    /// log holds the whole request (the next open replays it); dropped when
+    /// nothing of it reached the store; dropped with the logs marked in
+    /// doubt when its outcome is unknown (an on-disk store that failed
+    /// part-way, a RocksDB journal that could not be deleted or a log sync
+    /// that failed).
+    fn end_statement_logs(
+        &mut self,
+        update: Option<(&str, usize)>,
+        fate: CommitFate,
+    ) -> Result<()> {
         self.redo_hold = false;
         if self.redo_log.is_none() && self.update_log.is_none() {
             return Ok(());
@@ -4121,12 +4308,20 @@ impl Database {
         if self.txn.is_some() {
             return Ok(());
         }
-        if self.storage_failure().is_some() {
-            self.redo_pending.clear();
-            self.update_pending.clear();
-            return Ok(());
+        match fate {
+            CommitFate::Durable | CommitFate::Replayed => self.log_commit(),
+            CommitFate::NotApplied | CommitFate::InDoubt => {
+                self.redo_pending.clear();
+                self.update_pending.clear();
+                if fate == CommitFate::InDoubt {
+                    let why = self
+                        .storage_failure()
+                        .unwrap_or_else(|| "a commit point failed".into());
+                    self.note_logs_in_doubt(&GStoreError::Database(why));
+                }
+                Ok(())
+            }
         }
-        self.log_commit()
     }
 
     /// The commit point of the logs, for [`sync`](Self::sync): append what

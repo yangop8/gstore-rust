@@ -2221,7 +2221,24 @@ impl Database {
     /// on-disk store's dirty pages / fsync RocksDB's WAL), then report the first
     /// persistence failure recorded since the previous commit point.
     pub(super) fn commit_point(&self) -> Result<()> {
+        self.commit_point_report().0
+    }
+
+    /// [`commit_point`](Self::commit_point), and whether every failure it
+    /// met was the on-disk store's flush (no RocksDB error, no recorded
+    /// write error): only then can a failed commit point have left its
+    /// whole batch in a write-ahead log the next open replays (see
+    /// `CommitFate::Replayed`).
+    pub(super) fn commit_point_report(&self) -> (Result<()>, bool) {
         let mut failure: Option<GStoreError> = None;
+        let mut only_flush = true;
+        // Write errors recorded before this commit point (taken first: a
+        // Stream-mode store also records the error that breaks its flush,
+        // which is the flush's own failure, not another one).
+        let prior = self
+            .persist_error_slot()
+            .take()
+            .or_else(|| self.store.take_write_error());
         {
             let mut disk = self.disk_guard();
             if let Some(sink) = disk.as_mut() {
@@ -2240,24 +2257,28 @@ impl Database {
         #[cfg(feature = "rocksdb")]
         if let Some(rocks) = self.store.as_rocks() {
             if let Err(e) = rocks.sync_wal() {
+                only_flush = false;
                 failure.get_or_insert(e);
             }
             // Not `take`n: a stale journal keeps failing commit points until
             // it is cleaned up.
             if let Some(e) = rocks.journal_error() {
+                only_flush = false;
                 failure.get_or_insert(GStoreError::Database(format!("rocksdb: {e}")));
             }
         }
-        let recorded = self
+        let during = self
             .persist_error_slot()
             .take()
             .or_else(|| self.store.take_write_error());
+        let recorded = prior.or(if failure.is_none() { during } else { None });
         if let Some(msg) = recorded {
+            only_flush = false;
             failure.get_or_insert(GStoreError::Database(format!(
                 "an update could not be persisted: {msg}"
             )));
         }
-        failure.map_or(Ok(()), Err)
+        (failure.map_or(Ok(()), Err), only_flush)
     }
 
     /// Intern a triple's terms (and its graph IRI) for an insert. Errs once a

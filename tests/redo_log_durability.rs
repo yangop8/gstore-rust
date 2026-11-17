@@ -329,7 +329,10 @@ fn child_redo_scenarios() {
     match scenario.as_str() {
         "crash" => child_crash_mid_append(&dir),
         "efbig" => child_failed_append(&dir),
-        "commit_point" => child_failed_commit_point(&dir),
+        "commit_point" => child_failed_commit_point(&dir, false, false),
+        "commit_point_txn" => child_failed_commit_point(&dir, true, false),
+        "commit_point_nowal" => child_failed_commit_point(&dir, false, true),
+        "commit_point_txn_nowal" => child_failed_commit_point(&dir, true, true),
         other => panic!("unknown scenario {other}"),
     }
     println!("{CHILD_OK}");
@@ -448,8 +451,12 @@ fn disk_update() -> String {
     format!("INSERT DATA {{ {body} }}")
 }
 
-/// An update whose commit point fails: `kvstore.kv` cannot grow.
-fn child_failed_commit_point(dir: &Path) {
+/// An update — auto-commit, or in a transaction when `txn` — whose commit
+/// point fails: `kvstore.kv` cannot grow, so applying the batch fails after
+/// its write-ahead log got a durable name; with `no_wal`, files cannot grow
+/// past 8 KiB, so the log itself cannot be written (two 4 KiB pages and
+/// their framing do not fit).
+fn child_failed_commit_point(dir: &Path, txn: bool, no_wal: bool) {
     rlimit::ignore_sigxfsz();
     let mode = match std::env::var(CHILD_MODE).unwrap().as_str() {
         "stream" => DiskQueryMode::Stream,
@@ -464,37 +471,104 @@ fn child_failed_commit_point(dir: &Path) {
     db.enable_redo_log(dir.join("redo.log"));
     db.enable_update_log(dir.join("update.log"));
     db.query(&ins(&["before"])).unwrap();
-    rlimit::limit_file_size(len(&db_dir.join("kvstore.kv")));
-    let r = db.query(&disk_update());
-    assert!(r.is_err(), "the update's commit point must fail: {r:?}");
+    rlimit::limit_file_size(if no_wal {
+        8192
+    } else {
+        len(&db_dir.join("kvstore.kv"))
+    });
+    if txn {
+        db.begin().unwrap();
+        db.query(&disk_update()).unwrap();
+        let r = db.commit_checked();
+        assert!(
+            if no_wal {
+                matches!(r, Err(gstore::db::CommitFailure::RolledBack(_)))
+            } else {
+                matches!(r, Err(gstore::db::CommitFailure::NotDurable(_)))
+            },
+            "the transaction's commit point must fail (no_wal: {no_wal}): {r:?}"
+        );
+    } else {
+        let r = db.query(&disk_update());
+        assert!(r.is_err(), "the update's commit point must fail: {r:?}");
+    }
     std::mem::forget(db);
 }
 
-/// durability#6 / db#8: the logs are written after the commit point. An
-/// update whose commit point fails is not known to be durable, so it is in
-/// neither log (it used to be appended to both before its commit point).
+/// durability#6 / db#8: the logs are written after the commit point, and
+/// they follow what a reopen keeps. An update or transaction whose commit
+/// point failed after its write-ahead log got a durable name survives the
+/// reopen (the open replays the log), so it is in both logs; one whose log
+/// could not be written does not survive, so it is in neither.
+///
+/// Review (round 3): this test was `an_update_whose_commit_point_failed_is_in_neither_log`
+/// and only checked that the update reached no log — never what the
+/// reopened database held. The first case is replayed by the next open, so
+/// the logs had silently diverged from the database; the test now reopens
+/// it and checks that both logs agree with it, for the replayed case and
+/// the not-applied one, auto-commit and transaction, in both disk modes.
 #[test]
-fn an_update_whose_commit_point_failed_is_in_neither_log() {
+fn the_logs_agree_with_the_reopened_database_after_a_failed_commit_point() {
+    let nt_data: String = (0..DISK_BASE)
+        .map(|i| format!("<http://ex/s{i}> <http://ex/p> <http://ex/o{i}> .\n"))
+        .collect();
     for mode in ["memory", "stream"] {
-        let tmp = TmpDir::new(&format!("commit_point_{mode}"));
-        let nt = tmp.path("base.nt");
-        let data: String = (0..DISK_BASE)
-            .map(|i| format!("<http://ex/s{i}> <http://ex/p> <http://ex/o{i}> .\n"))
-            .collect();
-        fs::write(&nt, data).unwrap();
-        Database::build_disk(tmp.path("t.db"), &[&nt]).unwrap();
-        let out = run_child("commit_point", &tmp.0, mode);
-        child_ok(&out, &format!("commit_point ({mode})"));
-        let redo = fs::read_to_string(tmp.path("redo.log")).unwrap();
-        let update = fs::read_to_string(tmp.path("update.log")).unwrap();
-        assert!(
-            redo.contains("ex/before") && update.contains("ex/before"),
-            "{mode}"
-        );
-        assert!(
-            !redo.contains("update value") && !update.contains("update value"),
-            "{mode}: the failed update reached a log:\n{redo}\n{update}"
-        );
+        for scenario in [
+            "commit_point",
+            "commit_point_txn",
+            "commit_point_nowal",
+            "commit_point_txn_nowal",
+        ] {
+            let what = format!("{scenario} ({mode})");
+            let tmp = TmpDir::new(&format!("{scenario}_{mode}"));
+            let nt = tmp.path("base.nt");
+            fs::write(&nt, &nt_data).unwrap();
+            Database::build_disk(tmp.path("t.db"), &[&nt]).unwrap();
+            let out = run_child(scenario, &tmp.0, mode);
+            child_ok(&out, &what);
+            let redo = fs::read_to_string(tmp.path("redo.log")).unwrap();
+            let update = fs::read_to_string(tmp.path("update.log")).unwrap();
+            assert!(
+                redo.contains("ex/before") && update.contains("ex/before"),
+                "{what}"
+            );
+            let opts = OpenOptions {
+                disk_query_mode: if mode == "stream" {
+                    DiskQueryMode::Stream
+                } else {
+                    DiskQueryMode::Materialize
+                },
+                ..OpenOptions::default()
+            };
+            let mut reopened = Database::open_with(tmp.path("t.db"), &opts).unwrap();
+            let kept = ask(&mut reopened, "ASK { <http://ex/u/s0> ?p ?o }");
+            assert!(
+                ask(&mut reopened, "ASK { <http://ex/before> ?p ?o }"),
+                "{what}"
+            );
+            assert_eq!(
+                kept,
+                !scenario.ends_with("nowal"),
+                "{what}: the reopen replays the log exactly when it got a durable name"
+            );
+            assert_eq!(
+                redo.contains("update value"),
+                kept,
+                "{what}: the redo log disagrees with the reopened database:\n{redo}"
+            );
+            assert_eq!(
+                update.contains("update value"),
+                kept,
+                "{what}: the update log disagrees with the reopened database:\n{update}"
+            );
+            // The redo log replays to the reopened database's triples.
+            let (_, replayed) = replayed(&tmp.path("redo.log"));
+            assert_eq!(
+                replayed.triple_num() + DISK_BASE as u64,
+                reopened.triple_num() + 2,
+                "{what}"
+            );
+        }
     }
 }
 
