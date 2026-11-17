@@ -179,6 +179,13 @@ deb 在 runner 上经 systemd 启动,rpm 在 Fedora 容器中 `rpm -V`,镜像在
   - The unit is installed in `/lib/systemd/system` by the deb (current
     Debian prefers `/usr/lib/systemd/system`; cargo-deb's `systemd-units`
     could take over the unit and its maintainer-script snippets).
+  - infra#12: `RestartPreventExitStatus=1 2` keys on gserver's general
+    error status, which also covers failures a retry could cure (a
+    `listen_addr` not yet configured at boot despite
+    `After=network-online.target`, a port still held by another process):
+    those now leave the service failed instead of retrying. A dedicated
+    exit status for a refused configuration (src/bin/gserver.rs, outside
+    this package) would let the unit prevent only that.
 
 ## Measured numbers
 
@@ -206,6 +213,16 @@ Machine shared with three other implementers' builds.
   (not installed; running a downloaded binary was not permitted; the
   workflow was parsed with PyYAML and its `run` blocks with `bash -n`).
   The proof of those is the GitHub run of `packaging.yml`.
+- Package review (same branch): the image's builder toolchain checked
+  without Docker — `cargo check --locked -p gstore --bins --features
+  pfn-wasm` and `cargo check --locked -p gnlqa` with rustc 1.89.0 (the
+  Dockerfile's `RUST_VERSION`, the declared MSRV of every workspace
+  member): both pass. The packages job's `.deb` binary-list step was
+  fixed before its first run: its `sed` turned the archive's own
+  `./usr/bin/` directory entry (cargo-deb writes one) into an empty name,
+  so the list never matched (reproduced with a `dpkg-deb -b` package).
+  Full `scripts/conformance.sh --no-build` again: six suites PASS, port
+  picked by the kernel.
 
 ## Requests/Not yet
 
