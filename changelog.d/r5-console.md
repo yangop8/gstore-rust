@@ -34,16 +34,21 @@ Behaviour changes first:
   once per login. When the session ends (it expired — 24 h by default — or
   the user's password changed, which ends their sessions) the server answers
   `1001`, and the console logs in again and repeats the request once; at the
-  end it logs out (`POST /logout`). Against a server without `POST /login`
-  (an upstream gserver) it falls back to upstream's `/api` `login` and the
-  per-request password. Wrong credentials still print upstream's
+  end it logs out (`POST /logout`). It checks a new session with `/api`
+  `login`; against a server without `POST /login` (an upstream gserver), or
+  whose `/api` does not take the session (a gstore-rust gserver older than
+  this change, which has `POST /login`; the session is then ended), it
+  falls back to upstream's `/api` `login` and the per-request password.
+  Wrong credentials still print upstream's
   `login failed: Username or password is wrong.`.
 - **`/api` accepts a `/login` session in place of the password (review
   ext#12; a gstore-rust extension of the upstream protocol).** A request
   without a `password` parameter may authenticate with a live session token
   of a `POST /login`, presented as the REST endpoints take it
   (`Authorization: Bearer`, `X-Session-Token`, `session=` / `token=` in the
-  URL). A `username` given must name the session's user; an unknown,
+  URL); the same holds for upstream's `/file/upload` and, when it names a
+  `username`, `/file/download`. A `username` given must name the session's
+  user; an unknown,
   expired, logged-out or revoked token is answered `1001 "The session is
   invalid or has expired: log in again."`. A request that carries a
   password is checked exactly as before (the token is then ignored), so
@@ -100,10 +105,13 @@ Developers and tests:
 - New tests: `tests/api_session_tokens.rs` (the `/api` session path);
   in `tests/dt_gconsole.rs`
   `the_local_mode_saves_acknowledged_updates_when_it_leaves_a_database`,
+  `the_local_mode_keeps_imports_writes_disk_databases_through_and_reports_a_failed_save`,
   `the_local_mode_ends_statements_like_the_remote_console`,
   `server_fields_cannot_drive_the_terminal`,
   `setpriv_refuses_invalid_numbers_and_sets_exactly_the_given_ones`,
   `setpriv_rolls_back_its_grant_when_the_revoke_fails`,
+  `a_server_whose_api_takes_no_session_gets_the_password` (a fake
+  gserver whose `POST /login` gives a session its `/api` refuses),
   `the_password_crosses_the_network_once_per_login` (a relay records what
   the client sends), `the_console_talks_to_a_tls_gserver` (feature `tls`:
   nothing crosses in clear text), `tls_needs_the_tls_feature` (default
@@ -135,7 +143,8 @@ none
 
 - README.md (gconsole section): the console logs in once and sends a
   session token, not the password, with every request (falls back to
-  upstream's per-request password against a server without `POST /login`);
+  upstream's per-request password against a server without `POST /login`
+  or whose `/api` does not take its sessions);
   new options `--tls` and `--ca-file FILE` (feature `tls`) and the
   cleartext warning for a non-loopback host; `gconsole --local` saves a
   snapshot / new in-memory database with unsaved updates when it leaves it
@@ -169,13 +178,15 @@ none
   that case.
 - Suites on this branch (machine shared with other agents), toolchain
   1.99.1: `cargo test --workspace` with `GSTORE_DISK_QUERY_MODE=memory`
-  and with `=stream`: 2950 passed, 0 failed, 8 ignored each;
-  `cargo test -p gstore --features tls`: 2732 passed, 0 failed, 7 ignored;
-  `cargo test -p gstore --features readline`: 2722 passed, 0 failed, 7 ignored;
+  and with `=stream`: 2952 passed, 0 failed, 8 ignored each;
+  `cargo test -p gstore --features tls`: 2734 passed, 0 failed, 7 ignored;
+  `cargo test -p gstore --features readline`: 2724 passed, 0 failed, 7 ignored;
   `cargo clippy --workspace --all-targets -- -D warnings` and
   `cargo clippy -p gstore --all-targets --features tls|readline -- -D
   warnings`: clean; `RUSTDOCFLAGS=-D warnings cargo doc -p gstore
-  --no-deps` (default and `--features tls`): clean.
+  --no-deps` (default and `--features tls`): clean. (Re-run by the
+  package's reviewer after its two commits — the ext#12 session check and
+  the ext#5 guard test — on the final head.)
 
 ## Requests/Not yet
 
