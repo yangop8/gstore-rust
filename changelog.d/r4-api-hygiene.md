@@ -204,6 +204,15 @@ none
   `api_hygiene`, `http_preauth_limits`, `rest_api_parity` pass; workspace
   clippy `-D warnings` and `RUSTDOCFLAGS=-D warnings cargo doc -p gstore`
   clean.
+- After the review commits (the look-alike-directory test added): 2962
+  passed, 0 failed in each disk mode; `--features rocksdb`: 2827 passed, 0
+  failed, clippy clean; workspace clippy `-D warnings`, rustdoc
+  `-D warnings` and `cargo fmt --check` clean. Each fix's test was run
+  against the reverted fix and failed (the seven handle-creation paths at
+  the hang guard, torn tails, rotation and incremental reads, unloaded
+  statistics, the `tls` options, the `/api show` scan, the raw SPARQL body),
+  and the conformance suite caught an off-by-one put into
+  `DiskSource::distinct_p_of_o`.
 
 ## Requests/Not yet
 
