@@ -4,11 +4,15 @@
 //! sidecar, results merge, and every backend answers alike.
 //!
 //! The build phase runs the real `gbuild` from the same target directory
-//! when it is there (`cargo test --workspace` builds it; for
-//! `--features rocksdb` build it with the feature first, as the bench
-//! workflow does). `cargo test -p gstore-bench` alone does not build the
-//! gstore binaries; the tests then use the library builder and say so.
-//! `GSTORE_BENCH_TEST_BUILDER=cli|lib` forces one.
+//! (`cargo test --workspace` builds it; for `--features rocksdb` build it
+//! with the feature first, as the bench workflow does). `cargo test -p
+//! gstore-bench` alone does not build the gstore binaries, and a `gbuild`
+//! left by an older build would be measured without notice, so a missing
+//! `gbuild`, one older than a gstore source file, or one without RocksDB
+//! for `--features rocksdb` fails the tests (review infra#18; they used to
+//! fall back to the library builder, or use the stale binary, saying so
+//! only on captured stderr). `GSTORE_BENCH_TEST_BUILDER=lib` chooses the
+//! library builder explicitly.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -46,25 +50,112 @@ fn gbuild_has_rocksdb(tmp: &Path) -> bool {
     ok
 }
 
-fn builder(tmp: &Path, rocksdb: bool) -> String {
-    if let Ok(b) = std::env::var("GSTORE_BENCH_TEST_BUILDER") {
-        return b;
+/// The newest modification time of the gstore sources `gbuild` is built
+/// from (`src/**`, `Cargo.toml`, `Cargo.lock` under `root`) and that file.
+fn newest_source(root: &Path) -> Option<(std::time::SystemTime, PathBuf)> {
+    fn walk(p: &Path, best: &mut Option<(std::time::SystemTime, PathBuf)>) {
+        let Ok(meta) = std::fs::metadata(p) else {
+            return;
+        };
+        if meta.is_dir() {
+            for e in std::fs::read_dir(p).into_iter().flatten().flatten() {
+                walk(&e.path(), best);
+            }
+        } else if let Ok(t) = meta.modified() {
+            if best.as_ref().is_none_or(|(b, _)| t > *b) {
+                *best = Some((t, p.to_path_buf()));
+            }
+        }
     }
-    if !gbuild().is_file() {
-        eprintln!(
-            "note: {} is not built; using the library builder",
-            gbuild().display()
+    let mut best = None;
+    for rel in ["src", "Cargo.toml", "Cargo.lock"] {
+        walk(&root.join(rel), &mut best);
+    }
+    best
+}
+
+/// Why the `gbuild` at `bin` cannot measure the gstore sources under
+/// `root`: missing, or older than one of them.
+fn gbuild_problem(bin: &Path, root: &Path) -> Option<String> {
+    let Ok(built) = std::fs::metadata(bin).and_then(|m| m.modified()) else {
+        return Some(format!("{} is not built", bin.display()));
+    };
+    match newest_source(root) {
+        Some((t, f)) if t > built => Some(format!(
+            "{} is older than {}: it was built from other sources",
+            bin.display(),
+            f.display()
+        )),
+        _ => None,
+    }
+}
+
+/// The builder of the end-to-end runs: the real `gbuild`, which must be
+/// there, current and (for `--features rocksdb`) built with RocksDB; or the
+/// library builder when `GSTORE_BENCH_TEST_BUILDER=lib` asks for it.
+fn builder(tmp: &Path, rocksdb: bool) -> String {
+    match std::env::var("GSTORE_BENCH_TEST_BUILDER").as_deref() {
+        Ok("lib") => return "lib".into(),
+        Ok("cli") | Err(_) => {}
+        Ok(other) => panic!("GSTORE_BENCH_TEST_BUILDER={other}: give cli or lib"),
+    }
+    let features = if rocksdb { " --features rocksdb" } else { "" };
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    if let Some(why) = gbuild_problem(&gbuild(), root) {
+        panic!(
+            "{why}; build it with `cargo build --profile test -p gstore --bin gbuild{features}` \
+             (or run `cargo test --workspace`), or set GSTORE_BENCH_TEST_BUILDER=lib for the \
+             library builder"
         );
-        return "lib".into();
     }
     if rocksdb && !gbuild_has_rocksdb(tmp) {
-        eprintln!(
-            "note: {} lacks --features rocksdb; using the library builder",
+        panic!(
+            "{} lacks RocksDB; build it with `cargo build --profile test -p gstore --bin gbuild \
+             --features rocksdb`, or set GSTORE_BENCH_TEST_BUILDER=lib",
             gbuild().display()
         );
-        return "lib".into();
     }
     "cli".into()
+}
+
+/// The builder check itself (review infra#18): a missing `gbuild` or one
+/// older than a source file is refused, a current one accepted.
+#[test]
+fn a_missing_or_stale_gbuild_is_refused() {
+    let t = Tmp::new("stale");
+    let root = t.0.join("repo");
+    std::fs::create_dir_all(root.join("src/db")).unwrap();
+    std::fs::write(root.join("Cargo.toml"), "[package]\n").unwrap();
+    std::fs::write(root.join("src/lib.rs"), "").unwrap();
+    let bin = t.0.join("gbuild");
+    let why = gbuild_problem(&bin, &root).unwrap();
+    assert!(why.ends_with("is not built"), "{why}");
+    std::fs::write(&bin, "").unwrap();
+    let set = |p: &Path, secs: u64| {
+        std::fs::File::options()
+            .write(true)
+            .open(p)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            .unwrap();
+    };
+    set(&root.join("Cargo.toml"), 1_000);
+    set(&root.join("src/lib.rs"), 1_000);
+    set(&bin, 2_000);
+    assert_eq!(gbuild_problem(&bin, &root), None);
+    // A source file changed after the build.
+    std::fs::write(root.join("src/db/mod.rs"), "// edited").unwrap();
+    set(&root.join("src/db/mod.rs"), 3_000);
+    let why = gbuild_problem(&bin, &root).unwrap();
+    assert!(
+        why.contains("is older than") && why.contains("mod.rs"),
+        "{why}"
+    );
+    // The real one next to the harness is current (the tests use it).
+    let real_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    if std::env::var("GSTORE_BENCH_TEST_BUILDER").as_deref() != Ok("lib") {
+        assert_eq!(gbuild_problem(&gbuild(), real_root), None);
+    }
 }
 
 struct Tmp(PathBuf);

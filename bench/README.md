@@ -431,8 +431,14 @@ splicing, every committed result still loading and comparing); and the
 binary end to end with the `micro` profile (bless → check, the canary, an
 injected crash and timeout exiting 2, the data cache, merging, every backend
 answering alike, a WatDiv-like run on snapshot and disk with the mixed phase,
-a check that reports a new workload and passes). The end-to-end tests use
-the `gbuild` next to the test binary when it exists (`cargo test
---workspace` builds it) and otherwise the library build, and say so;
-`GSTORE_BENCH_TEST_BUILDER=cli|lib` forces one. The LUBM micro run on the
-disk layout is `#[ignore]` (slow in a debug build).
+a check that reports a new workload and passes). The end-to-end tests
+run the `gbuild` next to the test binary (`cargo test --workspace` builds
+it; alone, build it first with `cargo build --profile test -p gstore --bin
+gbuild`, adding `--features rocksdb` for a RocksDB test run): a missing
+`gbuild`, one older than a gstore source file, or one without RocksDB for
+`--features rocksdb` fails them with that instruction (review infra#18:
+they used to fall back to the library build, or measure a stale binary,
+saying so only on captured stderr). `GSTORE_BENCH_TEST_BUILDER=lib`
+chooses the library build explicitly. The tests of the update phase
+(`tests/update_phase_reopen.rs`) build with the library on purpose. The
+LUBM micro run on the disk layout is `#[ignore]` (slow in a debug build).
