@@ -1,0 +1,7 @@
+{
+  "head": {"vars": ["s", "n", "friends"]},
+  "results": {"bindings": [
+    {"s": {"type": "uri", "value": "http://example.org/a"}, "n": {"type": "literal", "value": "Alice"}, "friends": {"type": "literal", "value": "2", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}},
+    {"s": {"type": "uri", "value": "http://example.org/b"}, "n": {"type": "literal", "value": "Bob"}, "friends": {"type": "literal", "value": "1", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}}
+  ]}
+}

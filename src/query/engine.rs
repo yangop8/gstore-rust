@@ -2209,8 +2209,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// in order (a later one may use an earlier alias) and ORDER BY sees the
     /// aliases. A group row binds each GROUP BY variable to the group's key
     /// and, as before, every other WHERE variable to its value in the group's
-    /// first solution. `bind_only` is [`bind_only_vars`] of the pattern, for
-    /// the projected graph functions.
+    /// first solution — which the projection cannot show: projecting a
+    /// non-grouped variable, or using one in a SELECT expression outside an
+    /// aggregate, is a query error (§11.4, review sparqlconf#15; HAVING and
+    /// ORDER BY still see the first solution's value). `bind_only` is
+    /// [`bind_only_vars`] of the pattern, for the projected graph functions.
     fn eval_aggregation(
         &self,
         solutions: &[Binding],
@@ -2226,6 +2229,76 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 ))
             }
         };
+        // SPARQL 1.1 §11.4 (Aggregate Projection Restrictions): a variable
+        // of the WHERE pattern may be projected — or used in a SELECT
+        // expression outside an aggregate — only when it is a GROUP BY key.
+        // Anything else would show the value of an arbitrary solution of
+        // its group (the first one), so it is a query error (review
+        // sparqlconf#15). Allowed besides the keys: a variable of a
+        // trailing VALUES block (joined after grouping, §18.2.4.3), an
+        // earlier SELECT alias, a sub-expression equal to a GROUP BY
+        // expression (`(STR(?o) AS ?k) … GROUP BY STR(?o)`), and what the
+        // pattern never binds (unbound in every group). Graph-function and
+        // PFN projections and EXISTS are not looked into.
+        fn ungrouped<'e>(
+            e: &'e Expr,
+            keys: &[Expr],
+            allowed: &HashSet<&str>,
+            layout: &VarLayout,
+        ) -> Option<&'e str> {
+            if keys.contains(e) {
+                return None;
+            }
+            let free = |x: &'e Expr| ungrouped(x, keys, allowed, layout);
+            match e {
+                Expr::Var(v) => (layout.index.contains_key(v) && !allowed.contains(v.as_str()))
+                    .then_some(v.as_str()),
+                Expr::Const(_)
+                | Expr::Aggregate { .. }
+                | Expr::GraphFn { .. }
+                | Expr::Pfn { .. }
+                | Expr::Exists(..) => None,
+                Expr::Or(a, b)
+                | Expr::And(a, b)
+                | Expr::Compare(_, a, b)
+                | Expr::Arith(_, a, b) => free(a).or_else(|| free(b)),
+                Expr::Not(a) | Expr::Unary(_, a) => free(a),
+                Expr::Builtin(_, args) | Expr::IriCall { args, .. } => args.iter().find_map(free),
+                Expr::In { expr, list, .. } => free(expr).or_else(|| list.iter().find_map(free)),
+            }
+        }
+        let mut allowed: HashSet<&str> = q
+            .group_by
+            .iter()
+            .filter_map(|e| match e {
+                Expr::Var(v) => Some(v.as_str()),
+                _ => None,
+            })
+            .collect();
+        if let Some((vars, _)) = &q.values {
+            allowed.extend(vars.iter().map(String::as_str));
+        }
+        for it in items {
+            let bad = match it {
+                SelectItem::Var(v) => (layout.index.contains_key(v)
+                    && !allowed.contains(v.as_str()))
+                .then_some(v.as_str()),
+                SelectItem::Expr(e, _) => ungrouped(e, &q.group_by, &allowed, layout),
+            };
+            if let Some(v) = bad {
+                let what = if q.group_by.is_empty() {
+                    "an aggregate query without GROUP BY (one group)"
+                } else {
+                    "a GROUP BY query"
+                };
+                return Err(GStoreError::Query(format!(
+                    "?{v} is not grouped: {what} may project a variable of the WHERE                      pattern, or use it in a SELECT expression, only as a GROUP BY key or                      inside an aggregate (SPARQL 1.1 §11.4); group by ?{v} or project                      (SAMPLE(?{v}) AS ?…)"
+                )));
+            }
+            if let SelectItem::Expr(_, alias) = it {
+                allowed.insert(alias);
+            }
+        }
 
         // Group key = the GROUP BY expression values (empty ⇒ one group). A
         // plain variable keys by its bound term itself (RDF term identity, in
