@@ -3561,6 +3561,26 @@ impl ReplicaGroup {
         Some((leader, idx))
     }
 
+    /// Propose a mutation and report whether it **committed**: `Ok(index)` once
+    /// a quorum stored it (delivery is synchronous, so this is decided before
+    /// returning) and the leader applied it; [`ProposeError::NotLeader`] when
+    /// the group has no leader; [`ProposeError::NotCommitted`] when the leader
+    /// appended it but no quorum acknowledged it. The entry then stays in the
+    /// leader's log and may still commit once a quorum is back (or be dropped
+    /// by a later leader), so the outcome is unknown and a retry is safe —
+    /// every [`LogOp`] is idempotent (review cluster-nlqa#4; the
+    /// [`ClusterNode::propose_and_wait`] contract).
+    pub fn commit(&mut self, op: LogOp) -> std::result::Result<u64, ProposeError> {
+        let leader = self.leader().ok_or(ProposeError::NotLeader(None))?;
+        let term = self.state(leader).current_term();
+        let (leader, idx) = self.propose(op).ok_or(ProposeError::NotLeader(None))?;
+        let st = self.state(leader);
+        match st.entry_outcome(idx, term) {
+            Some(true) if st.last_applied() >= idx => Ok(idx),
+            _ => Err(ProposeError::NotCommitted(self.leader())),
+        }
+    }
+
     /// Tick the current leader `rounds` times so pending work — heartbeats,
     /// backfill to a rejoined follower, an [`Request::InstallSnapshot`] to a
     /// replica behind the compaction point — flushes through. A no-op once the
@@ -3681,10 +3701,14 @@ impl ShardedRaftCluster {
     }
 
     /// Route a triple to its bucket's group and commit it through that group's
-    /// Raft log. Returns `Some(true)` if newly added, `Some(false)` if already
-    /// present, or `None` if the owning group currently has no leader to accept
-    /// it. The check against the leader's committed store keeps the op idempotent
-    /// (a duplicate is not re-logged).
+    /// Raft log. Returns `Some(true)` once it is **committed** (newly added),
+    /// `Some(false)` if already present, or `None` if it could not be
+    /// committed now: the owning group has no leader, or its leader has no
+    /// quorum (the entry may stay appended and commit once a quorum returns —
+    /// the outcome is unknown, retry; see [`ReplicaGroup::commit`]). Before
+    /// review cluster-nlqa#4 an appended-but-uncommitted write was reported
+    /// `Some(true)`. The check against the leader's committed store keeps the op
+    /// idempotent (a duplicate is not re-logged).
     pub fn insert(&mut self, t: IdTriple) -> Option<bool> {
         let g = shard_of(t.sub, self.num_shards);
         if let Some(store) = self.groups[g].readable_store() {
@@ -3692,10 +3716,12 @@ impl ShardedRaftCluster {
                 return Some(false);
             }
         }
-        self.groups[g].propose(LogOp::Insert(t)).map(|_| true)
+        self.groups[g].commit(LogOp::Insert(t)).ok().map(|_| true)
     }
 
-    /// Routed bulk insert; returns the number of triples newly committed.
+    /// Routed bulk insert; returns the number of triples newly committed (a
+    /// triple that could not be committed — no leader, no quorum — is not
+    /// counted; see [`ShardedRaftCluster::insert`]).
     pub fn insert_all(&mut self, triples: impl IntoIterator<Item = IdTriple>) -> u64 {
         let mut added = 0;
         for t in triples {
@@ -3707,8 +3733,9 @@ impl ShardedRaftCluster {
     }
 
     /// Route a delete to its bucket's group and commit it. Returns `Some(true)`
-    /// if the triple was present (and is now removed), `Some(false)` if it was
-    /// absent, or `None` if the group has no leader.
+    /// once the delete of a present triple is **committed**, `Some(false)` if it
+    /// was absent, or `None` if the delete could not be committed now (no
+    /// leader, or no quorum — outcome unknown, retry; review cluster-nlqa#4).
     pub fn remove(&mut self, t: IdTriple) -> Option<bool> {
         let g = shard_of(t.sub, self.num_shards);
         // Decide presence only against the leader. With no leader, a probe would
@@ -3723,7 +3750,7 @@ impl ShardedRaftCluster {
         if !present {
             return Some(false);
         }
-        self.groups[g].propose(LogOp::Delete(t)).map(|_| true)
+        self.groups[g].commit(LogOp::Delete(t)).ok().map(|_| true)
     }
 
     /// Tick every bucket's leader `rounds` times so any pending catch-up /
@@ -6105,9 +6132,19 @@ mod replicated_shard_tests {
         // commit, so nothing new is applied.
         cluster.set_replica_down(0, followers[2], true);
         let before = cluster.group(0).state(leader).commit_index();
+        let appended = cluster.group(0).state(leader).log_len();
+        // review cluster-nlqa#12: this asserted `Some(true)` — "committed",
+        // per insert's docs — for exactly this uncommitted write (the bug of
+        // cluster-nlqa#4). An uncommitted write reports `None` (outcome
+        // unknown); that the leader still appends it is checked directly.
         assert_eq!(
             cluster.insert(t(7, 8, 9)),
-            Some(true),
+            None,
+            "an uncommitted write is not reported committed"
+        );
+        assert_eq!(
+            cluster.group(0).state(leader).log_len(),
+            appended + 1,
             "leader still appends"
         );
         let after = cluster.group(0).state(leader).commit_index();
@@ -6753,5 +6790,53 @@ mod review_fix_tests {
         }
         assert!(node.0.current_term() < u64::MAX);
         assert!(node.0.store_contains(t(1, 2, 3)));
+    }
+
+    // ----- review cluster-nlqa#4: commit reporting ----------------------------
+
+    /// With both followers down the leader can append but never commit:
+    /// `insert_all` used to report 5 triples "newly committed" while the
+    /// cluster held none. Writes that cannot commit are reported as such
+    /// (`None`: outcome unknown, retry), and commit once a quorum is back.
+    #[test]
+    fn writes_without_a_quorum_are_not_reported_committed() {
+        let mut c = ShardedRaftCluster::with_compaction(1, 3, RaftConfig::default(), 0);
+        c.bootstrap();
+        let leader = c.group(0).leader().unwrap();
+        assert_eq!(
+            c.insert(t(100, 1, 1)),
+            Some(true),
+            "committed with a quorum"
+        );
+        let followers: Vec<NodeId> = c
+            .group(0)
+            .replicas()
+            .iter()
+            .copied()
+            .filter(|&r| r != leader)
+            .collect();
+        for &f in &followers {
+            c.set_replica_down(0, f, true);
+        }
+
+        let n = c.insert_all((1..=5).map(|s| t(s, 2, 3)));
+        assert_eq!(n, 0, "nothing was committed");
+        assert_eq!(c.try_triple_count().unwrap(), 1);
+        assert_eq!(c.insert(t(9, 9, 9)), None, "an uncommitted insert");
+        assert_eq!(
+            c.remove(t(100, 1, 1)),
+            None,
+            "a delete that cannot commit is not reported done"
+        );
+        assert!(c.try_exists(100, 1, 1).unwrap());
+
+        // A quorum returns: the appended entries commit (which is why the
+        // outcome was "unknown", not "failed").
+        for &f in &followers {
+            c.set_replica_down(0, f, false);
+        }
+        c.settle(5);
+        assert_eq!(c.try_triple_count().unwrap(), 6);
+        assert!(!c.try_exists(100, 1, 1).unwrap());
     }
 }
