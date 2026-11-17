@@ -1386,6 +1386,18 @@ pub struct Dictionary {
     allocations: Option<Vec<TermId>>,
 }
 
+/// Cloning is cheap (the interners are copy-on-write) but **not free of side
+/// effects** for an out-of-core dictionary (review design#14): a clone that
+/// shares the backend takes a [`DictPin`] of its own (a clone of a clone
+/// takes a newer one) and holds it until it is dropped, so no id retired
+/// after the clone was taken is reused while it lives
+/// ([`release`](Dictionary::release) keeps those ids back, and on
+/// a Stream-mode database the frees wait: `Database::has_deferred_frees`).
+/// A long-lived clone (a published `concurrent::Snapshot`, the
+/// construction-time base snapshot a `ConcurrentDb` keeps for its whole
+/// life, a reader holding an old snapshot) therefore defers id reuse until
+/// it is dropped. Drop clones promptly; a clone of an in-memory dictionary
+/// takes no pin (it owns its copy-on-write version of every id).
 impl Clone for Dictionary {
     fn clone(&self) -> Dictionary {
         Dictionary {

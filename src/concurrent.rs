@@ -1,6 +1,14 @@
 //! Concurrent access with snapshot isolation — a scoped analogue of gStore's
 //! `Txn_manager` + MVCC.
 //!
+//! **Status: a library API, and a second concurrency model** (review
+//! design#14). No server or command-line tool uses [`ConcurrentDb`]: the HTTP
+//! servers keep each [`Database`] read-shared / write-exclusive with their own
+//! single-writer transactions (`/begin`, whose three `isolevel` values all
+//! behave serializably — see `crate::http_api::TxnIsolation`). The OCC
+//! multi-writer transactions, the four [`IsolationLevel`]s and the per-key
+//! version chains below exist only here, for programs that embed the crate.
+//!
 //! [`ConcurrentDb`] lets many reader threads query while writers commit, with
 //! **snapshot isolation**: a query runs against an immutable, consistent
 //! [`Snapshot`] (an `Arc`), so readers never observe a half-applied write and
@@ -26,7 +34,8 @@
 //!
 //! A bounded history of `version → written-key-set` backs validation; entries
 //! older than the oldest live transaction's start version are garbage-collected
-//! on every commit/abort, so the history never grows unbounded.
+//! on every commit/abort (from the oldest end: the cost is the entries
+//! dropped), so the history never grows unbounded.
 //!
 //! Cost model: publishing a [`Snapshot`] of an in-memory database is O(1) in
 //! the data: the dictionary (an `Arc`'d interner), the default graph's
@@ -39,7 +48,11 @@
 //! let it go — by replaying the changes made since (O(changes)), instead of
 //! copying the whole store (O(triples), the fallback when a reader still
 //! holds that older snapshot). A one-triple update therefore costs about
-//! two triple inserts, not a store copy. Memory: the database's indexes,
+//! two triple inserts, not a store copy — as long as it interns no new
+//! term: the dictionary's interners are copy-on-write without a spare, so
+//! the first brand-new term after a publish copies that term space's
+//! interner (O(terms of the space), about 0.4 ms at 20,000 entities in an
+//! unoptimized build; `crate::dict`). Memory: the database's indexes,
 //! the spare and the construction-time base snapshot's (see
 //! [`VersionView`]) — three copies at most, as when every publish cloned
 //! the store. A database with no in-RAM store — a Stream-mode on-disk one
@@ -62,6 +75,21 @@
 //! materializes the visible state only on demand. Records below the oldest live
 //! reader's version are garbage-collected, so each chain collapses to one record
 //! per key in steady state.
+//!
+//! The version-chain GC is incremental (review conc#2, http#8): each commit
+//! queues the keys it wrote under its version, and a GC — on every commit,
+//! conflict, [`Txn`] or [`VersionView`] drop — examines only the keys of the
+//! versions the oldest live pin has passed since the previous one. Its cost
+//! is the records it can collect, not the number of chains (it used to walk
+//! every chain each time, 8 ms per commit after 20,000 transactional
+//! inserts); a transaction or view dropped with nothing to collect does no
+//! chain work. Memory: a chain whose single remaining record agrees with the
+//! base snapshot is dropped, but a key whose committed state *differs* from
+//! the construction-time base — every triple a transaction inserted, every
+//! base triple it deleted — keeps a one-record chain for the wrapper's life
+//! (the base is never re-based; `docs/REFACTOR_BACKLOG.md`).
+//! [`ConcurrentDb::version_chain_stats`] reports the chains, their records
+//! and the GC work.
 //!
 //! Scope note: the legacy `update()`/`write()` path stays snapshot-consistent for
 //! readers and records its commit version, so a [`Txn`] whose lifetime overlaps a
@@ -106,12 +134,31 @@
 //! long enough to clone the `Arc` and `versioned` only while materializing,
 //! never while evaluating.
 //!
+//! Failures and panics (review conc#3, conc#4, http#9, http#17, robust#13):
+//!
+//! * An UPDATE that fails part-way keeps its earlier operations applied, as
+//!   [`Database::query`] does; [`ConcurrentDb::update`] publishes them and
+//!   records them as a non-transactional write, so readers see what the
+//!   database holds and an overlapping [`Txn`] conflicts.
+//! * No lock stays poisoned. A [`write`](ConcurrentDb::write) closure that
+//!   panics has the transaction it opened rolled back and what it applied
+//!   published before the panic continues into the caller; a panic inside a
+//!   commit rolls back the writes it was applying; whatever a panicking
+//!   writer leaves is published by the next writer (as a non-transactional
+//!   write), and a panic while the OCC state was held makes every
+//!   transaction live at the time conflict.
+//! * [`Txn`] and [`VersionView`] drops never panic, so a panic inside a
+//!   commit (which drops the transaction while it unwinds) cannot turn into
+//!   a double panic and a process abort.
+//!
 //! NOT done (see `docs/REFACTOR_BACKLOG.md` E): lock-free reads beyond the
 //! `Arc`-swap / `RwLock`, deadlock detection, and version-chaining the legacy
 //! `update()`/`write()` path.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, Mutex, RwLock};
+use std::convert::Infallible;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::analytics::csr::{CsrCache, CsrGraph};
 use crate::db::{CommitFailure, Database};
@@ -139,6 +186,16 @@ fn evaluate_scoped(eval: Evaluator<'_>, q: &sparql::ast::Query) -> Result<QueryR
         return Err(read_failure("evaluating the query", e));
     }
     result
+}
+
+/// A test-only failpoint: panic at the named step when a test of this module
+/// armed it on this thread (`tests::arm_failpoint`); nothing otherwise.
+/// Drives the panics inside a commit or an UPDATE that no public call can
+/// provoke (review conc#3).
+#[inline]
+fn failpoint(_step: &'static str) {
+    #[cfg(test)]
+    tests::hit_failpoint(_step);
 }
 
 /// A canonical, dictionary-independent key for a triple: its N-Triples surface
@@ -435,9 +492,16 @@ impl OccState {
     /// Drop history entries no live transaction can still need. A txn that
     /// started at `s` only validates versions `> s`, so anything at or below the
     /// smallest live start is unreachable; with no live txns, all of it is.
+    /// Pops from the oldest end: the cost is the entries dropped, not the
+    /// history's length (review conc#2).
     fn gc(&mut self) {
         let floor = self.gc_floor();
-        self.history.retain(|&v, _| v > floor);
+        while let Some(oldest) = self.history.first_entry() {
+            if *oldest.key() > floor {
+                break;
+            }
+            oldest.remove();
+        }
     }
 }
 
@@ -476,19 +540,30 @@ impl Chain {
 /// A per-key version-chain store shared (behind an `RwLock`) by every
 /// version-pinned reader. Maps each triple key to its [`Chain`]; readers filter
 /// by version instead of cloning the store.
+///
+/// Garbage collection is incremental (review conc#2, http#8): a record can
+/// only become collectable once the GC floor (the oldest live pin) reaches
+/// its version, so every record's key is queued under its version in
+/// `pending`, and a GC examines just the keys of the versions the floor has
+/// passed since the previous GC — each record once, whatever the number of
+/// chains. A chain left with one record that differs from the base snapshot
+/// is then not looked at again until a later commit writes its key.
 #[derive(Debug, Default)]
 struct VersionedStore {
     chains: HashMap<TripleKey, Chain>,
+    /// `version → keys a commit at that version appended a record to`, not
+    /// yet examined by a GC (the floor has not reached the version).
+    pending: BTreeMap<u64, Vec<TripleKey>>,
+    /// Work counter: chains examined by [`gc`](Self::gc) so far.
+    gc_visits: u64,
 }
 
 impl VersionedStore {
-    fn new() -> VersionedStore {
-        VersionedStore::default()
-    }
-
-    /// Append a version record for `triple`'s key at `version`.
+    /// Append a version record for `triple`'s key at `version` (queued for
+    /// the GC that the floor passing `version` runs).
     fn record(&mut self, version: u64, triple: Triple, op: ChainOp) {
         let key = triple.to_string();
+        self.pending.entry(version).or_default().push(key.clone());
         self.chains
             .entry(key)
             .or_insert_with(|| Chain {
@@ -559,27 +634,62 @@ impl VersionedStore {
     /// the `base` snapshot is then dropped from the map entirely: a read would
     /// fall back to `base` and get the same answer, so keeping the entry only
     /// grows memory without bound under a churny insert/delete workload.
+    ///
+    /// Only the chains of the `pending` versions `<= floor` are examined:
+    /// a chain whose records are all older than the last floor was already
+    /// collapsed to its anchor, and one with a record newer than `floor` is
+    /// queued under that record's version, so it is examined again when the
+    /// floor gets there (see the type docs).
     fn gc(&mut self, floor: u64, base: &Snapshot) {
-        self.chains.retain(|_key, chain| {
-            if let Some(anchor) = chain.records.iter().rposition(|r| r.version <= floor) {
-                chain.records.drain(0..anchor);
+        while let Some(oldest) = self.pending.first_entry() {
+            if *oldest.key() > floor {
+                break;
             }
-            match chain.records.as_slice() {
-                // No surviving record ⇒ nothing to observe; drop it.
-                [] => false,
-                // A single surviving record that agrees with the base snapshot is
-                // redundant (a base fallback yields the same present/absent
-                // answer) and every live reader is at/after it, so drop the entry.
-                // A base that cannot be read (an out-of-core dictionary's
-                // read error) cannot tell: keep the record.
-                [only] => base
-                    .try_contains(&chain.triple)
-                    .is_none_or(|present| (only.op == ChainOp::Insert) != present),
-                // Multiple versions are still distinguishable by live readers.
-                _ => true,
+            for key in oldest.remove() {
+                self.gc_visits += 1;
+                // Already dropped (a key queued under several versions).
+                let Some(chain) = self.chains.get_mut(&key) else {
+                    continue;
+                };
+                if let Some(anchor) = chain.records.iter().rposition(|r| r.version <= floor) {
+                    chain.records.drain(0..anchor);
+                }
+                let redundant = match chain.records.as_slice() {
+                    // No surviving record ⇒ nothing to observe; drop it.
+                    [] => true,
+                    // A single surviving record (at or below `floor`, so every
+                    // live reader is at/after it) that agrees with the base
+                    // snapshot is redundant: a base fallback yields the same
+                    // present/absent answer. A base that cannot be read (an
+                    // out-of-core dictionary's read error) cannot tell: keep
+                    // the record.
+                    [only] => base
+                        .try_contains(&chain.triple)
+                        .is_some_and(|present| (only.op == ChainOp::Insert) == present),
+                    // Multiple versions are still distinguishable by live readers.
+                    _ => false,
+                };
+                if redundant {
+                    self.chains.remove(&key);
+                }
             }
-        });
+        }
     }
+}
+
+/// The size of a [`ConcurrentDb`]'s per-key version chains and the work their
+/// garbage collection has done ([`ConcurrentDb::version_chain_stats`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VersionChainStats {
+    /// Triple keys that have a version chain: the keys a version-pinned
+    /// reader still needs to tell apart, plus every key whose committed
+    /// state differs from the construction-time base snapshot.
+    pub chains: usize,
+    /// Version records over all chains.
+    pub records: usize,
+    /// Chains the garbage collection has examined since the wrapper was
+    /// created — a work counter.
+    pub gc_visits: u64,
 }
 
 /// A thread-safe database wrapper offering concurrent snapshot-isolated reads,
@@ -597,7 +707,27 @@ pub struct ConcurrentDb {
     /// they need not clone the store per snapshot.
     base: Arc<Snapshot>,
     /// Per-key version chains backing [`VersionView`] reads.
-    versioned: RwLock<VersionedStore>,
+    versioned: ChainLock,
+}
+
+/// The lock of the version chains, poison-tolerant (review conc#3): a panic
+/// while it was held (there is no known source inside the chain code) does
+/// not make later reads and commits panic — each record is appended whole
+/// and the GC drops whole records, so the chains stay readable. `read`
+/// keeps `RwLock::read`'s shape with an error that cannot occur.
+#[derive(Debug, Default)]
+struct ChainLock(RwLock<VersionedStore>);
+
+impl ChainLock {
+    /// Shared access; never fails.
+    fn read(&self) -> std::result::Result<RwLockReadGuard<'_, VersionedStore>, Infallible> {
+        Ok(self.0.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Exclusive access.
+    fn write(&self) -> RwLockWriteGuard<'_, VersionedStore> {
+        self.0.write().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 impl ConcurrentDb {
@@ -610,7 +740,7 @@ impl ConcurrentDb {
             writer: Mutex::new(db),
             current: RwLock::new(snap),
             occ: Mutex::new(OccState::new()),
-            versioned: RwLock::new(VersionedStore::new()),
+            versioned: ChainLock::default(),
         }
     }
 
@@ -619,15 +749,89 @@ impl ConcurrentDb {
         Ok(ConcurrentDb::new(Database::build_from_str(name, content)?))
     }
 
+    // ---- poison-tolerant locking (review conc#3, http#17) ------------------
+    //
+    // A panic while one of these locks is held poisons it; none of them is
+    // left poisoned. Each guarded value stays consistent across a panic or
+    // is made so here: a reader's `Arc` is swapped whole, the OCC state
+    // conservatively conflicts every transaction live at the panic, and the
+    // writer database is published as it was left. No lock acquisition can
+    // panic, so a `Drop` that runs while a panic unwinds never panics again.
+
+    /// The writer database. When a writer panicked while holding it, the
+    /// state it left — the database's own operations keep what they applied
+    /// on a panic, as on a failure (`Database::query`), and write paths here
+    /// roll back a transaction they opened — is published first and counts
+    /// as a non-transactional write, so readers see what the database holds
+    /// and every transaction overlapping the panic conflicts.
+    fn lock_writer(&self) -> MutexGuard<'_, Database> {
+        match self.writer.lock() {
+            Ok(db) => db,
+            Err(poisoned) => {
+                let db = poisoned.into_inner();
+                self.writer.clear_poison();
+                crate::gs_warn!(
+                    "database '{}': a ConcurrentDb writer panicked; publishing the state it left",
+                    db.name()
+                );
+                self.publish_legacy(&db);
+                db
+            }
+        }
+    }
+
+    /// The OCC state. After a panic while it was held (inside a commit) a
+    /// published version may lack its write set in the history: every
+    /// transaction that started before the current version then conflicts,
+    /// as after a non-transactional write.
+    fn lock_occ(&self) -> MutexGuard<'_, OccState> {
+        match self.occ.lock() {
+            Ok(occ) => occ,
+            Err(poisoned) => {
+                let mut occ = poisoned.into_inner();
+                self.occ.clear_poison();
+                occ.last_legacy_version = occ.last_legacy_version.max(self.version());
+                occ
+            }
+        }
+    }
+
+    /// The published snapshot, for reading (a whole `Arc`, never torn).
+    fn read_current(&self) -> RwLockReadGuard<'_, Arc<Snapshot>> {
+        self.current.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The version chains, for writing (see [`ChainLock`]).
+    fn write_versioned(&self) -> RwLockWriteGuard<'_, VersionedStore> {
+        self.versioned.write()
+    }
+
+    /// The version chains, for reading (see [`ChainLock`]).
+    fn read_versioned(&self) -> RwLockReadGuard<'_, VersionedStore> {
+        let Ok(chains) = self.versioned.read();
+        chains
+    }
+
+    /// Publish `db` as a non-transactional ("legacy") write: a new version
+    /// that every transaction live now conflicts with on commit
+    /// (repeatable-read and serializable). Takes the OCC lock (writer → occ
+    /// → current order: the caller holds the writer).
+    fn publish_legacy(&self, db: &Database) -> u64 {
+        let mut occ = self.lock_occ();
+        let v = self.publish(db);
+        occ.last_legacy_version = v;
+        v
+    }
+
     /// The current committed version number.
     pub fn version(&self) -> u64 {
-        self.current.read().unwrap().version
+        self.read_current().version
     }
 
     /// Acquire a stable snapshot handle. Subsequent commits do not affect it, so
     /// a sequence of reads against the same snapshot is consistent.
     pub fn snapshot(&self) -> Arc<Snapshot> {
-        Arc::clone(&self.current.read().unwrap())
+        Arc::clone(&self.read_current())
     }
 
     /// Run a read query against the latest committed snapshot — without holding
@@ -636,25 +840,37 @@ impl ConcurrentDb {
         self.snapshot().query(sparql)
     }
 
-    /// Apply a SPARQL UPDATE atomically: mutate the authoritative database (under
-    /// the writer lock), then publish a new snapshot. Returns the changed count.
+    /// Apply a SPARQL UPDATE: mutate the authoritative database (under the
+    /// writer lock), then publish a new snapshot atomically — readers see all
+    /// of it or none of it. Returns the changed count.
+    ///
+    /// An UPDATE that fails part-way keeps the operations before the failing
+    /// one applied, as [`Database::query`] does (and makes them durable on a
+    /// persistent layout). They are published too — readers see what the
+    /// database holds — as a non-transactional write, so a transaction
+    /// overlapping it conflicts on commit; the error is returned as
+    /// [`Database::query`] returned it (review conc#4, http#9, robust#13). A
+    /// request that changed nothing before failing publishes nothing.
     pub fn update(&self, sparql: &str) -> Result<usize> {
-        let mut db = self.writer.lock().unwrap();
-        let result = db.query(sparql)?;
-        let changed = match result {
-            QueryResult::Update { changed } => changed,
-            _ => {
-                return Err(GStoreError::Query(
-                    "ConcurrentDb::update expects a SPARQL UPDATE request".into(),
-                ))
+        let mut db = self.lock_writer();
+        let before = db.mutation_count();
+        let result = db.query(sparql);
+        failpoint("update:applied");
+        match result {
+            Ok(QueryResult::Update { changed }) => {
+                self.publish_legacy(&db);
+                Ok(changed)
             }
-        };
-        // Record the legacy-write version under the OCC lock so overlapping
-        // transactions detect it (writer → occ → current order preserved).
-        let mut occ = self.occ.lock().unwrap();
-        let v = self.publish(&db);
-        occ.last_legacy_version = v;
-        Ok(changed)
+            Ok(_) => Err(GStoreError::Query(
+                "ConcurrentDb::update expects a SPARQL UPDATE request".into(),
+            )),
+            Err(e) => {
+                if db.mutation_count() != before {
+                    self.publish_legacy(&db);
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Run a closure that mutates the database under the writer lock, then
@@ -665,16 +881,32 @@ impl ConcurrentDb {
     /// RocksDB database become durable at the next commit point: call
     /// [`Database::sync`] inside the closure (or [`sync`](Self::sync) after it)
     /// to make them durable now and to see any persistence failure.
+    ///
+    /// A closure that panics does not poison the wrapper (review conc#3,
+    /// http#17): a database transaction it opened ([`Database::begin`]) and
+    /// left open is rolled back, what it applied otherwise is published (and
+    /// counts as a non-transactional write, like any `write()`), the locks
+    /// are released, and the panic then continues into the caller. A
+    /// transaction the closure leaves open when it *returns* is left alone.
     pub fn write<F, T>(&self, f: F) -> T
     where
         F: FnOnce(&mut Database) -> T,
     {
-        let mut db = self.writer.lock().unwrap();
-        let out = f(&mut db);
-        let mut occ = self.occ.lock().unwrap();
-        let v = self.publish(&db);
-        occ.last_legacy_version = v;
-        out
+        let mut db = self.lock_writer();
+        let had_txn = db.in_transaction();
+        let out = catch_unwind(AssertUnwindSafe(|| f(&mut db)));
+        if out.is_err() && !had_txn && db.in_transaction() {
+            if let Err(e) = db.rollback() {
+                crate::gs_warn!(
+                    "database '{}': rolling back the transaction a panicking ConcurrentDb::write \
+                     closure left open failed: {e}",
+                    db.name()
+                );
+            }
+        }
+        self.publish_legacy(&db);
+        drop(db);
+        out.unwrap_or_else(|panic| resume_unwind(panic))
     }
 
     /// A commit point on the authoritative database (see [`Database::sync`]):
@@ -682,7 +914,7 @@ impl ConcurrentDb {
     /// reports any persistence failure since the previous commit point. A no-op
     /// for an in-memory database.
     pub fn sync(&self) -> Result<()> {
-        self.writer.lock().unwrap().sync()
+        self.lock_writer().sync()
     }
 
     /// Publish a fresh snapshot from the writer database (bumping the version),
@@ -693,7 +925,9 @@ impl ConcurrentDb {
         Self::keep_spares(db);
         let next = self.version() + 1;
         let snap = Arc::new(Snapshot::from_db(db, next));
-        let old = std::mem::replace(&mut *self.current.write().unwrap(), snap);
+        let mut current = self.current.write().unwrap_or_else(PoisonError::into_inner);
+        let old = std::mem::replace(&mut *current, snap);
+        drop(current);
         drop(old);
         next
     }
@@ -723,8 +957,8 @@ impl ConcurrentDb {
     pub fn begin_with(&self, level: IsolationLevel) -> Txn<'_> {
         // Register liveness and capture the snapshot atomically under the OCC
         // lock, so a concurrent commit cannot GC a history entry we will need.
-        let mut occ = self.occ.lock().unwrap();
-        let snapshot = Arc::clone(&self.current.read().unwrap());
+        let mut occ = self.lock_occ();
+        let snapshot = self.snapshot();
         let start_version = snapshot.version;
         occ.register(start_version);
         drop(occ);
@@ -775,8 +1009,8 @@ impl ConcurrentDb {
     pub fn version_view(&self) -> VersionView<'_> {
         // Capture the version + register liveness atomically under the OCC lock,
         // so a concurrent commit cannot GC a version this view will need.
-        let mut occ = self.occ.lock().unwrap();
-        let version = self.current.read().unwrap().version;
+        let mut occ = self.lock_occ();
+        let version = self.version();
         occ.register(version);
         drop(occ);
         VersionView {
@@ -798,7 +1032,7 @@ impl ConcurrentDb {
     /// call time yields a view that silently omits keys whose old records were
     /// collected. Pin the version *before* dropping the reader that keeps it live.
     pub fn version_view_at(&self, version: u64) -> VersionView<'_> {
-        let mut occ = self.occ.lock().unwrap();
+        let mut occ = self.lock_occ();
         occ.register(version);
         drop(occ);
         VersionView {
@@ -812,21 +1046,30 @@ impl ConcurrentDb {
     /// snapshot version). Callers compute `floor` from [`OccState::gc_floor`]
     /// while holding the OCC lock, preserving the writer → occ → versioned order.
     fn gc_versions(&self, floor: u64) {
-        self.versioned.write().unwrap().gc(floor, &self.base);
+        self.write_versioned().gc(floor, &self.base);
+    }
+
+    /// The size of the per-key version chains and the work their garbage
+    /// collection has done so far (diagnostics; see [`VersionChainStats`]).
+    pub fn version_chain_stats(&self) -> VersionChainStats {
+        let vs = self.read_versioned();
+        VersionChainStats {
+            chains: vs.chains.len(),
+            records: vs.chains.values().map(|c| c.records.len()).sum(),
+            gc_visits: vs.gc_visits,
+        }
     }
 
     /// Number of retained history entries (used by tests to assert GC bounds).
     #[cfg(test)]
     fn history_len(&self) -> usize {
-        self.occ.lock().unwrap().history.len()
+        self.lock_occ().history.len()
     }
 
     /// Number of version records retained in a triple key's chain (tests).
     #[cfg(test)]
     fn chain_len(&self, key: &str) -> usize {
-        self.versioned
-            .read()
-            .unwrap()
+        self.read_versioned()
             .chains
             .get(key)
             .map_or(0, |c| c.records.len())
@@ -842,7 +1085,9 @@ impl Drop for ConcurrentDb {
     /// database, as at a restart (`gcompact --reclaim` finds them).
     fn drop(&mut self) {
         let Ok(db) = self.writer.get_mut() else {
-            // A writer panicked mid-change: touch nothing more.
+            // A writer panicked and no writer recovered the database since
+            // (`lock_writer`): touch nothing more — its deferred frees are
+            // lost as at a restart (`gcompact --reclaim` finds them).
             return;
         };
         if !db.has_deferred_frees() {
@@ -961,8 +1206,8 @@ impl Txn<'_> {
     /// touched a triple key this txn also wrote.
     pub fn commit(mut self) -> Result<u64> {
         // Lock order is always writer → occ → current (see module docs).
-        let mut db = self.db.writer.lock().unwrap();
-        let mut occ = self.db.occ.lock().unwrap();
+        let mut db = self.db.lock_writer();
+        let mut occ = self.db.lock_occ();
 
         // Conflict checks depend on the isolation level (see `IsolationLevel`).
         let ww = self.level.checks_write_write();
@@ -988,10 +1233,7 @@ impl Txn<'_> {
                 .range((self.start_version + 1)..)
                 .any(|(_v, keys)| !self.reads.is_disjoint(keys));
         if legacy_during || ww_conflict || rw_conflict {
-            occ.deregister(self.start_version);
-            occ.gc();
-            self.db.gc_versions(occ.gc_floor());
-            self.registered = false;
+            self.retire(&mut occ);
             let kind = if legacy_during {
                 "non-transactional write"
             } else if rw_conflict {
@@ -1013,13 +1255,11 @@ impl Txn<'_> {
         let persist_failure = match apply_txn_ops(&mut db, &self.ops) {
             Ok(failure) => failure,
             Err(e) => {
-                occ.deregister(self.start_version);
-                occ.gc();
-                self.db.gc_versions(occ.gc_floor());
-                self.registered = false;
+                self.retire(&mut occ);
                 return Err(e);
             }
         };
+        failpoint("commit:applied");
         let new_version = self.db.publish(&db);
 
         // Append this commit's per-key version records to the shared chains: one
@@ -1037,7 +1277,7 @@ impl Txn<'_> {
             }
         }
         {
-            let mut vs = self.db.versioned.write().unwrap();
+            let mut vs = self.db.write_versioned();
             for (_, (triple, op)) in net {
                 vs.record(new_version, triple, op);
             }
@@ -1047,10 +1287,7 @@ impl Txn<'_> {
         // ourselves from the live registry and GC unreachable history + versions.
         let keys = std::mem::take(&mut self.keys);
         occ.history.insert(new_version, keys);
-        occ.deregister(self.start_version);
-        occ.gc();
-        self.db.gc_versions(occ.gc_floor());
-        self.registered = false;
+        self.retire(&mut occ);
         // The writes are applied and published either way; a commit point
         // that failed once they could no longer be undone is reported like an
         // auto-commit UPDATE's persistence failure.
@@ -1064,6 +1301,16 @@ impl Txn<'_> {
     /// committing has the same effect.)
     pub fn abort(self) {
         // `Drop` performs the deregistration + GC.
+    }
+
+    /// Retire this transaction from the live registry, then collect the
+    /// history and the version records no live transaction or view can still
+    /// need (the caller holds the OCC lock: occ → versioned order).
+    fn retire(&mut self, occ: &mut OccState) {
+        occ.deregister(self.start_version);
+        self.registered = false;
+        occ.gc();
+        self.db.gc_versions(occ.gc_floor());
     }
 }
 
@@ -1085,21 +1332,38 @@ fn apply_txn_ops(db: &mut Database, ops: &[TxnOp]) -> Result<Option<GStoreError>
     // out-of-core dictionary's read error) fails the transaction instead of
     // silently removing nothing.
     let scope = ReadScope::enter();
-    let applied = ops.iter().try_for_each(|op| {
-        match op {
-            TxnOp::Insert(t) => {
-                db.try_insert_triple(t)?;
+    let applied = catch_unwind(AssertUnwindSafe(|| {
+        ops.iter().try_for_each(|op| {
+            failpoint("commit:apply-op");
+            match op {
+                TxnOp::Insert(t) => {
+                    db.try_insert_triple(t)?;
+                }
+                TxnOp::Delete(t) => {
+                    db.remove_triple(t);
+                }
             }
-            TxnOp::Delete(t) => {
-                db.remove_triple(t);
+            match scope.take_error() {
+                Some(e) => Err(read_failure("applying the transaction's writes", e)),
+                None => Ok(()),
             }
-        }
-        match scope.take_error() {
-            Some(e) => Err(read_failure("applying the transaction's writes", e)),
-            None => Ok(()),
-        }
-    });
+        })
+    }));
     drop(scope);
+    // A panic part-way (review conc#3) undoes the ops applied before it, as
+    // an error does, so the writer database is not left inside a transaction
+    // nobody commits; the panic then continues.
+    let applied = applied.unwrap_or_else(|panic| {
+        if own_txn {
+            if let Err(e) = db.rollback() {
+                crate::gs_warn!(
+                    "database '{}': rolling back a ConcurrentDb commit that panicked failed: {e}",
+                    db.name()
+                );
+            }
+        }
+        resume_unwind(panic)
+    });
     match applied {
         // Review (r2-txn): a commit the database rolled back must not be
         // published — its writes would live on in the version chains.
@@ -1123,13 +1387,20 @@ fn apply_txn_ops(db: &mut Database, ops: &[TxnOp]) -> Result<Option<GStoreError>
 }
 
 impl Drop for Txn<'_> {
+    /// Deregister an uncommitted transaction. Never panics (review conc#3,
+    /// http#17): a panic inside [`commit`](Txn::commit) drops the
+    /// transaction while it unwinds, after poisoning the OCC lock, and a
+    /// second panic would abort the process. While a panic unwinds only the
+    /// deregistration runs; the GC is left to the next commit or drop.
     fn drop(&mut self) {
         if self.registered {
-            let mut occ = self.db.occ.lock().unwrap();
-            occ.deregister(self.start_version);
-            occ.gc();
-            self.db.gc_versions(occ.gc_floor());
-            self.registered = false;
+            let mut occ = self.db.lock_occ();
+            if std::thread::panicking() {
+                occ.deregister(self.start_version);
+                self.registered = false;
+            } else {
+                self.retire(&mut occ);
+            }
         }
     }
 }
@@ -1159,13 +1430,7 @@ impl VersionView<'_> {
     /// snapshot for keys with no such record — cloning nothing.
     pub fn contains(&self, t: &Triple) -> bool {
         let key = t.to_string();
-        match self
-            .db
-            .versioned
-            .read()
-            .unwrap()
-            .visible_present(&key, self.version)
-        {
+        match self.db.read_versioned().visible_present(&key, self.version) {
             Some(present) => present,
             None => self.db.base.contains(t),
         }
@@ -1230,13 +1495,17 @@ impl VersionView<'_> {
 }
 
 impl Drop for VersionView<'_> {
+    /// Release the GC pin. Never panics, also not while a panic unwinds (then
+    /// the GC is left to the next commit or drop), like [`Txn`]'s drop.
     fn drop(&mut self) {
         if self.registered {
-            let mut occ = self.db.occ.lock().unwrap();
+            let mut occ = self.db.lock_occ();
             occ.deregister(self.version);
-            occ.gc();
-            self.db.gc_versions(occ.gc_floor());
             self.registered = false;
+            if !std::thread::panicking() {
+                occ.gc();
+                self.db.gc_versions(occ.gc_floor());
+            }
         }
     }
 }
@@ -1245,6 +1514,7 @@ impl Drop for VersionView<'_> {
 mod tests {
     use super::*;
     use crate::model::Term;
+    use std::panic::AssertUnwindSafe;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Barrier;
     use std::thread;
@@ -2181,7 +2451,18 @@ mod tests {
 
     #[test]
     fn redo_log_captures_committed_transactions() {
-        let dir = std::env::temp_dir().join("gstore_conc_redo_ut");
+        // A directory of this process (parallel runs of the suite do not
+        // share it), removed also when the test fails.
+        struct TempDir(std::path::PathBuf);
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let tmp = TempDir(
+            std::env::temp_dir().join(format!("gstore_conc_redo_ut_{}", std::process::id())),
+        );
+        let dir = tmp.0.clone();
         let _ = std::fs::remove_dir_all(&dir);
         let c = cdb();
         // Enable the redo log on the wrapped database.
@@ -2219,6 +2500,160 @@ mod tests {
             0,
             "the committed delete is replayed"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- panics in the writer paths (review conc#3, http#17) ---------------
+
+    thread_local! {
+        /// The failpoint armed on this thread: its step and how many hits
+        /// to let pass before it panics.
+        static ARMED: std::cell::Cell<Option<(&'static str, u32)>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// Arm `step` on this thread: its `skip + 1`-th hit panics (once).
+    fn arm_failpoint(step: &'static str, skip: u32) {
+        ARMED.with(|a| a.set(Some((step, skip))));
+    }
+
+    /// Called by [`failpoint`](super::failpoint).
+    pub(super) fn hit_failpoint(step: &'static str) {
+        ARMED.with(|a| match a.get() {
+            Some((armed, 0)) if armed == step => {
+                a.set(None);
+                panic!("failpoint {step}");
+            }
+            Some((armed, n)) if armed == step => a.set(Some((armed, n - 1))),
+            _ => {}
+        });
+    }
+
+    fn assert_not_poisoned(c: &ConcurrentDb) {
+        assert!(!c.writer.is_poisoned(), "writer poisoned");
+        assert!(!c.occ.is_poisoned(), "occ poisoned");
+    }
+
+    /// A panic inside `Txn::commit` while it holds the writer and OCC locks
+    /// (here once its writes are applied, before they are published) unwinds
+    /// through the transaction's own drop without a second panic — before,
+    /// that drop unwrapped the OCC lock the panic had just poisoned and the
+    /// process aborted — and leaves no lock poisoned for good: the next
+    /// writer publishes what the commit applied, as a non-transactional
+    /// write, so a transaction that overlapped it conflicts.
+    #[test]
+    fn a_panic_inside_commit_neither_aborts_nor_poisons() {
+        let c = cdb();
+        let mut overlapping = c.begin();
+        overlapping.insert(triple("http://ex/q", "http://ex/p", "http://ex/r"));
+        let v = c.version();
+        let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let mut txn = c.begin();
+            txn.insert(triple("http://ex/x", "http://ex/p", "http://ex/y"));
+            arm_failpoint("commit:applied", 0);
+            txn.commit()
+        }));
+        assert!(r.is_err(), "the failpoint panicked inside commit");
+        assert_eq!(c.version(), v, "nothing published by the panicking commit");
+        assert_eq!(count(&c, "SELECT * WHERE { ?s ?p ?o }"), 1, "reads work");
+
+        // The next writer recovers the lock and publishes the applied commit.
+        c.sync().unwrap();
+        assert_not_poisoned(&c);
+        assert_eq!(c.version(), v + 1);
+        assert_eq!(count(&c, "SELECT * WHERE { ?s ?p ?o }"), 2);
+        let r = overlapping.commit();
+        assert!(matches!(r, Err(GStoreError::Conflict(_))), "{r:?}");
+        assert!(c.occ.lock().unwrap().live_starts.is_empty());
+
+        let mut later = c.begin();
+        later.insert(triple("http://ex/z", "http://ex/p", "http://ex/w"));
+        later.commit().unwrap();
+        assert_eq!(count(&c, "SELECT * WHERE { ?s ?p ?o }"), 3);
+    }
+
+    /// A panic while a commit applies its writes undoes the ones applied
+    /// before it: the writer database is not left inside a transaction that
+    /// nobody commits (which would swallow every later commit).
+    #[test]
+    fn a_panic_while_applying_a_commit_rolls_its_writes_back() {
+        let c = cdb();
+        let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let mut txn = c.begin();
+            txn.insert(triple("http://ex/x1", "http://ex/p", "http://ex/y"));
+            txn.insert(triple("http://ex/x2", "http://ex/p", "http://ex/y"));
+            arm_failpoint("commit:apply-op", 1);
+            txn.commit()
+        }));
+        assert!(r.is_err(), "the failpoint panicked at the second write");
+        assert!(!c.write(|db| db.in_transaction()), "rolled back");
+        assert_not_poisoned(&c);
+        assert_eq!(count(&c, "SELECT * WHERE { ?s ?p ?o }"), 1, "x1 undone");
+        let mut txn = c.begin();
+        txn.insert(triple("http://ex/x3", "http://ex/p", "http://ex/y"));
+        txn.commit().unwrap();
+        assert_eq!(count(&c, "SELECT * WHERE { ?s ?p ?o }"), 2);
+        assert_eq!(c.write(|db| db.triple_num()), 2, "committed, not pending");
+    }
+
+    /// A panic inside `update` once the request is applied: the next writer
+    /// recovers the writer lock and publishes the applied request as a
+    /// non-transactional write before its own.
+    #[test]
+    fn a_panic_inside_update_is_published_by_the_next_writer() {
+        let c = cdb();
+        let mut overlapping = c.begin();
+        overlapping.insert(triple("http://ex/q", "http://ex/p", "http://ex/r"));
+        let v = c.version();
+        arm_failpoint("update:applied", 0);
+        let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            c.update("INSERT DATA { <http://ex/x> <http://ex/p> <http://ex/y> }")
+        }));
+        assert!(r.is_err());
+        assert_eq!(
+            count(&c, "SELECT * WHERE { ?s ?p ?o }"),
+            1,
+            "not yet published"
+        );
+        drop(c.version_view());
+        c.update("INSERT DATA { <http://ex/z> <http://ex/p> <http://ex/w> }")
+            .unwrap();
+        assert_not_poisoned(&c);
+        assert_eq!(c.version(), v + 2, "the recovered state, then the update");
+        assert_eq!(count(&c, "SELECT * WHERE { ?s ?p ?o }"), 3);
+        let r = overlapping.commit();
+        assert!(matches!(r, Err(GStoreError::Conflict(_))), "{r:?}");
+    }
+
+    /// Transactions and version views dropped while a panic unwinds, with the
+    /// OCC lock poisoned (as a panic inside a commit leaves it), deregister
+    /// without panicking a second time — which aborted the process — and the
+    /// registry stays consistent.
+    #[test]
+    fn drops_while_unwinding_with_a_poisoned_occ_lock_do_not_abort() {
+        let c = cdb();
+        let mut txn = c.begin();
+        txn.insert(triple("http://ex/q", "http://ex/p", "http://ex/r"));
+        let view = c.version_view();
+        thread::scope(|s| {
+            let poisoner = s.spawn(|| {
+                let _occ = c.occ.lock().unwrap();
+                panic!("poison the OCC lock");
+            });
+            assert!(poisoner.join().is_err());
+        });
+        assert!(c.occ.is_poisoned());
+        let r = std::panic::catch_unwind(AssertUnwindSafe(move || {
+            let _live = (txn, view);
+            panic!("unwind with a live transaction and view");
+        }));
+        assert!(r.is_err());
+        assert_not_poisoned(&c);
+        assert!(c.occ.lock().unwrap().live_starts.is_empty());
+        let mut later = c.begin();
+        later.insert(triple("http://ex/z", "http://ex/p", "http://ex/w"));
+        later.commit().unwrap();
+        assert!(c
+            .version_view()
+            .contains(&triple("http://ex/z", "http://ex/p", "http://ex/w")));
     }
 }
