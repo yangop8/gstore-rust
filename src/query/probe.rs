@@ -413,9 +413,9 @@ mod tests {
         for _ in 0..300 {
             // A left solution binding a random strict part of the key.
             let mut l: Binding = vec![None; width];
-            for v in 0..width {
+            for slot in l.iter_mut() {
                 if rng.below(2) == 0 {
-                    l[v] = Some(rng.below(7) as u32);
+                    *slot = Some(rng.below(7) as u32);
                 }
             }
             l[rng.below(width)] = None;
