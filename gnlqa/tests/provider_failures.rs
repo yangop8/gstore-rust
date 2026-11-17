@@ -251,3 +251,21 @@ fn a_failed_linker_build_waits_for_the_retry_interval() {
         "no rebuild storm: one attempt per retry interval"
     );
 }
+
+#[test]
+fn a_panicking_linker_build_does_not_disable_the_linker_for_good() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c2 = Arc::clone(&calls);
+    let engine = SolveEngine::new(Box::new(MockLlm::fixed("x")), Box::new(MockKb::new(vec![])))
+        .with_linker_builder(Duration::ZERO, move || {
+            if c2.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("simulated bug in the linker build");
+            }
+            Ok(alien_linker())
+        });
+    let first =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.linker().is_some()));
+    assert!(first.is_err(), "the first build panicked");
+    assert!(engine.linker().is_some(), "the next use builds it again");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}

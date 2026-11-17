@@ -507,7 +507,13 @@ impl SolveEngine {
         }
         let src = self.linker_source.as_ref()?;
         // One build at a time; a concurrent caller goes on without a linker.
-        let mut last = src.last_failure.try_lock().ok()?;
+        // A build that panicked leaves the lock poisoned, not the engine
+        // without a linker for good: its state is still a valid timestamp.
+        let mut last = match src.last_failure.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
         if let Some(l) = self.linker.get() {
             return Some(l); // built while we waited for the lock
         }
