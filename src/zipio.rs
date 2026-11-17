@@ -30,8 +30,10 @@
 //! refused before anything is written (zip-slip); symbolic-link entries are
 //! ignored; encrypted entries and compression methods other than stored /
 //! deflate are refused; a package with more than [`ZipLimits::max_entries`]
-//! entries, or whose files declare more than [`ZipLimits::max_size`] bytes in
-//! all, is refused, and the bytes actually written are counted against the
+//! entries — refused from its end-of-central-directory records, before the
+//! central directory is decoded into memory — or whose files declare more
+//! than [`ZipLimits::max_size`] bytes in all, is refused, and the bytes
+//! actually written are counted against the
 //! same limit (a lying header does not help a zip bomb). The limits come from
 //! `conf.ini` (`[upload] unzip_max_entries`, `unzip_max_size`). Files are
 //! created exclusively inside the fresh destination directory; archives are
@@ -269,7 +271,7 @@ pub fn unpack(
     accept: &dyn Fn(&str) -> bool,
 ) -> std::result::Result<Vec<Unpacked>, ZipError> {
     use std::fs;
-    let mut archive = open_archive(zip)?;
+    let mut archive = open_archive(zip, limits)?;
     let plan = check(&archive, limits, accept)?;
     fs::create_dir_all(dest).map_err(|e| ZipError::unzip(ZipCode::WriteError, e.to_string()))?;
     let write_err = |what: &Path, e: &dyn fmt::Display| {
@@ -337,7 +339,9 @@ pub fn unpack(
 }
 
 /// The content of entry `name` of package `zip` (at most `max` bytes; more is
-/// an error), or `None` when it holds no such file.
+/// an error), or `None` when it holds no such file. A package that declares
+/// more than [`DEFAULT_MAX_ENTRIES`] entries is refused before its central
+/// directory is read (see [`unpack`]).
 #[cfg(feature = "zip")]
 pub fn read_entry(
     zip: &Path,
@@ -345,7 +349,8 @@ pub fn read_entry(
     max: u64,
 ) -> std::result::Result<Option<Vec<u8>>, ZipError> {
     use io::Read;
-    let mut archive = open_archive(zip)?;
+    // Only the default entry limit: the central directory is read whole.
+    let mut archive = open_archive(zip, &ZipLimits::default())?;
     let mut entry = match archive.by_name(name) {
         Ok(e) => e,
         Err(zip::result::ZipError::FileNotFound) => return Ok(None),
@@ -382,13 +387,157 @@ pub fn read_entry(
 #[cfg(feature = "zip")]
 type Archive = zip::ZipArchive<io::BufReader<std::fs::File>>;
 
-/// Open `zip` (upstream `unzOpen64`: failure is code 1).
+/// Open `zip` (upstream `unzOpen64`: failure is code 1) — once
+/// [`declared_entries`] has shown that no end-of-central-directory record
+/// the reader may use declares more than `limits.max_entries` entries (code
+/// 3, as the entry limit always answered): the zip reader decodes every
+/// record of the central directory into memory before it returns, so the
+/// limit must hold before it runs, not after (review bulkcli#5: a package
+/// of a million empty entries cost about 190 MB before it was refused).
 #[cfg(feature = "zip")]
-fn open_archive(zip: &Path) -> std::result::Result<Archive, ZipError> {
-    let file = std::fs::File::open(zip)
-        .map_err(|e| ZipError::unzip(ZipCode::NotFound, format!("'{}': {e}", zip.display())))?;
-    zip::ZipArchive::new(io::BufReader::new(file))
-        .map_err(|e| ZipError::unzip(ZipCode::NotFound, format!("'{}': {e}", zip.display())))
+fn open_archive(zip: &Path, limits: &ZipLimits) -> std::result::Result<Archive, ZipError> {
+    use io::Seek;
+    let not_found = |e: &dyn fmt::Display| {
+        ZipError::unzip(ZipCode::NotFound, format!("'{}': {e}", zip.display()))
+    };
+    let mut file = std::fs::File::open(zip).map_err(|e| not_found(&e))?;
+    let declared = declared_entries(&mut file).map_err(|e| not_found(&e))?;
+    if declared > limits.max_entries as u64 {
+        return Err(too_many_entries(declared, limits));
+    }
+    file.seek(io::SeekFrom::Start(0))
+        .map_err(|e| not_found(&e))?;
+    zip::ZipArchive::new(io::BufReader::new(file)).map_err(|e| not_found(&e))
+}
+
+/// The entry limit refused a package that holds (or declares) `n` entries.
+#[cfg(feature = "zip")]
+fn too_many_entries(n: impl fmt::Display, limits: &ZipLimits) -> ZipError {
+    ZipError::unzip(
+        ZipCode::NotSupported,
+        format!(
+            "the package holds {n} entries, more than {} (unzip_max_entries)",
+            limits.max_entries
+        ),
+    )
+}
+
+#[cfg(feature = "zip")]
+/// The end-of-central-directory record's signature (`PK\x05\x06`).
+const EOCD_SIG: [u8; 4] = *b"PK\x05\x06";
+#[cfg(feature = "zip")]
+/// The zip64 end-of-central-directory locator's signature (`PK\x06\x07`).
+const EOCD64_LOCATOR_SIG: [u8; 4] = *b"PK\x06\x07";
+#[cfg(feature = "zip")]
+/// The zip64 end-of-central-directory record's signature (`PK\x06\x06`).
+const EOCD64_SIG: [u8; 4] = *b"PK\x06\x06";
+#[cfg(feature = "zip")]
+/// The fixed part of an end-of-central-directory record.
+const EOCD_LEN: u64 = 22;
+#[cfg(feature = "zip")]
+/// The fixed part of a central-directory file header.
+const CDFH_LEN: u64 = 46;
+/// How far from the end an end-of-central-directory record may start: its
+/// fixed part, its signature again and the longest comment (64 KiB) — the
+/// window zip readers search.
+#[cfg(feature = "zip")]
+const EOCD_SEARCH: u64 = EOCD_LEN + 4 + (1 << 16);
+
+#[cfg(feature = "zip")]
+fn le16(b: &[u8], at: usize) -> u64 {
+    u64::from(u16::from_le_bytes([b[at], b[at + 1]]))
+}
+
+#[cfg(feature = "zip")]
+fn le32(b: &[u8], at: usize) -> u64 {
+    u64::from(u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]))
+}
+
+#[cfg(feature = "zip")]
+fn le64(b: &[u8], at: usize) -> u64 {
+    let mut a = [0u8; 8];
+    a.copy_from_slice(&b[at..at + 8]);
+    u64::from_le_bytes(a)
+}
+
+/// The most entries any end-of-central-directory record of the package in
+/// `r` declares, among the records a zip reader may use: it searches the
+/// last [`EOCD_SEARCH`] bytes backwards and falls back to an earlier
+/// candidate when one is inconsistent, so every plausible candidate counts
+/// (one on a single disk, its comment inside the file, its directory before
+/// it). A zip64 record is read where its locator says; one that is not
+/// there, or is inconsistent in a way that would make a reader search the
+/// file for another, makes the package unsupported (`InvalidData`) rather
+/// than unchecked. Reads at most the search window plus one zip64 record —
+/// never the central directory itself.
+#[cfg(feature = "zip")]
+fn declared_entries<R: io::Read + io::Seek>(r: &mut R) -> io::Result<u64> {
+    use io::SeekFrom;
+    let len = r.seek(SeekFrom::End(0))?;
+    let start = len.saturating_sub(EOCD_SEARCH);
+    let mut tail = Vec::with_capacity((len - start) as usize);
+    r.seek(SeekFrom::Start(start))?;
+    io::Read::read_to_end(&mut io::Read::take(&mut *r, len - start), &mut tail)?;
+    let unsupported = |what: &str| io::Error::new(io::ErrorKind::InvalidData, what.to_string());
+    let mut most = 0u64;
+    let mut found = false;
+    for pos in (0..tail.len().saturating_sub(EOCD_LEN as usize - 1)).rev() {
+        if tail[pos..pos + 4] != EOCD_SIG {
+            continue;
+        }
+        let e = &tail[pos..pos + EOCD_LEN as usize];
+        let at = start + pos as u64;
+        let (disk, cd_disk) = (le16(e, 4), le16(e, 6));
+        let (on_disk, total) = (le16(e, 8), le16(e, 10));
+        let (cd_size, cd_offset, comment) = (le32(e, 12), le32(e, 16), le16(e, 20));
+        if at + EOCD_LEN + comment > len {
+            continue; // the comment runs past the end: not a record
+        }
+        found = true;
+        let zip64 = on_disk == 0xFFFF
+            || total == 0xFFFF
+            || cd_size == 0xFFFF_FFFF
+            || cd_offset == 0xFFFF_FFFF;
+        if zip64 && at >= 20 {
+            let mut loc = [0u8; 20];
+            r.seek(SeekFrom::Start(at - 20))?;
+            io::Read::read_exact(r, &mut loc)?;
+            if loc[..4] == EOCD64_LOCATOR_SIG {
+                let (eocd64_at, disks) = (le64(&loc, 8), le32(&loc, 16));
+                if disks > 1 || eocd64_at >= at - 20 {
+                    continue; // multi-disk or misplaced: no reader uses it
+                }
+                let mut z = [0u8; 56];
+                r.seek(SeekFrom::Start(eocd64_at))?;
+                io::Read::read_exact(r, &mut z)
+                    .map_err(|_| unsupported("truncated zip64 record"))?;
+                let (size, z_on_disk, z_total) = (le64(&z, 4), le64(&z, 24), le64(&z, 32));
+                let z_cd_offset = le64(&z, 48);
+                let fits = z[..4] == EOCD64_SIG
+                    && size.checked_add(12) == Some(at - 20 - eocd64_at)
+                    && z_total
+                        .checked_mul(4 + CDFH_LEN)
+                        .and_then(|n| n.checked_add(z_cd_offset))
+                        .is_some_and(|end| end <= eocd64_at);
+                if !fits {
+                    return Err(unsupported(
+                        "the zip64 end of central directory is not where its locator says",
+                    ));
+                }
+                most = most.max(z_on_disk).max(z_total);
+                continue;
+            }
+        }
+        // A single-disk record with its directory before it is what a
+        // reader takes (an empty one too).
+        if disk == 0 && cd_disk == 0 && on_disk == total && (total == 0 || cd_offset < at) {
+            most = most.max(total);
+        }
+    }
+    if !found {
+        return Err(unsupported("no end of central directory record"));
+    }
+    Ok(most)
 }
 
 /// One entry [`unpack`] writes.
@@ -415,14 +564,10 @@ fn check(
             detail: None,
         });
     }
+    // `open_archive` refused a package declaring more already; this
+    // guards what the reader actually decoded.
     if n > limits.max_entries {
-        return Err(ZipError::unzip(
-            ZipCode::NotSupported,
-            format!(
-                "the package holds {n} entries, more than {} (unzip_max_entries)",
-                limits.max_entries
-            ),
-        ));
+        return Err(too_many_entries(n, limits));
     }
     let mut plan = Vec::with_capacity(n);
     let mut declared: u64 = 0;
@@ -852,6 +997,92 @@ fn write_statements(db: &Database, format: ExportFormat, out: &mut dyn Write) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A package made by the zip writer, with `n` small files.
+    #[cfg(feature = "zip")]
+    fn written(n: usize, comment: &[u8]) -> Vec<u8> {
+        let mut zw = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
+        for i in 0..n {
+            zw.start_file(format!("f{i}.nt"), zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(b"<a> <b> <c> .\n").unwrap();
+        }
+        zw.set_raw_comment(comment.into()).unwrap();
+        zw.finish().unwrap().into_inner()
+    }
+
+    /// Review bulkcli#5: the declared entry count comes from the end of the
+    /// file — the end record, a zip64 record where its locator says — and
+    /// every candidate record a reader may fall back to counts.
+    #[cfg(feature = "zip")]
+    #[test]
+    fn declared_entries_reads_the_end_records_only() {
+        let count = |b: &[u8]| declared_entries(&mut io::Cursor::new(b));
+        assert_eq!(count(&written(3, b"")).unwrap(), 3);
+        assert_eq!(count(&written(0, b"")).unwrap(), 0);
+        assert_eq!(count(&written(5, b"a comment")).unwrap(), 5);
+        // Data prepended (a self-extracting stub): same records.
+        let mut stub = b"#!/bin/sh\nexit 0\n".to_vec();
+        stub.extend(written(4, b""));
+        assert_eq!(count(&stub).unwrap(), 4);
+        // A forged record inside the comment, declaring more entries, is a
+        // candidate a reader may fall back to: it counts.
+        let mut forged = Vec::new();
+        forged.extend_from_slice(&EOCD_SIG);
+        forged.extend_from_slice(&[0, 0, 0, 0]);
+        forged.extend_from_slice(&60_000u16.to_le_bytes());
+        forged.extend_from_slice(&60_000u16.to_le_bytes());
+        forged.extend_from_slice(&[0; 10]);
+        assert_eq!(count(&written(2, &forged)).unwrap(), 60_000);
+        // Not a zip, or truncated before its end record.
+        assert!(count(b"not a zip at all").is_err());
+        let whole = written(3, b"");
+        assert!(count(&whole[..whole.len() - 10]).is_err());
+        // A zip64 end record that is not where its locator says.
+        let mut z64 = whole[..whole.len() - 22].to_vec();
+        let locator_at = z64.len() as u64;
+        z64.extend_from_slice(&EOCD64_LOCATOR_SIG);
+        z64.extend_from_slice(&[0; 4]);
+        z64.extend_from_slice(&(locator_at - 56).to_le_bytes());
+        z64.extend_from_slice(&1u32.to_le_bytes());
+        z64.extend_from_slice(&EOCD_SIG);
+        z64.extend_from_slice(&[0; 4]);
+        z64.extend_from_slice(&[0xFF; 12]);
+        z64.extend_from_slice(&[0; 2]);
+        let e = count(&z64).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e}");
+    }
+
+    /// The limit is applied to what the end records declare: one entry over
+    /// it is refused with the entry-limit error, before the archive opens.
+    #[cfg(feature = "zip")]
+    #[test]
+    fn open_archive_refuses_a_declared_count_over_the_limit() {
+        let dir =
+            std::env::temp_dir().join(format!("gstore_zipio_declared_{}", std::process::id()));
+        fs_reset(&dir);
+        let zip = dir.join("p.zip");
+        std::fs::write(&zip, written(11, b"")).unwrap();
+        let limits = ZipLimits {
+            max_entries: 10,
+            ..ZipLimits::default()
+        };
+        let e = open_archive(&zip, &limits).map(drop).unwrap_err();
+        assert_eq!(e.code(), Some(ZipCode::NotSupported), "{e}");
+        assert!(e.to_string().contains("holds 11 entries"), "{e}");
+        let ok = ZipLimits {
+            max_entries: 11,
+            ..ZipLimits::default()
+        };
+        assert_eq!(open_archive(&zip, &ok).unwrap().len(), 11);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "zip")]
+    fn fs_reset(dir: &Path) {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn entry_names_are_confined() {
