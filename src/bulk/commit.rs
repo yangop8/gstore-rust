@@ -1,12 +1,12 @@
 //! The staged, crash-safe install of a bulk build.
 //!
 //! The build claims the directory with [`BuildGuard::lock`], which takes
-//! its [`DirLock`] in the same step (another process holding the directory
-//! makes it fail, and so do a database of this process that has it open and
-//! another bulk build of this process; while the claim lives no other thread
-//! of this process can open it), and writes everything into
-//! `<dir>/.bulk-tmp/`, which no
-//! layout detection looks at. A stale `.bulk-tmp/` from a crashed build is
+//! its [`DirLock`](crate::db::dirlock::DirLock) in the same step (another
+//! process holding the directory makes it fail, and so do a database of
+//! this process that has it open and another bulk build of this process;
+//! while the claim lives no other thread of this process can open it), and
+//! writes everything into `<dir>/.bulk-tmp/`, which no layout detection
+//! looks at. A stale `.bulk-tmp/` from a crashed build is
 //! removed first. Once both files are complete and `fsync`ed, the install
 //! runs; after each step a crash leaves a directory that an unmodified
 //! binary opens as either the old database or the new one:
@@ -314,9 +314,10 @@ pub(crate) fn build_disk(
 /// `vstree.kv`) with this module's install steps — how the incremental
 /// disk build replaces a database (review durability#5), so a failed or
 /// interrupted rebuild leaves the old database as a bulk build does. The
-/// caller holds `dir`'s [`DirLock`] and [`BuildGuard`]. An error before the
-/// commit point is returned with the old database in place (the staging
-/// area removed); errors after it come back as warnings.
+/// caller holds `dir`'s [`DirLock`](crate::db::dirlock::DirLock) and
+/// [`BuildGuard`]. An error before the commit point is returned with the
+/// old database in place (the staging area removed); errors after it come
+/// back as warnings.
 pub(crate) fn install_staged_disk(dir: &Path, staging: &Path) -> Result<Vec<String>> {
     let mut fp = Failpoints::load(dir);
     install(dir, staging, &mut fp).inspect_err(|_| {
