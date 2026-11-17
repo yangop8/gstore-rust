@@ -456,7 +456,7 @@ fn lock_dir(db_dir: &Path) -> StoreLock {
 ///
 /// The copy is staged beside the destination (`reason_rule_files.tmp`),
 /// every file and directory of it fsynced, and swapped in as a whole
-/// ([`fsutil::StagedDir`]); a removal renames the directory aside durably
+/// (`fsutil::StagedDir`); a removal renames the directory aside durably
 /// before deleting it. So a crash or a failed write (a full disk) leaves the
 /// destination's previous rules or the new ones — never some rule files
 /// without their ledgers, which [`super::manage`] would take for upstream
