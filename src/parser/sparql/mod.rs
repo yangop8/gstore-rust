@@ -26,7 +26,17 @@
 //!   in a template as a fresh blank node per solution); in `INSERT DATA`
 //!   they are fresh blank nodes; in `DELETE DATA`, `DELETE WHERE` and DELETE
 //!   templates they are an error, as SPARQL 1.1 Update forbids blank nodes
-//!   there. `[]` and `()` (`rdf:nil`) are plain terms.
+//!   there — labelled ones (`_:b`) too. `[]` and `()` (`rdf:nil`) are plain
+//!   terms.
+//! * The grammar's structure is enforced where a lenient reading would
+//!   change the request (review parser#13): `PREFIX` declares a `PNAME_NS`
+//!   (`PREFIX foaf:knows <…>` is an error, not a declaration of `foaf:`);
+//!   two triple statements are separated by `.` in group patterns,
+//!   templates and DATA blocks (`{ ?s ?p ?o ?a ?b ?c }` is an error; a `.`
+//!   stays optional after the last statement and around `FILTER`,
+//!   `OPTIONAL` and the other group elements, and stray ones are skipped);
+//!   `ORDER BY`, `LIMIT` and `OFFSET` come at most once each, `ORDER BY`
+//!   first, `LIMIT` / `OFFSET` in either order.
 //! * `ORDER BY` keys: `ASC(…)`/`DESC(…)`, `?var`, `( expr )` and bare calls
 //!   (`STRLEN(?x)`, `COUNT(?x)`, `xsd:integer(?z)`). `GROUP BY` conditions:
 //!   `?var`, bare calls, `( expr )` and `( expr AS ?v )`, which binds `?v`.
@@ -48,9 +58,9 @@
 //!
 //! Known deviations: a labelled blank node `_:b` in a WHERE pattern is a
 //! constant (as in upstream gStore, which reads it as the IRI `<_:b>`), not
-//! a variable, and in a template or `INSERT DATA` it names the same node for
-//! every solution / request; `FROM`/`FROM NAMED` are skipped; CONSTRUCT, ASK
-//! and DESCRIBE accept no GROUP BY / HAVING.
+//! a variable, and in an INSERT template or `INSERT DATA` it names the same
+//! node for every solution / request; `FROM`/`FROM NAMED` are skipped;
+//! CONSTRUCT, ASK and DESCRIBE accept no GROUP BY / HAVING.
 //!
 //! ## gStore advanced functions
 //!
