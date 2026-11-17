@@ -68,7 +68,16 @@
   with `-z`, an `<archive>.export-tmp` — and destroyed an existing file of
   that name. Both now write `<dest>.part-<pid>-<n>` (created exclusively)
   beside the destination, sync it and rename it over the destination once
-  complete; a failure removes it and leaves the destination as it was.
+  complete; a failure removes it and leaves the destination as it was. The
+  destinations the in-place write served keep working: a symbolic link
+  stays a link (the file it names is replaced), a replaced file keeps its
+  permission bits and, where the process may set it, its owner, a file the
+  user may not write is refused as before, and a FIFO, a device
+  (`/dev/null`) or a dangling link is written in place, opened only once
+  the output is ready (a writable file in a directory where no file can be
+  created too). The first version of this change renamed its temporary
+  file over the link, the FIFO and — run as root — the device, and gave
+  the result the default mode; fixed before hand-over.
 - **`gserver` answers invalid arguments with exit status 2** (review
   bulkcli#18), as every other tool does (it was `1`, which a script or a
   service manager could not tell from a failed start). `0` success and `1`
@@ -133,7 +142,8 @@
   the snapshot / bulk / incremental layouts, zip scratch directories, the
   inline-comment rule, inert settings, `db_path`, `gbuild` conf.ini
   warnings, `gquery -f` on failure, `gexport` under a file-size limit,
-  zipped `gexport`, `gserver`'s usage status, the failpoint report) and
+  zipped `gexport`, output destinations that are links, FIFOs, private or
+  read-only files, `gserver`'s usage status, the failpoint report) and
   `tests/zip_central_directory_bound.rs` (peak resident set before a
   400,000-entry package is refused; its own binary). The kill test of
   `tests/dt_bulk_crash.rs` no longer depends on a 25 s wall-clock budget
@@ -183,6 +193,9 @@ none
   - `gquery -f FILE` and `gexport` write `<dest>.part-<pid>-<n>` and rename
     it over the destination once complete: a failure leaves the previous
     file. A crash may leave such a `.part-*` file behind (safe to delete).
+    A symbolic link keeps pointing at its file (which is replaced, keeping
+    its mode and, where possible, its owner); a FIFO or a device is written
+    in place; a replaced file loses extra hard links (it is a new inode).
   - Zip packages of `gbuild` / `gadd` / `gsub` are unpacked into
     `<db>.db.unzip-tmp-<pid>-<random>` (mode 0700), removed when the tool
     ends; a crash may leave one behind (safe to delete when no tool runs).
@@ -260,6 +273,17 @@ none
   "bulkcli#1"); this package added the concurrent-gbuild, failed-print,
   conf.ini-warning and `gquery -f` failure tests and made the kill test
   load-independent.
+- Residual window of bulkcli#2, recorded for docs/REFACTOR_BACKLOG.md
+  (not changed: no deterministic test is possible, D6): `gbuild` decides
+  "the directory is new" (`holds_data`) just before it claims the
+  directory, two adjacent statements. If another process created, built
+  and released the same new name entirely between them (microseconds; a
+  real build takes far longer, and while it runs its lock file makes the
+  directory non-empty, so the second `gbuild` is refused), a second
+  `gbuild` without `--force` would rebuild that database instead of
+  refusing; it never deletes it (the cleanup removes only a directory that
+  holds no database, under the claim). A fix would re-check
+  `Database::storage_kind` under the claim and refuse without `--force`.
 - Observed, not this package's: `tests/rdf_parser_conformance.rs`
   `jsonld_node_contexts_and_context_arrays_add_layers_not_copies` (review
   parser#7, r3-parser) is a wall-clock ratio test that fails under load —
