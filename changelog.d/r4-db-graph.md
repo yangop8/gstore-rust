@@ -222,7 +222,10 @@ none
   `infer_scoped`, `materialize_rdfs_scoped`, `run_rules_scoped` and the
   `TRANSFER_CHUNK` const; `src/parser/sparql/mod.rs`
   `parse_triples_only_block` (the `.` rule for CONSTRUCT templates) and a
-  new `require_triples_separator`.
+  new `require_triples_separator`; the corrected assertions of
+  `tests/dt_merge5_review.rs` (`drop_or_clear_of_the_empty_graph_iri_is_not_drop_named`)
+  and `tests/sparql_builtins.rs` (`delete_templates_keep_labelled_blank_nodes`),
+  convention 13b.
 - Not done, with reasons: see the REFACTOR_BACKLOG notes above (Stream-mode
   in-session `vstree.kv` rebuild, the fallible storage seam, the `USING`
   merge, stray dots).
