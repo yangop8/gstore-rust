@@ -73,7 +73,7 @@ which no server or command-line tool uses):
   incremental backup copies the redo log, upstream has no JSON-LD parser,
   32 graph functions, "gap basically zero"); a dated paragraph records the
   rewrite.
-- Tests: new `tests/concurrent_db.rs` (8 tests, public API) and 4 tests in
+- Tests: new `tests/concurrent_db.rs` (9 tests, public API) and 4 tests in
   `src/concurrent.rs` driven by test-only failpoints (`failpoint(step)`,
   armed per thread; no crate-wide failpoint module). The redo-log unit test
   of `src/concurrent.rs` uses a per-process temp directory removed also on
@@ -85,7 +85,7 @@ which no server or command-line tool uses):
   | `ConcurrentDb::write()` closure panic: no poisoning | `tests/concurrent_db.rs`: `a_panicking_write_closure_does_not_poison_the_writer`, `a_transaction_left_open_by_a_panicking_closure_is_rolled_back`, `a_transaction_a_closure_leaves_open_on_return_stays_open` |
   | panics inside commit / update; drops while unwinding | `src/concurrent.rs` tests: `a_panic_inside_commit_neither_aborts_nor_poisons`, `a_panic_while_applying_a_commit_rolls_its_writes_back`, `a_panic_inside_update_is_published_by_the_next_writer`, `drops_while_unwinding_with_a_poisoned_occ_lock_do_not_abort` |
   | `ConcurrentDb::update()` partial failure | `tests/concurrent_db.rs`: `a_partially_applied_update_is_published_and_conflicts_overlapping_txns`, `a_failed_update_that_changed_nothing_is_not_a_write` |
-  | version-chain GC cost (conc#2, http#8) | `tests/concurrent_db.rs`: `version_chain_gc_work_stays_flat_after_20k_commits`, `churned_keys_leave_no_chains`, `a_pinned_view_keeps_its_records_until_dropped` |
+  | version-chain GC cost (conc#2, http#8) | `tests/concurrent_db.rs`: `version_chain_gc_work_stays_flat_after_20k_commits`, `churned_keys_leave_no_chains`, `a_pinned_view_keeps_its_records_until_dropped`; correctness of the incremental GC against a model of every version's state (random commits, aborts, conflicts and pinned views): `version_views_match_a_model_under_incremental_gc` |
   | concurrent UUID uniqueness (round 3, exists) | `tests/sparql_builtins.rs`: `uuids_and_rand_are_unique_across_threads` (r3-sparql-functions, conc#1 / query#16) |
   | cancelling a live CSR build (round 2, exists) | `tests/cancellation.rs`: `a_cancelled_read_stops_its_csr_build_and_caches_nothing`, `a_cancelled_update_stops_its_csr_build_and_caches_nothing`, `cancel_stops_the_csr_build_of_a_stream_database`, `cancel_stops_the_csr_build_of_a_snapshot_read` (r2-index-cancel, conc#5) |
   | concurrent log-line integrity (round 1, exists) | `tests/crash_regressions.rs`: `concurrent_log_lines_never_interleave`, `concurrent_rest_requests_log_whole_lines` (conc#6) |
@@ -216,6 +216,28 @@ which no server or command-line tool uses):
   `GSTORE_DISK_QUERY_MODE=stream`: 2,924 passed, 1 failed (the load-sensitive
   JSON-LD timing test below, which passed 3 of 3 times re-run alone in
   stream mode), 8 ignored.
+- Reviewer's verification (branch head with the review commits, same
+  busy machine): the fix tests above re-run against the reverted fixes
+  (the base's full-scan GC with the new counter, the early-returning
+  `update`, `unwrap`ped locks / no `catch_unwind` / the base's drops) —
+  `version_chain_gc_work_stays_flat_after_20k_commits` (83 s on the
+  reverted GC), `churned_keys_leave_no_chains`,
+  `a_partially_applied_update_is_published_and_conflicts_overlapping_txns`,
+  the two panicking-closure tests and the four failpoint unit tests fail,
+  two of the latter with `panic in a destructor during cleanup` /
+  SIGABRT; all pass on the branch. The new model test fails on a GC that
+  collects three versions past the oldest pin. `cargo +1.99.1 clippy
+  --workspace --all-targets -- -D warnings` and `RUSTDOCFLAGS="-D
+  warnings" cargo +1.99.1 doc -p gstore --no-deps --locked` clean;
+  `cargo +1.99.1 test --workspace --no-fail-fast`: stream mode 2,925
+  passed, 0 failed, 8 ignored; memory mode 2,923 passed, 2 failed (the
+  two load-sensitive tests named under Requests/Not yet, both passing 3
+  of 3 alone), 8 ignored; `--features rocksdb` (`--lib` filtered to
+  `concurrent`, `txn_commit`, `r4_review`, `stream_review`, `hardening`,
+  `reclaim`: 88 passed; `concurrent_db`, `dt_persist_backends`,
+  `dt_reclaim_concurrency`, `dt_cow_store`: all passed). These runs
+  predate the model test, which was added after them and run with its
+  file (`tests/concurrent_db.rs`: 9 passed; clippy `-D warnings` clean).
 - Bench smoke gate: not run — `gstore-bench` does not use `ConcurrentDb`
   (no hot path of convention 8 is touched: only `src/concurrent.rs`, docs and
   comments changed), so the gate's workloads run identical code.
@@ -242,7 +264,15 @@ which no server or command-line tool uses):
   23.7x / 20.5x as long (1.42 ms -> 33.6 ms / 1.74 ms -> 35.6 ms)", over its
   30 ms floor; it passed 3 of 3 times run alone in stream mode, and this
   branch changes no parser code. A 4x input taking ~20x under load may be
-  noise or a superlinear part; worth a work-counter check.
+  noise or a superlinear part; worth a work-counter check. The reviewer's
+  memory-mode workspace run hit it once more (2.09 ms -> 42.2 ms, 20.2x)
+  and, also once, `src/db/concurrency_tests.rs::generation_oracle_under_a_rwlock`
+  (`checked > 0`: under load the writer thread took all 60 write locks
+  before any of the 4 reader threads completed one check — reader
+  starvation, not a stale answer); both passed 3 of 3 times run alone,
+  and neither touches code this package changed. The second wants a
+  deterministic hand-off (e.g. the writer waits for one reader check per
+  insert) instead of relying on scheduling.
 - Not yet: the memory half of conc#2/http#8 (re-basing the version-chain
   base; reason above, backlog), and the dictionary's interner copy on the
   first new term after a publish, which keeps commits that intern new terms
