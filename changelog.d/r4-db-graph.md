@@ -232,6 +232,15 @@ none
   `tests/dt_merge5_review.rs` (`drop_or_clear_of_the_empty_graph_iri_is_not_drop_named`)
   and `tests/sparql_builtins.rs` (`delete_templates_keep_labelled_blank_nodes`),
   convention 13b.
+- For r4-sparql-guard (owner of `Evaluator`'s modify evaluation) or the
+  closing step: the comment above the DELETE/INSERT template loop in
+  `src/query/engine.rs` (the one beginning "One map per solution") still
+  says a labelled `_:v` in a DELETE template names the stored node "as in
+  … `DELETE DATA`, so `DELETE WHERE { … _:v }` deletes what it matched".
+  Parsed requests no longer reach that (the parser refuses them, review
+  sparqlconf#16 / parser#13); only operations built in code do (e.g.
+  `reason_retract`'s `DeleteData`). Not edited here: outside this
+  package's region of `engine.rs`.
 - Not done, with reasons: see the REFACTOR_BACKLOG notes above (Stream-mode
   in-session `vstree.kv` rebuild, the fallible storage seam, the `USING`
   merge, stray dots).
