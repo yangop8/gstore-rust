@@ -87,7 +87,7 @@ fn spoilers() -> Vec<(&'static str, Spoil, &'static str)> {
         (
             "tree state unknown",
             |r| r.env.git_dirty = None,
-            "work tree state at 769c627",
+            "the work tree state at ",
         ),
         (
             "library builder",
@@ -101,8 +101,10 @@ fn spoilers() -> Vec<(&'static str, Spoil, &'static str)> {
         ),
         (
             "busy machine",
-            |r| r.env.loadavg = Some([7.5, 6.0, 5.0]),
-            "a busy machine: load average 7.50 on 4 CPUs",
+            // Twice the CPUs the baseline recorded, whatever machine
+            // blessed it.
+            |r| r.env.loadavg = Some([2.0 * r.env.nproc.max(1) as f64 + 0.5, 1.0, 1.0]),
+            "a busy machine: load average ",
         ),
         (
             "noisy processes",
