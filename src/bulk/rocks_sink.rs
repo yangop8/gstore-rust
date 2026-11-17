@@ -691,7 +691,7 @@ fn write_pred_counters(stats: &Stats, out: Out<'_>) -> Result<Vec<(&'static str,
     a.counter(K_SUBJECTS, u64::from(stats.distinct_subj))?;
     a.counter(K_TRIPLES, stats.triples)?;
     for (p, (n, _, _)) in live() {
-        a.counter(&tag1(T_CARD, p), u64::from(n))?;
+        a.counter(&tag1(T_CARD, p), n)?;
     }
     let mut b = SstOut::new(&opts, out, "stats-b");
     for (p, (_, ds, _)) in live() {
