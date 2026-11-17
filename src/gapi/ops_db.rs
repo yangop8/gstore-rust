@@ -250,25 +250,15 @@ fn read_cost(dir: &Path) -> i64 {
         .map_or(0, i64::from_ne_bytes)
 }
 
-/// The databases on disk under `root`: `<name>.db` directories with a valid,
-/// non-system name.
+/// The databases on disk under `root`: the directories the system registry
+/// scans for ([`crate::sysdb::database_dirs`]: `<name>.db` with a valid,
+/// non-system name — one scan and one name rule for both protocol layers,
+/// review gapi#15) that hold a database. A root that cannot be listed has
+/// none.
 fn databases_on_disk(root: &Path) -> BTreeMap<String, PathBuf> {
-    let mut out = BTreeMap::new();
-    let Ok(rd) = fs::read_dir(root) else {
-        return out;
-    };
-    for entry in rd.flatten() {
-        let fname = entry.file_name().to_string_lossy().into_owned();
-        if let Some(name) = fname.strip_suffix(DB_SUFFIX) {
-            // A directory holding no database (a build cut short) is not one.
-            if check_db_name(name).is_ok()
-                && entry.path().is_dir()
-                && Database::storage_kind(entry.path()).is_some()
-            {
-                out.insert(name.to_string(), entry.path());
-            }
-        }
-    }
+    let mut out = crate::sysdb::database_dirs(root).unwrap_or_default();
+    // A directory holding no database (a build cut short) is not one.
+    out.retain(|_, dir| Database::storage_kind(dir).is_some());
     out
 }
 

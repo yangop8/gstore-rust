@@ -67,6 +67,8 @@ pub mod stdout;
 pub mod store;
 // The system store: users, per-database privileges, the database registry.
 pub mod sysdb;
+// The decoders the protocol layers share (form / URL decoding, base64).
+pub mod util;
 // Zip packages (feature `zip`) and export files: RDF packages for `build` /
 // `batchInsert`, zipped backups and exports, N-Triples / N-Quads exports.
 pub mod zipio;

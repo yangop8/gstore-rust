@@ -515,8 +515,9 @@ fn registrable(name: &str) -> bool {
 /// The database directories under `root`: `<name>.db` directories (or
 /// symlinks to directories) whose `name` is a valid, non-system database
 /// name. An error listing `root` is returned, never read as "no databases"
-/// (review gapi#9).
-fn database_dirs(root: &Path) -> io::Result<BTreeMap<String, PathBuf>> {
+/// (review gapi#9). The `/api` layer lists the same directories (review
+/// gapi#15).
+pub(crate) fn database_dirs(root: &Path) -> io::Result<BTreeMap<String, PathBuf>> {
     #[cfg(test)]
     if tests::FAIL_LIST_ROOT.with(std::cell::Cell::get) {
         return Err(io::Error::other("injected failure listing the root"));

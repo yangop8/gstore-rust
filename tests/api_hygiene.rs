@@ -20,6 +20,11 @@
 //!   `--tls-key` as an argument error instead of serving plaintext HTTP
 //!   (review http#19).
 //!
+//! * One form / URL decoder and one base64 decoder serve the REST
+//!   endpoints, the `/api` layer and PFN, under each caller's rules
+//!   (`gstore::util`); `/api` `show` lists the database directories the
+//!   system registry scans (review gapi#15, robust#16, design#13).
+//!
 //! Every server here is in-process on `127.0.0.1:0` in a temp directory
 //! removed when the test ends (also when it fails). Synchronisation is by
 //! test hooks that park a step; a timeout only guards against a hang.
@@ -641,4 +646,152 @@ fn a_gserver_without_tls_refuses_the_tls_options() {
     assert!(stderr.contains("--tls-cert"), "stderr: {stderr}");
     assert!(stderr.contains("`tls` feature"), "stderr: {stderr}");
     assert!(!stdout.contains("http://"), "it served: {stdout}");
+}
+
+// ---- one database-directory scan (gapi#15) ----------------------------------
+
+/// The names in an `/api` `show` answer.
+fn api_show_names(srv: &Srv) -> Vec<String> {
+    let j = srv.api_ok(&[("operation", "show")]);
+    j.get("ResponseBody")
+        .and_then(Json::as_array)
+        .unwrap_or_else(|| panic!("{j}"))
+        .iter()
+        .map(|d| {
+            d.get("database")
+                .and_then(Json::as_str)
+                .unwrap()
+                .to_string()
+        })
+        .collect()
+}
+
+/// `/api` `show` scans the database directories with the system
+/// registry's scan and name rule, so it lists every database REST `/show`
+/// and the registry know — before, a name shorter than three characters
+/// (which REST `/build` and `gbuild` accept) was missing from it.
+#[test]
+fn api_show_lists_the_databases_the_registry_scan_finds() {
+    let srv = Srv::start("scan");
+    srv.ok("POST", "/build?db_name=ab", DATA);
+    srv.ok("POST", "/build?db_name=abc", DATA);
+    srv.ok("POST", "/unload?db_name=ab", "");
+    srv.ok("POST", "/unload?db_name=abc", "");
+    // A directory holding no database is no database.
+    fs::create_dir_all(srv.db_dir("empty")).unwrap();
+    let rest = srv.ok("GET", "/show", "").body;
+    let api = api_show_names(&srv);
+    for name in ["ab", "abc"] {
+        assert!(rest.contains(&format!("\"{name}\"")), "REST /show: {rest}");
+        assert!(api.iter().any(|n| n == name), "/api show: {api:?}");
+    }
+    assert!(!api.iter().any(|n| n == "empty"), "/api show: {api:?}");
+}
+
+// ---- the shared decoders (gapi#15, robust#16, design#13) ---------------------
+
+#[test]
+fn every_layer_percent_decodes_alike() {
+    use gstore::util::form;
+    let cases = [
+        ("a%20b+c", "a b c"),
+        ("%41", "A"),
+        ("100%", "100%"),
+        ("%4", "%4"),
+        ("%", "%"),
+        ("%zz%4", "%zz%4"),
+        ("a+b%2B%41%zz%", "a b+A%zz%"),
+        ("%E4%B8%AD", "中"),
+        ("%e4%b8%ad", "中"),
+        ("%ff", "\u{FFFD}"),
+        ("", ""),
+    ];
+    for (enc, want) in cases {
+        assert_eq!(form::url_decode(enc), want, "util {enc:?}");
+        assert_eq!(
+            form::url_decode_bytes(enc.as_bytes()),
+            want,
+            "bytes {enc:?}"
+        );
+        assert_eq!(gstore::gapi::params::url_decode(enc), want, "/api {enc:?}");
+        assert_eq!(gstore::pfn::url_decode(enc), want, "pfn {enc:?}");
+    }
+}
+
+#[test]
+fn a_form_is_listed_for_the_api_layer_and_looked_up_by_name_for_rest() {
+    use gstore::util::form;
+    let pairs = |v: &[(&str, &str)]| -> Vec<(String, String)> {
+        v.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    };
+    // Every pair; a bare name has an empty value; an empty name is dropped.
+    let want = pairs(&[("a", ""), ("b", ""), ("c", "1=2"), ("d e", "f+g")]);
+    let form_text = "a&=x&b=&c=1=2&&d+e=f%2Bg";
+    assert_eq!(form::parse_form(form_text), want);
+    assert_eq!(gstore::gapi::params::parse_form(form_text), want);
+    // By name: the first pair with an `=`, names decoded as they are
+    // compared.
+    let get = |f: &str, k: &str| form::form_lookup(f.as_bytes(), k);
+    assert_eq!(get("q=1&q=2", "q").as_deref(), Some("1"));
+    assert_eq!(get("stream&x=1", "stream"), None, "a bare name is no value");
+    assert_eq!(get("%71uery=A+B%21", "query").as_deref(), Some("A B!"));
+    assert_eq!(get("query%3D=x", "query"), None, "the name is `query=`");
+    assert_eq!(get("query=", "query").as_deref(), Some(""));
+    assert_eq!(get("", "query"), None);
+}
+
+#[test]
+fn base64_is_decoded_by_one_decoder_under_each_callers_rules() {
+    use gstore::util::base64::{decode, Base64Error, BASIC_AUTH, LENIENT};
+    // HTTP Basic credentials: standard alphabet, whitespace skipped, the
+    // first `=` ends the token, a partial group is ignored.
+    assert_eq!(decode("dXNlcjpwYXNz", BASIC_AUTH).unwrap(), b"user:pass");
+    assert_eq!(
+        decode(" dXNl\r\ncjpw\tYXNz ", BASIC_AUTH).unwrap(),
+        b"user:pass"
+    );
+    assert_eq!(
+        decode("dXNlcjpwYXNz=*junk", BASIC_AUTH).unwrap(),
+        b"user:pass"
+    );
+    assert_eq!(decode("YQ==", BASIC_AUTH).unwrap(), b"a");
+    assert_eq!(decode("YWJjZA", BASIC_AUTH).unwrap(), b"abcd");
+    assert_eq!(decode("A", BASIC_AUTH).unwrap(), b"");
+    assert_eq!(
+        decode("-_8=", BASIC_AUTH),
+        Err(Base64Error::InvalidCharacter(0))
+    );
+    assert_eq!(
+        decode("not*base64", BASIC_AUTH),
+        Err(Base64Error::InvalidCharacter(3))
+    );
+    // PFN modules: both alphabets, a space is `+`, padding optional but
+    // final, a truncated group refused.
+    assert_eq!(decode("AGFzbQEAAAA=", LENIENT).unwrap(), b"\0asm\x01\0\0\0");
+    assert_eq!(decode("AGFzbQEAAAA", LENIENT).unwrap(), b"\0asm\x01\0\0\0");
+    assert_eq!(decode("-_8=", LENIENT).unwrap(), [0xfb, 0xff]);
+    assert_eq!(decode("+/8=", LENIENT).unwrap(), [0xfb, 0xff]);
+    assert_eq!(decode(" /8=", LENIENT).unwrap(), [0xfb, 0xff]);
+    assert_eq!(decode("YQ==\n", LENIENT).unwrap(), b"a");
+    assert_eq!(decode("A", LENIENT), Err(Base64Error::Truncated));
+    assert_eq!(
+        decode("AA=A", LENIENT),
+        Err(Base64Error::DataAfterPadding(3))
+    );
+    assert_eq!(decode("A*", LENIENT), Err(Base64Error::InvalidCharacter(1)));
+    // PFN's own entry point keeps its messages.
+    assert_eq!(
+        gstore::pfn::base64_decode("A*").unwrap_err(),
+        "invalid base64 character at offset 1"
+    );
+    assert_eq!(
+        gstore::pfn::base64_decode("AA=A").unwrap_err(),
+        "base64 data after padding at offset 3"
+    );
+    assert_eq!(
+        gstore::pfn::base64_decode("A").unwrap_err(),
+        "truncated base64 data"
+    );
 }

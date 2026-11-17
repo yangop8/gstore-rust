@@ -4338,30 +4338,10 @@ pub(crate) fn strip_basic_prefix(h: &str) -> Option<&str> {
 }
 
 /// Decode standard (RFC 4648) base64, ignoring ASCII whitespace and stopping at
-/// padding. Returns `None` on an invalid alphabet character.
+/// padding. Returns `None` on an invalid alphabet character. The crate's one
+/// decoder under its Basic-auth rules ([`crate::util::base64::BASIC_AUTH`]).
 pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(s.len() / 4 * 3 + 3);
-    let mut acc = 0u32;
-    let mut bits = 0u32;
-    for &c in s.as_bytes() {
-        let v = match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            b'=' => break,
-            b'\r' | b'\n' | b' ' | b'\t' => continue,
-            _ => return None,
-        };
-        acc = (acc << 6) | v as u32;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-        }
-    }
-    Some(out)
+    crate::util::base64::decode(s, crate::util::base64::BASIC_AUTH).ok()
 }
 
 /// Length-checked, byte-by-byte equality that does not short-circuit on the
@@ -4380,66 +4360,17 @@ pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 
 // --- URL form decoding -------------------------------------------------------
 
-/// Look up `key` in an `application/x-www-form-urlencoded` string.
+/// Look up `key` in an `application/x-www-form-urlencoded` string (see
+/// [`form_lookup`]).
 fn form_get(qs: &str, key: &str) -> Option<String> {
     form_lookup(qs.as_bytes(), key)
 }
 
 /// Look up `key` in an `application/x-www-form-urlencoded` byte string: the
-/// value of the first pair whose decoded name is `key`. One pass, and no
-/// allocation but the value found: names are compared as they are decoded.
+/// value of the first pair whose decoded name is `key` (the crate's one form
+/// decoder, [`crate::util::form`]).
 fn form_lookup(form: &[u8], key: &str) -> Option<String> {
-    form.split(|&b| b == b'&').find_map(|pair| {
-        let eq = pair.iter().position(|&b| b == b'=')?;
-        decoded_eq(&pair[..eq], key.as_bytes()).then(|| url_decode_bytes(&pair[eq + 1..]))
-    })
-}
-
-/// Whether the form-decoding of `enc` is exactly `want`.
-fn decoded_eq(enc: &[u8], want: &[u8]) -> bool {
-    let (mut i, mut j) = (0, 0);
-    while i < enc.len() {
-        let (b, step) = decode_at(enc, i);
-        if want.get(j) != Some(&b) {
-            return false;
-        }
-        i += step;
-        j += 1;
-    }
-    j == want.len()
-}
-
-/// The byte a form encoding holds at `i` (`+` a space, `%XX` an escape,
-/// a malformed `%` itself) and how many input bytes it took.
-fn decode_at(b: &[u8], i: usize) -> (u8, usize) {
-    match b[i] {
-        b'+' => (b' ', 1),
-        b'%' if i + 2 < b.len() => match (hex(b[i + 1]), hex(b[i + 2])) {
-            (Some(h), Some(l)) => (h * 16 + l, 3),
-            _ => (b'%', 1),
-        },
-        c => (c, 1),
-    }
-}
-
-fn url_decode_bytes(b: &[u8]) -> String {
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        let (c, step) = decode_at(b, i);
-        out.push(c);
-        i += step;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn hex(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
+    crate::util::form::form_lookup(form, key)
 }
 
 #[cfg(test)]

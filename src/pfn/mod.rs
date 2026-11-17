@@ -335,38 +335,10 @@ pub fn valid_user(user: &str) -> bool {
 
 /// Upstream's `StringUtil::url_decode`: `+` is a space and `%XX` a byte.
 /// Unlike upstream (which asserts), a `%` not followed by two hex digits is
-/// kept as is; invalid UTF-8 after decoding is replaced (U+FFFD).
+/// kept as is; invalid UTF-8 after decoding is replaced (U+FFFD). The
+/// crate's one decoder ([`crate::util::form::url_decode`]).
 pub fn url_decode(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'+' => out.push(b' '),
-            b'%' => match (
-                b.get(i + 1).copied().and_then(hex),
-                b.get(i + 2).copied().and_then(hex),
-            ) {
-                (Some(high), Some(low)) => {
-                    out.push((high << 4) | low);
-                    i += 2;
-                }
-                _ => out.push(b'%'),
-            },
-            c => out.push(c),
-        }
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn hex(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
+    crate::util::form::url_decode(s)
 }
 
 /// Upstream's `StringUtil::url_encode`: ASCII letters, digits and `-_.~`
@@ -470,41 +442,11 @@ pub fn generate_source(info: &PfnInfo) -> String {
 }
 
 /// Decode standard or URL-safe base64 (padding optional, ASCII whitespace
-/// ignored; a space reads as `+`, which URL-decoding a `+` produces).
+/// ignored; a space reads as `+`, which URL-decoding a `+` produces). The
+/// crate's one decoder under its lenient rules
+/// ([`crate::util::base64::LENIENT`]).
 pub fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
-    let mut out = Vec::with_capacity(s.len() / 4 * 3);
-    let mut acc: u32 = 0;
-    let mut bits = 0u32;
-    let mut padding = false;
-    for (i, c) in s.bytes().enumerate() {
-        let v = match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'+' | b'-' | b' ' => 62,
-            b'/' | b'_' => 63,
-            b'=' => {
-                padding = true;
-                continue;
-            }
-            b'\n' | b'\r' | b'\t' => continue,
-            _ => return Err(format!("invalid base64 character at offset {i}")),
-        };
-        if padding {
-            return Err(format!("base64 data after padding at offset {i}"));
-        }
-        acc = (acc << 6) | u32::from(v);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-            acc &= (1 << bits) - 1;
-        }
-    }
-    if bits >= 6 {
-        return Err("truncated base64 data".to_string());
-    }
-    Ok(out)
+    crate::util::base64::decode(s, crate::util::base64::LENIENT).map_err(|e| e.to_string())
 }
 
 /// The current server-local time as upstream's `TimeUtil::now()`
