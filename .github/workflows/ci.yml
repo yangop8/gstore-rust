@@ -101,15 +101,18 @@ jobs:
       # `gstore-bench report --update FILE...`; listing README.md and
       # CHANGELOG.md here left docs/BENCHMARKS.md and bench/README.md
       # unchecked). Here, with no paths-ignore, a docs-only change is
-      # checked too (bench.yml's smoke job skips those). `--profile test` runs
-      # the gstore-bench the test steps built: in the default dev profile
-      # (opt-level 0, Cargo.toml's [profile.test] has 1) cargo compiled
-      # gstore and gstore-bench a second time for this check.
+      # checked too (bench.yml's smoke job skips those). It runs the
+      # target/debug/gstore-bench the test steps built (gstore-bench's
+      # integration tests run that binary): `cargo run -p gstore-bench`
+      # compiled gstore and gstore-bench a second time — in the dev profile
+      # (opt-level 0; Cargo.toml's [profile.test] has 1), and even with
+      # `--profile test`, since features resolved for gstore-bench alone
+      # differ from the workspace's (serde), which gives gstore another unit.
       - name: generated documentation tables are current
         run: |
           docs=$(git grep -l -E '^[[:space:]]*<!-- gstore-bench report ' -- '*.md')
           echo "checking: $docs"
-          cargo run --locked -q --profile test -p gstore-bench --bin gstore-bench -- report --check $docs
+          target/debug/gstore-bench report --check $docs
 
   # The feature matrix: one job per optional feature of the gstore crate,
   # plus the console / zip / PFN features together (gconsole driving the PFN
