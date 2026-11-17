@@ -58,13 +58,12 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::db::dirlock::BuildGuard;
-use crate::db::fsutil::{remove_dir_if_exists, remove_file_if_exists, sync_dir};
+use crate::db::fsutil::{remove_file_if_exists, sync_dir};
 use crate::db::persist::remove_other_layouts;
 use crate::db::StorageKind;
 use crate::error::{GStoreError, Result};
 use crate::kvstore::Pager;
 use crate::parser::import::{ErrorLog, ImportOptions};
-use crate::reason::rules::RULE_DIR;
 
 use super::budget::Budget;
 use super::pipeline::{self, Ctx};
@@ -197,10 +196,11 @@ impl Failpoints {
 /// under the rule directory's lock: no `reasonManage` file operation of
 /// this process (a server's) is half-way through it meanwhile. Only this
 /// step holds it — not the whole build, which a `reasonManage` request
-/// would otherwise wait for.
+/// would otherwise wait for. The directory is renamed aside before it is
+/// deleted, so a crash part-way leaves no rule without its ledger
+/// ([`crate::reason::store::remove_rule_dir`]).
 pub(crate) fn remove_rule_dir(dir: &Path) -> Result<()> {
-    let _rules = crate::reason::store::RuleStore::dir(dir).lock();
-    remove_dir_if_exists(&dir.join(RULE_DIR)).and_then(|()| sync_dir(dir))
+    crate::reason::store::remove_rule_dir(dir)
 }
 
 /// `<path>.wal`, the pager's write-ahead log beside a paged file (the rule

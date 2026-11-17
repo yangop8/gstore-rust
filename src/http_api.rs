@@ -5137,7 +5137,7 @@ impl ApiInner {
                 }
                 return fail_with(&e, OpErrorKind::Failed, &format!("save failed: {e}"));
             }
-            let replaced = crate::db::fsutil::remove_dir_if_exists(&dir.join(RULE_DIR));
+            let replaced = crate::reason::store::remove_rule_dir_locked(&dir, &rules_lock);
             drop(rules_lock);
             if let Err(e) = replaced {
                 // Built, but the replaced rules are still there: not served

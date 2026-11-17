@@ -588,9 +588,12 @@ const SKIPPED: u8 = 3;
 /// would name triples the new data holds as asserted ones.
 fn drop_old_rules(dir: &str) -> ExitCode {
     let rules = Path::new(dir).join(gstore::reason::rules::RULE_DIR);
-    match std::fs::remove_dir_all(&rules) {
+    // Under the rule lock, which finishes a replacement of the rules a
+    // crash interrupted first (its staged copy would otherwise come back as
+    // the rebuilt database's rules), and renamed aside before the delete
+    // (review durability#11).
+    match gstore::reason::store::remove_rule_dir(Path::new(dir)) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!(
                 "gbuild: built, but the replaced database's reasoning rules could not be \

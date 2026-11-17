@@ -512,6 +512,28 @@ pub fn copy_rule_dir(src_db_dir: &Path, dst_db_dir: &Path) -> crate::Result<()> 
     Ok(())
 }
 
+/// Remove the rules (and ledgers) of the database in directory `db_dir`
+/// — the database is being replaced (a forced rebuild) — under its rule
+/// lock (see [`remove_rule_dir_locked`]).
+pub fn remove_rule_dir(db_dir: &Path) -> crate::Result<()> {
+    let held = lock_dir(db_dir);
+    remove_rule_dir_locked(db_dir, &held)
+}
+
+/// [`remove_rule_dir`] for a caller that already holds `db_dir`'s rule
+/// lock (`held`, from [`RuleStore::lock`]). Taking the lock finished a
+/// replacement of the rule directory a crash interrupted, so a staged
+/// `reason_rule_files.new` cannot come back later as the rules of the
+/// database that replaced this one; and the directory is renamed aside
+/// durably before it is deleted (`fsutil::discard_dir`), so a crash
+/// part-way never leaves some rule files without their ledgers, which
+/// [`super::manage`] would take for upstream rules (review durability#11,
+/// carried over to the paths that replace a database).
+pub fn remove_rule_dir_locked(db_dir: &Path, held: &StoreLock) -> crate::Result<()> {
+    debug_assert!(held.state.is_some(), "a directory store's lock");
+    fsutil::discard_dir(&db_dir.join(RULE_DIR))
+}
+
 /// Copy the regular files of `src` (and of its sub-directories) into `dst`:
 /// the files first, then the sub-directories — so a rule file another
 /// process adds meanwhile (its ledger is written first) is never copied
@@ -762,6 +784,36 @@ mod tests {
         }
         assert_eq!(crashed, 4, "two rule files and two ledgers");
         assert_eq!(shown(&dst), rules(&["a", "b"]));
+    }
+
+    /// Removing a replaced database's rules (a forced rebuild): a staged
+    /// `reason_rule_files.new` that an interrupted swap left — the old
+    /// directory already moved aside — goes too, instead of coming back
+    /// as the rebuilt database's rules at its first rule operation; and a
+    /// removal stopped after its rename (before the delete) shows no rule.
+    #[test]
+    fn removing_the_rules_also_removes_an_interrupted_swap() {
+        let root = tmp("remove");
+        let dst = db_with_rules(&root.0, "dst.db", &["old"]);
+        let rules_dir = dst.join(RULE_DIR);
+        fs::rename(&rules_dir, fsutil::with_suffix(&rules_dir, ".new")).unwrap();
+        remove_rule_dir(&dst).unwrap();
+        assert!(!fsutil::STORE_SWAP.in_progress(&rules_dir));
+        assert!(!rules_dir.exists());
+        assert_eq!(shown(&dst), rules(&[]));
+
+        let dst = db_with_rules(&root.0, "stopped.db", &["a", "b"]);
+        let rules_dir = dst.join(RULE_DIR);
+        fsutil::CRASH_BEFORE_DISCARD_DELETE.with(|c| c.set(true));
+        let stopped = {
+            let held = RuleStore::dir(&dst).lock();
+            remove_rule_dir_locked(&dst, &held)
+        };
+        fsutil::CRASH_BEFORE_DISCARD_DELETE.with(|c| c.set(false));
+        assert!(stopped.is_err(), "the failpoint stops the removal");
+        assert!(!rules_dir.exists(), "renamed aside before the delete");
+        assert_eq!(shown(&dst), rules(&[]));
+        assert!(!fsutil::STORE_SWAP.in_progress(&rules_dir), "cleaned up");
     }
 
     /// A swap a crash interrupted after the old directory was moved aside
