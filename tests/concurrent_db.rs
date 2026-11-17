@@ -1,9 +1,15 @@
 //! `ConcurrentDb` (the library's snapshot-isolation + OCC wrapper): the cost
-//! of its version-chain garbage collection (review conc#2, http#8).
+//! of its version-chain garbage collection, updates that fail part-way, and
+//! panics in its writer paths (review conc#2, http#8, conc#4, http#9,
+//! robust#13, conc#3, http#17, conc#15).
 //!
-//! Every test here uses the public API only.
+//! Every test here uses the public API only. The panics *inside* a commit or
+//! an UPDATE (which no public call can provoke) are driven by test-only
+//! failpoints in `src/concurrent.rs`'s own test module.
 
-use gstore::concurrent::{ConcurrentDb, VersionChainStats};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+
+use gstore::concurrent::{ConcurrentDb, IsolationLevel, VersionChainStats};
 use gstore::model::{Term, Triple};
 use gstore::{GStoreError, QueryResult};
 
@@ -156,4 +162,131 @@ fn a_pinned_view_keeps_its_records_until_dropped() {
     assert_eq!(s.chains, 48, "k2..k49: {s:?}");
     assert_eq!(s.records, s.chains);
     assert!(!c.version_view().contains(&t("k1", "v")));
+}
+
+// ---- UPDATE failing part-way (conc#4, http#9, robust#13) -------------------
+
+/// An UPDATE whose later operation fails keeps its earlier operations
+/// applied (as `Database::query` does). They are published as a new version
+/// — readers see what the writer database holds — and that version counts
+/// as a non-transactional write: a transaction that overlaps it conflicts
+/// instead of committing as if nothing had happened.
+#[test]
+fn a_partially_applied_update_is_published_and_conflicts_overlapping_txns() {
+    for level in [IsolationLevel::RepeatableRead, IsolationLevel::Serializable] {
+        let c = cdb();
+        let mut txn = c.begin_with(level);
+        assert!(!txn.read(&t("a", "b")));
+        txn.delete(t("a", "b"));
+        let v = c.version();
+
+        let r = c.update(
+            "INSERT DATA { <http://ex/a> <http://ex/p> <http://ex/b> } ; \
+             ADD <http://ex/nograph> TO DEFAULT",
+        );
+        assert!(r.is_err(), "the ADD fails: {r:?}");
+        assert!(
+            published(&c, "a", "b"),
+            "the applied INSERT is published ({level:?})"
+        );
+        assert_eq!(c.version(), v + 1, "as a new version ({level:?})");
+        let r = txn.commit();
+        assert!(
+            is_conflict(&r),
+            "a {level:?} transaction overlapping the partial update must conflict: {r:?}"
+        );
+        assert!(
+            published(&c, "a", "b"),
+            "the conflicting delete was not applied"
+        );
+    }
+}
+
+/// An UPDATE that fails before changing anything publishes nothing and does
+/// not conflict transactions (no spurious version).
+#[test]
+fn a_failed_update_that_changed_nothing_is_not_a_write() {
+    let c = cdb();
+    let mut txn = c.begin();
+    txn.insert(t("x", "y"));
+    let v = c.version();
+    assert!(c.update("ADD <http://ex/nograph> TO DEFAULT").is_err());
+    assert!(c.update("INSERT DATA { <http://ex/a> <bad iri> }").is_err());
+    assert_eq!(c.version(), v);
+    assert_eq!(txn.commit().unwrap(), v + 1);
+    assert!(published(&c, "x", "y"));
+}
+
+// ---- panics in the writer paths (conc#3, http#17) ---------------------------
+
+/// A `write()` closure that panics does not poison the wrapper: the panic
+/// reaches the caller, what the closure applied before it is published and
+/// counts as a non-transactional write (an overlapping transaction
+/// conflicts), and later updates, syncs, commits and reads all work.
+#[test]
+fn a_panicking_write_closure_does_not_poison_the_writer() {
+    let c = cdb();
+    let mut overlapping = c.begin();
+    overlapping.insert(t("q", "r"));
+    let v = c.version();
+
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        c.write(|db| {
+            db.insert_triple(&t("half", "done"));
+            panic!("a user closure panics");
+        })
+    }));
+    assert!(r.is_err(), "the closure's panic reaches the caller");
+    assert!(
+        published(&c, "half", "done"),
+        "its applied part is published"
+    );
+    assert_eq!(c.version(), v + 1);
+
+    c.update("INSERT DATA { <http://ex/u> <http://ex/p> <http://ex/v> }")
+        .expect("update after a panicking closure");
+    c.sync().expect("sync after a panicking closure");
+    let mut later = c.begin();
+    later.insert(t("w", "x"));
+    later.commit().expect("commit after a panicking closure");
+    assert_eq!(c.write(|db| db.triple_num()), 4);
+    assert!(published(&c, "u", "v") && published(&c, "w", "x"));
+    assert!(is_conflict(&overlapping.commit()));
+}
+
+/// A database transaction a panicking `write()` closure opened is rolled
+/// back: nothing of it is applied, and the next commit is not swallowed by
+/// the transaction left open.
+#[test]
+fn a_transaction_left_open_by_a_panicking_closure_is_rolled_back() {
+    let c = cdb();
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        c.write(|db| {
+            db.begin().unwrap();
+            db.insert_triple(&t("in", "txn"));
+            panic!("mid-transaction");
+        })
+    }));
+    assert!(r.is_err());
+    assert!(!c.write(|db| db.in_transaction()), "rolled back");
+    assert!(!published(&c, "in", "txn"));
+    let mut txn = c.begin();
+    txn.insert(t("after", "panic"));
+    txn.commit().unwrap();
+    assert!(published(&c, "after", "panic"));
+    assert_eq!(c.write(|db| db.triple_num()), 2);
+}
+
+/// A closure that opened a database transaction and returned normally is
+/// left alone (a caller may batch several `write()` calls into one).
+#[test]
+fn a_transaction_a_closure_leaves_open_on_return_stays_open() {
+    let c = cdb();
+    c.write(|db| {
+        db.begin().unwrap();
+        db.insert_triple(&t("open", "txn"));
+    });
+    assert!(c.write(|db| db.in_transaction()));
+    c.write(|db| db.commit().unwrap());
+    assert!(published(&c, "open", "txn"));
 }
