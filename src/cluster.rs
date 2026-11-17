@@ -7,9 +7,11 @@
 //!
 //! Everything in this module except the in-process [`ShardedStore`] is an
 //! **experimental library feature**: it is not wired into `gserver` or the HTTP
-//! API, its wire protocol ([`crate::rpc`]) and APIs may change without notice,
-//! and it has no persistence (a [`ClusterNode`]'s Raft log and store live in
-//! memory only). It is **not** a port of upstream gStore: upstream 1.4's
+//! API, its wire protocol ([`crate::rpc`]) is unauthenticated, and its APIs may
+//! change without notice. Stores live in memory only; the one durable piece is
+//! a [`ClusterNode`]'s Raft term, vote and log when it is bound with
+//! [`ClusterNode::bind_persistent`] (its triple store is rebuilt from that log
+//! after a restart). It is **not** a port of upstream gStore: upstream 1.4's
 //! `src/Cluster` (leader/follower replication) is not compiled into its
 //! release, and the distributed gStore edition is not open source. Use it for
 //! experiments and tests, not production data.
@@ -151,9 +153,11 @@
 //!   them from the triple-only snapshot. The transport never auto-compacts, so
 //!   config entries reach rejoining nodes by normal log backfill; a
 //!   config-carrying snapshot is the remaining fix.
-//! * **Persistence and server integration.** Nothing here is durable, and the
-//!   cluster is not reachable from `gserver` / the HTTP API (see *Experimental*
-//!   above).
+//! * **Persistence and server integration.** Only a persistent
+//!   [`ClusterNode`]'s Raft term, vote and log are durable (enough for a
+//!   replica to restart without breaking Raft's safety); shard nodes and the
+//!   coordinators keep everything in memory, and the cluster is not reachable
+//!   from `gserver` / the HTTP API (see *Experimental* above).
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashSet};
