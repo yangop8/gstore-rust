@@ -111,7 +111,12 @@ fn wait(child: &mut Child) -> i32 {
 
 /// Run a stdin script as root.
 fn script(srv: &Server, cwd: &Path, stdin: &str) -> Run {
-    let mut cmd = gconsole(&srv.addr, cwd);
+    script_at(&srv.addr, cwd, stdin)
+}
+
+/// Run a stdin script as root against the server at `addr`.
+fn script_at(addr: &SocketAddr, cwd: &Path, stdin: &str) -> Run {
+    let mut cmd = gconsole(addr, cwd);
     cmd.args(["-u", "root", "-p", PASSWORD]);
     run(cmd, stdin)
 }
@@ -2228,6 +2233,263 @@ fn ctrl_c_cancels_the_servers_query_task() {
     assert!(out.ends_with("slow\n\n"), "{out}\n{err}");
     assert_eq!(code, 1, "{out}\n{err}");
     assert!(tasks("0").is_empty(), "nothing left running");
+}
+
+// ---- what crosses the network: sessions and TLS (review ext#12) ------------------
+
+/// A TCP relay to `upstream` that records, per connection, the bytes the
+/// client sent (each recorded before it is forwarded, so a request the
+/// server answered is recorded whole).
+struct Relay {
+    addr: SocketAddr,
+    sent: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+impl Relay {
+    fn start(upstream: SocketAddr) -> Relay {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sent: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&sent);
+        thread::spawn(move || {
+            for client in listener.incoming() {
+                let Ok(client) = client else { continue };
+                let Ok(server) = TcpStream::connect(upstream) else {
+                    continue;
+                };
+                let index = {
+                    let mut log = log.lock().unwrap();
+                    log.push(Vec::new());
+                    log.len() - 1
+                };
+                let log = Arc::clone(&log);
+                let (mut from_client, mut to_server) =
+                    (client.try_clone().unwrap(), server.try_clone().unwrap());
+                thread::spawn(move || {
+                    let mut buf = [0u8; 8192];
+                    while let Ok(n @ 1..) = from_client.read(&mut buf) {
+                        log.lock().unwrap()[index].extend_from_slice(&buf[..n]);
+                        if to_server.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                    let _ = to_server.shutdown(std::net::Shutdown::Write);
+                });
+                let (mut from_server, mut to_client) = (server, client);
+                thread::spawn(move || {
+                    let _ = std::io::copy(&mut from_server, &mut to_client);
+                    let _ = to_client.shutdown(std::net::Shutdown::Write);
+                });
+            }
+        });
+        Relay { addr, sent }
+    }
+
+    /// What the client sent on each connection, as (lossy) text.
+    fn requests(&self) -> Vec<String> {
+        self.sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(r).into_owned())
+            .collect()
+    }
+}
+
+/// review ext#12: gconsole logs in once (`POST /login`) and sends the
+/// session, not the password, with every request; when the session ends —
+/// here because the user changed their password — it logs in again and
+/// repeats the request; at the end it logs out.
+#[test]
+fn the_password_crosses_the_network_once_per_login() {
+    let srv = Server::start("gc_session");
+    ok(&srv.build("small", &data("small/small.nt")));
+    let relay = Relay::start(srv.addr);
+    let cwd = scratch("gc_session_cwd");
+    let _cwd = DirGuard(cwd.clone());
+    let r = script_at(
+        &relay.addr,
+        &cwd,
+        "showdbs;\nuse small;\nselect (count(*) as ?n) where { ?s ?p ?o };\n",
+    );
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.out.contains("\"25\"^^"), "{r:?}");
+    let requests = relay.requests();
+    let with_password: Vec<&String> = requests.iter().filter(|r| r.contains(PASSWORD)).collect();
+    assert_eq!(with_password.len(), 1, "{requests:#?}");
+    assert!(
+        with_password[0].starts_with("POST /login HTTP/1.1\r\n"),
+        "{requests:#?}"
+    );
+    let api: Vec<&String> = requests
+        .iter()
+        .filter(|r| r.starts_with("POST /api "))
+        .collect();
+    assert_eq!(api.len(), 3, "{requests:#?}");
+    for request in api {
+        assert!(request.contains("\r\nAuthorization: Bearer "), "{request}");
+        assert!(!request.contains("\"password\""), "{request}");
+    }
+    assert!(
+        requests.last().unwrap().starts_with("POST /logout "),
+        "{requests:#?}"
+    );
+
+    // The password changes: the server ends the session, the console logs
+    // in again with the new password, and the next command still runs.
+    let r = script_at(
+        &relay.addr,
+        &cwd,
+        &format!("setpswd;\n{PASSWORD}\nnew-pw\nnew-pw\nshowdbs;\n"),
+    );
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(
+        printed_in_order(&r.out, &["Password set successfully.\n", "| small    |"]).is_ok(),
+        "{r:?}"
+    );
+    let logins = relay
+        .requests()
+        .iter()
+        .filter(|r| r.starts_with("POST /login ") && r.contains("new-pw"))
+        .count();
+    assert_eq!(logins, 1, "one login again, with the new password");
+}
+
+/// A self-signed certificate for `localhost` / `127.0.0.1` (the one
+/// `src/http_client.rs`'s HTTPS test uses) and its key.
+#[cfg(feature = "tls")]
+const CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBvTCCAWOgAwIBAgIUKHclqAxNOvVOQ3kWyfFT+rCJUHwwCgYIKoZIzj0EAwIw
+FDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDcwMjIwMjkyMFoXDTM2MDYyOTIw
+MjkyMFowFDESMBAGA1UEAwwJbG9jYWxob3N0MFkwEwYHKoZIzj0CAQYIKoZIzj0D
+AQcDQgAEYHEfrA2tZnM3sdpdua9aH0oSv8G2EmRrc10JlY7xgVO8+6VoyIJqtvH5
+AxyPvu6UfMZMa+/UFLAmk+WCYEKCi6OBkjCBjzAdBgNVHQ4EFgQUJOZ8AYKC5S5i
+QJhbdtMpHgmjlaowHwYDVR0jBBgwFoAUJOZ8AYKC5S5iQJhbdtMpHgmjlaowGgYD
+VR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAwGA1UdEwEB/wQCMAAwDgYDVR0PAQH/
+BAQDAgeAMBMGA1UdJQQMMAoGCCsGAQUFBwMBMAoGCCqGSM49BAMCA0gAMEUCIQCo
+ndoh3KosHMemvMMbjxtaNbbXmxGjfsgme3rBkLuziQIgFeUx/cU+Fpw/Dl5McuKP
+cCWfronEM/ASghi4/9ldMUI=
+-----END CERTIFICATE-----
+";
+
+#[cfg(feature = "tls")]
+const KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgUBOdoa9/azwl851s
+NPlNYkOXVnBaUKf3fk8J38AOaYehRANCAARgcR+sDa1mczex2l25r1ofShK/wbYS
+ZGtzXQmVjvGBU7z7pWjIgmq28fkDHI++7pR8xkxr79QUsCaT5YJgQoKL
+-----END PRIVATE KEY-----
+";
+
+/// review ext#12: gconsole talks to a gserver serving TLS (`--tls`),
+/// verifying its certificate (`--ca-file`, else `$SSL_CERT_FILE`): nothing
+/// of the session — not the password, not a statement — crosses the
+/// network in clear text, and a server whose certificate the CA bundle
+/// does not vouch for gets nothing.
+#[cfg(feature = "tls")]
+#[test]
+fn the_console_talks_to_a_tls_gserver() {
+    let root = scratch("gc_tls");
+    let _root = DirGuard(root.clone());
+    let certs = scratch("gc_tls_certs");
+    let _certs = DirGuard(certs.clone());
+    let (cert, key) = (certs.join("cert.pem"), certs.join("key.pem"));
+    fs::write(&cert, CERT_PEM).unwrap();
+    fs::write(&key, KEY_PEM).unwrap();
+    let empty = certs.join("empty.pem");
+    fs::write(&empty, "").unwrap();
+    let mut config = gstore::config::GStoreConfig::default();
+    config.ip_deny_path = None;
+    config.thread_num = 4;
+    let policy = gstore::LoadPolicy::restricted().with_allowed_dir(data("small"));
+    let server = Arc::new(
+        gstore::http_api::ApiServer::bind(&root, PASSWORD, "127.0.0.1:0")
+            .unwrap()
+            .with_config(config)
+            .with_load_policy(policy),
+    );
+    struct Stop(Arc<gstore::http_api::ApiServer>);
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            self.0.shutdown();
+        }
+    }
+    let _stop = Stop(Arc::clone(&server));
+    let tls = gstore::server::load_tls_config(&cert, &key).unwrap();
+    let serving = Arc::clone(&server);
+    thread::spawn(move || serving.serve_forever_tls(tls));
+    let relay = Relay::start(server.local_addr().unwrap());
+    let cwd = scratch("gc_tls_cwd");
+    let _cwd = DirGuard(cwd.clone());
+    let console = |extra: &[&str]| {
+        let mut cmd = gconsole(&relay.addr, &cwd);
+        cmd.args(["-u", "root", "-p", PASSWORD]).args(extra);
+        cmd
+    };
+    let r = run(
+        console(&["--tls", "--ca-file", &path_str(&cert)]),
+        &format!(
+            "create small {nt};\nuse small;\nselect (count(*) as ?n) where {{ ?s ?p ?o }};\n",
+            nt = small_nt()
+        ),
+    );
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(
+        r.out.contains("Build RDF database small successfully!"),
+        "{r:?}"
+    );
+    assert!(r.out.contains("\"25\"^^"), "{r:?}");
+    let sent = relay.requests().concat();
+    assert!(!sent.is_empty());
+    for clear in [PASSWORD, "POST ", "select", "Bearer"] {
+        assert!(
+            !sent.contains(clear),
+            "{clear:?} crossed the network in clear text"
+        );
+    }
+    // `$SSL_CERT_FILE` names the bundle when --ca-file does not.
+    let mut cmd = console(&["--tls", "-e", "showdbs;"]);
+    cmd.env("SSL_CERT_FILE", &cert);
+    let r = run(cmd, "");
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.out.contains("| small    |"), "{r:?}");
+    // A bundle that does not vouch for the server: refused before anything
+    // is sent.
+    let before = relay.requests().len();
+    let r = run(
+        console(&["--tls", "--ca-file", &path_str(&empty), "-e", "showdbs;"]),
+        "",
+    );
+    assert_eq!(r.code, 1, "{r:?}");
+    assert_eq!(
+        r.out, "Could not connect to server. Please check server status\n",
+        "{r:?}"
+    );
+    assert!(r.err.contains("TLS with 127.0.0.1"), "{r:?}");
+    assert!(
+        relay.requests()[before..]
+            .iter()
+            .all(|c| !c.contains(PASSWORD)),
+        "nothing is sent to an unverified server"
+    );
+}
+
+/// Without the `tls` feature, `--tls` is refused up front.
+#[cfg(not(feature = "tls"))]
+#[test]
+fn tls_needs_the_tls_feature() {
+    let cwd = scratch("gc_no_tls");
+    let _cwd = DirGuard(cwd.clone());
+    let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
+    let mut cmd = gconsole(&addr, &cwd);
+    cmd.args(["-u", "root", "-p", PASSWORD, "--tls", "-e", "showdbs;"]);
+    let r = run(cmd, "");
+    assert_eq!(r.code, 2, "{r:?}");
+    assert!(r.err.contains("`tls` cargo feature"), "{r:?}");
+    let mut cmd = gconsole(&addr, &cwd);
+    cmd.args(["--ca-file", "x.pem", "-e", "showdbs;"]);
+    let r = run(cmd, "");
+    assert_eq!(r.code, 2, "{r:?}");
+    assert!(r.err.contains("--ca-file needs --tls"), "{r:?}");
 }
 
 // ---- the README flow: gserver + conf.ini + gconsole -u root ---------------------

@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use super::client::{ApiClient, CallError};
+use super::client::{ApiClient, CallError, LoginError};
 use super::syntax;
 use super::table;
 use super::term::{self, EchoOff, LineReader, ReadOutcome};
@@ -516,8 +516,30 @@ impl Console {
         params: Vec<(&str, Json)>,
         query: Option<(&str, &str)>,
     ) -> Result<Resp, Fail> {
-        let body = self.client.body(op, params);
-        match self.client.call_interruptible(&body) {
+        let mut answer = self
+            .client
+            .call_interruptible(&self.client.body(op, params.clone()));
+        // A session that ended (it expired, or the user's password changed)
+        // is refused with `1001`: log in again and repeat the request once
+        // (the operation did not run).
+        if self.client.session.is_some()
+            && answer
+                .as_ref()
+                .is_ok_and(|j| j.get("StatusCode").and_then(Json::as_i64) == Some(1001))
+        {
+            match self.client.log_in() {
+                Ok(()) => {
+                    answer = self
+                        .client
+                        .call_interruptible(&self.client.body(op, params))
+                }
+                Err(LoginError::Call(CallError::Interrupted)) => {
+                    answer = Err(CallError::Interrupted)
+                }
+                Err(_) => {}
+            }
+        }
+        match answer {
             Ok(j) => Ok(Resp::from_json(j)),
             Err(CallError::Interrupted) => {
                 let _ = self.out.flush();

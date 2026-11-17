@@ -577,6 +577,24 @@ fn exchange(
     read_to_eof(&mut stream, &arm, limits, &timed_out, what)
 }
 
+/// Start a TLS client session to `host` over `sock` — the `https://` client
+/// side of [`post_with`] (`rustls`, pure-`ring` backend), verifying the
+/// server's certificate against the CA certificates of `ca_file` (`None`:
+/// `$SSL_CERT_FILE`, else the system bundle), for a caller that runs its own
+/// exchange over the stream (`gconsole`, which must be able to shut the
+/// socket down from another thread on Ctrl-C and to wait for a long query
+/// without a deadline). The handshake runs on the first read or write, or
+/// when the caller drives it (`conn.complete_io`); bound it with the
+/// socket's timeouts.
+#[cfg(feature = "tls")]
+pub fn tls_client_stream<S: Read + Write>(
+    sock: S,
+    host: &str,
+    ca_file: Option<&Path>,
+) -> io::Result<rustls::StreamOwned<rustls::ClientConnection, S>> {
+    tls_client::connect(sock, host, ca_file)
+}
+
 /// A TCP stream each of whose reads and writes is bounded by what is left
 /// of `deadline`, failing with `TimedOut` once it has passed — what the TLS
 /// session runs over: rustls drives the whole handshake with many reads
