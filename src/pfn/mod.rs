@@ -189,7 +189,8 @@ pub struct PfnLimits {
     /// of the query, its sub-queries and `GRAPH` blocks); `0` = unlimited.
     /// Without it a query could run [`call::MAX_COMBINATIONS`] calls of a
     /// full `fuel_per_call` each (review ext#1). The count belongs to the
-    /// [`PfnCaller`] a query runs with: every query starts from zero.
+    /// [`PfnCaller`] a query runs with: every query starts from zero (in an
+    /// update, every `DELETE` / `INSERT … WHERE` operation).
     pub fuel_per_query: u64,
 }
 

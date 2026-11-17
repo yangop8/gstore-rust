@@ -464,7 +464,7 @@ extensions) and applied to every served database like the `[query]` keys
 | `pfn_max_memory_pages` | `1024` (64 MiB) | the most 64 KiB pages the memory may grow to; `memory.grow` past it returns `-1`, as WebAssembly specifies |
 | `pfn_max_module_bytes` | `1048576` | the largest source text and compiled module `funcudb` accepts — also `funBody` and `funSubs` together as sent (URL-decoded, whitespace included), and at most 3 × this as stored in `data.json` (JSON-escaped: a control character takes 6 bytes); `funDesc` may have at most 64 KiB, also as stored, and `funSubs` must be empty next to a complete module, when the function is created or updated |
 | `pfn_max_functions` | `100` | the most functions one user may own |
-| `pfn_fuel_per_query` | `10000000000` | the most fuel all the PFN calls of one query may use together — every argument combination, every `PFN.name(…)` of the statement, its sub-queries (`0` = unlimited); past it: `run f fail: the instruction budget of N for the PFN calls of one query (pfn_fuel_per_query) is exhausted`. Every query starts from zero |
+| `pfn_fuel_per_query` | `10000000000` | the most fuel all the PFN calls of one query may use together — every argument combination, every `PFN.name(…)` of the statement, its sub-queries (`0` = unlimited); past it: `run f fail: the instruction budget of N for the PFN calls of one query (pfn_fuel_per_query) is exhausted`. Every query starts from zero (in an update, every `DELETE` / `INSERT … WHERE` operation) |
 | `[query] gfun_max_output_bytes` | `67108864` | the most bytes one call may emit (and the most a call's result array may hold) |
 
 **Fuel** is what both budgets count: one unit per WebAssembly instruction;

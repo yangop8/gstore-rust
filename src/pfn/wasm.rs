@@ -1040,4 +1040,38 @@ mod tests {
             .unwrap_err()
             .contains("pfn_max_module_bytes"));
     }
+
+    /// Review ext#1: what an instantiation is charged — one unit per
+    /// [`HOST_BYTES_PER_FUEL`] bytes of the initial memory and of the data
+    /// section, plus one — counts both parts.
+    #[test]
+    fn instantiation_is_charged_for_its_memory_and_data_section() {
+        let rt = Runtime::new();
+        let charged = |pages: u32, data: usize| {
+            let wat = format!(
+                "(module (memory (export \"memory\") {pages}) (data (i32.const 0) \"{}\") \
+                 (func (export \"f\") (result i32) (i32.const 1)))",
+                "a".repeat(data)
+            );
+            let bytes = rt.compile("f", &wat, &PfnLimits::default()).unwrap();
+            let m = rt.load("f", &bytes).unwrap().0;
+            let section = data_section_bytes(&bytes);
+            // The segment's bytes plus a few of framing (count, mode, offset
+            // expression, length).
+            assert!(
+                (data as u64..=data as u64 + 16).contains(&section),
+                "{data} -> {section}"
+            );
+            m.instantiate_fuel
+        };
+        let empty = charged(0, 0);
+        assert!((1..=3).contains(&empty), "{empty}");
+        // A page is 64 KiB: 8 Ki units.
+        assert_eq!(charged(1, 0) - empty, 8192);
+        assert_eq!(charged(16, 0) - empty, 16 * 8192);
+        // 80 000 bytes of data: 10 000 units (and the length's two more
+        // LEB128 bytes).
+        let data = charged(2, 80_000) - charged(2, 0);
+        assert!((10_000..=10_001).contains(&data), "{data}");
+    }
 }
