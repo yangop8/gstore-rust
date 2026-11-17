@@ -236,10 +236,16 @@ pub(crate) fn check_before_body(
 /// Authenticate the request's `username` / `password` (`encryption=1`: the
 /// password's MD5 hex digest) and record the user in [`Ctx::user`].
 ///
+/// * no `password` but a session token ([`session_user`]) → that session;
 /// * either parameter missing (or the username empty) → `1003 "username or
 ///   password is empty"`;
 /// * otherwise [`verify`] (the system user is not accepted here).
 pub fn authenticate(ctx: &mut Ctx<'_>, params: &Params) -> Result<String, GResp> {
+    if params.str("password").is_none() {
+        if let Some(token) = ctx.req.bearer_or_session_token() {
+            return session_user(ctx, params, &token);
+        }
+    }
     if params.str("username").is_none() || params.str("password").is_none() {
         return Err(GResp::error(
             Status::ParamIsIllegal,
@@ -254,6 +260,31 @@ pub fn authenticate(ctx: &mut Ctx<'_>, params: &Params) -> Result<String, GResp>
         ));
     }
     verify(ctx, &creds, false)
+}
+
+/// A gstore-rust extension (review ext#12): a request without a `password`
+/// may authenticate with the session `token` of a `POST /login` — in
+/// `Authorization: Bearer`, `X-Session-Token` or the URL's `session=` /
+/// `token=`, as the REST endpoints take it — so a client (`gconsole`) logs
+/// in once instead of sending the password with every request. A
+/// `username` given must name the session's user. An unknown, expired,
+/// logged-out or revoked token (a password change ends the user's
+/// sessions) → `1001`. No password is checked, so nothing counts towards
+/// the failed-login lockout (the `/login` that issued the token did); the
+/// IP checks have run before, as for every operation.
+fn session_user(ctx: &mut Ctx<'_>, params: &Params, token: &str) -> Result<String, GResp> {
+    let user = ctx.state().users.session_user(token);
+    let named = params.str("username").filter(|n| !n.is_empty());
+    match user {
+        Some(user) if named.as_deref().is_none_or(|n| n == user) => {
+            ctx.user = Some(user.clone());
+            Ok(user)
+        }
+        _ => Err(GResp::error(
+            Status::AuthenticationFailed,
+            "The session is invalid or has expired: log in again.",
+        )),
+    }
 }
 
 /// The credential check: verify `creds` and record the user in
