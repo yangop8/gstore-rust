@@ -1379,9 +1379,12 @@ mod tests {
     }
 
     /// One generic function drives a backend's *write* face ([`MutableStore`])
-    /// and *read* face ([`TripleSource`]) without naming a concrete type — the
-    /// pluggability proof. The same `exercise` body would accept a future
-    /// RocksDB / MySQL `StorageBackend` unchanged.
+    /// and *read* face ([`TripleSource`]) without naming a concrete type: a
+    /// compile-time check of the seam, on `TripleStore`. The conformance of
+    /// every backend — the in-memory and on-disk stores, `Backend`, the
+    /// overlay view, `ShardedStore` and `RocksStore` — to the model, the
+    /// ordering contract and contract C1 is checked by one generic suite,
+    /// `tests/storage_backend_conformance.rs` (review design#17).
     #[test]
     fn storage_backend_seam_is_generic() {
         fn exercise<B: StorageBackend>(b: &mut B) {

@@ -27,6 +27,13 @@
 //! of a database in a transaction writes its committed state (`/api`
 //! refuses, as upstream).
 //!
+//! Review design#17 added the protocol-level parity of requests: a
+//! statement holding form-like text means the same through REST (raw
+//! `application/sparql-query` / `-update` bodies), the single-database
+//! server and `/api` (where a raw SPARQL body carries no parameters), and
+//! the deepest statements the parser accepts also run as asynchronous
+//! `/api` operations.
+//!
 //! Synchronisation is by test hooks (a parked statement), never by sleeping.
 
 use std::collections::BTreeSet;
@@ -1118,4 +1125,287 @@ fn a_backup_that_fails_part_way_leaves_no_directory_on_either_surface() {
         .map(|e| e.file_name())
         .collect();
     assert!(left.is_empty(), "{left:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Content-Type and deep requests on every surface (review design#17)
+// ---------------------------------------------------------------------------
+
+/// [`send`] with a `Content-Type`.
+fn send_typed(
+    addr: SocketAddr,
+    user: Option<(&str, &str)>,
+    target: &str,
+    ctype: &str,
+    body: &str,
+) -> Reply {
+    let mut s = TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(HANG_GUARD)).unwrap();
+    let auth = user
+        .map(|(u, p)| format!("Authorization: Basic {}\r\n", base64(&format!("{u}:{p}"))))
+        .unwrap_or_default();
+    let raw = format!(
+        "POST {target} HTTP/1.1\r\nHost: localhost\r\n{auth}Content-Type: {ctype}\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    s.write_all(raw.as_bytes()).unwrap();
+    let mut resp = Vec::new();
+    s.read_to_end(&mut resp).unwrap();
+    let resp = String::from_utf8_lossy(&resp).into_owned();
+    let (head, body) = resp.split_once("\r\n\r\n").unwrap_or((&resp, ""));
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or_else(|| panic!("no status in {resp:?}"));
+    Reply {
+        status,
+        head: head.to_string(),
+        body: body.to_string(),
+    }
+}
+
+/// The values bound to `var` in a SPARQL JSON results document.
+fn bound(j: &Json, var: &str) -> BTreeSet<String> {
+    let rows = j
+        .get("results")
+        .and_then(|r| r.get("bindings"))
+        .and_then(Json::as_array)
+        .unwrap_or_else(|| panic!("no bindings in {j}"));
+    rows.iter()
+        .filter_map(|b| b.get(var)?.get("value")?.as_str().map(str::to_string))
+        .collect()
+}
+
+/// A statement whose text holds what a form would read as parameters
+/// (`&query=`, `&sparql=`, `&update=`, `&db_name=`) means the same on every
+/// surface: REST `/sparql` and `/update` with a raw
+/// `application/sparql-query` / `-update` body, the single-database
+/// server's, and `/api` with the statement as a parameter (a JSON or a
+/// form body). And a raw SPARQL body sent to `/api` carries no parameters:
+/// before, `/api` read any body holding `=` as a form whatever its
+/// `Content-Type`, so its text could replace the statement of the URL.
+#[test]
+fn form_like_text_inside_a_statement_means_the_same_on_every_surface() {
+    use gstore::server::Server;
+    use gstore::Database;
+
+    let srv = Srv::start("contenttype");
+    srv.ok("POST", "/build?db_name=ctmain", DATA);
+    srv.ok("POST", "/build?db_name=ctother", DATA);
+    let single = Arc::new(
+        Server::bind(
+            Database::build_from_str("single", DATA).unwrap(),
+            "127.0.0.1:0",
+        )
+        .unwrap(),
+    );
+    let single_addr = single.local_addr().unwrap();
+    let serving = {
+        let s = Arc::clone(&single);
+        thread::spawn(move || s.serve_forever())
+    };
+    struct Stop(Arc<Server>, Option<thread::JoinHandle<ShutdownReport>>);
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            self.0.shutdown();
+            if let Some(h) = self.1.take() {
+                let _ = h.join();
+            }
+        }
+    }
+    let _stop = Stop(Arc::clone(&single), Some(serving));
+
+    let query = "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }\n\
+                 #&query=ASK {}&sparql=ASK {}&db_name=ctother\n";
+    let want: BTreeSet<String> = ["http://ex/b".to_string()].into();
+    let rest = send_typed(
+        srv.addr,
+        Some(ROOT),
+        "/sparql?db_name=ctmain&format=json",
+        "application/sparql-query",
+        query,
+    );
+    assert_eq!(rest.status, 200, "REST: {}", rest.body);
+    assert_eq!(bound(&rest.json(), "o"), want, "REST /sparql");
+    let one = send_typed(
+        single_addr,
+        None,
+        "/sparql?format=json",
+        "application/sparql-query",
+        query,
+    );
+    assert_eq!(one.status, 200, "single: {}", one.body);
+    assert_eq!(bound(&one.json(), "o"), want, "single-database /sparql");
+    let api = srv.api_ok(&[
+        ("operation", "query"),
+        ("db_name", "ctmain"),
+        ("sparql", query),
+    ]);
+    assert_eq!(bound(&api, "o"), want, "/api JSON: {api}");
+    let form = format!(
+        "username=root&password=root&operation=query&db_name=ctmain&sparql={}",
+        enc(query)
+    );
+    let r = send_typed(
+        srv.addr,
+        None,
+        "/api",
+        "application/x-www-form-urlencoded",
+        &form,
+    );
+    assert_eq!(bound(&r.json(), "o"), want, "/api form: {}", r.body);
+
+    // Updates whose literal holds form-like text: inserted verbatim, on
+    // the database named by the request, nothing cleared.
+    let literal = "x&update=CLEAR ALL&sparql=CLEAR ALL&db_name=ctother";
+    let update = |s: &str| format!("INSERT DATA {{ <http://ex/{s}> <http://ex/p> \"{literal}\" }}");
+    let r = send_typed(
+        srv.addr,
+        Some(ROOT),
+        "/update?db_name=ctmain",
+        "application/sparql-update",
+        &update("rest"),
+    );
+    assert_eq!(r.status, 200, "REST /update: {}", r.body);
+    let r = send_typed(
+        single_addr,
+        None,
+        "/update",
+        "application/sparql-update",
+        &update("single"),
+    );
+    assert_eq!(r.status, 200, "single /update: {}", r.body);
+    srv.api_ok(&[
+        ("operation", "query"),
+        ("db_name", "ctmain"),
+        ("sparql", &update("api")),
+    ]);
+    let check = "SELECT ?s ?o WHERE { ?s <http://ex/p> ?o }";
+    let rows = srv.api_ok(&[
+        ("operation", "query"),
+        ("db_name", "ctmain"),
+        ("sparql", check),
+    ]);
+    let subjects = bound(&rows, "s");
+    for s in ["http://ex/a", "http://ex/rest", "http://ex/api"] {
+        assert!(subjects.contains(s), "ctmain lost or missed {s}: {rows}");
+    }
+    assert!(bound(&rows, "o").contains(literal), "{rows}");
+    let r = send_typed(
+        single_addr,
+        None,
+        "/sparql?format=json",
+        "application/sparql-query",
+        check,
+    );
+    assert!(
+        bound(&r.json(), "s").contains("http://ex/single"),
+        "{}",
+        r.body
+    );
+    assert_eq!(
+        srv.statements("ctother"),
+        lines("http://ex/a http://ex/p http://ex/b -\nhttp://ex/a http://ex/q x -"),
+        "the other database is untouched"
+    );
+
+    // A raw SPARQL body sent to `/api`: the parameters are the URL's.
+    let target = format!(
+        "/api?username=root&password=root&operation=query&db_name=ctmain&sparql={}",
+        enc("SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }")
+    );
+    for ctype in ["application/sparql-query", "application/sparql-update"] {
+        let r = send_typed(
+            srv.addr,
+            None,
+            &target,
+            ctype,
+            "ASK {}&sparql=DELETE WHERE { ?s ?p ?o }&db_name=ctother",
+        );
+        assert_eq!(r.status, 200, "{ctype}: {}", r.body);
+        assert_eq!(bound(&r.json(), "o"), want, "{ctype}: {}", r.body);
+    }
+    for db in ["ctmain", "ctother"] {
+        assert!(
+            srv.statements(db)
+                .contains("http://ex/a http://ex/p http://ex/b -"),
+            "{db} was changed by a raw body's text"
+        );
+    }
+}
+
+/// The deepest statements the parser accepts (nested groups, sub-selects,
+/// parenthesized filters) answer the same synchronously and as an
+/// asynchronous `/api` operation (`async=true`), whose runner threads have
+/// the HTTP workers' stack (review design#8, design#17).
+#[test]
+fn the_deepest_allowed_statements_also_run_asynchronously() {
+    use gstore::gapi::tasks::TaskState;
+    use gstore::parser::sparql::MAX_NESTING_DEPTH;
+
+    let srv = Srv::start("deepasync");
+    srv.ok("POST", "/build?db_name=deep", DATA);
+    let nested = |n: usize| {
+        format!(
+            "SELECT * WHERE {}?s ?p ?o{}",
+            "{ ".repeat(n),
+            " }".repeat(n)
+        )
+    };
+    let groups = nested(MAX_NESTING_DEPTH);
+    // One level more is refused: these are the deepest allowed.
+    let refused = srv.api(&[
+        ("operation", "query"),
+        ("db_name", "deep"),
+        ("sparql", &nested(MAX_NESTING_DEPTH + 1)),
+    ]);
+    assert_ne!(code(&refused), 0, "{refused}");
+    let subselects = {
+        let n = MAX_NESTING_DEPTH / 2 - 1;
+        format!(
+            "{}SELECT * WHERE {{ ?s ?p ?o }}{}",
+            "SELECT * WHERE { { ".repeat(n),
+            " } }".repeat(n)
+        )
+    };
+    let filter = format!(
+        "SELECT * WHERE {{ ?s ?p ?o FILTER({}1{}) }}",
+        "(".repeat(MAX_NESTING_DEPTH - 2),
+        ")".repeat(MAX_NESTING_DEPTH - 2)
+    );
+    for (shape, q) in [
+        ("groups", &groups),
+        ("sub-selects", &subselects),
+        ("filter", &filter),
+    ] {
+        let sync = srv.api(&[("operation", "query"), ("db_name", "deep"), ("sparql", q)]);
+        assert_eq!(code(&sync), 0, "{shape}, synchronously: {sync}");
+        let submitted = srv.api_ok(&[
+            ("operation", "query"),
+            ("db_name", "deep"),
+            ("sparql", q),
+            ("async", "true"),
+        ]);
+        let opt_id = submitted
+            .get("opt_id")
+            .and_then(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .or_else(|| v.as_i64().map(|n| n.to_string()))
+            })
+            .unwrap_or_else(|| panic!("{shape}: no opt_id in {submitted}"));
+        let state = srv
+            .server
+            .task_manager()
+            .wait_finished(opt_id.parse().unwrap(), HANG_GUARD);
+        assert_eq!(state, Some(TaskState::Succeeded), "{shape}, async=true");
+        let done = srv.api_ok(&[("operation", "checkOperationState"), ("opt_id", &opt_id)]);
+        assert_eq!(
+            done.get("state").and_then(Json::as_i64),
+            Some(1),
+            "{shape}: {done}"
+        );
+    }
 }

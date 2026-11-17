@@ -250,25 +250,15 @@ fn read_cost(dir: &Path) -> i64 {
         .map_or(0, i64::from_ne_bytes)
 }
 
-/// The databases on disk under `root`: `<name>.db` directories with a valid,
-/// non-system name.
+/// The databases on disk under `root`: the directories the system registry
+/// scans for ([`crate::sysdb::database_dirs`]: `<name>.db` with a valid,
+/// non-system name — one scan and one name rule for both protocol layers,
+/// review gapi#15) that hold a database. A root that cannot be listed has
+/// none.
 fn databases_on_disk(root: &Path) -> BTreeMap<String, PathBuf> {
-    let mut out = BTreeMap::new();
-    let Ok(rd) = fs::read_dir(root) else {
-        return out;
-    };
-    for entry in rd.flatten() {
-        let fname = entry.file_name().to_string_lossy().into_owned();
-        if let Some(name) = fname.strip_suffix(DB_SUFFIX) {
-            // A directory holding no database (a build cut short) is not one.
-            if check_db_name(name).is_ok()
-                && entry.path().is_dir()
-                && Database::storage_kind(entry.path()).is_some()
-            {
-                out.insert(name.to_string(), entry.path());
-            }
-        }
-    }
+    let mut out = crate::sysdb::database_dirs(root).unwrap_or_default();
+    // A directory holding no database (a build cut short) is not one.
+    out.retain(|_, dir| Database::storage_kind(dir).is_some());
     out
 }
 
@@ -938,14 +928,9 @@ fn load(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
                     crate::gs_warn!("{warning}");
                     match ctx.inner.open_db(&dir) {
                         Ok(opened) => {
+                            let prepared = DbSlot::prepare(opened, dir, false);
                             let mut st = ctx.state();
-                            let slot = DbSlot::handle(
-                                opened,
-                                dir,
-                                false,
-                                &st.load_policy,
-                                &st.query_settings,
-                            );
+                            let slot = prepared.serve(&st.load_policy, &st.query_settings);
                             st.dbs.insert(db.clone(), slot);
                         }
                         Err(e) => {
@@ -1009,8 +994,11 @@ fn load(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     progress("loading", 0);
     match ctx.inner.open_db(&dir) {
         Ok(opened) => {
+            // The directory is locked and measured with the state lock
+            // released (review http#13/conc#7).
+            let prepared = DbSlot::prepare(opened, dir, false);
             let mut st = ctx.state();
-            let slot = DbSlot::handle(opened, dir, false, &st.load_policy, &st.query_settings);
+            let slot = prepared.serve(&st.load_policy, &st.query_settings);
             st.dbs.insert(db.clone(), slot);
         }
         Err(e) => {
@@ -1128,6 +1116,7 @@ fn unload(ctx: &mut Ctx<'_>, _p: &Params) -> GResp {
 }
 
 /// The statistics `monitor` and `schema` report of one database instance.
+#[derive(Clone)]
 struct Inspection {
     triples: u64,
     stats: crate::db::DbStats,
@@ -1141,7 +1130,8 @@ struct Inspection {
     /// An on-disk database's query mode.
     query_mode: Option<crate::db::DiskQueryMode>,
     /// The bytes of its directory: as last measured for a loaded database
-    /// (see `DbCell::disk_bytes`), walked for an unloaded one.
+    /// (see `DbCell::disk_bytes`), walked for an unloaded one (with the
+    /// walk that checks its cached statistics, see `DirPrint`).
     disk_bytes: Option<u64>,
 }
 
@@ -1500,8 +1490,10 @@ fn unreadable(db: &str, e: impl std::fmt::Display) -> GResp {
 /// Inspect database `db`: the loaded instance, else — upstream reads an
 /// unloaded database's statistics from its files — a temporary copy (a
 /// snapshot read without the directory lock, another layout opened under
-/// it), the database name reserved meanwhile. `1005` when it does not exist
-/// or cannot be read.
+/// it), the database name reserved meanwhile; the statistics read so are
+/// cached until a walk of the directory shows its files changed (review
+/// gapi#17), so polling an unloaded database neither opens it every time
+/// nor reserves its name. `1005` when it does not exist or cannot be read.
 fn inspect(ctx: &Ctx<'_>, db: &str) -> Result<Inspection, GResp> {
     let (dbh, dir) = {
         let st = ctx.state();
@@ -1581,7 +1573,14 @@ fn inspect(ctx: &Ctx<'_>, db: &str) -> Result<Inspection, GResp> {
     if !dir.is_dir() {
         return Err(not_loaded(db, false));
     }
+    // The statistics read from these very files before (review gapi#17):
+    // a walk of the directory (which `diskUsed` needs anyway) instead of
+    // opening the database and a pass over its data on every request.
+    if let Some(hit) = cached_unloaded(&dir, &DirPrint::of(&dir)) {
+        return Ok(hit);
+    }
     let _busy = claim(ctx, db)?;
+    *locked(unloaded_reads()).entry(dir.clone()).or_insert(0) += 1;
     let copy = if Database::storage_kind(&dir) == Some(crate::StorageKind::Snapshot) {
         Database::read_copy(&dir)
     } else {
@@ -1589,7 +1588,7 @@ fn inspect(ctx: &Ctx<'_>, db: &str) -> Result<Inspection, GResp> {
     };
     let copy = copy.map_err(|e| unreadable(db, e))?;
     let (subjects, classes, graph) = compute_stats(&copy).map_err(|e| unreadable(db, e))?;
-    Ok(Inspection {
+    let ins = Inspection {
         triples: copy.triple_num(),
         stats: copy.stats(),
         subjects,
@@ -1600,7 +1599,134 @@ fn inspect(ctx: &Ctx<'_>, db: &str) -> Result<Inspection, GResp> {
         layout: copy.storage(),
         query_mode: copy.disk_query_mode(),
         disk_bytes: None,
+    };
+    // Keyed by the files as the read left them: opening a database may
+    // write some (RocksDB's LOG, MANIFEST and OPTIONS), so they are walked
+    // once it is closed again.
+    drop(copy);
+    let print = DirPrint::of(&dir);
+    // Neither map keeps a database directory that is gone.
+    locked(unloaded_reads()).retain(|d, _| d.is_dir());
+    let mut cache = locked(unloaded_stats());
+    cache.retain(|d, _| d.is_dir());
+    cache.insert(
+        dir,
+        UnloadedStats {
+            print,
+            ins: ins.clone(),
+        },
+    );
+    Ok(Inspection {
+        disk_bytes: Some(print.bytes),
+        ..ins
     })
+}
+
+/// What a walk of a database directory sees of its files (review
+/// gapi#17): how many there are, their total size, the latest
+/// modification of any of them or of a directory (a file created, removed,
+/// renamed or written changes it), and a digest of each file and
+/// directory's path, inode, size and modification time — so a file or
+/// directory replaced by another (a save renamed over it, a directory
+/// swapped in) changes the print even when sizes and timestamps cannot
+/// tell them apart (a copy that kept the timestamps, a file system with
+/// coarse ones). The cached statistics of an unloaded database hold while
+/// its directory shows the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DirPrint {
+    files: u64,
+    bytes: u64,
+    latest: Option<std::time::SystemTime>,
+    /// The sum (wrapping) of one hash per file and directory seen: the
+    /// same whatever order the walk lists them in.
+    digest: u64,
+}
+
+impl DirPrint {
+    fn of(dir: &Path) -> DirPrint {
+        let mut print = DirPrint {
+            files: 0,
+            bytes: 0,
+            latest: None,
+            digest: 0,
+        };
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            if let Ok(m) = fs::metadata(&d) {
+                print.saw(&d, &m);
+            }
+            let Ok(rd) = fs::read_dir(&d) else { continue };
+            for e in rd.flatten() {
+                match e.file_type() {
+                    Ok(t) if t.is_dir() => stack.push(e.path()),
+                    Ok(t) if t.is_file() => {
+                        if let Ok(m) = e.metadata() {
+                            print.files += 1;
+                            print.bytes += m.len();
+                            print.saw(&e.path(), &m);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        print
+    }
+
+    fn saw(&mut self, path: &Path, m: &fs::Metadata) {
+        use std::hash::{Hash, Hasher};
+        let modified = m.modified().ok();
+        self.latest = self.latest.max(modified);
+        #[cfg(unix)]
+        let inode = std::os::unix::fs::MetadataExt::ino(m);
+        #[cfg(not(unix))]
+        let inode = 0u64;
+        // A fixed-key hasher: the same entry hashes alike for the life of
+        // the process (the cache lives in memory only).
+        let mut h = std::hash::DefaultHasher::new();
+        (path, inode, m.len(), modified).hash(&mut h);
+        self.digest = self.digest.wrapping_add(h.finish());
+    }
+}
+
+/// The statistics of an unloaded database, as read from its files when its
+/// directory showed `print`.
+struct UnloadedStats {
+    print: DirPrint,
+    ins: Inspection,
+}
+
+/// The cached statistics of unloaded databases, by directory (one entry
+/// per database directory that exists).
+fn unloaded_stats() -> &'static Mutex<HashMap<PathBuf, UnloadedStats>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, UnloadedStats>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The statistics read from the unloaded database in `dir` while it showed
+/// `print`, if any, with `print`'s size as its `diskUsed`.
+fn cached_unloaded(dir: &Path, print: &DirPrint) -> Option<Inspection> {
+    let cache = locked(unloaded_stats());
+    let c = cache.get(dir).filter(|c| c.print == *print)?;
+    Some(Inspection {
+        disk_bytes: Some(print.bytes),
+        ..c.ins.clone()
+    })
+}
+
+/// How many times the statistics of the unloaded database in each
+/// directory were read from its files.
+fn unloaded_reads() -> &'static Mutex<HashMap<PathBuf, u64>> {
+    static READS: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+    READS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// How many times `monitor` / `schema` read the statistics of the unloaded
+/// database in `dir` from its files (opened it, or read its snapshot, and
+/// computed them) in this process — for tests.
+#[doc(hidden)]
+pub fn unloaded_stats_reads(dir: &Path) -> u64 {
+    locked(unloaded_reads()).get(dir).copied().unwrap_or(0)
 }
 
 /// The `layout` field's spelling of a layout (as `/build`'s parameter).
@@ -2336,7 +2462,7 @@ fn backup(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
             // Upstream replaces a backup of the same second.
             let _ = fs::remove_dir_all(&dest);
             // `Database::backup` carries the reasoning rules of the directory
-            // it is served from (`DbSlot::handle`), as upstream's
+            // it is served from (`DbSlot::prepare`), as upstream's
             // whole-directory copy does. Marked as a backup in progress
             // first: one a crash stops is never restored (round-3 review).
             fs::create_dir_all(&dest)
@@ -2620,9 +2746,9 @@ fn restore(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         Database::discard_staged_restore(&staged);
         if loaded.is_some() {
             if let Ok(old) = ctx.inner.open_db(&dir) {
+                let prepared = DbSlot::prepare(old, dir.clone(), false);
                 let mut st = ctx.state();
-                let slot =
-                    DbSlot::handle(old, dir.clone(), false, &st.load_policy, &st.query_settings);
+                let slot = prepared.serve(&st.load_policy, &st.query_settings);
                 st.dbs.insert(db.clone(), slot);
             }
         }
@@ -2631,14 +2757,9 @@ fn restore(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     if loaded.is_some() {
         match ctx.inner.open_db(&dir) {
             Ok(restored) => {
+                let prepared = DbSlot::prepare(restored, dir.clone(), false);
                 let mut st = ctx.state();
-                let slot = DbSlot::handle(
-                    restored,
-                    dir.clone(),
-                    false,
-                    &st.load_policy,
-                    &st.query_settings,
-                );
+                let slot = prepared.serve(&st.load_policy, &st.query_settings);
                 st.dbs.insert(db.clone(), slot);
             }
             Err(e) => return fail(format!("the restored copy could not be opened: {e}")),

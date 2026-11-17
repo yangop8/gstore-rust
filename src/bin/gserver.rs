@@ -378,11 +378,15 @@ impl Cli {
             cli.passthrough.extend(args[start..=i].iter().cloned());
             i += 1;
         }
+        // A build without TLS cannot serve HTTPS: the options are refused
+        // as an argument error, never ignored for plaintext HTTP (review
+        // http#19) — as a TLS build refuses a cert without its key.
         #[cfg(not(feature = "tls"))]
         if cli.tls_cert.is_some() || cli.tls_key.is_some() {
-            eprintln!(
-                "warning: --tls-cert/--tls-key ignored — gserver was built without the `tls` feature \
-                 (rebuild with `--features tls` to serve HTTPS)"
+            return Err(
+                "--tls-cert/--tls-key need a gserver built with the `tls` feature \
+                        (rebuild with `--features tls` to serve HTTPS)"
+                    .into(),
             );
         }
         // HTTPS needs BOTH a cert and a key; one without the other would

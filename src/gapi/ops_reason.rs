@@ -110,7 +110,7 @@ fn file_store(ctx: &Ctx<'_>, db: &str) -> Result<RuleStore<'static>, GResp> {
         ));
     }
     // A loaded database already keeps its rules in the directory it is
-    // served from (`DbSlot::handle` tells it so), whose rules are these.
+    // served from (`DbSlot::prepare` tells it so), whose rules are these.
     let (handle, dir) = target(ctx, db);
     if handle.is_none() && !dir.is_dir() {
         return Err(GResp::error(

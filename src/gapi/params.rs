@@ -14,6 +14,10 @@
 //!   named `file` also sets the `filename` parameter, like upstream);
 //! * the URL query string (`GET /api?operation=…&…`).
 //!
+//! A body labelled `application/sparql-query` or `application/sparql-update`
+//! carries no parameters (the SPARQL Protocol's raw statement): only the URL
+//! query string does then.
+//!
 //! The URL query and the body are merged; on a duplicated name the body wins
 //! (the last occurrence wins in general). Values keep their JSON type
 //! ([`Json`]) — `"tid": 1` and `"tid": "1"` both read as `"1"` through
@@ -140,7 +144,14 @@ impl Params {
             }
         };
         let trimmed = text.trim_start_matches('\u{FEFF}').trim();
-        if trimmed.is_empty() {
+        // A body labelled as a raw SPARQL statement is never read as
+        // parameters, whatever text it holds (review design#17: a `&sparql=`
+        // or `&db_name=` inside it replaced the URL's parameters).
+        let raw_sparql = matches!(
+            media.as_str(),
+            "application/sparql-query" | "application/sparql-update"
+        );
+        if trimmed.is_empty() || raw_sparql {
             // No body parameters.
         } else if media == "application/json" || trimmed.starts_with('{') {
             match json::parse_with_limits(trimmed, &BODY_JSON_LIMITS) {
@@ -316,51 +327,17 @@ fn check_form_size(s: &str, what: &str) -> Result<(), String> {
 
 /// Decode an `application/x-www-form-urlencoded` string (also a URL query):
 /// `&`-separated `name=value` pairs, `+` as a space, `%XX` escapes. A pair
-/// without `=` is a name with an empty value; empty names are skipped.
+/// without `=` is a name with an empty value; empty names are skipped. The
+/// crate's one form decoder ([`crate::util::form::parse_form`]).
 pub fn parse_form(s: &str) -> Vec<(String, String)> {
-    s.split('&')
-        .filter(|pair| !pair.is_empty())
-        .filter_map(|pair| {
-            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-            let k = url_decode(k);
-            (!k.is_empty()).then(|| (k, url_decode(v)))
-        })
-        .collect()
+    crate::util::form::parse_form(s)
 }
 
 /// Percent-decode `s` (`+` decodes to a space; a malformed `%` escape is kept
-/// literally). Invalid UTF-8 is replaced with U+FFFD.
+/// literally). Invalid UTF-8 is replaced with U+FFFD. The crate's one
+/// decoder ([`crate::util::form::url_decode`]).
 pub fn url_decode(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b'%' if i + 2 < b.len() => match (hex_val(b[i + 1]), hex_val(b[i + 2])) {
-                (Some(h), Some(l)) => {
-                    out.push((h << 4) | l);
-                    i += 3;
-                }
-                _ => {
-                    out.push(b'%');
-                    i += 1;
-                }
-            },
-            c => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn hex_val(b: u8) -> Option<u8> {
-    char::from(b).to_digit(16).map(|d| d as u8)
+    crate::util::form::url_decode(s)
 }
 
 /// Parse a `multipart/form-data` body (RFC 7578): text fields and files.
