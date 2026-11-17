@@ -488,7 +488,10 @@ pub enum Request {
     TripleCount,
     /// Number of triples with a predicate.
     PredCard { pred: PredId },
-    /// Insert a routed triple; the response reports whether it was new.
+    /// Insert a routed triple; the response reports whether it was new
+    /// (`Bool`). A replicated cluster node commits it through its Raft log
+    /// first, and answers `Error` when it is not the leader or cannot confirm
+    /// the commit.
     Insert {
         sub: EntityLiteralId,
         pred: PredId,
@@ -539,7 +542,9 @@ pub enum Request {
     ScanShard { shard: u32, num_shards: u32 },
     /// Migration cut-over: delete every triple in bucket `shard` of `num_shards`
     /// from this node (after its data has been streamed to the new owner);
-    /// replies with the number removed.
+    /// replies with the number removed. Served by a shard node only: a
+    /// replicated cluster node refuses it with `Error`, since it would change
+    /// one replica outside the Raft log.
     PurgeShard { shard: u32, num_shards: u32 },
 }
 

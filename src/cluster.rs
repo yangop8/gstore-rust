@@ -3042,10 +3042,20 @@ impl ClusterNode {
                 reply_to_response(reply)
             }
             Request::ClientWrite { op } => self.client_write_response(op),
-            // On a cluster node, a routed insert goes through the replicated log.
-            Request::Insert { sub, pred, obj } => {
-                self.client_write_response(LogOp::Insert(IdTriple::new(sub, pred, obj)))
-            }
+            // On a cluster node, a routed insert goes through the replicated
+            // log, and answers as [`RemoteShard::insert`] expects: `Bool` (was
+            // it new?) once committed, `Error` otherwise. It used to answer a
+            // `WriteAck`, so a [`RemoteShard`] reported an error for a write
+            // that had committed (review cluster-nlqa#3).
+            Request::Insert { sub, pred, obj } => self.routed_insert(IdTriple::new(sub, pred, obj)),
+            // Deleting a bucket on this replica alone, outside the log, made
+            // the replicas diverge for good (review cluster-nlqa#3). Every
+            // mutation of a replicated store goes through `ClientWrite`.
+            Request::PurgeShard { .. } => Response::Error(
+                "PurgeShard is not served by a replicated cluster node: it would change \
+                 this replica outside the Raft log; send ClientWrite Delete operations"
+                    .to_string(),
+            ),
             Request::ClusterStatus => {
                 let st = self.state.lock().unwrap();
                 Response::Status {
@@ -3067,7 +3077,36 @@ impl ClusterNode {
                 }
             }
             // Read-only shard queries are served from the replicated store.
-            other => dispatch(&self.store, &other),
+            // (Listed one by one, so a new request kind has to be classified
+            // as read-only or log-routed before it compiles.)
+            read @ (Request::Exists { .. }
+            | Request::PoByS { .. }
+            | Request::OBySp { .. }
+            | Request::PBySo { .. }
+            | Request::PsByO { .. }
+            | Request::SByPo { .. }
+            | Request::SoByP { .. }
+            | Request::SubsByP { .. }
+            | Request::ObjsByP { .. }
+            | Request::SubjectKeys
+            | Request::ObjectKeys
+            | Request::Predicates
+            | Request::TripleCount
+            | Request::PredCard { .. }
+            | Request::ScanShard { .. }) => dispatch(&self.store, &read),
+        }
+    }
+
+    /// Serve a routed [`Request::Insert`] (the [`RemoteShard`] surface) through
+    /// the replicated log: `Bool(true)` once a new triple is committed and
+    /// applied here, `Bool(false)` if it was already present, and an `Error`
+    /// (naming the leader, when known) when this node is not the leader or the
+    /// write is not confirmed committed within the commit timeout.
+    fn routed_insert(&self, t: IdTriple) -> Response {
+        let present = self.store_contains(t);
+        match self.propose_and_wait(LogOp::Insert(t), self.commit_timeout()) {
+            Ok(_) => Response::Bool(!present),
+            Err(e) => Response::Error(e.to_string()),
         }
     }
 
@@ -6790,6 +6829,173 @@ mod review_fix_tests {
         }
         assert!(node.0.current_term() < u64::MAX);
         assert!(node.0.store_contains(t(1, 2, 3)));
+    }
+
+    // ----- review cluster-nlqa#3: shard RPCs sent to a ClusterNode ------------
+
+    /// A [`RemoteShard`] pointed at a [`ClusterNode`]: its routed insert goes
+    /// through the Raft log and answers `Bool` as the [`RemoteShard`] contract
+    /// says (before the fix: `Err("expected a Bool response")` for a committed
+    /// write), and a `PurgeShard` — which would delete data on this replica
+    /// only, outside the log — is refused.
+    #[test]
+    fn a_cluster_node_honours_the_shard_insert_contract_and_refuses_purges() {
+        let node = LiveNode::start(TripleStore::new());
+        node.wait_leader();
+        let rs = RemoteShard::connect(node.addr()).unwrap();
+        let tr = t(11, 22, 33);
+        assert!(rs.insert(tr).unwrap(), "a new triple is reported new");
+        assert!(
+            !rs.insert(tr).unwrap(),
+            "a present triple is reported present"
+        );
+        assert!(node.0.store_contains(tr));
+
+        let commit = node.0.commit_index();
+        for s in 0..4 {
+            assert!(
+                rs.purge_shard(s, 4).is_err(),
+                "PurgeShard bypasses the replicated log and must be refused"
+            );
+        }
+        assert!(node.0.store_contains(tr), "the committed triple survives");
+        assert_eq!(node.0.commit_index(), commit);
+        assert!(
+            rs.read_exists(11, 22, 33).unwrap(),
+            "reads are still served"
+        );
+    }
+
+    /// Every request kind sent to a [`ClusterNode`] is either served from the
+    /// replicated store (reads), routed through the Raft log (writes), or
+    /// refused — none changes the store outside the log.
+    #[test]
+    fn every_request_sent_to_a_cluster_node_reads_goes_through_the_log_or_is_refused() {
+        let mut seed = TripleStore::new();
+        seed.bulk_load([t(1, 2, 3), t(4, 2, 6)]);
+        let node = LiveNode::start(seed);
+        node.wait_leader();
+        let mut s = TcpStream::connect(node.addr()).unwrap();
+        s.set_read_timeout(Some(HANG_GUARD)).unwrap();
+        let mut ask = |req: Request| rpc::round_trip(&mut s, &req).expect("round trip");
+
+        // Reads.
+        assert_eq!(
+            ask(Request::Exists {
+                sub: 1,
+                pred: 2,
+                obj: 3
+            }),
+            Response::Bool(true)
+        );
+        assert_eq!(
+            ask(Request::PoByS { sub: 1 }),
+            Response::Pairs(vec![(2, 3)])
+        );
+        assert_eq!(
+            ask(Request::OBySp { sub: 1, pred: 2 }),
+            Response::Ids(vec![3])
+        );
+        assert_eq!(
+            ask(Request::PBySo { sub: 1, obj: 3 }),
+            Response::Ids(vec![2])
+        );
+        assert_eq!(
+            ask(Request::PsByO { obj: 3 }),
+            Response::Pairs(vec![(2, 1)])
+        );
+        assert_eq!(
+            ask(Request::SByPo { pred: 2, obj: 3 }),
+            Response::Ids(vec![1])
+        );
+        assert_eq!(
+            ask(Request::SoByP { pred: 2 }),
+            Response::Pairs(vec![(1, 3), (4, 6)])
+        );
+        assert_eq!(ask(Request::SubsByP { pred: 2 }), Response::Ids(vec![1, 4]));
+        assert_eq!(ask(Request::ObjsByP { pred: 2 }), Response::Ids(vec![3, 6]));
+        assert_eq!(ask(Request::SubjectKeys), Response::Ids(vec![1, 4]));
+        assert_eq!(ask(Request::ObjectKeys), Response::Ids(vec![3, 6]));
+        assert_eq!(ask(Request::Predicates), Response::Ids(vec![2]));
+        assert_eq!(ask(Request::TripleCount), Response::Count(2));
+        assert_eq!(ask(Request::PredCard { pred: 2 }), Response::Count(2));
+        assert!(matches!(
+            ask(Request::ScanShard { shard: 0, num_shards: 1 }),
+            Response::Triples(v) if v.len() == 2
+        ));
+        assert!(matches!(
+            ask(Request::ClusterStatus),
+            Response::Status { role: 2, .. }
+        ));
+        assert!(matches!(ask(Request::GetConfig), Response::Config { .. }));
+
+        // Stale Raft traffic is answered without effect.
+        assert!(matches!(
+            ask(Request::RequestVote {
+                term: 0,
+                candidate_id: 9,
+                last_log_index: 0,
+                last_log_term: 0
+            }),
+            Response::Vote { granted: false, .. }
+        ));
+        assert!(matches!(
+            ask(Request::AppendEntries {
+                term: 0,
+                leader_id: 9,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                leader_commit: 0,
+                entries: vec![LogEntry::new(0, LogOp::Delete(t(1, 2, 3)))],
+            }),
+            Response::AppendAck { success: false, .. }
+        ));
+        assert!(matches!(
+            ask(Request::InstallSnapshot {
+                term: 0,
+                leader_id: 9,
+                last_included_index: 99,
+                last_included_term: 0,
+                triples: vec![],
+            }),
+            Response::SnapshotAck { .. }
+        ));
+        assert!(
+            node.0.is_leader(),
+            "stale traffic does not depose the leader"
+        );
+
+        // Writes go through the log.
+        let commit = node.0.commit_index();
+        assert_eq!(
+            ask(Request::Insert {
+                sub: 7,
+                pred: 2,
+                obj: 8
+            }),
+            Response::Bool(true)
+        );
+        assert!(matches!(
+            ask(Request::ClientWrite {
+                op: LogOp::Delete(t(4, 2, 6))
+            }),
+            Response::WriteAck { ok: true, .. }
+        ));
+        assert_eq!(node.0.commit_index(), commit + 2, "both writes were logged");
+
+        // Bucket purges are refused.
+        assert!(matches!(
+            ask(Request::PurgeShard {
+                shard: 0,
+                num_shards: 1
+            }),
+            Response::Error(_)
+        ));
+        assert_eq!(node.0.commit_index(), commit + 2);
+        assert!(node.0.store_contains(t(1, 2, 3)));
+        assert!(node.0.store_contains(t(7, 2, 8)));
+        assert!(!node.0.store_contains(t(4, 2, 6)));
+        assert_eq!(node.0.store_triple_count(), 2);
     }
 
     // ----- review cluster-nlqa#4: commit reporting ----------------------------
