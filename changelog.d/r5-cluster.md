@@ -19,12 +19,17 @@
   the owning node id) and are fsynced before the node answers a vote or
   append, sends a message, or counts its own entry toward a commit. A restart
   reloads term, vote and log and rebuilds the triple store as the log is
-  re-committed; a torn tail record (never acknowledged) is cut off; a
-  directory of another node id is refused, and so is a second running copy
-  of the same node (exclusive advisory lock on the journal while the node
-  lives); a journal write failure stops the node for good (fail-stop). A single-node leader now commits its log when it
-  is elected (before: only at the next write). `ClusterNode::bind` documents
-  the restart hazard of its in-memory state.
+  re-committed; a torn tail record (never acknowledged, including a
+  zero-filled one) is cut off, while an intact record that does not decode (a
+  newer format, a damaged file) refuses the start instead of being cut off
+  with every record after it; a new state directory is created durably (the
+  parent of each created directory is fsynced); a directory of another node
+  id is refused, and so is a second running copy of the same node (exclusive
+  advisory lock on the journal while the node lives); a journal write failure
+  stops the node for good (fail-stop): from then on it answers, applies and
+  writes nothing, even once the disk recovers. A single-node leader now
+  commits its log when it is elected (before: only at the next write).
+  `ClusterNode::bind` documents the restart hazard of its in-memory state.
 - **Behaviour change: forged Raft terms are refused** (review
   cluster-nlqa#2). One `RequestVote` at term `u64::MAX` used to wedge a
   `ClusterNode` cluster for good (the next election overflowed: a panic that
@@ -88,9 +93,10 @@
   `shard_survives_n_over_2_replica_failures_with_quorum` asserted
   `Some(true)` ("committed") for a write that cannot commit; it now expects
   `None` and checks that the leader still appended the entry.
-- Tests: `cluster::review_fix_tests` (19 tests; failures injected with
-  `test_support::Link::fail_after`, a link that dies after exactly n RPCs, and
-  with forged messages; wall clocks are hang guards only),
+- Tests: `cluster::review_fix_tests` (23 tests; failures injected with
+  `test_support::Link::fail_after`, a link that dies after exactly n RPCs,
+  with forged messages, and with a journal file handle swapped for a
+  read-only one; wall clocks are hang guards only),
   `rpc::tests::an_oversized_reply_is_encoded_as_an_error`,
   `tests/rpc_frame_reader_allocates_what_arrives.rs` (counting allocator),
   `tests/gnode_restarted_replica_votes_once_per_term.rs` (real binary: vote,
@@ -134,6 +140,23 @@ none
     fresh connection, so an `Insert` whose response was lost reports "not
     inserted" (needs idempotency tokens). Reason: D4 — authentication and the
     connection model are a redesign of a frozen experimental transport.
+  - cluster-nlqa#2 (rest): the term bound is per message (2^32), so it stops
+    the one-message wedge but not a sequence: a few forged plausible-step
+    messages to one node can still move it more than 2^32 terms past its
+    peers, which then refuse its messages and it theirs — that node is cut
+    off for good (and with `--state-dir` the forged term is durable). Any
+    bound short of authenticated peer RPCs leaves a variant of this. Reason:
+    D4 — peer authentication is the fix (above).
+  - cluster-nlqa#1 (rest): a member whose endpoint is gone for good cannot be
+    evicted while it has stranded buckets — every membership change resumes
+    them first — so the cluster's membership is frozen until the node comes
+    back (before the fix such a node could not be dropped either: its
+    endpoint stayed and every read failed); an explicit "forget node, accept
+    the loss" operation is missing. While a bucket is stranded,
+    `ShardCluster::insert` reports a triple that still sits only on the move's
+    source as new (`insert_all` can over-count; the counts read back are
+    exact). Reason: D4 — new membership API on a frozen experimental
+    coordinator.
   - cluster-nlqa#12 (rest): wall-clock assertions remain in
     `raft_tests::a_hung_peer_does_not_stall_the_healthy_majority` (commit in
     < 250 ms, no churn for 1.5 s) and
@@ -189,4 +212,10 @@ none
   library-only code (none touches gserver).
 - Partial ids (remainders in the backlog note above): cluster-nlqa#9 (with
   sec#19, conc#11) and cluster-nlqa#12; every other id of the package is
-  fixed.
+  fixed (cluster-nlqa#1 and #2 with the residual limits recorded above).
+- Independent review of this package: the raft journal now refuses an
+  intact but undecodable record instead of cutting it off, creates a new
+  state directory durably (reusing `db::fsutil::create_dir_durable`, no
+  edit there), and stays stopped after a failed write (before, a retried
+  vote whose journal write had failed was granted once the disk recovered);
+  four tests in `cluster::review_fix_tests` cover these.
