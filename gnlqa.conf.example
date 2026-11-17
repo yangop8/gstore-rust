@@ -37,6 +37,9 @@ GSTORE_ENDPOINT=http://127.0.0.1:9000/sparql
 # GNLQA_CACHE_TTL_SECS=3600  # cache entry lifetime in seconds (0 = no expiry)
 # GNLQA_CACHE_MAX_BYTES=67108864  # answer-cache byte budget; answers above 1/8 of it are not cached
 # GNLQA_MAX_TOKENS=1024      # minimum completion-token budget per request (raise for reasoning models)
+# GNLQA_LINKER_MAX_LABELS=10000  # entity labels the linker indexes (in label order)
+# GNLQA_LINKER_CACHE=on          # cache the linker's label index per KB fingerprint (off = rebuild every start)
+# GNLQA_LINKER_CACHE_DIR=        # default $XDG_CACHE_HOME/gnlqa or ~/.cache/gnlqa
 # GNLQA_RETRIES=3            # retries of a transient LLM/gStore failure (429, 5xx) with back-off (0 = none)
 
 # ---- gnlqa serve / mcp (HTTP authentication and per-request limits) ----

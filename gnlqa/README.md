@@ -109,6 +109,15 @@ an ungrounded guess or "no candidate query produced an answer". If the KB is
 unreachable when the entity linker is built, the failure is logged and the build is
 retried on a later request (at most once a minute).
 
+**Entity linker.** The linker indexes the KB's `rdfs:label`s (up to
+`GNLQA_LINKER_MAX_LABELS`), distinct predicates and types, fetched in `ORDER BY`
+pages so a capped index is always the same prefix; the sizes, and any truncation,
+are logged. The fetched lists are cached on disk (`GNLQA_LINKER_CACHE_DIR`) under a
+fingerprint of the endpoint, the label settings and the number of `rdfs:label` and
+`rdf:type` triples, for at most a day: a repeated `gnlqa "<question>"` then costs two
+cheap `COUNT` queries instead of full-store `DISTINCT` scans. Delete the cache
+directory to force a rebuild.
+
 ## CLI
 
 ```sh
@@ -277,6 +286,9 @@ over `http://` to a non-loopback host.
 | `GSTORE_PASSWORD`    | —                                  | optional HTTP Basic password (redacted `Secret`) |
 | `GNLQA_MAX_TOKENS`   | `1024`                             | minimum completion-token budget floored onto every LLM request (raise it for reasoning models that spend tokens on hidden reasoning) |
 | `GNLQA_TIMEOUT_SECS` | `60`                               | per-request HTTP timeout |
+| `GNLQA_LINKER_MAX_LABELS` | `10000`                       | entity labels the linker indexes; a larger KB is indexed up to this many, in label order, with a warning |
+| `GNLQA_LINKER_CACHE` | `on`                               | cache the linker's label index on disk per KB fingerprint (`off` = rebuild from the KB on every start) |
+| `GNLQA_LINKER_CACHE_DIR` | `$XDG_CACHE_HOME/gnlqa` or `~/.cache/gnlqa` | where that cache lives (files are mode 0600: labels are KB data) |
 | `GNLQA_RETRIES`      | `3`                                | retries of a transient LLM / embedding failure (429, 5xx, 529) or gStore overload (429, 502–504), with exponential back-off honouring `Retry-After` (`0` = none) |
 | `GNLQA_MODE`         | `auto`                             | answering mode: `auto`/`structured`/`graphrag`/`open` (see above); applies to CLI, chat, serve, and mcp |
 | `GNLQA_CACHE`        | `256`                              | answer-cache capacity in questions (`0` disables the cache) |

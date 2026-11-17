@@ -76,6 +76,14 @@ pub struct Config {
     /// Retries of a transient LLM / gStore / embedding failure (429, 5xx)
     /// with exponential back-off (`GNLQA_RETRIES`; 0 = no retry).
     pub retries: u32,
+    /// Most entity labels the linker indexes (`GNLQA_LINKER_MAX_LABELS`,
+    /// default 10000); a larger KB is indexed up to this many, in label
+    /// order, with a warning.
+    pub linker_max_labels: usize,
+    /// Where the linker's label index is cached between runs
+    /// (`GNLQA_LINKER_CACHE_DIR`, default `$XDG_CACHE_HOME/gnlqa` or
+    /// `~/.cache/gnlqa`); `None` when `GNLQA_LINKER_CACHE=off`.
+    pub linker_cache_dir: Option<PathBuf>,
 }
 
 impl Config {
@@ -148,6 +156,15 @@ impl Config {
                 crate::http_server::DEFAULT_REQUEST_TIMEOUT_SECS,
             ),
             retries: parse_or(get("GNLQA_RETRIES"), RetryPolicy::default().max_retries),
+            linker_max_labels: parse_or(get("GNLQA_LINKER_MAX_LABELS"), DEFAULT_LINKER_MAX_LABELS)
+                .max(1),
+            linker_cache_dir: if parse_switch_or(get("GNLQA_LINKER_CACHE"), true) {
+                non_empty(get("GNLQA_LINKER_CACHE_DIR"))
+                    .map(PathBuf::from)
+                    .or_else(|| crate::link::LinkerCache::default_dir(&var))
+            } else {
+                None
+            },
         }
     }
 
@@ -270,6 +287,8 @@ impl Default for Config {
             max_kb_rows: crate::http_server::DEFAULT_MAX_KB_ROWS,
             request_timeout_secs: crate::http_server::DEFAULT_REQUEST_TIMEOUT_SECS,
             retries: RetryPolicy::default().max_retries,
+            linker_max_labels: DEFAULT_LINKER_MAX_LABELS,
+            linker_cache_dir: None,
         }
     }
 }
@@ -307,6 +326,9 @@ fn plain_http_remote_host(url: &str) -> Option<String> {
     (!host.is_empty() && !loopback).then_some(host)
 }
 
+/// Default cap on the entity labels the linker indexes.
+pub const DEFAULT_LINKER_MAX_LABELS: usize = 10_000;
+
 /// Default answer-cache entry lifetime (seconds): an hour, so a long-running
 /// server neither serves stale answers nor holds them indefinitely (review
 /// cluster-nlqa#19). `GNLQA_CACHE_TTL_SECS=0` still disables expiry.
@@ -341,13 +363,21 @@ fn normalize_provider(v: Option<String>) -> String {
 /// Parse an on/off switch (`on|off|true|false|yes|no|1|0`, case-insensitive);
 /// absent → off. An unrecognized value warns and stays off (the safe side).
 fn parse_switch(v: Option<String>) -> bool {
-    let Some(s) = non_empty(v) else { return false };
+    parse_switch_or(v, false)
+}
+
+/// [`parse_switch`] with an explicit default for an absent or unrecognized value.
+fn parse_switch_or(v: Option<String>, default: bool) -> bool {
+    let Some(s) = non_empty(v) else {
+        return default;
+    };
     match s.trim().to_lowercase().as_str() {
         "on" | "true" | "yes" | "1" => true,
         "off" | "false" | "no" | "0" => false,
         other => {
-            eprintln!("gnlqa: warning: switch value {other:?} is not on/off; using off");
-            false
+            let d = if default { "on" } else { "off" };
+            eprintln!("gnlqa: warning: switch value {other:?} is not on/off; using {d}");
+            default
         }
     }
 }
@@ -662,5 +692,24 @@ mod tests {
         let w = c.security_warnings();
         assert_eq!(w.len(), 1, "{w:?}");
         assert!(w[0].contains("GSTORE_ENDPOINT") && !w[0].contains("s3cret"));
+    }
+
+    #[test]
+    fn linker_cache_dir_resolution() {
+        let c = Config::from_lookup(lookup(&[("HOME", "/h")]), None);
+        assert_eq!(c.linker_cache_dir, Some(PathBuf::from("/h/.cache/gnlqa")));
+        let c = Config::from_lookup(lookup(&[("XDG_CACHE_HOME", "/x"), ("HOME", "/h")]), None);
+        assert_eq!(c.linker_cache_dir, Some(PathBuf::from("/x/gnlqa")));
+        let c = Config::from_lookup(
+            lookup(&[("GNLQA_LINKER_CACHE_DIR", "/d"), ("HOME", "/h")]),
+            None,
+        );
+        assert_eq!(c.linker_cache_dir, Some(PathBuf::from("/d")));
+        let c = Config::from_lookup(
+            lookup(&[("GNLQA_LINKER_CACHE", "off"), ("HOME", "/h")]),
+            None,
+        );
+        assert_eq!(c.linker_cache_dir, None);
+        assert_eq!(c.linker_max_labels, DEFAULT_LINKER_MAX_LABELS);
     }
 }

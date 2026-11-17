@@ -5,9 +5,13 @@
 //! (C7) and used to ground SPARQL generation (C8).
 
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
 
 use crate::embed::{Embedder, VectorIndex};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::intent::{Mention, MentionKind};
 use crate::kb::{sparql_escape_literal, KbClient, SparqlAnswer, TermKind};
 
@@ -114,6 +118,11 @@ impl Linker {
     /// languages link against native labels rather than only English. Predicates
     /// and types are labeled by their URI local name (data rarely carries
     /// `rdfs:label` for them, and those names are language-neutral).
+    ///
+    /// The label, predicate and type lists are fetched in `ORDER BY` pages
+    /// (see [`LinkerLabels::fetch`]), so a capped list is a deterministic
+    /// prefix rather than an arbitrary subset, and the sizes and any
+    /// truncation are logged (review cluster-nlqa#22).
     pub fn build_from_kb_langs(
         kb: &dyn KbClient,
         embedder: Box<dyn Embedder>,
@@ -121,29 +130,58 @@ impl Linker {
         entity_limit: Option<usize>,
         languages: &[&str],
     ) -> Result<Linker> {
-        // Restrict to the requested languages (+ no-language) and (optionally) cap
-        // the count; a real KB can have millions of labels (full paging is a later
-        // step).
-        let lim = entity_limit
-            .map(|n| format!(" LIMIT {n}"))
-            .unwrap_or_default();
-        let ent_q = format!(
-            "SELECT DISTINCT ?s ?l WHERE {{ ?s <{RDFS_LABEL}> ?l \
-             FILTER({}) }}{lim}",
-            lang_filter_clause(languages)
-        );
-        let ent_ans = kb.query(&ent_q)?;
-        warn_if_no_rows(&ent_ans, "entity label");
-        let entities = pairs_with_label(&ent_ans, "s", "l");
+        let labels = LinkerLabels::fetch(kb, entity_limit, languages)?;
+        labels.log_summary(entity_limit);
+        Linker::from_label_set(embedder, &labels, min_score)
+    }
 
-        let pred_ans = kb.query("SELECT DISTINCT ?p WHERE { ?s ?p ?o }")?;
-        let predicates = uris_by_local_name(&pred_ans, "p");
+    /// Like [`build_from_kb_langs`](Self::build_from_kb_langs), but reuses the
+    /// label lists cached on disk for the same KB fingerprint (see
+    /// [`kb_fingerprint`] and [`LinkerCache`]): a repeated one-shot CLI
+    /// question then costs two predicate-bound `COUNT` queries instead of
+    /// full-store `DISTINCT` scans (review cluster-nlqa#22). A cache that
+    /// cannot be written only costs the next build; it is logged, not fatal.
+    pub fn build_cached(
+        kb: &dyn KbClient,
+        embedder: Box<dyn Embedder>,
+        min_score: f32,
+        entity_limit: Option<usize>,
+        languages: &[&str],
+        endpoint: &str,
+        cache: &LinkerCache,
+    ) -> Result<Linker> {
+        let fp = kb_fingerprint(kb, endpoint, entity_limit, languages)?;
+        if let Some(labels) = cache.load(&fp) {
+            eprintln!(
+                "gnlqa: linker: reusing the cached label index ({} entities, {} predicates, \
+                 {} types)",
+                labels.entities.len(),
+                labels.predicates.len(),
+                labels.types.len()
+            );
+            return Linker::from_label_set(embedder, &labels, min_score);
+        }
+        let labels = LinkerLabels::fetch(kb, entity_limit, languages)?;
+        labels.log_summary(entity_limit);
+        if let Err(e) = cache.store(&fp, &labels) {
+            eprintln!("gnlqa: warning: cannot cache the linker index: {e}");
+        }
+        Linker::from_label_set(embedder, &labels, min_score)
+    }
 
-        let type_q = format!("SELECT DISTINCT ?t WHERE {{ ?s <{RDF_TYPE}> ?t }}");
-        let type_ans = kb.query(&type_q)?;
-        let types = uris_by_local_name(&type_ans, "t");
-
-        Linker::from_labels(embedder, &entities, &predicates, &types, min_score)
+    /// Build from a fetched (or cached) [`LinkerLabels`].
+    pub fn from_label_set(
+        embedder: Box<dyn Embedder>,
+        labels: &LinkerLabels,
+        min_score: f32,
+    ) -> Result<Linker> {
+        Linker::from_labels(
+            embedder,
+            &labels.entities,
+            &labels.predicates,
+            &labels.types,
+            min_score,
+        )
     }
 
     /// Number of indexed (entities, predicates, types).
@@ -211,6 +249,292 @@ impl Linker {
     }
 }
 
+/// Rows per page of the paged linker queries (well under the client's
+/// [`MAX_RESULT_ROWS`](crate::kb::MAX_RESULT_ROWS)).
+pub const LABEL_PAGE: usize = 10_000;
+
+/// Cap on the indexed predicates and on the indexed types (each).
+pub const MAX_SCHEMA_TERMS: usize = 100_000;
+
+/// The `(uri, label)` lists a [`Linker`] indexes, as fetched from the KB —
+/// also what [`LinkerCache`] stores.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LinkerLabels {
+    pub entities: Vec<(String, String)>,
+    pub predicates: Vec<(String, String)>,
+    pub types: Vec<(String, String)>,
+    /// Whether the entity labels were cut at the requested limit.
+    pub entities_truncated: bool,
+    /// Whether the predicates / types were cut at [`MAX_SCHEMA_TERMS`].
+    pub predicates_truncated: bool,
+    pub types_truncated: bool,
+}
+
+impl LinkerLabels {
+    /// Fetch the entity labels (language-filtered, at most `entity_limit`),
+    /// distinct predicates and distinct types, each in `ORDER BY` pages of
+    /// [`LABEL_PAGE`] rows: a capped list is the same prefix on every build,
+    /// and no single reply can hit the client's row cap.
+    pub fn fetch(
+        kb: &dyn KbClient,
+        entity_limit: Option<usize>,
+        languages: &[&str],
+    ) -> Result<LinkerLabels> {
+        let ent_base = format!(
+            "SELECT DISTINCT ?s ?l WHERE {{ ?s <{RDFS_LABEL}> ?l FILTER({}) }}",
+            lang_filter_clause(languages)
+        );
+        let mut ent_rows = Vec::new();
+        let entities_truncated = fetch_paged(
+            kb,
+            &ent_base,
+            "?s ?l",
+            entity_limit.unwrap_or(usize::MAX),
+            |ans| ent_rows.extend(pairs_with_label(ans, "s", "l")),
+        )?;
+        if ent_rows.is_empty() {
+            eprintln!(
+                "gnlqa: warning: entity label query returned no rows — linker will be sparse"
+            );
+        }
+        ent_rows.truncate(entity_limit.unwrap_or(usize::MAX));
+
+        let mut predicates = Vec::new();
+        let predicates_truncated = fetch_paged(
+            kb,
+            "SELECT DISTINCT ?p WHERE { ?s ?p ?o }",
+            "?p",
+            MAX_SCHEMA_TERMS,
+            |ans| predicates.extend(uris_by_local_name(ans, "p")),
+        )?;
+        predicates.truncate(MAX_SCHEMA_TERMS);
+
+        let mut types = Vec::new();
+        let types_truncated = fetch_paged(
+            kb,
+            &format!("SELECT DISTINCT ?t WHERE {{ ?s <{RDF_TYPE}> ?t }}"),
+            "?t",
+            MAX_SCHEMA_TERMS,
+            |ans| types.extend(uris_by_local_name(ans, "t")),
+        )?;
+        types.truncate(MAX_SCHEMA_TERMS);
+
+        Ok(LinkerLabels {
+            entities: ent_rows,
+            predicates,
+            types,
+            entities_truncated,
+            predicates_truncated,
+            types_truncated,
+        })
+    }
+
+    /// Log the index sizes, and loudly any truncation (entities beyond the
+    /// limit can never be linked).
+    pub fn log_summary(&self, entity_limit: Option<usize>) {
+        eprintln!(
+            "gnlqa: linker: indexed {} entity labels, {} predicates, {} types",
+            self.entities.len(),
+            self.predicates.len(),
+            self.types.len()
+        );
+        if self.entities_truncated {
+            eprintln!(
+                "gnlqa: warning: the KB has more than {} entity labels; only the first {} \
+                 (in label order) are indexed and the rest cannot be linked — raise \
+                 GNLQA_LINKER_MAX_LABELS",
+                entity_limit.unwrap_or(0),
+                self.entities.len()
+            );
+        }
+        if self.predicates_truncated || self.types_truncated {
+            eprintln!(
+                "gnlqa: warning: more than {MAX_SCHEMA_TERMS} distinct predicates or types; \
+                 the linker indexes the first {MAX_SCHEMA_TERMS} of each"
+            );
+        }
+    }
+}
+
+/// Run `base ORDER BY order LIMIT … OFFSET …` page by page, handing each page
+/// to `collect`, until a short page or more than `limit` rows; returns
+/// whether rows beyond `limit` exist (the caller trims to `limit`).
+fn fetch_paged(
+    kb: &dyn KbClient,
+    base: &str,
+    order: &str,
+    limit: usize,
+    mut collect: impl FnMut(&SparqlAnswer),
+) -> Result<bool> {
+    let wanted_total = limit.saturating_add(1); // one extra row detects truncation
+    let mut got = 0usize;
+    loop {
+        let want = LABEL_PAGE.min(wanted_total - got);
+        let q = format!("{base} ORDER BY {order} LIMIT {want} OFFSET {got}");
+        let ans = kb.query(&q)?;
+        let n = ans.row_count();
+        collect(&ans);
+        got += n;
+        if got > limit {
+            return Ok(true);
+        }
+        if n < want {
+            return Ok(false);
+        }
+    }
+}
+
+/// A cheap fingerprint of what the linker index depends on: the endpoint,
+/// the label languages and limit, and the number of `rdfs:label` and
+/// `rdf:type` triples (two predicate-bound `COUNT`s — no full-store scan).
+/// A [`LinkerCache`] entry is reused only for the same fingerprint (and
+/// within its maximum age, which also bounds staleness from changes the
+/// counts cannot see, such as a new predicate without labels or types).
+pub fn kb_fingerprint(
+    kb: &dyn KbClient,
+    endpoint: &str,
+    entity_limit: Option<usize>,
+    languages: &[&str],
+) -> Result<String> {
+    let count = |q: String| -> Result<String> {
+        let ans = kb.query(&q)?;
+        Ok(ans
+            .column_values("n")
+            .into_iter()
+            .next()
+            .unwrap_or_default())
+    };
+    let labels = count(format!(
+        "SELECT (COUNT(*) AS ?n) WHERE {{ ?s <{RDFS_LABEL}> ?l }}"
+    ))?;
+    let types = count(format!(
+        "SELECT (COUNT(*) AS ?n) WHERE {{ ?s <{RDF_TYPE}> ?t }}"
+    ))?;
+    let key = format!(
+        "linker-v1|{}|{}|{:?}|labels={labels}|types={types}",
+        crate::error::redact_userinfo(endpoint),
+        languages.join(","),
+        entity_limit
+    );
+    // FNV-1a, 64 bit: stable across builds and platforms (unlike DefaultHasher).
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in key.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Ok(format!("{h:016x}"))
+}
+
+/// The on-disk cache of linker label lists, one JSON file per KB
+/// fingerprint. Files are private to the user (mode 0600 in a 0700
+/// directory on Unix): the labels are KB data.
+#[derive(Debug, Clone)]
+pub struct LinkerCache {
+    dir: PathBuf,
+    max_age: Duration,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CachedLabels {
+    format: u32,
+    fingerprint: String,
+    labels: LinkerLabels,
+}
+
+impl LinkerCache {
+    /// Default maximum age of a cache entry (a day).
+    pub const DEFAULT_MAX_AGE: Duration = Duration::from_secs(24 * 3600);
+
+    pub fn new(dir: impl Into<PathBuf>) -> LinkerCache {
+        LinkerCache {
+            dir: dir.into(),
+            max_age: Self::DEFAULT_MAX_AGE,
+        }
+    }
+
+    /// Rebuild entries older than `max_age` even if the fingerprint matches.
+    pub fn with_max_age(mut self, max_age: Duration) -> LinkerCache {
+        self.max_age = max_age;
+        self
+    }
+
+    /// The per-user default: `$XDG_CACHE_HOME/gnlqa`, else `$HOME/.cache/gnlqa`.
+    pub fn default_dir(var: impl Fn(&str) -> Option<String>) -> Option<PathBuf> {
+        let non_empty = |k: &str| var(k).filter(|v| !v.trim().is_empty());
+        non_empty("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| non_empty("HOME").map(|h| Path::new(&h).join(".cache")))
+            .map(|p| p.join("gnlqa"))
+    }
+
+    fn path(&self, fingerprint: &str) -> PathBuf {
+        self.dir.join(format!("linker-{fingerprint}.json"))
+    }
+
+    /// The cached labels for `fingerprint`, if present, readable, current
+    /// (younger than the maximum age) and well-formed.
+    pub fn load(&self, fingerprint: &str) -> Option<LinkerLabels> {
+        let path = self.path(fingerprint);
+        let age = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())?;
+        if age >= self.max_age {
+            return None;
+        }
+        let bytes = std::fs::read(&path).ok()?;
+        let c: CachedLabels = serde_json::from_slice(&bytes).ok()?;
+        let sane =
+            |v: &[(String, String)]| v.iter().all(|(u, _)| crate::schema::checked_iri(u).is_ok());
+        (c.format == 1
+            && c.fingerprint == fingerprint
+            && sane(&c.labels.entities)
+            && sane(&c.labels.predicates)
+            && sane(&c.labels.types))
+        .then_some(c.labels)
+    }
+
+    /// Store `labels` under `fingerprint` (write to a temporary file, then
+    /// rename, so a reader never sees a partial file).
+    pub fn store(&self, fingerprint: &str, labels: &LinkerLabels) -> Result<()> {
+        let io =
+            |e: std::io::Error| Error::Config(format!("linker cache {}: {e}", self.dir.display()));
+        std::fs::create_dir_all(&self.dir).map_err(io)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(io)?;
+        }
+        let body = serde_json::to_vec(&CachedLabels {
+            format: 1,
+            fingerprint: fingerprint.to_string(),
+            labels: labels.clone(),
+        })?;
+        let tmp = self
+            .dir
+            .join(format!(".linker-{fingerprint}.{}.tmp", std::process::id()));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let written = opts.open(&tmp).and_then(|mut f| {
+            use std::io::Write;
+            f.write_all(&body)?;
+            f.sync_all()
+        });
+        if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, self.path(fingerprint))) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(io(e));
+        }
+        Ok(())
+    }
+}
+
 /// Build a `FILTER` disjunction over language tags: always allows no-language
 /// (`""`) labels, plus each requested code. Codes are sanitized to `[A-Za-z0-9-]`
 /// (dropping anything else) so a resolved/config language can't inject into the
@@ -259,18 +583,6 @@ fn pairs_with_label(ans: &SparqlAnswer, uri_var: &str, label_var: &str) -> Vec<(
         }
     }
     out
-}
-
-/// Warn (don't fail) when a query expected to return rows returns none / a
-/// non-SELECT shape — a common sign of a misconfigured endpoint or vocabulary.
-fn warn_if_no_rows(ans: &SparqlAnswer, what: &str) {
-    let empty = match ans {
-        SparqlAnswer::Select { rows, .. } => rows.is_empty(),
-        _ => true,
-    };
-    if empty {
-        eprintln!("gnlqa: warning: {what} query returned no rows — linker will be sparse");
-    }
 }
 
 /// Build `(uri, local_name)` pairs from a 1-column SELECT of URIs.

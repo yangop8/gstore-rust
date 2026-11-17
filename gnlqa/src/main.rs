@@ -17,8 +17,8 @@ use std::sync::Arc;
 
 use gnlqa::{
     load_lcquad, load_qald, run_eval, AnthropicClient, Config, EvalOptions, GStoreClient,
-    HashEmbedder, HttpAuth, HttpServer, Linker, LlmClient, McpServer, Mode, OpenAiClient, Session,
-    SolveEngine,
+    HashEmbedder, HttpAuth, HttpServer, Linker, LinkerCache, LlmClient, McpServer, Mode,
+    OpenAiClient, Session, SolveEngine,
 };
 
 /// How long after a failed linker build the next request may try again.
@@ -76,12 +76,24 @@ fn build_engine(cfg: &Config, mode: Mode, progress: bool) -> SolveEngine {
         .with_cache_max_bytes(cfg.cache_max_bytes)
         .with_progress(progress)
         .with_linker_builder(LINKER_RETRY, move || {
-            Linker::build_from_kb(
-                &GStoreClient::from_config(&linker_cfg),
-                Box::new(HashEmbedder::new(256)),
-                0.0,
-                Some(10_000),
-            )
+            // The label index is cached on disk per KB fingerprint, so a
+            // one-shot question does not rescan the store (review
+            // cluster-nlqa#22).
+            let kb = GStoreClient::from_config(&linker_cfg);
+            let embedder = Box::new(HashEmbedder::new(256));
+            let limit = Some(linker_cfg.linker_max_labels);
+            match &linker_cfg.linker_cache_dir {
+                Some(dir) => Linker::build_cached(
+                    &kb,
+                    embedder,
+                    0.0,
+                    limit,
+                    &["en"],
+                    &linker_cfg.gstore_endpoint,
+                    &LinkerCache::new(dir),
+                ),
+                None => Linker::build_from_kb(&kb, embedder, 0.0, limit),
+            }
         });
     engine.prepare_linker();
     engine

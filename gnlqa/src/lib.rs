@@ -65,7 +65,9 @@ pub use kb::{
 pub use lang::{
     abstain_message, detect_script_lang, lang_instruction, language_name, resolve_lang,
 };
-pub use link::{local_name, Candidate, LinkKind, Linker};
+pub use link::{
+    kb_fingerprint, local_name, Candidate, LinkKind, Linker, LinkerCache, LinkerLabels,
+};
 pub use llm::{AnthropicClient, LlmClient, LlmRequest, Message, MockLlm, OpenAiClient, Role};
 pub use mcp::McpServer;
 pub use net::RetryPolicy;
