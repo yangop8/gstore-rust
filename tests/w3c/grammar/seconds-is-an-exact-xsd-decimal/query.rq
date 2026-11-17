@@ -1,0 +1,10 @@
+# spec: SPARQL 1.1 Query §17.4.5.7 SECONDS: xsd:decimal SECONDS(xsd:dateTime) — the
+# seconds of the time, with their fraction (the spec's example: 13.815), and an
+# xsd:decimal also for whole seconds (review sparqlconf#16, which this
+# package's grammar area hosts)
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT ?s ?d ?n WHERE {
+  BIND(SECONDS("2011-01-10T14:45:13.815-05:00"^^xsd:dateTime) AS ?s)
+  BIND(DATATYPE(SECONDS("2011-01-10T14:45:07Z"^^xsd:dateTime)) AS ?d)
+  BIND(SECONDS("2011-01-10T14:45:07Z"^^xsd:dateTime) = 7 AS ?n)
+}

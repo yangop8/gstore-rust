@@ -1,0 +1,5 @@
+# spec: SPARQL 1.1 Query §19.8 Grammar, rule [25] LimitOffsetClauses ::= LimitClause
+# OffsetClause? | OffsetClause LimitClause?, and §15.4-15.5: OFFSET 1 LIMIT 2 is the
+# same slice as LIMIT 2 OFFSET 1 — the second and third value in order
+PREFIX : <http://example.org/>
+SELECT ?v WHERE { :a :p ?v } ORDER BY ?v OFFSET 1 LIMIT 2

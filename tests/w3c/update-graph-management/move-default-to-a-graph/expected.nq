@@ -1,0 +1,4 @@
+<http://example.org/a> <http://example.org/name> "Alice"@en <http://example.org/g1> .
+<http://example.org/a> <http://example.org/age> "30"^^<http://www.w3.org/2001/XMLSchema#integer> <http://example.org/g1> .
+<http://example.org/a> <http://example.org/knows> _:b <http://example.org/g1> .
+_:b <http://example.org/name> "Bob" <http://example.org/g1> .

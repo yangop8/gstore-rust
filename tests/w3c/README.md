@@ -28,6 +28,7 @@ files (any other file is an error):
 | `expected.srj` | with a SELECT / ASK | the answer in [SPARQL 1.1 Query Results JSON](https://www.w3.org/TR/sparql11-results-json/) |
 | `expected.nt` | with a CONSTRUCT / DESCRIBE | the answer graph in N-Triples |
 | `expected.nq` | with `update.ru` | the whole dataset after the update, in N-Quads (default graph: triples without a graph term) |
+| `expected.error` | instead of the above | a negative case: the request must be rejected (see below) |
 | `xfail` | no | the case exposes a known engine bug: see below |
 
 The query or update must contain a comment line `# spec: <document> §<section> <title>`
@@ -66,6 +67,19 @@ the N-Quads export, and again after the database is closed and reopened.
   an `xsd:decimal` result is written in its canonical form (`"20.0"`). The
   only identities are RDF 1.1's: a simple literal is the same term as the
   `xsd:string` literal, and language tags compare case-insensitively.
+
+## expected.error: a request that must be rejected
+
+A negative case (the W3C suites' negative syntax and update tests) holds
+`expected.error` instead of an expected answer. Its first line says how the
+request must be rejected; the following lines may say why.
+
+- `syntax`: the query or update is not SPARQL. The parser must refuse it,
+  and so must `Database::query` on every layout, with a parse error.
+- `failure` (an update only): it parses, but running it must fail on a fresh
+  database of every layout with the `full` and `stream` settings — not with
+  a parse error — and leave the dataset exactly as `data.*` had it, also
+  after the database is closed and opened again.
 
 ## xfail: a known bug
 

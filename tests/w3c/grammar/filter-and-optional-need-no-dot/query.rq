@@ -1,0 +1,5 @@
+# spec: SPARQL 1.1 Query §19.8 Grammar, rule [54] GroupGraphPatternSub ::= TriplesBlock?
+# ( GraphPatternNotTriples '.'? TriplesBlock? )*: a "." is optional around FILTER and
+# OPTIONAL, which may sit between two triple patterns
+PREFIX : <http://example.org/>
+SELECT ?s ?o2 ?x WHERE { ?s :p ?o FILTER(?o = :b) ?s :q ?o2 OPTIONAL { ?s :r ?x } ?s :q ?o2 . }

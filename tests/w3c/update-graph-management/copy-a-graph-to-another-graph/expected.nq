@@ -1,0 +1,5 @@
+<http://example.org/x> <http://example.org/p> <http://example.org/y> .
+<http://example.org/c> <http://example.org/p> "c"@fr <http://example.org/g1> .
+<http://example.org/c> <http://example.org/q> _:n <http://example.org/g1> .
+<http://example.org/c> <http://example.org/p> "c"@fr <http://example.org/g2> .
+<http://example.org/c> <http://example.org/q> _:n <http://example.org/g2> .

@@ -1,0 +1,3 @@
+# spec: SPARQL 1.1 Query §19.8 Grammar, rule [55] TriplesBlock ::= TriplesSameSubjectPath
+# ( '.' TriplesBlock? )?: two triple patterns are separated by "."
+SELECT * WHERE { ?s ?p ?o ?a ?b ?c }

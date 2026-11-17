@@ -327,8 +327,11 @@ pub struct Database {
     /// Stream-mode database records only its named-graph changes here: its
     /// default graph's transaction is the on-disk store's overlay.
     txn: Option<Vec<UndoOp>>,
-    /// Stream mode: [`rebuild_index`](Self::rebuild_index) was called inside a
-    /// transaction; the rebuild runs when the transaction ends.
+    /// A [`rebuild_index`](Self::rebuild_index) is owed, run by
+    /// [`run_deferred_rebuild`](Self::run_deferred_rebuild) once no
+    /// transaction is open: Stream mode, it was called inside a transaction;
+    /// any other store, the tree in use went stale (a clear of the default
+    /// graph, reasoning; see [`mark_vstree_stale`](Self::mark_vstree_stale)).
     vstree_rebuild_pending: bool,
     /// Byte-bounded LRU cache of read-query results keyed by the SPARQL
     /// string (gStore `QueryCache`; see the `query_cache` module), cleared on
@@ -719,6 +722,10 @@ impl GraphTransfer {
         }
     }
 }
+
+/// How many triples [`Database::transfer_graph`] inserts into the
+/// destination per chunk (one insert batch on an in-memory default graph).
+const TRANSFER_CHUNK: usize = 1 << 16;
 
 /// The query-evaluation settings a server applies to every database it opens,
 /// builds, creates or restores ([`Database::apply_query_settings`]); `gserver`
@@ -1171,12 +1178,34 @@ impl Database {
         Ok(())
     }
 
-    /// Stream mode: run a [`rebuild_index`](Self::rebuild_index) deferred by
-    /// the transaction that just ended.
+    /// Run a [`rebuild_index`](Self::rebuild_index) that is owed
+    /// ([`vstree_rebuild_pending`](Self::vstree_rebuild_pending)) once no
+    /// transaction is open: at the end of the transaction, or of the
+    /// operation that made the tree stale outside one. A rebuild that fails
+    /// is logged and leaves the index unused (it is not retried).
     fn run_deferred_rebuild(&mut self) {
         if self.vstree_rebuild_pending && self.txn.is_none() {
             self.rebuild_index();
+            self.vstree_rebuild_pending = false;
         }
+    }
+
+    /// The VS-tree no longer matches the default graph (a clear, or
+    /// reasoning a disk-backed tree cannot take): stop filtering through it.
+    /// A tree that was in use on a store other than Stream mode's is then
+    /// owed a rebuild, which [`run_deferred_rebuild`](Self::run_deferred_rebuild)
+    /// runs at the end of the operation (or transaction) — so it is not
+    /// lost for the rest of the session (review db#4). Rebuilding right
+    /// after a clear costs what is left, usually nothing; a Stream-mode
+    /// `vstree.kv` is rewritten only by an explicit
+    /// [`rebuild_index`](Self::rebuild_index) or at the next open (its
+    /// rebuild takes commit points, which an operation must not take
+    /// part-way).
+    fn mark_vstree_stale(&mut self) {
+        if self.index_valid && self.store.as_disk().is_none() {
+            self.vstree_rebuild_pending = true;
+        }
+        self.index_valid = false;
     }
 
     /// Whether queries may filter through the VS-tree now: it is consistent
@@ -1627,6 +1656,13 @@ impl Database {
         let Some((_, id)) = self.intern_for_insert(t, None)? else {
             return Ok(None);
         };
+        Ok(self.insert_default_id(id)?.then_some(id))
+    }
+
+    /// Insert the default-graph triple `id`, whose terms are interned (and
+    /// persisted) already, with its VS-tree and book-keeping; `true` if it
+    /// was newly added.
+    fn insert_default_id(&mut self, id: IdTriple) -> Result<bool> {
         // Stream mode: by id, into the open transaction's overlay or at once;
         // a write error breaks the store and fails this insert.
         let (changed, disk) = match self.store.as_disk_mut() {
@@ -1637,12 +1673,17 @@ impl Database {
             // While the index is consistent, keep it consistent *incrementally*:
             // the inserted edge only changes the signatures of its subject (and
             // its object, when that is an entity), so re-sign just those entities
-            // and update their VS-tree entries in place — no full rebuild. If the
-            // index is already stale we leave it stale and rebuild lazily.
+            // and update their VS-tree entries in place — no full rebuild. A
+            // stale index stays stale here; the operation that made an
+            // in-memory tree stale rebuilds it (see `run_deferred_rebuild`).
             //
             // An out-of-core (disk-backed) tree can't be updated in place here
-            // (its nodes live in a paged file), so we instead invalidate it; the
-            // next consistent query rebuilds it in memory (or skips filtering).
+            // (its nodes live in a paged file), so we instead stop using it:
+            // queries run without the filter until `rebuild_index` rebuilds
+            // it, or a reopen rebuilds the `vstree.kv` the store's header now
+            // marks stale (Materialize mode always, Stream mode with
+            // `vstree_on_open`) — the non-incremental paged tree, PHASE6_PLAN
+            // §8 D6 (review db#4).
             if self.index_valid {
                 if self.vstree.is_disk_backed() {
                     self.index_valid = false;
@@ -1652,7 +1693,7 @@ impl Database {
             }
             self.inserted_default(id, disk);
         }
-        Ok(changed.then_some(id))
+        Ok(changed)
     }
 
     /// The book-keeping of a newly added default-graph triple, the VS-tree
@@ -2476,6 +2517,13 @@ impl Database {
         let Some((Some(gid), id)) = self.intern_for_insert(t, Some(g))? else {
             return Ok(None);
         };
+        Ok(self.insert_named_id(gid, id).then_some((Some(gid), id)))
+    }
+
+    /// Add statement `id` to named graph `gid`, whose terms are interned (and
+    /// persisted) already; `true` if it was newly added (the mirror of
+    /// [`remove_named_id`](Self::remove_named_id)).
+    fn insert_named_id(&mut self, gid: u32, id: IdTriple) -> bool {
         let present = self
             .named
             .get(&gid)
@@ -2484,7 +2532,7 @@ impl Database {
         // all (so a retry writes it again), and the error is reported at the
         // next commit point.
         if present || !self.persist_named_quad(true, gid, id) {
-            return Ok(None);
+            return false;
         }
         self.named.insert(gid, id);
         self.touched();
@@ -2493,7 +2541,7 @@ impl Database {
         }
         self.record_redo(b'I', Some(gid), id);
         self.persist_mutation(true, Some(gid), id);
-        Ok(Some((Some(gid), id)))
+        true
     }
 
     /// Remove a triple from a named graph (`None` ⇒ default graph). Returns
@@ -2578,21 +2626,88 @@ impl Database {
 
     /// Materialize the RDFS closure over the current data (gStore `src/Reason`):
     /// subclass/subproperty transitivity, type propagation, and domain/range
-    /// typing. Returns the number of inferred triples added; the VS-tree is
-    /// invalidated (and rebuilt lazily on save / next consistent query).
+    /// typing. Returns the number of inferred triples added. An in-memory
+    /// VS-tree takes them as it takes inserts; a disk-backed one is rebuilt
+    /// in memory at the end of the run (Stream mode: by
+    /// [`rebuild_index`](Self::rebuild_index) or at the next open).
+    ///
+    /// A read error of the store (Stream mode, RocksDB) ends the run early
+    /// and is only logged, so the closure may be incomplete:
+    /// [`try_materialize_rdfs`](Self::try_materialize_rdfs) reports it.
     pub fn materialize_rdfs(&mut self) -> usize {
-        let added =
-            self.infer(|dict, store, insert| crate::reason::materialize_with(dict, store, insert));
-        self.record_inferred(added)
+        let (n, error) = self.materialize_rdfs_scoped();
+        if let Some(e) = error {
+            crate::gs_warn!("materializing the RDFS closure of '{}': {e}", self.name);
+        }
+        n
+    }
+
+    /// [`materialize_rdfs`](Self::materialize_rdfs), reporting a read error
+    /// of the store (contract C2; review design#7): the run reads inside a
+    /// [`ReadScope`], and an error recorded there fails it. The triples
+    /// inferred before the failure stay inserted — each is entailed by the
+    /// data, so the store stays sound, only its closure incomplete — and a
+    /// later run, once the store reads cleanly, completes it.
+    pub fn try_materialize_rdfs(&mut self) -> Result<usize> {
+        match self.materialize_rdfs_scoped() {
+            (n, None) => Ok(n),
+            (_, Some(e)) => Err(e),
+        }
+    }
+
+    /// The RDFS run of [`materialize_rdfs`](Self::materialize_rdfs): the
+    /// number of triples inferred, and the read error that ended it early.
+    fn materialize_rdfs_scoped(&mut self) -> (usize, Option<GStoreError>) {
+        self.infer_scoped("materializing the RDFS closure", |dict, store, insert| {
+            crate::reason::materialize_with(dict, store, insert)
+        })
+    }
+
+    /// Run reasoner `run` ([`infer`](Self::infer)) and record what it
+    /// inferred ([`record_inferred`](Self::record_inferred)) inside a
+    /// [`ReadScope`], then run a VS-tree rebuild that is owed. Returns how
+    /// many triples were inferred, and the read error the scope recorded
+    /// (`what` names the run in it), which ended the run early: a backend
+    /// answers a failed read as "nothing there".
+    fn infer_scoped<R>(&mut self, what: &str, run: R) -> (usize, Option<GStoreError>)
+    where
+        R: FnOnce(
+            &mut Dictionary,
+            &mut Backend,
+            &mut dyn FnMut(&Dictionary, &mut Backend, IdTriple) -> bool,
+        ) -> Vec<IdTriple>,
+    {
+        let scope = ReadScope::enter();
+        let added = self.infer(run);
+        let n = self.record_inferred(added);
+        let error = scope.take_error();
+        drop(scope);
+        if error.is_some() && n > 0 {
+            // A fold into the VS-tree that read nothing would leave a
+            // signature short of its edges: rebuild before filtering again.
+            self.mark_vstree_stale();
+        }
+        self.run_deferred_rebuild();
+        (n, error.map(|e| read_failure(what, e)))
     }
 
     /// Book-keeping after reasoning inserted `added` into the default graph:
-    /// invalidate the index and cache, log them for rollback, and write them
-    /// through (on-disk). Returns how many there were.
+    /// the VS-tree (an in-memory tree takes them as it takes inserts, a
+    /// disk-backed one is owed a rebuild — review db#4), the caches, the
+    /// undo log for rollback, the redo log and the write-through (on-disk).
+    /// Returns how many there were.
     fn record_inferred(&mut self, added: Vec<IdTriple>) -> usize {
         let n = added.len();
         if n > 0 {
-            self.index_valid = false;
+            if self.index_valid && !self.vstree.is_disk_backed() {
+                // Every inferred triple is in the store already: each fold
+                // re-signs from it or ORs the edge in, a sound superset.
+                for &t in &added {
+                    self.vstree_index_insert(t);
+                }
+            } else {
+                self.mark_vstree_stale();
+            }
             self.touched();
             // Record inferred triples so reasoning inside a transaction rolls
             // back (Stream mode: they are in the store's overlay).
@@ -3090,14 +3205,29 @@ impl Database {
                 Err(e) if silent && !matches!(e, GStoreError::Cancelled) => Ok(0),
                 Err(e) => Err(e),
             },
-            UpdateOp::Clear { target, .. } | UpdateOp::Drop { target, .. } => match target {
-                GraphTarget::Default => self.clear_default(),
-                GraphTarget::All => Ok(self.clear_default()? + self.clear_all_named()),
-                GraphTarget::AllNamed => Ok(self.clear_all_named()),
-                GraphTarget::Named(g) => Ok(self.clear_named(&g)),
-            },
-            // CREATE GRAPH only declares an (empty) graph; data ops create it.
-            UpdateOp::Create { .. } => Ok(0),
+            // The graph-management operations share one existence rule
+            // (SPARQL 1.1 Update §3.2; review sparqlconf#16): a named graph
+            // exists while it holds a triple — this store keeps no empty
+            // named graphs — and the default graph always exists. An
+            // operation on a graph that must exist but does not (CLEAR /
+            // DROP GRAPH, the source of ADD / MOVE / COPY), or that must not
+            // exist but does (CREATE GRAPH), fails, changing nothing, unless
+            // SILENT, which makes it a successful no-op.
+            UpdateOp::Clear { target, silent } => self.clear_target("CLEAR", target, silent),
+            UpdateOp::Drop { target, silent } => self.clear_target("DROP", target, silent),
+            // CREATE GRAPH declares an empty graph, and this store keeps
+            // none: creating a graph that does not exist changes nothing
+            // (data operations create it), one that exists is an error.
+            UpdateOp::Create { name, silent } => {
+                if silent || !self.named_graph_exists(&name) {
+                    Ok(0)
+                } else {
+                    Err(GStoreError::Query(format!(
+                        "CREATE GRAPH failed: the graph <{name}> already exists (it holds \
+                         triples); use CREATE SILENT GRAPH to ignore an existing graph"
+                    )))
+                }
+            }
             UpdateOp::Add { from, to, silent } => {
                 self.transfer_graph(GraphTransfer::Add, from, to, silent)
             }
@@ -3115,12 +3245,21 @@ impl Database {
     /// triples changed: those cleared from the destination (COPY/MOVE), added
     /// to it, and dropped from the source (MOVE).
     ///
-    /// * The same graph on both sides is a no-op, whatever the operation.
+    /// * The same graph on both sides is a no-op, whatever the operation
+    ///   (the operation has no effect), even for a graph that does not exist.
+    /// * The source must exist — the existence rule of every graph-management
+    ///   operation (see [`exec_update_op`](Self::exec_update_op)): a named
+    ///   source that holds no triples fails the operation, changing nothing,
+    ///   unless SILENT, which makes it a successful no-op. The default graph
+    ///   always exists.
     /// * The destination is created as needed.
-    /// * A named source graph that holds no triples does not exist — this
-    ///   store keeps no empty named graphs (CREATE GRAPH declares nothing) —
-    ///   and the operation fails, as the spec allows, unless SILENT, which
-    ///   makes it a successful no-op. The default graph always exists.
+    /// * The triples are copied by id — every graph shares the dictionary —
+    ///   in chunks of [`TRANSFER_CHUNK`]: the source is read once, as ids (12
+    ///   bytes a triple, in a read scope: a read error fails the operation
+    ///   before anything changes), and never turned into terms that are
+    ///   interned again one by one (review db#16). Only the first triple into
+    ///   a named destination takes the term path, which interns the
+    ///   destination graph's IRI (on RocksDB writing it to the store first).
     fn transfer_graph(
         &mut self,
         op: GraphTransfer,
@@ -3131,7 +3270,7 @@ impl Database {
         if from == to {
             return Ok(0);
         }
-        let Some(triples) = self.graph_triples(from.as_deref())? else {
+        let Some(ids) = self.graph_triples(from.as_deref())? else {
             if silent {
                 return Ok(0);
             }
@@ -3150,9 +3289,7 @@ impl Database {
                 Some(g) => self.clear_named(g),
             };
         }
-        let mut added = Vec::new();
-        self.insert_statements(triples.iter().map(|t| (t, to.as_deref())), &mut added)?;
-        changed += added.len();
+        changed += self.insert_graph_ids(to.as_deref(), &ids)?;
         if op == GraphTransfer::Move {
             changed += match from.as_deref() {
                 None => self.clear_default()?,
@@ -3162,10 +3299,39 @@ impl Database {
         Ok(changed)
     }
 
+    /// `CLEAR` / `DROP` (`keyword`) `[SILENT] target` (SPARQL 1.1 Update
+    /// §3.1.5 / §3.2.2; this store keeps no empty graphs, so the two are the
+    /// same): the number of triples cleared. `GRAPH <g>` of a graph that does
+    /// not exist (holds no triples) fails, changing nothing, unless SILENT —
+    /// the existence rule of [`exec_update_op`](Self::exec_update_op);
+    /// `DEFAULT`, `NAMED` and `ALL` always succeed.
+    fn clear_target(&mut self, keyword: &str, target: GraphTarget, silent: bool) -> Result<usize> {
+        match target {
+            GraphTarget::Default => self.clear_default(),
+            GraphTarget::All => Ok(self.clear_default()? + self.clear_all_named()),
+            GraphTarget::AllNamed => Ok(self.clear_all_named()),
+            GraphTarget::Named(g) if self.named_graph_exists(&g) => Ok(self.clear_named(&g)),
+            GraphTarget::Named(_) if silent => Ok(0),
+            GraphTarget::Named(g) => Err(GStoreError::Query(format!(
+                "{keyword} GRAPH failed: the graph <{g}> does not exist (it holds no triples); \
+                 use {keyword} SILENT GRAPH to ignore a missing graph"
+            ))),
+        }
+    }
+
+    /// Whether named graph `<g>` exists: it holds a triple (this store keeps
+    /// no empty named graphs; review sparqlconf#16).
+    fn named_graph_exists(&self, g: &str) -> bool {
+        self.dict
+            .entity_id(&Term::iri(g).dict_key())
+            .and_then(|gid| self.named.get(&gid))
+            .is_some_and(|s| s.triple_count() > 0)
+    }
+
     /// Every triple of the default graph (`None`) or of a named graph, as
-    /// terms; `Ok(None)` for a named graph that holds no triples. Reads in a
-    /// read scope: a store or dictionary read error fails it (C2).
-    fn graph_triples(&self, graph: Option<&str>) -> Result<Option<Vec<Triple>>> {
+    /// ids; `Ok(None)` for a named graph that holds no triples. Reads in a
+    /// read scope: a store read error fails it (C2).
+    fn graph_triples(&self, graph: Option<&str>) -> Result<Option<Vec<IdTriple>>> {
         let scope = ReadScope::enter();
         let triples = self.graph_triples_unscoped(graph);
         match scope.take_error() {
@@ -3175,30 +3341,107 @@ impl Database {
     }
 
     /// [`graph_triples`](Self::graph_triples) without the read scope.
-    fn graph_triples_unscoped(&self, graph: Option<&str>) -> Option<Vec<Triple>> {
-        let ids = match graph {
-            None => self.store.iter_all(),
+    fn graph_triples_unscoped(&self, graph: Option<&str>) -> Option<Vec<IdTriple>> {
+        match graph {
+            None => Some(self.store.iter_all()),
             Some(g) => {
                 let gid = self.dict.entity_id(&Term::iri(g).dict_key())?;
                 let ids: Vec<IdTriple> = self.named.get(&gid)?.iter_all().collect();
-                if ids.is_empty() {
-                    return None;
+                (!ids.is_empty()).then_some(ids)
+            }
+        }
+    }
+
+    /// Insert `ids` — triples of another graph of this database, so their
+    /// terms are interned and persisted already — into the default graph
+    /// (`None`) or named graph `<g>` (see
+    /// [`transfer_graph`](Self::transfer_graph)): by id, in chunks of
+    /// [`TRANSFER_CHUNK`] (an in-memory default graph takes each chunk as one
+    /// batch, [`insert_default_batch`](Self::insert_default_batch)). Returns
+    /// how many were newly added; on an error the triples before stay
+    /// inserted, as with any failing operation.
+    fn insert_graph_ids(&mut self, graph: Option<&str>, ids: &[IdTriple]) -> Result<usize> {
+        let mut added = 0;
+        let mut rest = ids;
+        let gid = match graph {
+            None => None,
+            Some(g) => {
+                // The first triple interns the graph's IRI the way every
+                // insert does (RocksDB: written before the quad).
+                let Some((&first, tail)) = ids.split_first() else {
+                    return Ok(0);
+                };
+                let t = self.id_triple_terms(first)?;
+                added += usize::from(self.insert_quad_id(&t, Some(g))?.is_some());
+                rest = tail;
+                match self.persisted_graph_id(g) {
+                    Some(gid) => Some(gid),
+                    None => {
+                        // The IRI could not be persisted (RocksDB; reported
+                        // at the next commit point): every triple takes the
+                        // term path, which writes it again first.
+                        for &id in rest {
+                            let t = self.id_triple_terms(id)?;
+                            added += usize::from(self.insert_quad_id(&t, Some(g))?.is_some());
+                        }
+                        return Ok(added);
+                    }
                 }
-                ids
             }
         };
+        let batched = self.store.as_memory().is_some();
+        for chunk in rest.chunks(TRANSFER_CHUNK) {
+            match gid {
+                Some(gid) => {
+                    for &id in chunk {
+                        added += usize::from(self.insert_named_id(gid, id));
+                    }
+                }
+                None if batched => added += self.insert_default_batch(chunk).len(),
+                None => {
+                    for &id in chunk {
+                        added += usize::from(self.insert_default_id(id)?);
+                    }
+                }
+            }
+        }
+        Ok(added)
+    }
+
+    /// The id of named graph `<g>`'s IRI when the dictionary knows it and
+    /// (RocksDB) its write did not fail: quads may then reference it.
+    fn persisted_graph_id(&self, g: &str) -> Option<u32> {
+        let gid = self.dict.entity_id(&Term::iri(g).dict_key())?;
+        #[cfg(feature = "rocksdb")]
+        if self
+            .unpersisted_terms
+            .contains(&(crate::backend::rocks::TermSpace::Entity, gid))
+        {
+            return None;
+        }
+        Some(gid)
+    }
+
+    /// The terms of triple `id` (read in a read scope: a dictionary read
+    /// error fails it, C2).
+    fn id_triple_terms(&self, id: IdTriple) -> Result<Triple> {
+        let scope = ReadScope::enter();
         let term = |s: Option<TermStr<'_>>| s.and_then(|s| Term::from_dict_key(&s));
-        Some(
-            ids.into_iter()
-                .filter_map(|id| {
-                    Some(Triple::new(
-                        term(self.dict.term(id.sub))?,
-                        term(self.dict.pred(id.pred))?,
-                        term(self.dict.term(id.obj))?,
-                    ))
-                })
-                .collect(),
-        )
+        let (s, p, o) = (
+            term(self.dict.term(id.sub)),
+            term(self.dict.pred(id.pred)),
+            term(self.dict.term(id.obj)),
+        );
+        if let Some(e) = scope.take_error() {
+            return Err(read_failure("reading the source graph", e));
+        }
+        match (s, p, o) {
+            (Some(s), Some(p), Some(o)) => Ok(Triple::new(s, p, o)),
+            _ => Err(GStoreError::Database(format!(
+                "a triple of the source graph ({id:?}) references an id missing from the \
+                 dictionary"
+            ))),
+        }
     }
 
     /// Clear the default graph, returning the count cleared. Stream mode:
@@ -3245,7 +3488,10 @@ impl Database {
                 }
                 gone
             };
-            self.index_valid = false;
+            // Every entry of the tree is a phantom now: rebuilt from what is
+            // left (usually nothing) at the end of this clear, or of the
+            // open transaction (review db#4).
+            self.mark_vstree_stale();
             self.touched();
             if gone.len() == total {
                 self.record_redo_clear(RedoClear::Default);
@@ -3259,6 +3505,7 @@ impl Database {
             for &t in &gone {
                 self.note_removed(None, t);
             }
+            self.run_deferred_rebuild();
         }
         Ok(n)
     }
@@ -3279,8 +3526,10 @@ impl Database {
         };
         let result = dt.remove_many(removed.iter().copied());
         // Whatever happened, the tree may name deleted edges: rebuild before
-        // filtering through it again (as for the other layouts).
-        self.index_valid = false;
+        // filtering through it again (as for the other layouts). The
+        // Stream-mode `vstree.kv` is rewritten by `rebuild_index` or at the
+        // next open only (see `mark_vstree_stale`).
+        self.mark_vstree_stale();
         let n = match result {
             Ok(n) => n as usize,
             Err(e) => {
@@ -4491,11 +4740,36 @@ impl Database {
     /// updating each rule's effect count. Returns the number of triples inferred;
     /// inferred triples are recorded for transaction rollback like
     /// [`materialize_rdfs`](Self::materialize_rdfs).
+    ///
+    /// A read error of the store (Stream mode, RocksDB) ends the run early
+    /// and is only logged: [`try_run_rules`](Self::try_run_rules) reports it.
     pub fn run_rules(&mut self) -> usize {
+        let (n, error) = self.run_rules_scoped();
+        if let Some(e) = error {
+            crate::gs_warn!("running the reasoning rules of '{}': {e}", self.name);
+        }
+        n
+    }
+
+    /// [`run_rules`](Self::run_rules), reporting a read error of the store
+    /// as [`try_materialize_rdfs`](Self::try_materialize_rdfs) does (review
+    /// design#7); the triples inferred before it stay inserted.
+    pub fn try_run_rules(&mut self) -> Result<usize> {
+        match self.run_rules_scoped() {
+            (n, None) => Ok(n),
+            (_, Some(e)) => Err(e),
+        }
+    }
+
+    /// The run of [`run_rules`](Self::run_rules): the number of triples
+    /// inferred, and the read error that ended it early.
+    fn run_rules_scoped(&mut self) -> (usize, Option<GStoreError>) {
         let mut rules = std::mem::take(&mut self.rules);
-        let added = self.infer(|dict, store, insert| rules.apply_with(dict, store, insert));
+        let out = self.infer_scoped("running the reasoning rules", |dict, store, insert| {
+            rules.apply_with(dict, store, insert)
+        });
         self.rules = rules;
-        self.record_inferred(added)
+        out
     }
 
     // ---- upstream reasoning rules (`reasonManage`) --------------------------
@@ -4713,6 +4987,10 @@ impl Database {
         )?;
         let mut seen = HashSet::new();
         let mut derived: Vec<(String, bool, Triple)> = Vec::new();
+        // Whether each derived triple existed is read in a read scope (C2;
+        // review design#7): a store that fails a read must fail the run
+        // before the ledger records a wrong answer.
+        let scope = ReadScope::enter();
         for (g, t) in &ins {
             if g.is_some() {
                 continue;
@@ -4723,6 +5001,10 @@ impl Database {
                 derived.push((line, existed, t.clone()));
             }
         }
+        if let Some(e) = scope.take_error() {
+            return Err(read_failure("checking which derived triples exist", e));
+        }
+        drop(scope);
         let lines: Vec<(String, bool)> = derived.iter().map(|(l, e, _)| (l.clone(), *e)).collect();
         record(&lines).map_err(GStoreError::Database)?;
         let ground = ins
@@ -4740,11 +5022,24 @@ impl Database {
             Ok(_) => Ok(0),
             Err(e) => Err(e.to_string()),
         };
-        let inserted = derived
+        // Which of them the insert added, in a read scope: when a read
+        // fails, every derived triple that did not exist is reported, so
+        // the rule owns (and its disable retracts) all it may have added —
+        // one it did not add is simply absent then.
+        let scope = ReadScope::enter();
+        let mut inserted: Vec<String> = derived
             .iter()
             .filter(|(_, existed, t)| !existed && self.contains_triple(t))
             .map(|(line, _, _)| line.clone())
             .collect();
+        if scope.take_error().is_some() {
+            inserted = derived
+                .iter()
+                .filter(|(_, existed, _)| !existed)
+                .map(|(line, _, _)| line.clone())
+                .collect();
+        }
+        drop(scope);
         Ok(InferReport {
             derived: lines,
             inserted,
@@ -4982,32 +5277,28 @@ impl Database {
 
     // ---- bulk / parallel loaders -----------------------------------------
 
-    /// Build a database from an N-Triples file in bounded-memory batches
-    /// (gStore RDFParser's chunked import): triples are streamed and flushed to
-    /// the store every `batch` triples, so the transient encode buffer never
-    /// exceeds `batch` entries — suitable for files too large to buffer whole.
-    // `drain(..).collect()` (not `mem::take`) is deliberate: it hands the
-    // batch's triples to `bulk_load` while keeping `buf`'s allocation for reuse.
-    #[allow(clippy::drain_collect)]
+    /// Build a database from an N-Triples file with bounded transient memory
+    /// (gStore RDFParser's chunked import): the file is streamed and each
+    /// triple is encoded to ids as it is read — never more than one triple's
+    /// terms are held as text — so it suits files too large to buffer
+    /// whole. The encoded triples (12 bytes each, about half of what the
+    /// store will hold for them) are indexed in one bulk load at the end, in
+    /// time linear in the file: loading every `batch` triples into the
+    /// growing store re-sorted the whole store each time, quadratic in the
+    /// file (review db#15). `batch` now only sizes the first allocation of
+    /// the id buffer (at most 2^20 entries); it is kept for compatibility.
     pub fn build_from_ntriples_batched<P: AsRef<Path>>(
         name: impl Into<String>,
         path: P,
         batch: usize,
     ) -> Result<Database> {
-        let batch = batch.max(1);
         let mut db = Database::new(name);
-        let mut buf: Vec<IdTriple> = Vec::with_capacity(batch.min(1 << 20));
+        let mut ids: Vec<IdTriple> = Vec::with_capacity(batch.clamp(1, 1 << 20));
         crate::parser::ntriples::for_each_triple_file(path, |t| {
-            let id = db.encode_triple(&t)?;
-            buf.push(id);
-            if buf.len() >= batch {
-                db.store.bulk_load(buf.drain(..).collect());
-            }
+            ids.push(db.encode_triple(&t)?);
             Ok(())
         })?;
-        if !buf.is_empty() {
-            db.store.bulk_load(buf.drain(..).collect());
-        }
+        db.store.bulk_load(ids);
         db.rebuild_index();
         Ok(db)
     }

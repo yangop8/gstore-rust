@@ -1,0 +1,2 @@
+# spec: SPARQL 1.1 Query §19.8 Grammar, rule [18] SolutionModifier: at most one OrderClause
+SELECT * WHERE { ?s ?p ?o } ORDER BY ?s ORDER BY ?o

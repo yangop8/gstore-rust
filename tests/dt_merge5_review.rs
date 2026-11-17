@@ -279,9 +279,19 @@ fn drop_or_clear_of_the_empty_graph_iri_is_not_drop_named() {
          GRAPH <http://ex/keep2> { <http://ex/a> <http://ex/p> <http://ex/c> } }",
     );
     let all = dump(&mut db);
-    assert_eq!(update(&mut db, "DROP GRAPH <>"), 0);
-    assert_eq!(update(&mut db, "CLEAR GRAPH <>"), 0);
+    // review sparqlconf#16: DROP / CLEAR GRAPH of a graph that does not
+    // exist now fails unless SILENT (these asserted `0` changed triples);
+    // what this test checks is unchanged — `<>` names that one (missing)
+    // graph, not every named graph, so nothing is dropped.
+    for u in ["DROP GRAPH <>", "CLEAR GRAPH <>"] {
+        let e = db.query(u).expect_err(u);
+        assert!(
+            e.to_string().contains("the graph <> does not exist"),
+            "{u}: {e}"
+        );
+    }
     assert_eq!(update(&mut db, "DROP SILENT GRAPH <>"), 0);
+    assert_eq!(update(&mut db, "CLEAR SILENT GRAPH <>"), 0);
     assert_eq!(dump(&mut db), all, "no named graph is <>");
     // The NAMED keyword still means every named graph.
     assert_eq!(update(&mut db, "CLEAR NAMED"), 2);

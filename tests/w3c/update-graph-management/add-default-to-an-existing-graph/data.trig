@@ -1,0 +1,6 @@
+@prefix : <http://example.org/> .
+:a :name "Alice"@en ;
+   :age 30 ;
+   :knows _:b .
+_:b :name "Bob" .
+:g1 { :c :p :d . }

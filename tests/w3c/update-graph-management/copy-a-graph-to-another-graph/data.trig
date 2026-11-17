@@ -1,0 +1,4 @@
+@prefix : <http://example.org/> .
+:x :p :y .
+:g1 { :c :p "c"@fr . :c :q _:n . }
+:g2 { :old :p :gone . }

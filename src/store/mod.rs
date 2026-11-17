@@ -30,6 +30,24 @@ pub mod read_scope;
 pub use backend::Backend;
 pub use overlay::{Overlay, OverlayChanges, OverlayView};
 
+std::thread_local! {
+    /// See [`bulk_load_sorted`].
+    static BULK_LOAD_SORTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many triples the in-memory stores' bulk loads on this thread have
+/// sorted into their indexes so far: a load into an empty store sorts its
+/// input, one into a non-empty store re-sorts every list, so the whole
+/// store. A work counter for scaling tests (review db#15), not an API.
+#[doc(hidden)]
+pub fn bulk_load_sorted() -> u64 {
+    BULK_LOAD_SORTED.with(std::cell::Cell::get)
+}
+
+fn count_bulk_load_sorted(n: u64) {
+    BULK_LOAD_SORTED.with(|c| c.set(c.get().saturating_add(n)));
+}
+
 /// A sorted, de-duplicated adjacency map `key → Vec<(a, b)>`.
 type AdjMap<K> = BTreeMap<K, Vec<(u32, u32)>>;
 
@@ -901,6 +919,7 @@ impl StoreData {
         }
         // `total` counts distinct triples (s2po dedup removes exact repeats).
         self.triple_count = total;
+        count_bulk_load_sorted(total);
         self.recompute_pred_stats();
     }
 
@@ -909,6 +928,7 @@ impl StoreData {
     /// sized lists, maps built from sorted input) instead of a map lookup per
     /// triple and index. The result equals the general path's.
     fn bulk_load_into_empty(&mut self, mut triples: Vec<IdTriple>) {
+        count_bulk_load_sorted(triples.len() as u64);
         triples.sort_unstable_by_key(|t| (t.sub, t.pred, t.obj));
         triples.dedup();
         self.triple_count = triples.len() as u64;

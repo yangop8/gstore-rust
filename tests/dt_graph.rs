@@ -135,12 +135,25 @@ fn clear_named_graph_and_clear_all() {
         QueryResult::Update { changed } => assert_eq!(changed, 1),
         other => panic!("got {other:?}"),
     }
-    assert!(col0(
-        &mut db,
-        "SELECT ?g ?s WHERE { GRAPH ?g { ?s <http://ex/p> ?o } }"
-    )
-    .iter()
-    .all(|_| true));
+    // review tests-a#3: this used to be `.iter().all(|_| true)`, which holds
+    // for any answer; the named graphs left must be exactly g2 with its one
+    // subject (g1 gone, g2 untouched).
+    let pairs: Vec<(String, String)> = db
+        .select("SELECT ?g ?s WHERE { GRAPH ?g { ?s <http://ex/p> ?o } }")
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| {
+            (
+                r[0].clone().unwrap_or_default(),
+                r[1].clone().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![("<http://ex/g2>".to_string(), "<http://ex/c>".to_string())]
+    );
     // g2 still present, default still present.
     assert_eq!(
         col0(&mut db, "SELECT ?s WHERE { ?s <http://ex/p> ?o }"),

@@ -1,0 +1,2 @@
+syntax
+a labelled blank node in a DELETE template (review sparqlconf#16, parser#13)
