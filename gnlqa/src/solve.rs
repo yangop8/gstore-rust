@@ -39,8 +39,8 @@ fn dedup(uris: Vec<String>) -> Vec<String> {
 
 /// Solve every candidate (with repair) and return the highest-scoring outcome.
 /// A per-candidate query/repair failure is skipped (try the next), but a
-/// transport failure ([`Error::Http`] — the endpoint is unreachable) is fatal and
-/// propagated so the caller reports the outage instead of masking it as "no
+/// transport failure ([`Error::Http`] — the endpoint is unreachable) or an
+/// exhausted cost budget ([`Error::Limit`]) is fatal and propagated so the caller reports the outage instead of masking it as "no
 /// candidate produced an answer".
 #[allow(clippy::too_many_arguments)]
 pub fn best_of(
@@ -62,8 +62,9 @@ pub fn best_of(
                     best = Some((o, s));
                 }
             }
-            // Endpoint unreachable — no point trying the remaining candidates.
-            Err(e @ Error::Http(_)) => return Err(e),
+            // Endpoint unreachable or the request's cost budget is spent — no
+            // point trying the remaining candidates.
+            Err(e) if e.is_fatal() => return Err(e),
             // Invalid/unanswerable for this candidate — try the next one.
             Err(_) => {}
         }
@@ -193,8 +194,11 @@ const ANALYTICS_CONFIDENCE: f32 = 0.85;
 impl SolveEngine {
     pub fn new(llm: Box<dyn LlmClient>, kb: Box<dyn KbClient>) -> SolveEngine {
         SolveEngine {
-            llm,
-            kb,
+            // Every LLM call and KB query the engine makes is charged against
+            // the per-request budget a server surface installs (review
+            // cluster-nlqa#13); with no budget installed this is a pass-through.
+            llm: Box::new(crate::budget::MeteredLlm(llm)),
+            kb: Box::new(crate::budget::MeteredKb(kb)),
             linker: None,
             candidates: 4,
             max_rounds: 2,

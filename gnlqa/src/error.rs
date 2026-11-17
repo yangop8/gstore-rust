@@ -20,6 +20,20 @@ pub enum Error {
     Http(String),
     /// (De)serialization failure.
     Json(String),
+    /// A per-request cost limit (LLM calls, KB rows, time) was exhausted; see
+    /// [`crate::budget`]. Like [`Error::Http`], it ends the request early
+    /// instead of being retried, degraded around or repaired.
+    Limit(String),
+}
+
+impl Error {
+    /// Whether this error must end the whole request rather than being
+    /// degraded around: a transport outage ([`Error::Http`]) or an exhausted
+    /// cost budget ([`Error::Limit`]). Trying the next candidate or another
+    /// repair round cannot help with either.
+    pub fn is_fatal(&self) -> bool {
+        matches!(self, Error::Http(_) | Error::Limit(_))
+    }
 }
 
 impl fmt::Display for Error {
@@ -31,6 +45,7 @@ impl fmt::Display for Error {
             Error::Sparql(m) => write!(f, "SPARQL error: {m}"),
             Error::Http(m) => write!(f, "HTTP error: {m}"),
             Error::Json(m) => write!(f, "JSON error: {m}"),
+            Error::Limit(m) => write!(f, "limit exceeded: {m}"),
         }
     }
 }

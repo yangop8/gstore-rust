@@ -4,6 +4,8 @@
 use std::collections::HashMap;
 use std::env;
 
+use crate::budget::CostLimits;
+use crate::http_server::{HttpAuth, HttpLimits};
 use crate::secret::Secret;
 
 /// gNLQA runtime configuration. Secret fields are [`Secret`] so they never leak
@@ -44,6 +46,27 @@ pub struct Config {
     pub cache_capacity: usize,
     /// Cache entry time-to-live in seconds (`GNLQA_CACHE_TTL_SECS`; 0 = no expiry).
     pub cache_ttl_secs: u64,
+    /// Bearer token clients of `gnlqa serve` must present on `/ask` and
+    /// `/gSolve` (`GNLQA_HTTP_TOKEN`). Without one (and without
+    /// [`http_allow_unauthenticated`](Self::http_allow_unauthenticated)),
+    /// `gnlqa serve` refuses to start.
+    pub http_token: Option<Secret>,
+    /// Explicit opt-out of HTTP client authentication
+    /// (`GNLQA_HTTP_ALLOW_UNAUTHENTICATED=on`, default off): the server then
+    /// answers loopback clients only and refuses to bind a non-loopback address.
+    pub http_allow_unauthenticated: bool,
+    /// `/ask` + `/gSolve` requests per client IP per minute
+    /// (`GNLQA_HTTP_RATE_PER_MIN`; 0 = unlimited).
+    pub http_rate_per_min: u32,
+    /// Maximum question length in bytes for `serve` (`GNLQA_MAX_QUESTION_BYTES`).
+    pub max_question_bytes: usize,
+    /// Maximum LLM calls per `serve`/`mcp` request (`GNLQA_MAX_LLM_CALLS`; 0 = unlimited).
+    pub max_llm_calls: usize,
+    /// Maximum KB rows fetched per `serve`/`mcp` request (`GNLQA_MAX_KB_ROWS`; 0 = unlimited).
+    pub max_kb_rows: usize,
+    /// Wall-clock budget per `serve`/`mcp` request in seconds
+    /// (`GNLQA_REQUEST_TIMEOUT_SECS`; 0 = none).
+    pub request_timeout_secs: u64,
 }
 
 impl Config {
@@ -79,6 +102,59 @@ impl Config {
             mode: or(get("GNLQA_MODE"), "auto"),
             cache_capacity: parse_or(get("GNLQA_CACHE"), 256),
             cache_ttl_secs: parse_or(get("GNLQA_CACHE_TTL_SECS"), 0),
+            http_token: non_empty(get("GNLQA_HTTP_TOKEN")).map(Secret::new),
+            http_allow_unauthenticated: parse_switch(get("GNLQA_HTTP_ALLOW_UNAUTHENTICATED")),
+            http_rate_per_min: parse_or(
+                get("GNLQA_HTTP_RATE_PER_MIN"),
+                crate::http_server::DEFAULT_REQUESTS_PER_MINUTE,
+            ),
+            max_question_bytes: parse_or(
+                get("GNLQA_MAX_QUESTION_BYTES"),
+                crate::http_server::DEFAULT_MAX_QUESTION_BYTES,
+            ),
+            max_llm_calls: parse_or(
+                get("GNLQA_MAX_LLM_CALLS"),
+                crate::http_server::DEFAULT_MAX_LLM_CALLS,
+            ),
+            max_kb_rows: parse_or(
+                get("GNLQA_MAX_KB_ROWS"),
+                crate::http_server::DEFAULT_MAX_KB_ROWS,
+            ),
+            request_timeout_secs: parse_or(
+                get("GNLQA_REQUEST_TIMEOUT_SECS"),
+                crate::http_server::DEFAULT_REQUEST_TIMEOUT_SECS,
+            ),
+        }
+    }
+
+    /// The per-request cost budget for the server surfaces (`serve`, `mcp`).
+    pub fn cost_limits(&self) -> CostLimits {
+        let opt = |n: usize| (n > 0).then_some(n);
+        CostLimits {
+            max_llm_calls: opt(self.max_llm_calls),
+            max_kb_rows: opt(self.max_kb_rows),
+            timeout: (self.request_timeout_secs > 0)
+                .then(|| std::time::Duration::from_secs(self.request_timeout_secs)),
+        }
+    }
+
+    /// The HTTP server limits (rate, question size, cost budget).
+    pub fn http_limits(&self) -> HttpLimits {
+        HttpLimits {
+            requests_per_minute: self.http_rate_per_min,
+            max_question_bytes: self.max_question_bytes.max(1),
+            cost: self.cost_limits(),
+        }
+    }
+
+    /// The HTTP client-authentication mode: a token if one is configured,
+    /// else the loopback-only opt-out if it was switched on, else
+    /// [`HttpAuth::Unconfigured`] (`gnlqa serve` refuses to start).
+    pub fn http_auth(&self) -> HttpAuth {
+        match (&self.http_token, self.http_allow_unauthenticated) {
+            (Some(t), _) => HttpAuth::Token(t.clone()),
+            (None, true) => HttpAuth::LoopbackOnly,
+            (None, false) => HttpAuth::Unconfigured,
         }
     }
 
@@ -111,6 +187,13 @@ impl Default for Config {
             mode: "auto".to_string(),
             cache_capacity: 256,
             cache_ttl_secs: 0,
+            http_token: None,
+            http_allow_unauthenticated: false,
+            http_rate_per_min: crate::http_server::DEFAULT_REQUESTS_PER_MINUTE,
+            max_question_bytes: crate::http_server::DEFAULT_MAX_QUESTION_BYTES,
+            max_llm_calls: crate::http_server::DEFAULT_MAX_LLM_CALLS,
+            max_kb_rows: crate::http_server::DEFAULT_MAX_KB_ROWS,
+            request_timeout_secs: crate::http_server::DEFAULT_REQUEST_TIMEOUT_SECS,
         }
     }
 }
@@ -138,6 +221,20 @@ fn normalize_provider(v: Option<String>) -> String {
                 "anthropic".to_string()
             }
         },
+    }
+}
+
+/// Parse an on/off switch (`on|off|true|false|yes|no|1|0`, case-insensitive);
+/// absent → off. An unrecognized value warns and stays off (the safe side).
+fn parse_switch(v: Option<String>) -> bool {
+    let Some(s) = non_empty(v) else { return false };
+    match s.trim().to_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" => true,
+        "off" | "false" | "no" | "0" => false,
+        other => {
+            eprintln!("gnlqa: warning: switch value {other:?} is not on/off; using off");
+            false
+        }
     }
 }
 
@@ -274,5 +371,40 @@ mod tests {
         assert_eq!(c.cache_capacity, 256);
         assert_eq!(c.cache_ttl_secs, 0);
         assert_eq!(c.max_tokens, 1024);
+    }
+
+    #[test]
+    fn server_limits_default_to_the_http_server_defaults() {
+        // review cluster-nlqa#13: the config defaults and HttpServer::bind's
+        // defaults must agree, and the server is never anonymous by default.
+        let c = Config::default();
+        assert_eq!(c.http_limits(), HttpLimits::default());
+        assert!(matches!(c.http_auth(), HttpAuth::Unconfigured));
+        let t = Config {
+            http_token: Some(Secret::new("t")),
+            ..Config::default()
+        };
+        assert!(matches!(t.http_auth(), HttpAuth::Token(_)));
+        let open = Config {
+            http_allow_unauthenticated: true,
+            ..Config::default()
+        };
+        assert!(matches!(open.http_auth(), HttpAuth::LoopbackOnly));
+        let unlimited = Config {
+            max_llm_calls: 0,
+            max_kb_rows: 0,
+            request_timeout_secs: 0,
+            ..Config::default()
+        };
+        assert_eq!(unlimited.cost_limits(), CostLimits::unlimited());
+    }
+
+    #[test]
+    fn switches_parse_on_off_and_default_off() {
+        assert!(parse_switch(Some("on".into())));
+        assert!(parse_switch(Some(" TRUE ".into())));
+        assert!(!parse_switch(Some("off".into())));
+        assert!(!parse_switch(None));
+        assert!(!parse_switch(Some("maybe".into())));
     }
 }

@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use gnlqa::{
     load_lcquad, load_qald, run_eval, AnthropicClient, Config, EvalOptions, GStoreClient,
-    HashEmbedder, HttpServer, Linker, LlmClient, McpServer, Mode, OpenAiClient, Session,
+    HashEmbedder, HttpAuth, HttpServer, Linker, LlmClient, McpServer, Mode, OpenAiClient, Session,
     SolveEngine,
 };
 
@@ -241,7 +241,9 @@ fn main() {
         Some("mcp") => {
             let engine = Arc::new(build_engine(&cfg, mode, false));
             eprintln!("gNLQA MCP server on stdio (tools: ask_kg, run_sparql, link_entity, graph_analytics)");
-            McpServer::new(engine).serve_stdio();
+            McpServer::new(engine)
+                .with_limits(cfg.cost_limits())
+                .serve_stdio();
         }
         Some("eval") => run_eval_cmd(&cfg, &args),
         Some("serve") => {
@@ -249,9 +251,38 @@ fn main() {
                 .get(1)
                 .cloned()
                 .unwrap_or_else(|| "127.0.0.1:9100".to_string());
+            // review cluster-nlqa#13 / sec#18: never serve questions
+            // anonymously by accident. A client token is required; the only
+            // alternative is the explicit loopback-only opt-out.
+            let auth = cfg.http_auth();
+            if matches!(auth, HttpAuth::Unconfigured) {
+                eprintln!(
+                    "error: gnlqa serve needs a client token: set GNLQA_HTTP_TOKEN (clients send \
+                     'Authorization: Bearer <token>'), or set GNLQA_HTTP_ALLOW_UNAUTHENTICATED=on \
+                     to serve loopback clients without one"
+                );
+                std::process::exit(2);
+            }
             let engine = Arc::new(build_engine(&cfg, mode, false));
             match HttpServer::bind(engine, &addr) {
                 Ok(server) => {
+                    let server = server.with_auth(auth).with_limits(cfg.http_limits());
+                    if matches!(server.auth(), HttpAuth::LoopbackOnly) {
+                        let local = server.local_addr().map(|a| a.ip().is_loopback());
+                        if !matches!(local, Ok(true)) {
+                            eprintln!(
+                                "error: GNLQA_HTTP_ALLOW_UNAUTHENTICATED=on only serves loopback \
+                                 clients; refusing to bind the non-loopback address {addr} \
+                                 (set GNLQA_HTTP_TOKEN instead)"
+                            );
+                            std::process::exit(2);
+                        }
+                        eprintln!(
+                            "gnlqa: warning: GNLQA_HTTP_ALLOW_UNAUTHENTICATED=on — answering \
+                             loopback clients without a token; every local user can query the \
+                             KB with this server's credentials and spend its LLM credit"
+                        );
+                    }
                     eprintln!("gNLQA serving on http://{addr}  (POST /ask, /gSolve; GET /health)");
                     server.serve_forever();
                 }

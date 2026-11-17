@@ -32,3 +32,15 @@ GSTORE_ENDPOINT=http://127.0.0.1:9000/sparql
 # GNLQA_CACHE=256            # answer-cache capacity (0 disables)
 # GNLQA_CACHE_TTL_SECS=0     # cache entry lifetime (0 = no expiry; set it if the KB changes under a long-running server)
 # GNLQA_MAX_TOKENS=1024      # minimum completion-token budget per request (raise for reasoning models)
+
+# ---- gnlqa serve / mcp (HTTP authentication and per-request limits) ----
+# `gnlqa serve` refuses to start without a client token; clients send
+# `Authorization: Bearer <token>`. Generate one, e.g. `openssl rand -hex 24`.
+# GNLQA_HTTP_TOKEN=
+# Explicit opt-out: answer loopback clients only, without a token (default off).
+# GNLQA_HTTP_ALLOW_UNAUTHENTICATED=off
+# GNLQA_HTTP_RATE_PER_MIN=30      # /ask + /gSolve requests per client IP per minute (0 = unlimited)
+# GNLQA_MAX_QUESTION_BYTES=4096   # longest accepted question (bytes)
+# GNLQA_MAX_LLM_CALLS=16          # LLM calls per request / MCP tool call (0 = unlimited)
+# GNLQA_MAX_KB_ROWS=200000        # KB rows per request / MCP tool call (0 = unlimited)
+# GNLQA_REQUEST_TIMEOUT_SECS=120  # wall-clock budget per request / MCP tool call (0 = none)

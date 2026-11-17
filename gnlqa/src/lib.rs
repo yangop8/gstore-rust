@@ -14,6 +14,7 @@
 //! * [`llm`]    — the [`llm::LlmClient`] trait + an Anthropic (Claude) client and a mock
 
 pub mod analytics;
+pub mod budget;
 pub mod config;
 pub mod embed;
 pub mod error;
@@ -36,6 +37,7 @@ pub mod session;
 pub mod solve;
 
 pub use analytics::{run_analytics, AnalyticsCfg, AnalyticsOp, AnalyticsResult};
+pub use budget::CostLimits;
 pub use config::Config;
 pub use embed::{Embedder, HashEmbedder, HttpEmbedder, Scored, VectorIndex};
 pub use error::{Error, Result};
@@ -48,7 +50,7 @@ pub use graphrag::{
     answer_from_subgraph, is_dont_know, render_subgraph, retrieve_subgraph, RetrievalCfg, Triple,
 };
 pub use ground::{explain, gather_citations, Citation};
-pub use http_server::HttpServer;
+pub use http_server::{HttpAuth, HttpLimits, HttpServer};
 pub use intent::{
     extract_intent, AggOp, Aggregation, Mention, MentionKind, Order, QType, QuestionIntent,
     RelationPhrase,

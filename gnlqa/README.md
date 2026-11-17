@@ -96,7 +96,7 @@ gnlqa chat                           # interactive multi-turn REPL (:reset / :qu
 gnlqa mcp                            # MCP server over stdio (see below)
 gnlqa eval qald   dataset.json       # score against a QALD benchmark
 gnlqa eval lcquad dataset.json       # score against LC-QuAD (gold resolved via KB)
-gnlqa serve 127.0.0.1:9100           # HTTP SPARQL-QA server (see below)
+gnlqa serve 127.0.0.1:9100           # HTTP SPARQL-QA server (needs GNLQA_HTTP_TOKEN; see below)
 gnlqa                                # print configuration/readiness
 ```
 
@@ -154,8 +154,30 @@ gnlqa chat
 | POST   | `/gSolve` | `{"question": "..."}`    | gAnswer-compatible shape (honours abstention with status `"abstained"`) |
 | GET    | `/health` | —                        | `{"status":"ok"}` |
 
-The server bounds request size and connection count and applies read/write
-timeouts.
+**Authentication.** `/ask` and `/gSolve` run LLM-chosen read-only SPARQL with
+the server's own gStore credentials and spend its LLM credit, so they are not
+open by default: `gnlqa serve` refuses to start unless a client token is set
+with `GNLQA_HTTP_TOKEN` (clients send `Authorization: Bearer <token>`). The only
+alternative is the explicit opt-out `GNLQA_HTTP_ALLOW_UNAUTHENTICATED=on`, which
+answers loopback clients only and refuses to bind a non-loopback address (behind
+a reverse proxy on the same host every client looks local — use a token there).
+`/health` needs no token.
+
+```sh
+GNLQA_HTTP_TOKEN=$(openssl rand -hex 24) gnlqa serve 127.0.0.1:9100
+curl -H "Authorization: Bearer $GNLQA_HTTP_TOKEN" -d '{"question":"who directed Alien?"}' \
+     http://127.0.0.1:9100/ask
+```
+
+**Limits.** Each client IP may send `GNLQA_HTTP_RATE_PER_MIN` (default 30)
+question requests per minute — counted before authentication, so token guessing
+is bounded too — and gets `429` with `Retry-After` beyond that. A question longer
+than `GNLQA_MAX_QUESTION_BYTES` (default 4096) gets `413`. The work one request
+may cause is budgeted: at most `GNLQA_MAX_LLM_CALLS` LLM calls (default 16),
+`GNLQA_MAX_KB_ROWS` KB rows (default 200000) and `GNLQA_REQUEST_TIMEOUT_SECS`
+seconds (default 120); a request that exhausts its budget gets `503` (`/gSolve`:
+`status: "error"`). The same budget applies to every MCP tool call. The server
+also bounds request size and connection count and applies read/write timeouts.
 
 ## MCP server
 
@@ -210,6 +232,13 @@ same names work as env vars.
 | `GNLQA_MODE`         | `auto`                             | answering mode: `auto`/`structured`/`graphrag`/`open` (see above); applies to CLI, chat, serve, and mcp |
 | `GNLQA_CACHE`        | `256`                              | answer-cache capacity in questions (`0` disables the cache) |
 | `GNLQA_CACHE_TTL_SECS` | `0`                              | cache entry lifetime in seconds (`0` = no expiry; set it when the KB changes under a long-running server) |
+| `GNLQA_HTTP_TOKEN`   | — (required by `serve`)            | bearer token HTTP clients must send on `/ask` and `/gSolve` (redacted `Secret`) |
+| `GNLQA_HTTP_ALLOW_UNAUTHENTICATED` | `off`                | `on` = serve loopback clients without a token (refuses non-loopback binds) |
+| `GNLQA_HTTP_RATE_PER_MIN` | `30`                          | `/ask` + `/gSolve` requests per client IP per minute (`0` = unlimited) |
+| `GNLQA_MAX_QUESTION_BYTES` | `4096`                       | longest accepted question for `serve` (bytes) |
+| `GNLQA_MAX_LLM_CALLS` | `16`                              | LLM calls per `serve` request / MCP tool call (`0` = unlimited) |
+| `GNLQA_MAX_KB_ROWS`  | `200000`                           | KB rows fetched per `serve` request / MCP tool call (`0` = unlimited) |
+| `GNLQA_REQUEST_TIMEOUT_SECS` | `120`                      | wall-clock budget per `serve` request / MCP tool call (`0` = none) |
 
 ## Library
 

@@ -17,6 +17,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::analytics::run_analytics;
+use crate::budget::CostLimits;
 use crate::intent::{Mention, MentionKind};
 use crate::kb::SparqlAnswer;
 use crate::solve::SolveEngine;
@@ -31,11 +32,25 @@ const MAX_MSG_BYTES: usize = 1 << 20;
 /// An MCP server backed by a [`SolveEngine`].
 pub struct McpServer {
     engine: Arc<SolveEngine>,
+    limits: CostLimits,
 }
 
 impl McpServer {
+    /// A server with no per-call cost budget (see [`with_limits`](Self::with_limits)).
     pub fn new(engine: Arc<SolveEngine>) -> McpServer {
-        McpServer { engine }
+        McpServer {
+            engine,
+            limits: CostLimits::unlimited(),
+        }
+    }
+
+    /// Run every `tools/call` under this per-call cost budget (LLM calls, KB
+    /// rows, time; review cluster-nlqa#13): an MCP client is an agent whose
+    /// inputs may be prompt-injected, so one tool call must not be able to
+    /// spend without bound. `gnlqa mcp` uses the same limits as `gnlqa serve`.
+    pub fn with_limits(mut self, limits: CostLimits) -> McpServer {
+        self.limits = limits;
+        self
     }
 
     /// Serve MCP over stdio until EOF: one JSON-RPC message per line.
@@ -169,13 +184,14 @@ impl McpServer {
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| json!({}));
-        let result = match name {
-            "ask_kg" => self.tool_ask_kg(&args),
-            "run_sparql" => self.tool_run_sparql(&args),
-            "link_entity" => self.tool_link_entity(&args),
-            "graph_analytics" => self.tool_graph_analytics(&args),
+        let tool: fn(&McpServer, &Value) -> Result<String, String> = match name {
+            "ask_kg" => McpServer::tool_ask_kg,
+            "run_sparql" => McpServer::tool_run_sparql,
+            "link_entity" => McpServer::tool_link_entity,
+            "graph_analytics" => McpServer::tool_graph_analytics,
             other => return err_response(id, -32602, &format!("unknown tool: {other}")),
         };
+        let result = crate::budget::with_limits(self.limits, || tool(self, &args));
         // Tool-level failures (bad arguments, engine/KB errors) are a normal result
         // with isError, so the calling model sees the message as tool output.
         match result {
@@ -557,5 +573,34 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("question"));
+    }
+
+    #[test]
+    fn tool_calls_run_under_the_cost_budget() {
+        // review cluster-nlqa#13: an MCP tool call is bounded like an HTTP request.
+        let llm = Arc::new(MockLlm::new(vec![
+            r#"{"qtype":"list"}"#.to_string(),
+            r#"["SELECT ?x WHERE { ?x <http://ex/p> ?o }"]"#.to_string(),
+        ]));
+        let kb = MockKb::new(vec![nonempty()]);
+        let engine = Arc::new(
+            SolveEngine::new(Box::new(Arc::clone(&llm)), Box::new(kb)).with_citations(false),
+        );
+        let srv = McpServer::new(engine).with_limits(CostLimits {
+            max_llm_calls: Some(1),
+            ..CostLimits::unlimited()
+        });
+        let req = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ask_kg","arguments":{"question":"which x?"}}}"#;
+        let v = parse(&srv.handle_message(req).unwrap());
+        assert_eq!(v["result"]["isError"], true, "{v}");
+        assert!(v["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("LLM call"));
+        assert_eq!(llm.call_count(), 1, "the second LLM call is refused");
+        // the budget is per call: the next call starts afresh
+        let v2 = parse(&srv.handle_message(req).unwrap());
+        assert_eq!(v2["result"]["isError"], true);
+        assert_eq!(llm.call_count(), 2);
     }
 }

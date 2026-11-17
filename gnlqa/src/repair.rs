@@ -60,12 +60,16 @@ pub fn solve_with_repair(
     seen.insert(current.clone());
 
     // Run one repair attempt; on no-progress / LLM failure, return None (stop).
-    let attempt = |tried: &[(String, String)], seen: &mut HashSet<String>| -> Option<String> {
-        match repair(llm, question, links_block, schema_block, tried, model) {
-            Ok(next) if seen.insert(next.clone()) => Some(next),
-            _ => None, // repeated query (no progress) or LLM error
-        }
-    };
+    // A fatal LLM failure (provider unreachable, cost budget spent) ends the
+    // whole request instead: every further candidate would hit it again.
+    let attempt =
+        |tried: &[(String, String)], seen: &mut HashSet<String>| -> Result<Option<String>> {
+            match repair(llm, question, links_block, schema_block, tried, model) {
+                Ok(next) if seen.insert(next.clone()) => Ok(Some(next)),
+                Err(e) if e.is_fatal() => Err(e),
+                _ => Ok(None), // repeated query (no progress) or LLM error
+            }
+        };
 
     for round in 0..=max_rounds {
         let last_round = round == max_rounds;
@@ -78,7 +82,7 @@ pub fn solve_with_repair(
                 break;
             }
             tried.push((current.clone(), last_err.clone().unwrap()));
-            match attempt(&tried, &mut seen) {
+            match attempt(&tried, &mut seen)? {
                 Some(next) => current = next,
                 None => break,
             }
@@ -101,7 +105,7 @@ pub fn solve_with_repair(
                     break;
                 }
                 tried.push((current.clone(), "returned no results".into()));
-                match attempt(&tried, &mut seen) {
+                match attempt(&tried, &mut seen)? {
                     Some(next) => current = next,
                     None => break,
                 }
@@ -110,14 +114,15 @@ pub fn solve_with_repair(
             // repairing the SPARQL can't fix a dead socket, and every round would
             // burn an LLM call + another dead connection. Fail fast and surface
             // the real cause instead of masking it as "no answer".
-            Err(e @ Error::Http(_)) => return Err(e),
+            // The same holds for an exhausted per-request cost budget.
+            Err(e) if e.is_fatal() => return Err(e),
             Err(e) => {
                 last_err = Some(format!("execution error: {e}"));
                 if last_round {
                     break;
                 }
                 tried.push((current.clone(), last_err.clone().unwrap()));
-                match attempt(&tried, &mut seen) {
+                match attempt(&tried, &mut seen)? {
                     Some(next) => current = next,
                     None => break,
                 }
