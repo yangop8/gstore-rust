@@ -6903,6 +6903,26 @@ impl ApiInner {
                 Ok(path) => path,
                 Err(r) => return r,
             };
+            // A backup that did not complete is restored for nobody — and is
+            // reported as such to whoever restores the database it was a
+            // backup of (round-3 review): its owner record no longer counts
+            // while it is incomplete, so the ownership check below would
+            // call it "not a backup of" the database.
+            let incomplete = backup_in_progress(&path);
+            let refuse_incomplete = || {
+                Resp::fail(
+                    409,
+                    &format!(
+                        "restore refused: the backup in '{}' is incomplete (a backup into it \
+                         did not finish); back the database up there again, or restore \
+                         another backup",
+                        path.display()
+                    ),
+                )
+            };
+            if incomplete.as_deref() == Some(name.as_str()) {
+                return refuse_incomplete();
+            }
             if !may_restore_from(&locked(&inner.state).users, &user, &name, &path) {
                 return Resp::fail(
                     403,
@@ -6912,16 +6932,8 @@ impl ApiInner {
                     ),
                 );
             }
-            if backup_in_progress(&path).is_some() {
-                return Resp::fail(
-                    409,
-                    &format!(
-                        "restore refused: the backup in '{}' is incomplete (a backup into it \
-                         did not finish); back the database up there again, or restore \
-                         another backup",
-                        path.display()
-                    ),
-                );
+            if incomplete.is_some() {
+                return refuse_incomplete();
             }
             if Database::storage_kind(&path).is_none() {
                 return Resp::fail(

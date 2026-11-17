@@ -755,24 +755,32 @@ fn load_finishes_an_interrupted_restore_on_both_surfaces() {
 // backup / restore
 // ---------------------------------------------------------------------------
 
-/// A failed REST `/backup` over an earlier backup of the database keeps that
-/// one, recorded as a backup of it: each store is replaced as a whole, so
-/// the directory still holds the earlier backup (or, past the store's
-/// replacement, the new one). Dropping its record would orphan it: a user
-/// who may restore the database only from its own backups could no longer,
-/// and every later `/backup` into the directory — the default `<db>.backup`
-/// is reused by every REST backup of the database — would be refused for
-/// good as "data that is not a backup" (`409`).
+/// A failed REST `/backup` over an earlier backup of the database keeps the
+/// directory recorded as the database's, so the next backup there is
+/// allowed: dropping its record would orphan it, and every later `/backup`
+/// into the directory — the default `<db>.backup` is reused by every REST
+/// backup of the database — would be refused for good as "data that is not
+/// a backup" (`409`).
+///
+/// Review (round 3, REST `/backup` in-progress marker): this test asserted
+/// that the earlier backup stays restorable after the failed replacement
+/// ("each store is replaced as a whole, so the directory still holds the
+/// earlier backup"). `Database::backup` copies the reasoning rules and
+/// ledgers before the store (conc#13), so the directory then pairs the new
+/// rules with the earlier store — no complete backup of either moment. It
+/// is marked incomplete (`BACKUP_OF.partial`) and refused by `/restore`
+/// (`409`, for its database's restorers and root alike) until a backup into
+/// it completes, which the retry below does.
 #[test]
 fn a_failed_backup_over_an_earlier_one_keeps_it_and_can_be_retried() {
     let srv = Srv::start("backupfail");
     srv.ok("POST", "/build?db_name=bkp", DATA);
-    let earlier = srv.statements("bkp");
     let r = srv.ok("POST", "/backup?db_name=bkp", "");
     let target = PathBuf::from(r.json().get("path").and_then(Json::as_str).unwrap());
     assert_eq!(fs::read_to_string(target.join("BACKUP_OF")).unwrap(), "bkp");
     let insert = "INSERT DATA { <http://ex/n> <http://ex/p> <http://ex/m> }";
     srv.ok("POST", "/update?db_name=bkp", insert);
+    let current = srv.statements("bkp");
     // The next backup there fails (a directory stands where its staging file
     // goes: what an I/O error does).
     let blocker = target.join("dict.bin.tmp");
@@ -782,11 +790,15 @@ fn a_failed_backup_over_an_earlier_one_keeps_it_and_can_be_retried() {
     assert_eq!(
         fs::read_to_string(target.join("BACKUP_OF")).unwrap(),
         "bkp",
-        "the earlier backup is no longer recorded as one"
+        "the directory is no longer recorded as the database's"
+    );
+    assert!(
+        target.join("BACKUP_OF.partial").exists(),
+        "the partly replaced backup is not marked incomplete"
     );
     fs::remove_dir_all(&blocker).unwrap();
     // A user who may restore `bkp` from its own backups only (root and admin
-    // users may restore from anything) restores the earlier backup.
+    // users may restore from anything) is told it is incomplete; so is root.
     srv.ok(
         "POST",
         "/user/create?op_username=carol&op_password=Carol-pass-123&privileges=restore&db_name=bkp",
@@ -798,13 +810,29 @@ fn a_failed_backup_over_an_earlier_one_keeps_it_and_can_be_retried() {
         enc(&target.to_string_lossy())
     );
     let r = send(srv.addr, carol, "POST", &restore, "");
-    assert_eq!(r.status, 200, "{}", r.body);
-    assert_eq!(srv.statements("bkp"), earlier);
-    // The fault gone, the next backup into the same directory succeeds.
-    srv.ok("POST", "/update?db_name=bkp", insert);
+    assert_eq!(r.status, 409, "{}", r.body);
+    assert!(r.body.contains("incomplete"), "{}", r.body);
+    let r = srv.rest("POST", &restore, "");
+    assert_eq!(r.status, 409, "{}", r.body);
+    assert_eq!(
+        srv.statements("bkp"),
+        current,
+        "a refused restore changed it"
+    );
+    // The fault gone, the next backup into the same directory succeeds and
+    // completes it: restorable again, by the database's restorers too.
     let r = srv.rest("POST", "/backup?db_name=bkp", "");
     assert_eq!(r.status, 200, "a retry is refused: {}", r.body);
     assert_eq!(fs::read_to_string(target.join("BACKUP_OF")).unwrap(), "bkp");
+    assert!(!target.join("BACKUP_OF.partial").exists());
+    srv.ok(
+        "POST",
+        "/update?db_name=bkp",
+        "DELETE DATA { <http://ex/n> <http://ex/p> <http://ex/m> }",
+    );
+    let r = send(srv.addr, carol, "POST", &restore, "");
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(srv.statements("bkp"), current);
     // The `/api` backup, which records only a complete backup, agrees on a
     // good one; and a good REST backup is recorded.
     let j = srv.api_ok(&[("operation", "backup"), ("db_name", "bkp")]);
