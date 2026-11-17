@@ -316,3 +316,65 @@ fn a_call_cut_short_by_the_time_budget_reports_the_budget() {
     assert_eq!(r.status, 503, "{r:?}");
     assert_eq!(r.json()["code"], "limit_exceeded", "{r:?}");
 }
+
+/// Run `gnlqa serve <addr>` with a clean environment plus `env` and return
+/// its exit status and stderr. A server that starts (instead of refusing)
+/// is killed by the hang guard and reported as `None`.
+fn run_serve(addr: &str, env: &[(&str, &str)]) -> (Option<i32>, String) {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+    let home = common::TempDir::new("serve-home");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_gnlqa"));
+    cmd.args(["serve", addr])
+        .current_dir(home.path())
+        .env_clear()
+        .env("HOME", home.path())
+        // nothing listens here: a server that got as far as building its
+        // engine fails its linker build fast instead of reaching a real KB
+        .env(
+            "GSTORE_ENDPOINT",
+            format!("http://127.0.0.1:{}/sparql", common::closed_port()),
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().expect("run the gnlqa binary");
+    let guard = Instant::now() + Duration::from_secs(60); // hang guard only
+    let status = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break st.code();
+        }
+        if Instant::now() > guard {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let mut err = String::new();
+    let _ = child.stderr.take().unwrap().read_to_string(&mut err);
+    (status, err)
+}
+
+#[test]
+fn gnlqa_serve_refuses_to_start_without_a_client_token() {
+    // review (r5-gnlqa reviewer): the CLI half of the secure default
+    // (cluster-nlqa#13 / sec#18) had no test.
+    let (status, err) = run_serve("127.0.0.1:0", &[]);
+    assert_eq!(
+        status,
+        Some(2),
+        "gnlqa serve started without a token:\n{err}"
+    );
+    assert!(err.contains("GNLQA_HTTP_TOKEN"), "{err}");
+}
+
+#[test]
+fn gnlqa_serve_unauthenticated_mode_refuses_a_non_loopback_bind() {
+    let (status, err) = run_serve("0.0.0.0:0", &[("GNLQA_HTTP_ALLOW_UNAUTHENTICATED", "on")]);
+    assert_eq!(status, Some(2), "{err}");
+    assert!(err.contains("non-loopback"), "{err}");
+}
