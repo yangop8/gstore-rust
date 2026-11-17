@@ -435,7 +435,29 @@ fn lock_dir(db_dir: &Path) -> StoreLock {
         }
         *held = true;
     }
-    let lock = StoreLock { state: Some(state) };
+    finish_interrupted_swap(db_dir, StoreLock { state: Some(state) })
+}
+
+/// [`lock_dir`] without waiting: `None` while another operation holds the
+/// lock.
+fn try_lock_dir(db_dir: &Path) -> Option<StoreLock> {
+    let state = dir_lock(db_dir);
+    {
+        let mut held = state.held.lock().unwrap_or_else(|p| p.into_inner());
+        if *held {
+            return None;
+        }
+        *held = true;
+    }
+    Some(finish_interrupted_swap(
+        db_dir,
+        StoreLock { state: Some(state) },
+    ))
+}
+
+/// With `lock` (`db_dir`'s rule lock) held: finish a replacement of the
+/// rule directory that a crash interrupted.
+fn finish_interrupted_swap(db_dir: &Path, lock: StoreLock) -> StoreLock {
     let rules = db_dir.join(RULE_DIR);
     if fsutil::STORE_SWAP.in_progress(&rules) {
         if let Err(e) = fsutil::recover_dir_swap(&rules) {
@@ -545,9 +567,24 @@ pub fn read_rule_dir(db_dir: &Path) -> crate::Result<MemoryRules> {
 /// rule lock, like [`copy_rule_dir`] (review durability#11: the directory
 /// was removed first and the files written one by one, so a crash part-way
 /// left rule files without ledgers, or no rules at all).
+///
+/// The lock is taken **without waiting**: a [`save`](crate::Database::save)
+/// calls this with the database's `persist_lock` and the directory's
+/// writing exclusion held, which contract C8 orders *after* a rule-directory
+/// lock — an operation holding this lock may be waiting for them
+/// (`reasonManage`'s disable saves its database under it), so waiting here
+/// could deadlock. While another operation of this process holds the lock
+/// (another database is changing the rules of that directory), the write
+/// is refused and nothing is changed.
 pub fn write_memory_rules(m: &MemoryRules, dst_db_dir: &Path) -> crate::Result<()> {
     let dir = dst_db_dir.join(RULE_DIR);
-    let _lock = lock_dir(dst_db_dir);
+    let Some(_lock) = try_lock_dir(dst_db_dir) else {
+        return Err(crate::GStoreError::Database(format!(
+            "the reasoning rules in '{}' are being changed by another operation; they were \
+             not written (try again)",
+            dst_db_dir.display()
+        )));
+    };
     if m.is_empty() {
         return fsutil::discard_dir(&dir);
     }
@@ -739,5 +776,35 @@ mod tests {
         fs::create_dir_all(fsutil::with_suffix(&rules_dir, ".old")).unwrap();
         assert_eq!(shown(&dst), rules(&["new"]));
         assert!(!fsutil::STORE_SWAP.in_progress(&rules_dir));
+    }
+
+    /// A save writes a detached database's in-memory rules with its
+    /// `persist_lock` and the directory's writing exclusion held, which
+    /// contract C8 orders after the rule lock; `reasonManage`'s disable
+    /// holds the rule lock while it saves. So the write never waits for the
+    /// rule lock (waiting there could deadlock): busy, it refuses and
+    /// changes nothing.
+    #[test]
+    fn writing_memory_rules_never_waits_for_the_rule_lock() {
+        let root = tmp("busy");
+        let src = db_with_rules(&root.0, "src.db", &["a"]);
+        let mem = read_rule_dir(&src).unwrap();
+        let dst = db_with_rules(&root.0, "dst.db", &["old"]);
+        let held = RuleStore::dir(&dst).lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (m, d) = (mem.clone(), dst.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(write_memory_rules(&m, &d).map_err(|e| e.to_string()));
+        });
+        // The timeout is a hang guard only: the write answers at once.
+        let answer = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the write waited for the rule lock");
+        let e = answer.expect_err("the write went ahead under a held rule lock");
+        assert!(e.contains("being changed"), "{e}");
+        drop(held);
+        assert_eq!(shown(&dst), rules(&["old"]));
+        write_memory_rules(&mem, &dst).unwrap();
+        assert_eq!(shown(&dst), rules(&["a"]));
     }
 }
