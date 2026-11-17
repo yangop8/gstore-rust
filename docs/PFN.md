@@ -460,19 +460,32 @@ extensions) and applied to every served database like the `[query]` keys
 
 | key | default | meaning |
 |-----|---------|---------|
-| `pfn_fuel_per_call` | `1000000000` | the most WebAssembly instructions one call may run (`0` = unlimited); past it: `run f fail: the instruction budget … is exhausted` |
+| `pfn_fuel_per_call` | `1000000000` | the most fuel (see below) one call may use (`0` = unlimited); past it: `run f fail: the instruction budget of N (pfn_fuel_per_call) is exhausted` |
 | `pfn_max_memory_pages` | `1024` (64 MiB) | the most 64 KiB pages the memory may grow to; `memory.grow` past it returns `-1`, as WebAssembly specifies |
 | `pfn_max_module_bytes` | `1048576` | the largest source text and compiled module `funcudb` accepts — also `funBody` and `funSubs` together as sent (URL-decoded, whitespace included), and at most 3 × this as stored in `data.json` (JSON-escaped: a control character takes 6 bytes); `funDesc` may have at most 64 KiB, also as stored, and `funSubs` must be empty next to a complete module, when the function is created or updated |
 | `pfn_max_functions` | `100` | the most functions one user may own |
+| `pfn_fuel_per_query` | `10000000000` | the most fuel all the PFN calls of one query may use together — every argument combination, every `PFN.name(…)` of the statement, its sub-queries (`0` = unlimited); past it: `run f fail: the instruction budget of N for the PFN calls of one query (pfn_fuel_per_query) is exhausted`. Every query starts from zero (in an update, every `DELETE` / `INSERT … WHERE` operation) |
 | `[query] gfun_max_output_bytes` | `67108864` | the most bytes one call may emit (and the most a call's result array may hold) |
+
+**Fuel** is what both budgets count: one unit per WebAssembly instruction;
+one per 8 bytes of guest memory a host function reads or writes (a string
+lookup, an argument key, `emit`, …); and, before the call starts, one per 8
+bytes its instantiation sets up — the module's initial linear memory and its
+data section — plus one, so a module declaring 1024 pages (64 MiB) costs
+8 Mi units per call before it runs an instruction (one page: 8 Ki). An
+instantiation that does not fit what is left of either budget is refused
+before any memory is allocated. Without the per-query budget, one statement
+could make a million calls (see below) of a full `pfn_fuel_per_call` each.
 
 The call runs in slices of about a million instructions; between slices the
 query's cancel flag is checked, so `operationTaskCancel` (`/api`) and
-`POST /cancel` (REST) stop a looping function, and the instruction budget is
-enforced. A host function is charged one instruction per 8 bytes of guest
-memory it reads or writes (a string lookup, an argument key, `emit`, …) and
-checks the cancel flag itself, so a loop of host calls on large strings is
-bounded and stopped like any other. `emit_json_str` escapes straight into the
+`POST /cancel` (REST) stop a looping function, and both budgets are
+enforced. A host function checks the cancel flag itself, so a loop of host
+calls on large strings is bounded and stopped like any other. A module's
+functions are translated to the interpreter's code once, when it is
+compiled and loaded — never during a call — so a function's size does not
+count against its budget and a large function (up to
+`pfn_max_module_bytes`) runs like a small one. `emit_json_str` escapes straight into the
 output, checking the bound as it goes. Modules may declare at most 10 000
 functions (wasmi's strict limits); compiling validates in a throw-away
 engine, and the engine modules are loaded into is replaced after 16 MiB of
@@ -508,7 +521,10 @@ usable as is: its bodies are C++). `data.json` is the record: a source or
 module file it does not name is ignored (replaced when a function of the
 name is created), so a write that failed half-way or a crash never blocks a
 name; a compilation removes the previous module only once `data.json`
-names the new one.
+names the new one. A compilation builds the source the `data.json` entry
+generates — the `.wat` file is rewritten from it when it differs, never
+compiled from — so an update interrupted between writing the source file
+and `data.json` cannot make the function run code `funquery` does not show.
 
 The functions belong to users, not to databases: a database backup
 (`backup`, `gbackup`, zipped or not) does not hold them. Back up

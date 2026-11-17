@@ -12,7 +12,17 @@ RDF文件 → RDF解析 → 字典编码(string↔id) → 六重索引存储 →
 SPARQL → SPARQL解析 → BGP查询计划 → 索引匹配+连接 → FILTER → 结果集
 ```
 
-本次Rust重写聚焦这条主干,使其成为一个可独立运行、测试完备的RDF存储引擎。
+Rust重写从这条主干起步,后续阶段补齐了上游的外围(服务器、`/api`协议、事务、推理、PFN、批量构建等,对照见`docs/CPP_PARITY.md`)。本文§2–§7描述**当前**架构,§8是初版时的差异记录(历史)。分层总览:
+
+```text
+bin/(gbuild gquery gserver gconsole …)
+  └─ 服务器:server.rs(单库SPARQL协议) · http_api.rs + gapi/(多库REST + 上游/api) · console/
+       └─ db::Database 门面(构建/打开/保存/查询/更新/事务/备份/推理/PFN)
+            ├─ parser/(RDF读取器、SPARQL查询+更新)
+            ├─ query/(两套执行器:物化的engine.rs、流式的topk.rs;优化器、候选集、VS-tree策略)
+            ├─ reason/、pfn/、analytics/(推理、用户函数、图函数)
+            └─ 存储:dict/ + store/(内存、TripleSource接缝) · kvstore/(磁盘布局) · backend/(RocksDB) · bulk/(批量构建)
+```
 
 ## 2. 核心数据模型(对应`src/Util/GlobalTypedef.h`)
 
@@ -34,14 +44,13 @@ RDF项(对应`src/Util/Triple.h`):
 
 ## 3. 字典层(对应`KVstore`的entity2id/literal2id/predicate2id + id2*)
 
-`src/dict`提供string↔id双向映射,三套独立词典:实体、字面量、谓语。
-- `string→id`:`HashMap<String, u32>`
-- `id→string`:`Vec<String>`(下标即ID)
-- 字面量对外暴露的ID = 内部下标 + `LITERAL_FIRST_ID`。
+`src/dict`提供string↔id双向映射,三套独立的interner:实体、字面量、谓语。字典的键是RDF项的存储形式(`Term::dict_key`:IRI写成`<…>`,空节点`_:label`,字面量`"…"`加`@lang`或`^^<dt>`)。字面量对外暴露的ID = 内部下标 + `LITERAL_FIRST_ID`。
 
-原版用4种B+树(SS/SI/II/IS)把词典也存在磁盘上。本重写在内存里用哈希表+向量,落盘时整体序列化(见§7)。把"磁盘B+树词典"列入重构待办。
-
-> 现状(Phase 6 后):内存字典每个串只存一次(`Arc<str>`,串→id一侧是开放寻址的id表),三个interner是写时复制的`Arc`,克隆O(1);磁盘库的字典在`kvstore.kv`里(`*2id` B+树 + `id2*` IvArray),Stream模式经out-of-core的`DiskDict`与有界缓存访问;对外API返回`TermStr`(内存借用 / 磁盘`Arc<str>`)。删除后无人引用的id会被回收、最低id优先复用。见`docs/STORAGE_BACKEND.md`"字典"与"id回收"。
+- **内存字典**:每个串只存一次(`Arc<str>`),串→id一侧是开放寻址的id表,id→串一侧是向量;三个interner各是写时复制的`Arc<InternerData>`,克隆O(1),第一次改动只复制被改的那个。
+- **磁盘字典**:磁盘布局的字典在`kvstore.kv`里(`*2id` B+树 + `id2*` IvArray,对应上游的SS/SI/II/IS B+树);Stream模式经out-of-core的`DiskDict`与有界缓存访问,不整体载入。RocksDB布局的字典在RocksDB的列族里。
+- 对外API返回`TermStr`(内存时是借用,磁盘时是`Arc<str>`)。
+- **id回收**:删除后无人引用的id先retire,没有更早的`DictPin`存活时才release,最低id优先复用(见`docs/STORAGE_BACKEND.md`"字典"与"id回收")。
+- 所有读取器、SPARQL词法器与项构造函数共用`model::term`的一套项校验规则(语言标签、空节点标签、IRIREF),所以每个存进字典的项都能经严格的N-Triples读取器读回。
 
 ## 4. 存储层(对应`KVstore`的subID2values/objID2values/preID2values)
 
@@ -70,27 +79,57 @@ RDF项(对应`src/Util/Triple.h`):
 
 ## 5. 解析层(对应`src/Parser`)
 
-- **N-Triples**(`src/parser/ntriples.rs`):逐行解析`<iri>`/`"literal"`(可带`^^<datatype>`或`@lang`)/`_:blank`,制表符或空格分隔,可选结尾`.`。还提供`parse_term`(从字典key反解出`Term`,供查询引擎FILTER求值用)。
-- **Turtle**(`src/parser/turtle.rs`):N-Triples是Turtle的子集,故Turtle解析器是**主导入器**。gStore的多个数据集(如`data/lubm/lubm.nt`)实为Turtle——含`@prefix`指令、前缀名(`rdf:type`)。支持`@prefix`/`@base`(及SPARQL风格`PREFIX`/`BASE`)、前缀名、`a`关键字、谓宾列表(`;`)、宾语列表(`,`)、各类字面量。未支持`[ ]`空节点属性列表与`( )`集合(列入重构待办)。
-- **SPARQL**(`src/parser/sparql`):手写词法器+递归下降解析,产出AST。支持:`PREFIX`/`BASE`、`SELECT`(变量列表/`*`/`DISTINCT`)、`WHERE`图模式、**`UNION`与嵌套组**、`FILTER`表达式(比较、`&&`/`||`/`!`、算术、`abs/str/lang/regex/...`等内建)、`ORDER BY`、`LIMIT`/`OFFSET`、`ASK`、`INSERT/DELETE DATA`。仍缺`OPTIONAL`/`MINUS`/聚合/属性路径/子查询(列入重构待办D)。
+**RDF读取器**(`src/parser`):
+
+- N-Triples、N-Quads、Turtle、TriG从任意`BufRead`**流式**读取,内存有界:`stream::CharSource`逐字符解码(只保留读缓冲与少量前瞻),`StatementSink`逐语句接收结果并决定语法错误的含义(严格:失败;宽容:记录到上游的`parse_error.log`、跳过该语句继续,同上游`RDFParser`),单个记号的长度有上限(`rdf_max_token_size`)。Turtle/TriG支持`@prefix`/`@base`与SPARQL风格的`PREFIX`/`BASE`、前缀名、`a`、谓宾列表与宾语列表、`[ … ]`空节点属性列表与`( … )`集合(嵌套深度上限256)、各类字面量。
+- RDF/XML、JSON-LD、RDFa整篇解析。
+- `stream::BlankLabeler`给空节点命名:批量导入时每篇文档一个作用域,两份文件(或两次`gadd`/`batchInsert`)的空节点永不合并;产出的每个标签都是合法的空节点标签,能被导出再读回。
+- `parser::import`是批量导入的入口:按扩展名选格式、目录与URL、宽容/严格模式、命名图;`bulk`在其上做外部排序的批量构建(§7)。
+
+**SPARQL**(`src/parser/sparql`):手写词法器 + 递归下降解析,产出`ast.rs`的AST(对应上游的`QueryTree`)。覆盖SPARQL 1.1查询与更新:
+
+- 查询形式:`SELECT`(含表达式投影、`DISTINCT`/`REDUCED`)、`ASK`、`CONSTRUCT`、`DESCRIBE`;
+- 图模式代数`GraphPattern`:BGP、属性路径、`Join`、`UNION`、`OPTIONAL`(`LeftJoin`)、`MINUS`、`FILTER`(含`EXISTS`/`NOT EXISTS`)、`BIND`、`VALUES`、子查询、`GRAPH`、`SERVICE`;
+- 聚合、`GROUP BY`、`HAVING`、`ORDER BY`、`LIMIT`/`OFFSET`;
+- 更新:`INSERT DATA`/`DELETE DATA`、`DELETE/INSERT … WHERE`(含`WITH`/`USING`)、`LOAD`、`CLEAR`、`DROP`、`CREATE`、`ADD`/`MOVE`/`COPY`;
+- gStore扩展:高级图函数(`shortestPath(…)`、`PR(…)`等,见`analytics::gfun`)与`PFN.name({…})`(见`docs/PFN.md`)。
+
+数据集子句`FROM`/`FROM NAMED`不支持。
 
 ## 6. 查询引擎(对应`src/Query` + `src/Database/Executor|Join|Optimizer`)
 
-- `Value`(`src/query/value.rs`):FILTER求值用的运行时类型(整数/浮点/字符串/IRI/布尔/类型化字面量),含SPARQL比较语义、有效布尔值(EBV)、`ORDER BY`全序。
-- 图模式代数(`GraphPattern`:`Bgp`/`Join`/`Union`/`Filter`):WHERE子句解析成小型代数树。求值(`src/query/engine.rs`):
-  - 单个**BGP**:把每个三元组模式编译成对索引的取数,按"已知位数+选择度"贪心定模式顺序,经统一(unification)逐步扩展绑定——索引下推。
-  - **Join**:把连接树拍平成多个合取项,各自独立求值,再按"连通+结果小"贪心顺序用**哈希连接**(共享变量为键的兼容合并)两两合并。这避免了朴素左深求值在UNION引入新变量时的笛卡尔爆炸(实测使LUBM q9从挂死降到亚毫秒)。这是原版代价优化器的轻量替身(列入重构待办C)。
-  - **Union**:两分支结果拼接。**Filter**:对内层结果按EBV过滤。
-- FILTER在所在组求值时应用;DISTINCT、ORDER BY、LIMIT/OFFSET在投影阶段应用。
-- `ResultSet`:变量名 + 行(每行是绑定的字符串值)。
+求值器`query::engine::Evaluator`对任何实现了`TripleSource`读接缝的后端运行(内存`TripleStore`、Stream模式的`DiskTriples`、RocksDB、事务覆盖层、`cluster::ShardedStore`),所以同一套优化器与执行器服务所有布局。
+
+**两套执行器**(都在`Evaluator`上):
+
+- **物化执行器**(`engine.rs`的`eval_*`):自底向上求出每个图模式的全部解,再做`ORDER BY`、`DISTINCT`、`OFFSET`/`LIMIT`与投影。BGP的流程:常量解析成id(缺一个常量则整个BGP为空)→ 每个变量的精确候选集(`query::candidates`,常量边的索引列表求交,上游`FilterPlan`/`CacheConstantCandidates`的移植)与VS-tree候选(`signature`,按`query::VsPolicy`决定是否查树)→ 代价优化器定计划 → 按计划用索引查找 + unification扩展部分解。
+- **流式执行器**(`topk.rs`的`stream_*`):`LIMIT`且无`ORDER BY`的SELECT/CONSTRUCT、`ASK`、`EXISTS`逐个拉取解,够数即停;`ORDER BY` + `LIMIT`经大小为OFFSET+LIMIT的有界堆(Top-K);线性`ORDER BY`键 + 树形BGP用上游DP-B Top-K的移植。它产出与物化执行器**完全相同**的行与行序(`TopKOptions`可关掉,`tests/dt_topk.rs`在随机数据与查询上核对)。两套执行器各自实现代数算子(合并它们记在`docs/REFACTOR_BACKLOG.md`,review query#17/design#10);OPTIONAL、MINUS与含可能未绑定共享变量的连接,两者都用`src/query/probe.rs`(`engine`的私有子模块)的`RowIndex`哈希索引。
+
+**计划**:
+
+- `query::optimizer`:上游`PlanGenerator`动态规划优化器的移植——左深DP(流水线连接顺序)与bushy DP(`ConsiderBinaryJoin`,两个连通半边的二元哈希连接);System-R式代价模型,基数来自它会扫描的索引,连接基数用谓词统计的去重subject/object数(NDV),并用精确候选集收紧。DP表即计划缓存。
+- `query::planner`:上游NodeScore启发式 + 采样基数估计 + 卫星节点后置,用于大查询。
+- 组内多个合取项按大小定连接顺序,用哈希连接两两合并。
+
+**表达式与结果**:`query::value::Value`是FILTER/BIND/聚合求值的运行时类型(SPARQL比较语义、EBV、`ORDER BY`全序、数值塔);内建函数在`parser/sparql/builtins.rs`与`engine.rs`;用户函数经`FunctionRegistry`注册。`ResultSet`是变量名 + 行,按需序列化为SPARQL JSON/XML/CSV/TSV(`sparql_results`)或N-Triples。
+
+**取消、预算与错误**:每条语句可带取消标志(`/cancel`、`query_timeout`的deadline);图函数的输出与PFN调用的燃料按每查询计预算;后端报告的读错误使这条语句失败(契约C2)。
+
+**推理**(`src/reason`):RDFS物化(库API)、上游的JSON规则`reasonManage`、库自己的文本规则;都只读写默认图。
 
 ## 7. 持久化(对应`KVstore`落盘 + `Database::save/load`)
 
-数据库是一个`<name>.db`目录。本重写把字典与索引整体用`serde`+`bincode`序列化成几个文件(`dict.bin`、`store.bin`、`meta.bin`)。这换来正确、简单、可测的落盘/加载;代价是不像原版那样支持超内存数据集的按需分页。"磁盘原生B+树KVstore + mmap分页"列入重构待办(§见REFACTOR_BACKLOG)。
+数据库是一个`<name>.db`目录,有三种布局(`db::StorageKind`,`Database::open`自动识别):
 
-> 现状(Phase 6 后):有三种布局——快照(上面的bincode文件)、磁盘(`kvstore.kv` + `vstree.kv`,分页B+树,带WAL;Stream模式按需分页读取,默认的Materialize模式载入工作集)、RocksDB(`rocksdb/`)。磁盘与RocksDB布局可由批量构建(外部排序、自底向上)生成。见`docs/STORAGE_BACKEND.md`。
+- **快照**:字典与索引用`serde`+`bincode`整体序列化成一组文件(`dict.bin`、`store.bin`、`named.bin`、`meta.bin`、`vstree.bin`),经提交记录(`SNAPSHOT.commit`)作为一组原子写入;打开时整体载入内存。
+- **磁盘**:`kvstore.kv` + `vstree.kv`——固定大小页、CLOCK页缓存、WAL、B+树上的六重索引与GSPO四元组索引和字典(`src/kvstore`,格式版本与特性位见`kvstore/format.rs`)。默认的Materialize模式把工作集载入内存并写穿到磁盘;Stream模式(`DiskTriples`/`DiskDict`)按需分页读取,内存有界。
+- **RocksDB**(特性`rocksdb`):`rocksdb/`目录,`backend::rocks::RocksStore`。
 
-## 8. 与原版的主要差异(有意为之)
+磁盘与RocksDB布局可由批量构建(`bulk`:外部排序、自底向上写页镜像或SST,崩溃安全地安装)生成。替换整个目录的路径都先在旁边暂存、fsync,再一次交换进位(`db::fsutil::StagedDir`)。详见`docs/STORAGE_BACKEND.md`。
+
+## 8. 初版与原版的差异(历史记录)
+
+> 本节记录主干初版时的取舍,**不是**当前状态:后来的阶段补齐了其中的功能缺口(快照布局仍整体序列化,另有磁盘与RocksDB布局);gRPC线格式、完整MVCC版本链等至今仍是有意的偏离(见`docs/CPP_PARITY.md`)。当前架构见下面的说明与§2–§7。
 
 1. 索引在内存,落盘用整体序列化(非B+树分页)。
 2. 暂不实现VS-tree签名索引(它是查询剪枝优化,不影响正确性)。

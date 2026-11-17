@@ -45,6 +45,7 @@ mod registry;
 #[cfg(feature = "pfn-wasm")]
 mod wasm;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub use graph::{CsrGraphCtx, GraphCtx};
@@ -162,11 +163,18 @@ impl PfnInfo {
 /// compile-time ones, by the registry
 /// ([`PfnRegistry::set_limits`]). The output of one call is bounded by the
 /// graph functions' `gfun_max_output_bytes`.
+///
+/// **Fuel.** A call is charged one unit per WebAssembly instruction, one
+/// per [`HOST_BYTES_PER_FUEL`] guest bytes a host function reads or writes,
+/// and — before it starts — one per [`HOST_BYTES_PER_FUEL`] bytes its
+/// instantiation sets up (the module's initial linear memory and its data
+/// segments; review ext#1), plus one. Both budgets count that fuel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PfnLimits {
-    /// `pfn_fuel_per_call`: the most WebAssembly instructions (wasmi fuel
-    /// units) one function call may execute; `0` = unlimited (the call then
-    /// stops only when cancelled).
+    /// `pfn_fuel_per_call`: the most fuel (WebAssembly instructions, host
+    /// work and instantiation, see the type docs) one function call may
+    /// use; `0` = unlimited (the call then stops only when cancelled or
+    /// when its query's budget runs out).
     pub fuel_per_call: u64,
     /// `pfn_max_memory_pages`: the most 64 KiB pages a function's linear
     /// memory may grow to.
@@ -176,6 +184,14 @@ pub struct PfnLimits {
     pub max_module_bytes: usize,
     /// `pfn_max_functions`: the most functions one user may own.
     pub max_functions: usize,
+    /// `pfn_fuel_per_query`: the most fuel all the PFN calls of one query
+    /// may use together (every argument combination, every `PFN.name(…)`
+    /// of the query, its sub-queries and `GRAPH` blocks); `0` = unlimited.
+    /// Without it a query could run [`call::MAX_COMBINATIONS`] calls of a
+    /// full `fuel_per_call` each (review ext#1). The count belongs to the
+    /// [`PfnCaller`] a query runs with: every query starts from zero (in an
+    /// update, every `DELETE` / `INSERT … WHERE` operation).
+    pub fuel_per_query: u64,
 }
 
 /// Default [`PfnLimits::fuel_per_call`]: one billion instructions.
@@ -186,6 +202,14 @@ pub const DEFAULT_MAX_MEMORY_PAGES: u32 = 1024;
 pub const DEFAULT_MAX_MODULE_BYTES: usize = 1 << 20;
 /// Default [`PfnLimits::max_functions`] per user.
 pub const DEFAULT_MAX_FUNCTIONS: usize = 100;
+/// Default [`PfnLimits::fuel_per_query`]: ten billion, ten calls' worth of
+/// the default per-call budget (a few tens of seconds of interpretation).
+pub const DEFAULT_FUEL_PER_QUERY: u64 = 10 * DEFAULT_FUEL_PER_CALL;
+
+/// Guest bytes a host function may read or write, or an instantiation may
+/// set up, per unit of fuel it is charged (about the cost of an
+/// instruction).
+pub const HOST_BYTES_PER_FUEL: u64 = 8;
 
 impl Default for PfnLimits {
     fn default() -> PfnLimits {
@@ -194,6 +218,7 @@ impl Default for PfnLimits {
             max_memory_pages: DEFAULT_MAX_MEMORY_PAGES,
             max_module_bytes: DEFAULT_MAX_MODULE_BYTES,
             max_functions: DEFAULT_MAX_FUNCTIONS,
+            fuel_per_query: DEFAULT_FUEL_PER_QUERY,
         }
     }
 }
@@ -202,11 +227,21 @@ impl Default for PfnLimits {
 /// query evaluator needs to evaluate `PFN.name({…})`
 /// ([`Evaluator::with_pfn`](crate::query::engine::Evaluator::with_pfn)).
 /// Cheap to clone.
+///
+/// A caller also counts the fuel its calls used, for
+/// [`PfnLimits::fuel_per_query`]: clones share the count (the evaluators
+/// of one query — sub-queries, `GRAPH` blocks — hold clones), while
+/// [`new`](Self::new), [`with_limits`](Self::with_limits),
+/// [`as_user`](Self::as_user) and [`for_query`](Self::for_query) start a
+/// new one. Every database query path installs its caller through
+/// `with_limits` (or `for_query`), so each query has its own budget.
 #[derive(Debug, Clone)]
 pub struct PfnCaller {
     registry: Arc<PfnRegistry>,
     user: String,
     limits: PfnLimits,
+    /// The fuel the calls of this caller's query used so far.
+    spent: Arc<AtomicU64>,
 }
 
 impl PfnCaller {
@@ -217,23 +252,47 @@ impl PfnCaller {
             registry,
             user: user.into(),
             limits,
+            spent: Arc::default(),
         }
     }
 
     /// The same caller under `limits` (a database's
-    /// [`QuerySettings::pfn`](crate::db::QuerySettings::pfn)).
-    pub fn with_limits(mut self, limits: PfnLimits) -> PfnCaller {
-        self.limits = limits;
-        self
+    /// [`QuerySettings::pfn`](crate::db::QuerySettings::pfn)), for a new
+    /// query: its [per-query fuel](PfnLimits::fuel_per_query) count starts
+    /// from zero.
+    pub fn with_limits(self, limits: PfnLimits) -> PfnCaller {
+        PfnCaller {
+            limits,
+            spent: Arc::default(),
+            ..self
+        }
     }
 
-    /// The same registry and limits, called as `user`.
+    /// The same caller for a new query: same registry, user and limits, the
+    /// [per-query fuel](PfnLimits::fuel_per_query) count from zero.
+    pub fn for_query(&self) -> PfnCaller {
+        PfnCaller {
+            registry: Arc::clone(&self.registry),
+            user: self.user.clone(),
+            limits: self.limits,
+            spent: Arc::default(),
+        }
+    }
+
+    /// The same registry and limits, called as `user` (a new query).
     pub fn as_user(&self, user: impl Into<String>) -> PfnCaller {
         PfnCaller {
             registry: Arc::clone(&self.registry),
             user: user.into(),
             limits: self.limits,
+            spent: Arc::default(),
         }
+    }
+
+    /// The fuel the calls of this caller's query used so far (see
+    /// [`PfnLimits::fuel_per_query`]).
+    pub fn fuel_spent(&self) -> u64 {
+        self.spent.load(Ordering::Relaxed)
     }
 
     /// The calling user.
@@ -291,6 +350,7 @@ impl PfnCaller {
                 limits: self.limits,
                 cancel,
                 max_output,
+                spent: Some(&self.spent),
             },
         )
     }
@@ -303,6 +363,11 @@ pub struct CallOptions<'a> {
     pub cancel: Option<&'a std::sync::atomic::AtomicBool>,
     /// The most bytes the function may emit.
     pub max_output: usize,
+    /// The fuel the earlier calls of the query used, which this call adds
+    /// its own to; the call stops when the total passes
+    /// [`PfnLimits::fuel_per_query`]. `None`: the call is a query of its
+    /// own (only its own fuel counts against that budget).
+    pub spent: Option<&'a AtomicU64>,
 }
 
 /// Whether `name` is a valid function name: what the SPARQL lexer reads as

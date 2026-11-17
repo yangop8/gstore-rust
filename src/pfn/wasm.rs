@@ -7,14 +7,26 @@
 //!   exported `memory` and the function exported under its name with type
 //!   `() -> i32`. Start functions are refused. Sizes are bounded by
 //!   [`PfnLimits::max_module_bytes`].
+//! * **Translation** is eager ([`CompilationMode::Eager`]): a module's
+//!   functions are translated to wasmi's bytecode when it is compiled and
+//!   loaded, never at a call. wasmi's default, lazy translation, charges a
+//!   function's translation (7 fuel units per byte) at its first call and
+//!   reports a shortfall of the current fuel slice as an error rather than
+//!   as resumable: every call of a function larger than about 150 KB failed,
+//!   and a smaller one failed or not depending on how much of the slice
+//!   the call had used before it first reached it (review ext#2).
 //! * **Run** ([`Runtime::run`]): a fresh store and instance per call (no
 //!   state survives a call), memory capped at
 //!   [`PfnLimits::max_memory_pages`] (a `memory.grow` past it returns `-1`,
 //!   as WebAssembly specifies), at most one table of
 //!   [`MAX_TABLE_ELEMENTS`], and wasmi *fuel* metering: the call runs in
 //!   slices of [`FUEL_SLICE`] instructions; between slices the query's
-//!   cancel flag is checked and the [`PfnLimits::fuel_per_call`] budget
-//!   enforced. A host function is charged fuel for the guest bytes it reads
+//!   cancel flag is checked and the [`PfnLimits::fuel_per_call`] and
+//!   [`PfnLimits::fuel_per_query`] budgets enforced. The instantiation is
+//!   charged before it happens, one unit per [`HOST_BYTES_PER_FUEL`] bytes
+//!   of initial linear memory and data segments (review ext#1: a module
+//!   declaring 64 MiB of memory cost 35 ms per call and no fuel). A host
+//!   function is charged fuel for the guest bytes it reads
 //!   or writes (one unit per [`HOST_BYTES_PER_FUEL`]) and checks the cancel
 //!   flag itself, so a call into the host costs what its work costs. Traps
 //!   (`unreachable`, an out-of-bounds access, a stack overflow, a host
@@ -32,12 +44,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use wasmi::{
-    Caller, Config, EnforcedLimits, Engine, Error as WasmError, Extern, ExternType, Linker, Memory,
-    Module, Store, StoreLimits, StoreLimitsBuilder, TypedResumableCall, ValType as WasmVal,
+    Caller, CompilationMode, Config, EnforcedLimits, Engine, Error as WasmError, Extern,
+    ExternType, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder, TypedResumableCall,
+    ValType as WasmVal,
 };
 
 use super::abi::{self, ValType};
 use super::graph::GraphCtx;
+use super::HOST_BYTES_PER_FUEL;
 use super::{CallOptions, PfnLimits};
 use crate::error::{GStoreError, Result};
 use crate::json::Json;
@@ -49,16 +63,63 @@ pub const FUEL_SLICE: u64 = 1 << 20;
 /// The most table elements a module may have.
 pub const MAX_TABLE_ELEMENTS: usize = 10_000;
 
-/// Guest bytes a host function may read or write per unit of fuel it is
-/// charged (about the cost of an instruction).
-pub const HOST_BYTES_PER_FUEL: u64 = 8;
-
 /// The bytes of modules loaded into one engine before loads move to a fresh
 /// one (see the module docs).
 pub const ENGINE_RECYCLE_BYTES: usize = 16 << 20;
 
-/// A compiled, validated module.
-pub(crate) type LoadedModule = Module;
+/// A compiled, validated module, with the fuel an instantiation of it is
+/// charged ([`instantiation_fuel`]).
+#[derive(Clone)]
+pub(crate) struct LoadedModule {
+    module: Module,
+    instantiate_fuel: u64,
+}
+
+/// The fuel instantiating `module` (whose binary is `bytes`) is charged:
+/// one unit per [`HOST_BYTES_PER_FUEL`] bytes of the initial linear memory
+/// (allocated and zeroed) and of the data section (copied into it), plus
+/// one.
+fn instantiation_fuel(module: &Module, bytes: &[u8]) -> u64 {
+    let memory = match module.get_export("memory") {
+        Some(ExternType::Memory(m)) => m.minimum().saturating_mul(65_536),
+        _ => 0,
+    };
+    1 + memory.saturating_add(data_section_bytes(bytes)) / HOST_BYTES_PER_FUEL
+}
+
+/// The size of the data section(s) of the WebAssembly binary `bytes` (a
+/// module wasmi validated): the section headers are walked, nothing else is
+/// decoded.
+fn data_section_bytes(bytes: &[u8]) -> u64 {
+    /// A LEB128 `u32` at `bytes[*at..]`, advancing `at`.
+    fn leb_u32(bytes: &[u8], at: &mut usize) -> Option<u32> {
+        let mut v: u32 = 0;
+        for shift in (0..35).step_by(7) {
+            let b = *bytes.get(*at)?;
+            *at += 1;
+            v |= u32::from(b & 0x7f).checked_shl(shift)?;
+            if b & 0x80 == 0 {
+                return Some(v);
+            }
+        }
+        None
+    }
+    const DATA_SECTION: u8 = 11;
+    let mut at = 8; // magic + version
+    let mut total: u64 = 0;
+    while at < bytes.len() {
+        let id = bytes[at];
+        at += 1;
+        let Some(size) = leb_u32(bytes, &mut at) else {
+            break;
+        };
+        if id == DATA_SECTION {
+            total = total.saturating_add(u64::from(size));
+        }
+        at = at.saturating_add(size as usize);
+    }
+    total
+}
 
 /// The PFN WebAssembly runtime (one per registry; see the module docs).
 pub(crate) struct Runtime {
@@ -84,6 +145,9 @@ impl Runtime {
         config
             .consume_fuel(true)
             .allow_start_fn(false)
+            // Translated once, when loaded: never charged to a call (see
+            // the module docs, review ext#2).
+            .compilation_mode(CompilationMode::Eager)
             .enforced_limits(EnforcedLimits::strict());
         let engine = Engine::new(&config);
         Runtime {
@@ -135,7 +199,7 @@ impl Runtime {
         &self,
         name: &str,
         bytes: &[u8],
-    ) -> std::result::Result<(Module, bool), String> {
+    ) -> std::result::Result<(LoadedModule, bool), String> {
         let mut slot = self
             .current
             .lock()
@@ -150,22 +214,100 @@ impl Runtime {
         }
         // A module that fails validation registers in the engine too.
         slot.loaded = slot.loaded.saturating_add(bytes.len());
-        Ok((validate(&slot.engine, name, bytes)?, fresh))
+        let module = validate(&slot.engine, name, bytes)?;
+        let instantiate_fuel = instantiation_fuel(&module, bytes);
+        Ok((
+            LoadedModule {
+                module,
+                instantiate_fuel,
+            },
+            fresh,
+        ))
     }
 
     /// Call function `name` of `module` once with argument text `params`.
+    /// The fuel the call used (also when it fails) is added to
+    /// `opts.spent`, the count of its query.
     pub(crate) fn run(
         &self,
-        module: &Module,
+        module: &LoadedModule,
         name: &str,
         params: &str,
         graph: &dyn GraphCtx,
         opts: &CallOptions<'_>,
     ) -> Result<String> {
+        let before = opts.spent.map_or(0, |s| s.load(Ordering::Relaxed));
+        let mut used = 0;
+        let out = self.run_metered(module, name, params, graph, opts, before, &mut used);
+        if let Some(spent) = opts.spent {
+            let mut now = spent.load(Ordering::Relaxed);
+            while let Err(seen) = spent.compare_exchange_weak(
+                now,
+                now.saturating_add(used),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                now = seen;
+            }
+        }
+        out
+    }
+
+    /// [`run`](Self::run), with `before` the fuel the query used before this
+    /// call; `used` is kept up to date with the fuel this call used.
+    #[allow(clippy::too_many_arguments)]
+    fn run_metered(
+        &self,
+        module: &LoadedModule,
+        name: &str,
+        params: &str,
+        graph: &dyn GraphCtx,
+        opts: &CallOptions<'_>,
+        before: u64,
+        used: &mut u64,
+    ) -> Result<String> {
         let fail = |m: String| GStoreError::Query(format!("run {name} fail: {m}"));
         let args = crate::json::parse(params).map_err(|e| fail(format!("bad arguments: {e}")))?;
         let max_memory =
             usize::try_from(u64::from(opts.limits.max_memory_pages) * 65_536).unwrap_or(usize::MAX);
+        let call_budget = opts.limits.fuel_per_call;
+        let query_budget = opts.limits.fuel_per_query;
+        // What is left of each budget once the call used `used` fuel.
+        let call_left = |used: u64| {
+            if call_budget == 0 {
+                u64::MAX
+            } else {
+                call_budget.saturating_sub(used)
+            }
+        };
+        let query_left = |used: u64| {
+            if query_budget == 0 {
+                u64::MAX
+            } else {
+                query_budget.saturating_sub(before.saturating_add(used))
+            }
+        };
+        let room = |used: u64| call_left(used).min(query_left(used));
+        // The budget that `need` more fuel after `used` would pass.
+        let exhausted = |used: u64, need: u64| {
+            if need > call_left(used) {
+                fail(format!(
+                    "the instruction budget of {call_budget} (pfn_fuel_per_call) is exhausted"
+                ))
+            } else {
+                fail(format!(
+                    "the instruction budget of {query_budget} for the PFN calls of one query \
+                     (pfn_fuel_per_query) is exhausted"
+                ))
+            }
+        };
+        // The instantiation is charged first, and refused when it does not
+        // fit (nothing is allocated then).
+        let setup = module.instantiate_fuel;
+        if setup > room(0) {
+            return Err(exhausted(0, setup));
+        }
+        *used = setup;
         let host = Host {
             graph,
             args_text: params,
@@ -185,45 +327,40 @@ impl Runtime {
         };
         // The store and linker belong to the module's engine (an older one
         // when the shared engine was replaced since the module was loaded).
-        let engine = module.engine();
+        let engine = module.module.engine();
         let mut store = Store::new(engine, host);
         store.limiter(|h| &mut h.limits);
         let linker = linker(engine).map_err(|e| fail(e.to_string()))?;
-        let budget = opts.limits.fuel_per_call;
-        let remaining = |used: u64| {
-            if budget == 0 {
-                u64::MAX
-            } else {
-                budget.saturating_sub(used)
-            }
-        };
-        let exhausted = || {
-            fail(format!(
-                "the instruction budget of {budget} (pfn_fuel_per_call) is exhausted"
-            ))
-        };
-        let mut used: u64 = 0;
-        let mut granted = FUEL_SLICE.min(remaining(0));
+        let mut granted = FUEL_SLICE.min(room(*used));
         store.set_fuel(granted).map_err(|e| fail(e.to_string()))?;
+        // The fuel used so far: before the current slice, the part of the
+        // slice used, and what host functions were charged past it.
+        let total = |store: &Store<Host<'_>>, used: u64, granted: u64| {
+            let left = store.get_fuel().unwrap_or(0);
+            used.saturating_add(granted.saturating_sub(left))
+                .saturating_add(store.data().debt)
+        };
         let instance = linker
-            .instantiate_and_start(&mut store, module)
+            .instantiate_and_start(&mut store, &module.module)
             .map_err(|e| fail(e.to_string()))?;
         let func = instance
             .get_typed_func::<(), i32>(&store, name)
             .map_err(|e| fail(e.to_string()))?;
-        let mut call = func
-            .call_resumable(&mut store, ())
-            .map_err(|e| fail(e.to_string()))?;
+        let started = func.call_resumable(&mut store, ());
+        let mut call = match started {
+            Ok(c) => c,
+            Err(e) => {
+                *used = total(&store, *used, granted);
+                return Err(fail(e.to_string()));
+            }
+        };
         loop {
             match call {
                 TypedResumableCall::Finished(ret) => {
                     // Host work charged past the last slice counts too.
-                    let left = store.get_fuel().unwrap_or(0);
-                    let total = used
-                        .saturating_add(granted.saturating_sub(left))
-                        .saturating_add(store.data().debt);
-                    if budget != 0 && total > budget {
-                        return Err(exhausted());
+                    *used = total(&store, *used, granted);
+                    if *used > call_left(0) || *used > query_left(0) {
+                        return Err(exhausted(0, *used));
                     }
                     let host = store.into_data();
                     let out = String::from_utf8(host.out)
@@ -239,27 +376,28 @@ impl Runtime {
                     return Ok(out);
                 }
                 TypedResumableCall::OutOfFuel(invocation) => {
-                    let left = store.get_fuel().unwrap_or(0);
-                    // What host functions were charged past the slice too.
-                    let debt = std::mem::take(&mut store.data_mut().debt);
-                    used = used
-                        .saturating_add(granted.saturating_sub(left))
-                        .saturating_add(debt);
+                    *used = total(&store, *used, granted);
+                    store.data_mut().debt = 0;
                     if opts.cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
                         return Err(GStoreError::Cancelled);
                     }
-                    let room = remaining(used);
-                    let need = invocation.required_fuel();
-                    if room == 0 || need > room {
-                        return Err(exhausted());
+                    let room = room(*used);
+                    let need = invocation.required_fuel().max(1);
+                    if need > room {
+                        return Err(exhausted(*used, need));
                     }
                     granted = FUEL_SLICE.max(need).min(room);
                     store.set_fuel(granted).map_err(|e| fail(e.to_string()))?;
-                    call = invocation
-                        .resume(&mut store)
-                        .map_err(|e| fail(e.to_string()))?;
+                    call = match invocation.resume(&mut store) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            *used = total(&store, *used, granted);
+                            return Err(fail(e.to_string()));
+                        }
+                    };
                 }
                 TypedResumableCall::HostTrap(trap) => {
+                    *used = total(&store, *used, granted);
                     if store.data().cancelled {
                         return Err(GStoreError::Cancelled);
                     }
@@ -782,7 +920,7 @@ mod tests {
     use crate::pfn::{generate_source, CsrGraphCtx, PfnInfo};
     use crate::Database;
 
-    fn module_for(rt: &Runtime, name: &str, body: &str, subs: &str) -> Module {
+    fn module_for(rt: &Runtime, name: &str, body: &str, subs: &str) -> LoadedModule {
         let src = generate_source(&PfnInfo {
             name: name.into(),
             body: crate::pfn::url_encode(body),
@@ -798,6 +936,7 @@ mod tests {
             limits,
             cancel: None,
             max_output: 1 << 20,
+            spent: None,
         }
     }
 
@@ -900,5 +1039,39 @@ mod tests {
             .compile("f", no_fn, &tiny)
             .unwrap_err()
             .contains("pfn_max_module_bytes"));
+    }
+
+    /// Review ext#1: what an instantiation is charged — one unit per
+    /// [`HOST_BYTES_PER_FUEL`] bytes of the initial memory and of the data
+    /// section, plus one — counts both parts.
+    #[test]
+    fn instantiation_is_charged_for_its_memory_and_data_section() {
+        let rt = Runtime::new();
+        let charged = |pages: u32, data: usize| {
+            let wat = format!(
+                "(module (memory (export \"memory\") {pages}) (data (i32.const 0) \"{}\") \
+                 (func (export \"f\") (result i32) (i32.const 1)))",
+                "a".repeat(data)
+            );
+            let bytes = rt.compile("f", &wat, &PfnLimits::default()).unwrap();
+            let m = rt.load("f", &bytes).unwrap().0;
+            let section = data_section_bytes(&bytes);
+            // The segment's bytes plus a few of framing (count, mode, offset
+            // expression, length).
+            assert!(
+                (data as u64..=data as u64 + 16).contains(&section),
+                "{data} -> {section}"
+            );
+            m.instantiate_fuel
+        };
+        let empty = charged(0, 0);
+        assert!((1..=3).contains(&empty), "{empty}");
+        // A page is 64 KiB: 8 Ki units.
+        assert_eq!(charged(1, 0) - empty, 8192);
+        assert_eq!(charged(16, 0) - empty, 16 * 8192);
+        // 80 000 bytes of data: 10 000 units (and the length's two more
+        // LEB128 bytes).
+        let data = charged(2, 80_000) - charged(2, 0);
+        assert!((10_000..=10_001).contains(&data), "{data}");
     }
 }

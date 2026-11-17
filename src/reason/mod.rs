@@ -37,7 +37,31 @@
 //! Note the id-space subtlety: a property used as the *subject* of a schema
 //! triple (`p rdfs:subPropertyOf q`) is interned as an **entity**, while the same
 //! property in data (`x p y`) is a **predicate** — two different id spaces sharing
-//! the dictionary key. `ent_to_pred` bridges them through the dictionary.
+//! the dictionary key. `ent_to_pred` bridges them through the dictionary. Only
+//! an IRI is ever a property: a literal or blank node in a `subPropertyOf`,
+//! `domain` or `range` subject or object position (legal RDF, e.g. OWL's
+//! `:p rdfs:subPropertyOf [ owl:inverseOf :q ]`) never becomes a predicate,
+//! though `subPropertyOf` stays transitive through it.
+//!
+//! RDFS materialization is a library API
+//! ([`Database::materialize_rdfs`](crate::Database::materialize_rdfs)); no
+//! server operation or command-line tool runs it.
+//!
+//! # Textual rules
+//!
+//! [`RuleSet`] is the crate's own forward-chaining rule format (below),
+//! reached through [`Database::add_rule`](crate::Database::add_rule) …
+//! [`run_rules`](crate::Database::run_rules). It is a library API: rules are
+//! **not persisted** (they live as long as the `Database` value; save, backup
+//! and open do not carry them), and no server operation uses them — the
+//! server's rules are `reasonManage`'s.
+//!
+//! # Graphs
+//!
+//! Every reasoner here — RDFS materialization, textual rules and
+//! `reasonManage`'s rules — reads and writes the **default graph** only: a
+//! named graph's schema or data is never consulted, and nothing is inferred
+//! into a named graph (review ext#15).
 
 pub mod compile;
 pub mod manage;
@@ -47,7 +71,7 @@ pub mod store;
 pub use compile::CompiledRule;
 pub use manage::{ReasonError, ReasonErrorKind};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::dict::{Dictionary, TermStr};
 use crate::error::{GStoreError, Result};
@@ -104,7 +128,11 @@ where
     // A subproperty target may only ever appear as a schema object (e.g.
     // `:mother rdfs:subPropertyOf :parent` with no `:parent` data triple), so it
     // has no predicate id yet. Intern a predicate id for every property named in
-    // a subPropertyOf statement so [`ent_to_pred`] can resolve the target.
+    // a subPropertyOf statement so [`ent_to_pred`] can resolve the target —
+    // only IRIs: a literal or blank node there (`:p rdfs:subPropertyOf "x"`,
+    // OWL's `:p rdfs:subPropertyOf [ owl:inverseOf :q ]`) is legal data but
+    // no predicate, and became one (`<a> "x" <b>`, which no reader loads
+    // back; review ext#3).
     if let Some(spo) = spo_p {
         let prop_ents: Vec<u32> = store
             .so_by_p(spo)
@@ -114,6 +142,7 @@ where
         let keys: Vec<String> = prop_ents
             .iter()
             .filter_map(|&e| dict.term(e).map(TermStr::into_string))
+            .filter(|k| is_iri_key(k))
             .collect();
         for k in keys {
             // Best effort: a property that cannot get a predicate id (id space
@@ -242,10 +271,21 @@ fn gather<S: TripleSource>(
 
 /// Map an entity id (a property used as a schema subject/object) to its
 /// predicate id, via the shared dictionary key. `None` if that IRI is never used
-/// as a predicate in the data.
+/// as a predicate in the data, or the term is not an IRI (a literal or blank
+/// node is never a predicate, even where an older version interned one as
+/// such; review ext#3).
 fn ent_to_pred(dict: &Dictionary, ent: u32) -> Option<PredId> {
     let key = dict.term(ent)?;
+    if !is_iri_key(&key) {
+        return None;
+    }
     dict.predicate_id(&key)
+}
+
+/// Whether dictionary key `key` names an IRI (`<…>`), the only term that
+/// may be a predicate.
+fn is_iri_key(key: &str) -> bool {
+    key.starts_with('<') && key.ends_with('>')
 }
 
 // ===========================================================================
@@ -283,17 +323,6 @@ pub enum PatternTerm {
     Var(String),
     /// A fixed RDF term.
     Const(Term),
-}
-
-impl PatternTerm {
-    /// The required surface string this position imposes under a binding:
-    /// `Some(s)` ⇒ must equal `s`; `None` ⇒ a free (unbound) variable.
-    fn required<'a>(&'a self, binding: &'a HashMap<String, String>) -> Option<String> {
-        match self {
-            PatternTerm::Const(t) => Some(t.dict_key()),
-            PatternTerm::Var(name) => binding.get(name).cloned(),
-        }
-    }
 }
 
 /// A triple pattern: subject/predicate/object, each a variable or a constant.
@@ -358,108 +387,208 @@ impl Rule {
     }
 
     /// Evaluate the body against the current store and instantiate the head once
-    /// per satisfying binding, returning the concrete head triples (deduplicated
-    /// by the store on insert). Pure read — interning/insertion is the caller's.
-    fn derive<S: TripleSource>(&self, dict: &Dictionary, store: &S) -> Vec<Triple> {
-        // Conjunctive nested-loop join: start with the empty binding and extend
-        // it pattern by pattern.
-        let mut bindings: Vec<HashMap<String, String>> = vec![HashMap::new()];
+    /// per satisfying binding, returning the concrete head triples (each
+    /// once). Pure read — interning/insertion is the caller's. `work` counts
+    /// the stored pairs read and the bindings built (the join's cost).
+    ///
+    /// The body is a left-deep **hash join** over dictionary ids, pattern by
+    /// pattern: the pattern's pairs (`so_by_p`, its constants applied) are
+    /// indexed by the positions an earlier pattern bound, and every binding
+    /// probes that index — linear in the pairs plus the bindings, where the
+    /// nested loop it replaced compared every binding with every pair and
+    /// looked both terms of each pair up (review ext#7: a two-hop rule over
+    /// a 2000-edge chain took 150 ms, four times as long per doubling).
+    fn derive<S: TripleSource>(&self, dict: &Dictionary, store: &S, work: &mut u64) -> Vec<Triple> {
+        /// Where a pattern position's value comes from.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Pos {
+            /// A constant (its pairs are already filtered).
+            Fixed,
+            /// A variable an earlier pattern bound: binding column `i`.
+            Bound(usize),
+            /// A variable first bound here: a new binding column.
+            Free,
+        }
+        // The variables in the order they are bound; a binding is one row of
+        // their values, every row binding the same ones.
+        let mut vars: Vec<&str> = Vec::new();
+        let mut rows: Vec<Vec<u32>> = vec![Vec::new()];
         for pat in &self.body {
-            // The predicate must be a constant IRI resolvable to a predicate id;
-            // an unknown predicate matches nothing.
+            // The predicate is a constant IRI (`Rule::parse`); an unknown one,
+            // like an unknown constant term, matches nothing.
             let PatternTerm::Const(pred_term) = &pat.predicate else {
                 return Vec::new();
             };
             let Some(pred_id) = dict.predicate_id(&pred_term.dict_key()) else {
                 return Vec::new();
             };
-            let pairs = store.so_by_p(pred_id);
-            let mut next: Vec<HashMap<String, String>> = Vec::new();
-            for b in &bindings {
-                let req_s = pat.subject.required(b);
-                let req_o = pat.object.required(b);
-                for &(s_id, o_id) in &pairs {
-                    let (Some(s_str), Some(o_str)) = (dict.term(s_id), dict.term(o_id)) else {
-                        continue;
-                    };
-                    let (s_str, o_str) = (s_str.as_str(), o_str.as_str());
-                    if req_s.as_deref().is_some_and(|r| r != s_str) {
-                        continue;
+            let constant = |pt: &PatternTerm| -> Option<Option<u32>> {
+                match pt {
+                    PatternTerm::Const(t) => dict.term_id(t).map(Some),
+                    PatternTerm::Var(_) => Some(None),
+                }
+            };
+            let (Some(s_const), Some(o_const)) = (constant(&pat.subject), constant(&pat.object))
+            else {
+                return Vec::new();
+            };
+            let position = |pt: &PatternTerm, vars: &[&str]| match pt {
+                PatternTerm::Const(_) => Pos::Fixed,
+                PatternTerm::Var(name) => match vars.iter().position(|v| *v == name.as_str()) {
+                    Some(i) => Pos::Bound(i),
+                    None => Pos::Free,
+                },
+            };
+            let s_pos = position(&pat.subject, &vars);
+            let o_pos = position(&pat.object, &vars);
+            // `?x <p> ?x` with `?x` new: subject and object must be equal.
+            let same_free = s_pos == Pos::Free && o_pos == Pos::Free && pat.subject == pat.object;
+            let all = store.so_by_p(pred_id);
+            *work += all.len() as u64;
+            let pairs: Vec<(u32, u32)> = all
+                .iter()
+                .copied()
+                .filter(|&(s, o)| {
+                    s_const.is_none_or(|c| c == s)
+                        && o_const.is_none_or(|c| c == o)
+                        && (!same_free || s == o)
+                })
+                .collect();
+            let mut next: Vec<Vec<u32>> = Vec::new();
+            let extend = |row: &[u32], add: &[u32], next: &mut Vec<Vec<u32>>| {
+                let mut r = Vec::with_capacity(row.len() + add.len());
+                r.extend_from_slice(row);
+                r.extend_from_slice(add);
+                next.push(r);
+            };
+            match (s_pos, o_pos) {
+                (Pos::Bound(i), Pos::Bound(j)) => {
+                    let set: HashSet<(u32, u32)> = pairs.into_iter().collect();
+                    next = rows
+                        .into_iter()
+                        .filter(|r| set.contains(&(r[i], r[j])))
+                        .collect();
+                }
+                (Pos::Bound(i), Pos::Fixed) => {
+                    let set: HashSet<u32> = pairs.into_iter().map(|(s, _)| s).collect();
+                    next = rows.into_iter().filter(|r| set.contains(&r[i])).collect();
+                }
+                (Pos::Fixed, Pos::Bound(j)) => {
+                    let set: HashSet<u32> = pairs.into_iter().map(|(_, o)| o).collect();
+                    next = rows.into_iter().filter(|r| set.contains(&r[j])).collect();
+                }
+                (Pos::Bound(i), Pos::Free) | (Pos::Free, Pos::Bound(i)) => {
+                    let subject_bound = matches!(s_pos, Pos::Bound(_));
+                    let mut index: HashMap<u32, Vec<u32>> = HashMap::new();
+                    for (s, o) in pairs {
+                        let (key, value) = if subject_bound { (s, o) } else { (o, s) };
+                        index.entry(key).or_default().push(value);
                     }
-                    if req_o.as_deref().is_some_and(|r| r != o_str) {
-                        continue;
-                    }
-                    let mut nb = b.clone();
-                    let mut ok = true;
-                    if let PatternTerm::Var(name) = &pat.subject {
-                        bind_var(&mut nb, name, s_str, &mut ok);
-                    }
-                    if ok {
-                        if let PatternTerm::Var(name) = &pat.object {
-                            bind_var(&mut nb, name, o_str, &mut ok);
+                    for r in &rows {
+                        for &v in index.get(&r[i]).map_or(&[][..], Vec::as_slice) {
+                            extend(r, &[v], &mut next);
                         }
                     }
-                    if ok {
-                        next.push(nb);
+                }
+                (Pos::Fixed, Pos::Fixed) => {
+                    if !pairs.is_empty() {
+                        next = rows;
+                    }
+                }
+                (Pos::Fixed, Pos::Free) | (Pos::Free, Pos::Fixed) => {
+                    let subject_free = s_pos == Pos::Free;
+                    for r in &rows {
+                        for &(s, o) in &pairs {
+                            extend(r, &[if subject_free { s } else { o }], &mut next);
+                        }
+                    }
+                }
+                (Pos::Free, Pos::Free) => {
+                    for r in &rows {
+                        for &(s, o) in &pairs {
+                            if same_free {
+                                extend(r, &[s], &mut next);
+                            } else {
+                                extend(r, &[s, o], &mut next);
+                            }
+                        }
                     }
                 }
             }
-            bindings = next;
-            if bindings.is_empty() {
-                break;
+            // The columns this pattern added, in the order `extend` wrote them.
+            for (pt, pos) in [(&pat.subject, s_pos), (&pat.object, o_pos)] {
+                if let (PatternTerm::Var(name), Pos::Free) = (pt, pos) {
+                    if !vars.contains(&name.as_str()) {
+                        vars.push(name.as_str());
+                    }
+                }
+            }
+            *work += next.len() as u64;
+            rows = next;
+            if rows.is_empty() {
+                return Vec::new();
             }
         }
 
-        let mut out = Vec::new();
-        for b in &bindings {
-            if let Some(t) = instantiate(&self.head, b) {
-                out.push(t);
+        // The head, once per distinct (subject, object) binding.
+        let column = |pt: &PatternTerm| match pt {
+            PatternTerm::Var(name) => vars.iter().position(|v| *v == name.as_str()).map(Some),
+            PatternTerm::Const(_) => Some(None),
+        };
+        let (Some(s_col), Some(o_col)) = (column(&self.head.subject), column(&self.head.object))
+        else {
+            // A head variable the body never binds.
+            return Vec::new();
+        };
+        let term = |pt: &PatternTerm, col: Option<usize>, row: &[u32]| -> Option<Term> {
+            match (pt, col) {
+                (PatternTerm::Const(t), _) => Some(t.clone()),
+                (PatternTerm::Var(_), Some(c)) => Term::from_dict_key(&dict.term(row[c])?),
+                (PatternTerm::Var(_), None) => None,
             }
+        };
+        let mut seen: HashSet<(Option<u32>, Option<u32>)> = HashSet::new();
+        let mut out = Vec::new();
+        for row in &rows {
+            if !seen.insert((s_col.map(|c| row[c]), o_col.map(|c| row[c]))) {
+                continue;
+            }
+            let (Some(subject), Some(object)) = (
+                term(&self.head.subject, s_col, row),
+                term(&self.head.object, o_col, row),
+            ) else {
+                continue;
+            };
+            let PatternTerm::Const(predicate) = &self.head.predicate else {
+                continue;
+            };
+            // A subject cannot be a literal; a predicate must be an IRI.
+            if subject.is_literal() || !matches!(predicate, Term::Iri(_)) {
+                continue;
+            }
+            out.push(Triple::new(subject, predicate.clone(), object));
         }
         out
     }
 }
 
-/// Bind variable `name` to `value` in `binding`, requiring consistency if it is
-/// already bound (so a variable repeated within or across patterns must take the
-/// same value). Clears `ok` on a contradiction.
-fn bind_var(binding: &mut HashMap<String, String>, name: &str, value: &str, ok: &mut bool) {
-    match binding.get(name) {
-        Some(existing) if existing != value => *ok = false,
-        Some(_) => {}
-        None => {
-            binding.insert(name.to_owned(), value.to_owned());
-        }
-    }
-}
-
-/// Instantiate a pattern into a concrete triple under a binding, or `None` if a
-/// variable is unbound or the resulting subject/predicate is not a valid term
-/// (a literal subject, or a non-IRI predicate).
-fn instantiate(pat: &TriplePattern, binding: &HashMap<String, String>) -> Option<Triple> {
-    let subject = resolve_term(&pat.subject, binding)?;
-    let predicate = resolve_term(&pat.predicate, binding)?;
-    let object = resolve_term(&pat.object, binding)?;
-    // A subject cannot be a literal; a predicate must be an IRI.
-    if subject.is_literal() || !matches!(predicate, Term::Iri(_)) {
-        return None;
-    }
-    Some(Triple::new(subject, predicate, object))
-}
-
-/// Resolve a pattern position to a concrete term under a binding.
-fn resolve_term(pt: &PatternTerm, binding: &HashMap<String, String>) -> Option<Term> {
-    match pt {
-        PatternTerm::Const(t) => Some(t.clone()),
-        PatternTerm::Var(name) => parse_term(binding.get(name)?),
-    }
-}
-
-/// A named collection of forward-chaining rules (gStore's `reason_rule_files/`).
-/// Rules keep insertion order; names are unique.
+/// A named collection of forward-chaining rules in the textual format above
+/// (the library's own rules, [`Database::add_rule`](crate::Database::add_rule)
+/// … [`run_rules`](crate::Database::run_rules)). Rules keep insertion order;
+/// names are unique.
+///
+/// **Not persisted.** A rule set lives as long as the
+/// [`Database`](crate::Database) value: saving, backing up or reopening a
+/// database does not carry it (the triples it inferred are ordinary data
+/// and are kept). Nothing outside the library uses it: the server's
+/// `reasonManage`, which keeps its rules in `reason_rule_files/`, is the
+/// upstream JSON rule system ([`manage`]). Like every reasoner here it reads
+/// and writes the default graph only.
 #[derive(Debug, Default, Clone)]
 pub struct RuleSet {
     rules: Vec<Rule>,
+    /// The join work of the last [`apply`](Self::apply) (see `Rule::derive`).
+    work: u64,
 }
 
 impl RuleSet {
@@ -519,6 +648,13 @@ impl RuleSet {
             .collect()
     }
 
+    /// The join work (stored pairs read, bindings built) of the last
+    /// [`apply`](Self::apply) (tests).
+    #[cfg(test)]
+    pub(crate) fn last_work(&self) -> u64 {
+        self.work
+    }
+
     /// The effect count of a named rule, if it exists.
     pub fn effect_count(&self, name: &str) -> Option<usize> {
         self.rules
@@ -556,6 +692,7 @@ impl RuleSet {
         for r in &mut self.rules {
             r.effect_count = 0;
         }
+        self.work = 0;
         let mut added_all: Vec<IdTriple> = Vec::new();
         loop {
             let mut round_added = 0usize;
@@ -565,7 +702,7 @@ impl RuleSet {
                 }
                 // Read phase: derive concrete head triples against the current
                 // store (immutable borrow of dict + store).
-                let derived = self.rules[i].derive(dict, store);
+                let derived = self.rules[i].derive(dict, store, &mut self.work);
                 // Write phase: intern + insert; count only genuinely-new triples.
                 for t in derived {
                     // A head triple whose terms cannot be interned (a
@@ -614,167 +751,152 @@ fn parse_patterns(s: &str) -> Result<Vec<TriplePattern>> {
 }
 
 /// Tokenize a rule side into [`PatternTerm`]s, skipping `.` triple separators.
+/// It walks characters, never bytes, so no input — non-ASCII text, an
+/// escape before a multi-byte character, a truncated literal — can make it
+/// slice inside a character (it panicked on `é <p> ?y …` and on `"\\é"`;
+/// review ext#4). Every term is checked with the crate's one term validator
+/// ([`crate::model::term`]) and decoded with [`Term::from_dict_key`], the
+/// inverse of the stored form a binding takes (review ext#7: the format had
+/// a parser of its own with different escape rules).
 fn tokenize(s: &str) -> Result<Vec<PatternTerm>> {
-    let bytes = s.as_bytes();
-    let mut i = 0usize;
+    use crate::model::term::{is_valid_blank_label, is_valid_iriref, is_valid_lang_tag};
+    let err = |m: String| GStoreError::Database(m);
+    let ends_token = |c: char| c.is_whitespace() || c == '.';
     let mut out = Vec::new();
-    while i < bytes.len() {
-        let c = bytes[i];
-        if c.is_ascii_whitespace() {
-            i += 1;
+    let mut chars = s.char_indices().peekable();
+    while let Some(&(start, c)) = chars.peek() {
+        if c.is_whitespace() || c == '.' {
+            // A standalone triple separator (IRIs/literals keep their dots
+            // inside the bracketed/quoted token below, so a bare '.' is
+            // punctuation).
+            chars.next();
             continue;
         }
-        if c == b'.' {
-            // A standalone triple separator (IRIs/literals keep their dots inside
-            // the bracketed/quoted token below, so a bare '.' is punctuation).
-            i += 1;
-            continue;
-        }
-        let start = i;
-        if c == b'<' {
-            // <iri>
-            i += 1;
-            while i < bytes.len() && bytes[i] != b'>' {
-                i += 1;
-            }
-            if i >= bytes.len() {
-                return Err(GStoreError::Database("unterminated <iri> in rule".into()));
-            }
-            i += 1; // consume '>'
-            let raw = &s[start..i];
-            out.push(PatternTerm::Const(parse_term(raw).ok_or_else(|| {
-                GStoreError::Database(format!("invalid IRI term '{raw}'"))
-            })?));
-        } else if c == b'"' {
-            // "literal" with optional ^^<dt> or @lang suffix.
-            i += 1;
-            while i < bytes.len() {
-                match bytes[i] {
-                    b'\\' => i += 2, // skip escaped char
-                    b'"' => break,
-                    _ => i += 1,
+        match c {
+            '<' => {
+                // <iri>
+                let Some(len) = s[start..].find('>') else {
+                    return Err(err("unterminated <iri> in rule".into()));
+                };
+                let end = start + len + 1;
+                let raw = &s[start..end];
+                let iri = &raw[1..raw.len() - 1];
+                if !is_valid_iriref(iri) {
+                    return Err(err(format!(
+                        "invalid IRI term '{raw}' (it holds a space, a control character or \
+                         one of <>\"{{}}|^`\\)"
+                    )));
+                }
+                out.push(PatternTerm::Const(Term::iri(iri)));
+                while chars.peek().is_some_and(|&(i, _)| i < end) {
+                    chars.next();
                 }
             }
-            if i >= bytes.len() {
-                return Err(GStoreError::Database("unterminated literal in rule".into()));
-            }
-            i += 1; // consume closing '"'
-                    // optional @lang or ^^<dt>
-            if i < bytes.len() && bytes[i] == b'@' {
-                i += 1;
-                while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'.' {
-                    i += 1;
-                }
-            } else if i + 1 < bytes.len() && bytes[i] == b'^' && bytes[i + 1] == b'^' {
-                i += 2;
-                if i < bytes.len() && bytes[i] == b'<' {
-                    while i < bytes.len() && bytes[i] != b'>' {
-                        i += 1;
-                    }
-                    if i < bytes.len() {
-                        i += 1; // consume '>'
+            '"' => {
+                // "literal" with an optional @lang or ^^<dt> suffix.
+                chars.next();
+                let mut closed = None;
+                while let Some((i, ch)) = chars.next() {
+                    match ch {
+                        '\\' => {
+                            if chars.next().is_none() {
+                                break;
+                            }
+                        }
+                        '"' => {
+                            closed = Some(i + 1);
+                            break;
+                        }
+                        _ => {}
                     }
                 }
+                let Some(mut end) = closed else {
+                    return Err(err("unterminated literal in rule".into()));
+                };
+                let rest = &s[end..];
+                if let Some(tag) = rest.strip_prefix('@') {
+                    let len = tag.find(ends_token).unwrap_or(tag.len());
+                    if !is_valid_lang_tag(&tag[..len]) {
+                        return Err(err(format!(
+                            "invalid language tag '@{}' in rule",
+                            &tag[..len]
+                        )));
+                    }
+                    end += 1 + len;
+                } else if let Some(dt) = rest.strip_prefix("^^<") {
+                    let Some(len) = dt.find('>') else {
+                        return Err(err("unterminated datatype IRI in rule".into()));
+                    };
+                    if !is_valid_iriref(&dt[..len]) {
+                        return Err(err(format!("invalid datatype IRI '<{}>'", &dt[..len])));
+                    }
+                    end += 3 + len + 1;
+                }
+                let raw = &s[start..end];
+                let term = Term::from_dict_key(raw).ok_or_else(|| {
+                    err(format!(
+                        "invalid literal term '{raw}' (escapes: \\\\ \\\" \\n \\r \\t)"
+                    ))
+                })?;
+                out.push(PatternTerm::Const(term));
+                while chars.peek().is_some_and(|&(i, _)| i < end) {
+                    chars.next();
+                }
+                if chars.peek().is_some_and(|&(_, c)| !ends_token(c)) {
+                    return Err(err(format!("unexpected text after the literal '{raw}'")));
+                }
             }
-            let raw = &s[start..i];
-            out.push(PatternTerm::Const(parse_term(raw).ok_or_else(|| {
-                GStoreError::Database(format!("invalid literal term '{raw}'"))
-            })?));
-        } else if c == b'?' {
-            // ?variable
-            i += 1;
-            while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'.' {
-                i += 1;
+            '?' => {
+                // ?variable
+                chars.next();
+                let from = start + 1;
+                let mut end = from;
+                while let Some(&(i, ch)) = chars.peek() {
+                    if ends_token(ch) {
+                        break;
+                    }
+                    end = i + ch.len_utf8();
+                    chars.next();
+                }
+                let name = &s[from..end];
+                if name.is_empty() {
+                    return Err(err("empty variable name '?'".into()));
+                }
+                if !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                    return Err(err(format!(
+                        "invalid variable name '?{name}' (letters, digits and '_')"
+                    )));
+                }
+                out.push(PatternTerm::Var(name.to_owned()));
             }
-            let name = &s[start + 1..i];
-            if name.is_empty() {
-                return Err(GStoreError::Database("empty variable name '?'".into()));
+            '_' if s[start..].starts_with("_:") => {
+                // _:blank
+                let from = start + 2;
+                let mut end = from;
+                chars.next();
+                chars.next();
+                while let Some(&(i, ch)) = chars.peek() {
+                    if ends_token(ch) {
+                        break;
+                    }
+                    end = i + ch.len_utf8();
+                    chars.next();
+                }
+                let label = &s[from..end];
+                if !is_valid_blank_label(label) {
+                    return Err(err(format!("invalid blank node '_:{label}'")));
+                }
+                out.push(PatternTerm::Const(Term::blank(label)));
             }
-            out.push(PatternTerm::Var(name.to_owned()));
-        } else if c == b'_' && i + 1 < bytes.len() && bytes[i + 1] == b':' {
-            // _:blank
-            while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'.' {
-                i += 1;
+            other => {
+                return Err(err(format!(
+                    "unexpected token starting at '{other}' (use <iri>, ?var, \"literal\", or \
+                     _:blank)"
+                )));
             }
-            let raw = &s[start..i];
-            out.push(PatternTerm::Const(parse_term(raw).ok_or_else(|| {
-                GStoreError::Database(format!("invalid blank node '{raw}'"))
-            })?));
-        } else {
-            return Err(GStoreError::Database(format!(
-                "unexpected token starting at '{}' (use <iri>, ?var, \"literal\", or _:blank)",
-                &s[start..(start + 1).min(s.len())]
-            )));
         }
     }
     Ok(out)
-}
-
-/// Parse one term from its N-Triples surface form (the inverse of
-/// [`Term::dict_key`]): `<iri>`, `_:blank`, or a literal `"v"`/`"v"@lang`/
-/// `"v"^^<dt>`. Returns `None` on malformed input.
-fn parse_term(s: &str) -> Option<Term> {
-    let s = s.trim();
-    if let Some(inner) = s.strip_prefix('<').and_then(|r| r.strip_suffix('>')) {
-        return Some(Term::iri(inner));
-    }
-    if let Some(label) = s.strip_prefix("_:") {
-        if label.is_empty() {
-            return None;
-        }
-        return Some(Term::blank(label));
-    }
-    if s.starts_with('"') {
-        // Find the closing quote, honoring backslash escapes.
-        let bytes = s.as_bytes();
-        let mut i = 1usize;
-        let mut value = String::new();
-        while i < bytes.len() {
-            match bytes[i] {
-                b'\\' => {
-                    i += 1;
-                    let e = *bytes.get(i)?;
-                    value.push(match e {
-                        b'n' => '\n',
-                        b'r' => '\r',
-                        b't' => '\t',
-                        b'"' => '"',
-                        b'\\' => '\\',
-                        other => other as char,
-                    });
-                    i += 1;
-                }
-                b'"' => break,
-                _ => {
-                    // Push this UTF-8 char whole.
-                    let ch = s[i..].chars().next()?;
-                    value.push(ch);
-                    i += ch.len_utf8();
-                }
-            }
-        }
-        if i >= bytes.len() || bytes[i] != b'"' {
-            return None;
-        }
-        i += 1; // past closing quote
-        let rest = &s[i..];
-        if let Some(lang) = rest.strip_prefix('@') {
-            return Some(Term::Literal {
-                value,
-                datatype: None,
-                lang: Some(lang.to_owned()),
-            });
-        }
-        if let Some(dt) = rest.strip_prefix("^^") {
-            let dt = dt.strip_prefix('<').and_then(|r| r.strip_suffix('>'))?;
-            return Some(Term::typed_literal(value, dt));
-        }
-        if rest.is_empty() {
-            return Some(Term::plain_literal(value));
-        }
-        return None;
-    }
-    None
 }
 
 #[cfg(test)]
@@ -1027,5 +1149,192 @@ mod tests {
             rs.add_rule("d", "?x <p> => ?x <q> ?y").is_err(),
             "incomplete pattern"
         );
+    }
+
+    /// Review ext#3: a literal or blank node in a subPropertyOf position
+    /// (legal data — OWL writes `:p rdfs:subPropertyOf [ owl:inverseOf :q ]`)
+    /// was interned as a predicate, and data was copied under it
+    /// (`<a> "lit" <b>`, which no reader loads back). Only IRIs are
+    /// properties; subPropertyOf stays transitive through a blank node.
+    #[test]
+    fn subproperty_never_makes_a_literal_or_blank_node_a_predicate() {
+        let mut d = Dictionary::new();
+        let spo = pred(&mut d, RDFS_SUBPROP);
+        let p_pred = pred(&mut d, "http://ex/p");
+        let p_ent = ent(&mut d, "http://ex/p");
+        let p2_pred = pred(&mut d, "http://ex/p2");
+        let p2_ent = ent(&mut d, "http://ex/p2");
+        let q_ent = ent(&mut d, "http://ex/q");
+        let lit_key = Term::plain_literal("lit").dict_key();
+        let lit = d.intern_literal(&lit_key);
+        let blank_key = Term::blank("b").dict_key();
+        let blank = d.intern_entity(&blank_key);
+        let (a, b, c) = (
+            ent(&mut d, "http://ex/a"),
+            ent(&mut d, "http://ex/b"),
+            ent(&mut d, "http://ex/c"),
+        );
+        let mut s = TripleStore::new();
+        s.insert(IdTriple::new(p_ent, spo, lit));
+        s.insert(IdTriple::new(p2_ent, spo, blank));
+        s.insert(IdTriple::new(blank, spo, q_ent));
+        s.insert(IdTriple::new(a, p_pred, b));
+        s.insert(IdTriple::new(a, p2_pred, c));
+
+        let added = materialize(&mut d, &mut s);
+        assert!(
+            d.predicate_id(&lit_key).is_none(),
+            "a literal became a predicate"
+        );
+        assert!(
+            d.predicate_id(&blank_key).is_none(),
+            "a blank node became a predicate"
+        );
+        for t in &added {
+            let key = d.pred(t.pred).unwrap();
+            assert!(
+                is_iri_key(&key),
+                "inferred under the predicate {key}: {added:?}"
+            );
+        }
+        // p2 ⊑ _:b ⊑ q: p2 ⊑ q, and a p2 c gives a q c.
+        assert!(s.exists(p2_ent, spo, q_ent));
+        let q_pred = d
+            .predicate_id(&Term::iri("http://ex/q").dict_key())
+            .unwrap();
+        assert!(s.exists(a, q_pred, c));
+        assert_eq!(added.len(), 2, "{added:?}");
+        // A literal interned as a predicate by an older version is not used.
+        let mut d2 = d.clone();
+        d2.intern_predicate(&lit_key);
+        let mut s2 = s.clone();
+        assert!(materialize(&mut d2, &mut s2).is_empty());
+    }
+
+    /// Review ext#4: the textual rule parser sliced its input by bytes and
+    /// panicked on a multi-byte character where a token was expected or
+    /// after a `\` (`é <p> ?y …`, `"\é"`). Every malformed text is an error;
+    /// well-formed non-ASCII rules work.
+    #[test]
+    fn non_ascii_rule_text_is_an_error_not_a_panic() {
+        let mut rs = RuleSet::new();
+        for bad in [
+            "é <p> ?y => ?x <q> ?y",
+            "?x <p> \"\\é\" => ?x <q> ?x",
+            "?x <p> \"\\é => ?x <q> ?x",
+            "?x <p> \"é => ?x <q> ?x",
+            "?x <p> ?y => ?x <q> \"x\"@é",
+            "?x <p> ?y => ?x <q> \"x\"é",
+            "?x <p> ?y => ?x <q> ?y é",
+            "?x <p> ?é! => ?x <q> ?x",
+            "?x <p> ?y => ?x <q> _:é!",
+            "?x <a b> ?y => ?x <q> ?y",
+            "?x <p> \"x\\u00e9\" => ?x <q> ?x",
+            "?x <p> \"x\"^^<a b> => ?x <q> ?x",
+            "?x <p> \"x\" ?y => ?x <q> ?x ✓",
+        ] {
+            assert!(rs.add_rule("bad", bad).is_err(), "{bad}");
+        }
+        assert!(rs.rules().is_empty());
+
+        let mut d = Dictionary::new();
+        let mut s = TripleStore::new();
+        let p = pred(&mut d, "http://ex/é");
+        let x = ent(&mut d, "http://ex/x");
+        let v = d.intern_literal(&Term::plain_literal("é\"").dict_key());
+        s.insert(IdTriple::new(x, p, v));
+        rs.add_rule(
+            "ok",
+            "?x <http://ex/é> \"é\\\"\" . => ?x <http://ex/q> \"ü\\n\"@de-CH",
+        )
+        .unwrap();
+        assert_eq!(rs.apply(&mut d, &mut s).len(), 1);
+        let q = d
+            .predicate_id(&Term::iri("http://ex/q").dict_key())
+            .unwrap();
+        let lit = Term::Literal {
+            value: "ü\n".into(),
+            datatype: None,
+            lang: Some("de-CH".into()),
+        };
+        assert!(s.exists(x, q, d.term_id(&lit).unwrap()));
+    }
+
+    /// Review ext#7: the textual rules' join compared every binding with
+    /// every stored pair, so a two-hop rule's cost grew with the square of
+    /// the data. The hash join's work (pairs read plus bindings built) grows
+    /// with the data.
+    #[test]
+    fn rule_joins_scale_linearly() {
+        let work = |n: usize| {
+            let mut d = Dictionary::new();
+            let mut s = TripleStore::new();
+            let p = pred(&mut d, "p");
+            let ids: Vec<u32> = (0..=n).map(|i| ent(&mut d, &format!("n{i}"))).collect();
+            for w in ids.windows(2) {
+                s.insert(IdTriple::new(w[0], p, w[1]));
+            }
+            let mut rs = RuleSet::new();
+            rs.add_rule("two", "?x <p> ?y . ?y <p> ?z => ?x <q> ?z")
+                .unwrap();
+            assert_eq!(rs.apply(&mut d, &mut s).len(), n - 1);
+            rs.last_work()
+        };
+        let (small, large) = (work(500), work(4000));
+        assert!(small > 0);
+        assert!(large <= 9 * small, "8x the data: {small} -> {large}");
+    }
+
+    /// Joins of every shape: a constant subject, a variable bound twice in
+    /// one pattern, a pattern binding nothing new, a cross product.
+    #[test]
+    fn rule_joins_of_every_shape() {
+        let mut d = Dictionary::new();
+        let mut s = TripleStore::new();
+        let p = pred(&mut d, "p");
+        let r = pred(&mut d, "r");
+        let (a, b, c) = (ent(&mut d, "a"), ent(&mut d, "b"), ent(&mut d, "c"));
+        s.insert(IdTriple::new(a, p, b));
+        s.insert(IdTriple::new(b, p, b));
+        s.insert(IdTriple::new(c, r, a));
+        let run = |rule: &str, d: &mut Dictionary, s: &mut TripleStore| {
+            let mut st = s.clone();
+            let mut rs = RuleSet::new();
+            rs.add_rule("x", rule).unwrap();
+            let n = rs.apply(d, &mut st).len();
+            (n, st)
+        };
+        // A self loop.
+        assert_eq!(run("?x <p> ?x => ?x <self> ?x", &mut d, &mut s).0, 1);
+        // A constant subject.
+        assert_eq!(run("<a> <p> ?y => ?y <q> <a>", &mut d, &mut s).0, 1);
+        // Both ends bound by earlier patterns.
+        assert_eq!(
+            run(
+                "?x <p> ?y . ?c <r> ?x . ?x <p> ?y => ?c <q> ?y",
+                &mut d,
+                &mut s
+            )
+            .0,
+            1
+        );
+        // A cross product (no shared variable).
+        assert_eq!(
+            run("?x <p> ?y . ?c <r> ?z => ?c <q> ?y", &mut d, &mut s).0,
+            1
+        );
+        // A constant pattern that holds, and one that does not.
+        assert_eq!(
+            run("<c> <r> <a> . ?x <p> ?y => ?x <q> ?y", &mut d, &mut s).0,
+            2
+        );
+        assert_eq!(
+            run("<c> <r> <b> . ?x <p> ?y => ?x <q> ?y", &mut d, &mut s).0,
+            0
+        );
+        // An unknown constant matches nothing.
+        assert_eq!(run("<zz> <p> ?y => ?y <q> <a>", &mut d, &mut s).0, 0);
+        // A head variable the body never binds infers nothing.
+        assert_eq!(run("?x <p> ?y => ?x <q> ?w", &mut d, &mut s).0, 0);
     }
 }

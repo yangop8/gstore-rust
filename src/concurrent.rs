@@ -363,6 +363,8 @@ impl Snapshot {
         // and one substring index.
         let csr = || self.csr.get_or_build(0, || CsrGraph::build(&self.store));
         let string_index = || self.string_index.get(&self.dict, None);
+        // `with_settings` installs the PFN caller through `with_limits`,
+        // so each query has a fuel budget of its own (review ext#1).
         let mut eval = Evaluator::new(&self.dict, &self.store).with_settings(
             self.settings.clone(),
             EvalProviders {
@@ -1202,7 +1204,9 @@ impl VersionView<'_> {
         }
         let q = sparql::parse(sparql)?;
         // The settings — user-defined functions and the PFN caller among
-        // them — are the latest snapshot's (they are not versioned data).
+        // them — are the latest snapshot's (they are not versioned data);
+        // the caller gets a fuel budget of its own for this query
+        // (`with_settings` installs it through `with_limits`; review ext#1).
         let latest = self.db.snapshot();
         let base = &self.db.base;
         let csr = || base.csr.get_or_build(0, || CsrGraph::build(&base.store));

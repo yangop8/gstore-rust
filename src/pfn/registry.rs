@@ -23,10 +23,11 @@
 //!   rewrites the source, status `"1"` — the function is not callable until
 //!   it is compiled again.
 //! * **delete** — removes the entry, the source and the module.
-//! * **compile** — compiles the source file; status `"2"` and the module
-//!   file on success, `"3"` and the compiler's message on failure. The
-//!   compilation runs without the registry's lock (a function changed
-//!   meanwhile is not stamped).
+//! * **compile** — compiles the source the `data.json` entry generates (the
+//!   source file is rewritten from it when it differs, never compiled
+//!   from); status `"2"` and the module file on success, `"3"` and the
+//!   compiler's message on failure. The compilation runs without the
+//!   registry's lock (a function changed meanwhile is not stamped).
 //! * **list** — the entries, filtered by exact `funName` and `funStatus`.
 //! * **drop_user** — every function of a deleted user.
 //!
@@ -580,10 +581,20 @@ impl PfnRegistry {
     /// Compile function `name` of `user` (upstream `fun_build`). `Ok(Ok(info))`
     /// on success; `Ok(Err(message))` when the source does not compile (the
     /// function's status is then `"3"`); `Err` when the function does not
-    /// exist (upstream's messages: its source file is looked for first), was
-    /// changed while it compiled, or this build has no runtime (status
-    /// unchanged). The compilation itself runs without the registry's lock,
-    /// so other users' lookups never wait for it.
+    /// exist (upstream's messages: "Function source file dose not exist"
+    /// when there is no source file either), was changed while it compiled,
+    /// or this build has no runtime (status unchanged). The compilation
+    /// itself runs without the registry's lock, so other users' lookups
+    /// never wait for it.
+    ///
+    /// The module is built from the source the `data.json` record generates
+    /// ([`generate_source`]), never from the source file next to it: an
+    /// update interrupted between writing the new source file and the
+    /// record (a crash, or a failed write whose rollback failed too) left a
+    /// file the record does not describe, and the function then ran code
+    /// that `funquery` / `funreview` did not show (review ext#8). The source
+    /// file is rewritten from the record when it differs, so it shows what
+    /// was compiled.
     pub fn compile(&self, user: &str, name: &str) -> Result<std::result::Result<PfnInfo, String>> {
         Self::check_user(user)?;
         Self::check_name(name)?;
@@ -592,17 +603,17 @@ impl PfnRegistry {
                 .data_lock
                 .read()
                 .unwrap_or_else(PoisonError::into_inner);
-            let source = match fs::read_to_string(self.source_file(user, name)) {
-                Ok(s) => s,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // Upstream's text (sic).
-                    return Err(query_err("Function source file dose not exist"));
-                }
-                Err(e) => return Err(e.into()),
-            };
             let Some(info) = self.entries(user)?.iter().find(|i| i.name == name).cloned() else {
-                return Err(query_err(format!("function {name} not exists")));
+                return Err(match fs::symlink_metadata(self.source_file(user, name)) {
+                    // Upstream looks for the source file first (its text,
+                    // sic).
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        query_err("Function source file dose not exist")
+                    }
+                    _ => query_err(format!("function {name} not exists")),
+                });
             };
+            let source = generate_source(&info);
             (info, source)
         };
         let outcome = self.compile_source(&compiled, &source);
@@ -624,6 +635,17 @@ impl PfnRegistry {
             return Err(query_err(format!(
                 "function {name} was changed while it was being compiled; compile it again"
             )));
+        }
+        // The source file shows what was compiled (it is never compiled
+        // from; a failure to rewrite it only leaves an out-of-date copy).
+        let source_file = self.source_file(user, name);
+        if fs::read(&source_file).ok().as_deref() != Some(source.as_bytes()) {
+            if let Err(e) = crate::db::fsutil::atomic_write(&source_file, source.as_bytes()) {
+                crate::gs_warn!(
+                    "PFN: cannot rewrite the source file '{}' from data.json: {e}",
+                    source_file.display()
+                );
+            }
         }
         let previous = self.module_file(user, name, &all[idx].last_time);
         let info = &mut all[idx];
@@ -665,8 +687,8 @@ impl PfnRegistry {
         Ok(result)
     }
 
-    /// Compile `source` (the source file of `info`): the module bytes, or the
-    /// error (a [`GStoreError::Query`] with the compiler's message).
+    /// Compile `source` (the source `info` generates): the module bytes, or
+    /// the error (a [`GStoreError::Query`] with the compiler's message).
     fn compile_source(&self, info: &PfnInfo, source: &str) -> Result<Vec<u8>> {
         let body = url_decode(&info.body);
         if source_kind(body.trim()) != SourceKind::Body && !url_decode(&info.subs).trim().is_empty()
@@ -1091,6 +1113,7 @@ mod tests {
             limits: PfnLimits::default(),
             cancel: None,
             max_output: 100,
+            spent: None,
         };
         let e = r.call("u", "f", "{}", &g, &opts).unwrap_err().to_string();
         assert!(e.contains("pfn-wasm"), "{e}");
@@ -1171,6 +1194,7 @@ mod tests {
             limits: PfnLimits::default(),
             cancel: None,
             max_output: 100,
+            spent: None,
         };
         r.create(
             "u",
@@ -1210,6 +1234,7 @@ mod tests {
             limits: PfnLimits::default(),
             cancel: None,
             max_output: 100,
+            spent: None,
         };
         let emit = |n: i64| format!("(call $emit_i64 (i64.const {n})) (i32.const 1)");
         r.create("u", info("f", &emit(7))).unwrap();
@@ -1250,6 +1275,7 @@ mod tests {
             limits: PfnLimits::default(),
             cancel: None,
             max_output: 100,
+            spent: None,
         };
         r.create(
             "u",

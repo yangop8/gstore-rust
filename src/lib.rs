@@ -1,22 +1,56 @@
 //! # gstore — a Rust rewrite of the gStore RDF triple store
 //!
 //! gStore (<https://github.com/pkumod/gStore>) is an RDF graph database that
-//! answers SPARQL queries by subgraph matching. This crate re-implements its
-//! *trunk* in idiomatic Rust:
+//! answers SPARQL queries by subgraph matching. This crate re-implements it in
+//! idiomatic Rust — the storage and query trunk, and the server, `/api`
+//! protocol, tools and extensions around it:
 //!
 //! ```text
-//! RDF file ─▶ parse ─▶ dictionary (string↔id) ─▶ six-way triple index ─▶ disk
-//! SPARQL   ─▶ parse ─▶ BGP plan ─▶ index match + join ─▶ FILTER ─▶ result set
+//! RDF files ─▶ parse ─▶ dictionary (string↔id) ─▶ six-way triple index ─▶ snapshot / disk / RocksDB
+//! SPARQL    ─▶ parse ─▶ candidates + cost-based plan ─▶ index match + joins ─▶ FILTER … ─▶ results
 //! ```
 //!
-//! Module map (see `docs/DESIGN.md` for the mapping to gStore's C++ modules):
+//! Module map (`docs/DESIGN.md` describes the architecture and the mapping to
+//! gStore's C++ modules; `README.md` has the same table with more detail):
 //!
-//! * [`model`]  — RDF terms, triples, integer-id conventions
-//! * [`dict`]   — bidirectional string↔id dictionaries
-//! * [`store`]  — the s2xx / o2xx / p2xx triple indexes
-//! * [`parser`] — N-Triples and SPARQL parsing
-//! * [`query`]  — BGP evaluation, joins, FILTER, result sets
-//! * [`db`]     — the [`db::Database`] facade: build / load / save / query / update
+//! * **Data model and storage**
+//!   * [`model`] — RDF terms, triples, integer-id conventions, the shared
+//!     term validator ([`model::term`])
+//!   * [`dict`] — bidirectional string↔id dictionaries (copy-on-write in
+//!     memory; bounded caches over an out-of-core dictionary)
+//!   * [`store`] — the in-memory s2xx / o2xx / p2xx index, the
+//!     [`TripleSource`] / [`MutableStore`] seam every backend implements,
+//!     [`Backend`], per-statement read errors, the transaction overlay
+//!   * [`kvstore`] — the disk layout: pager, WAL, B+ trees, format registry,
+//!     the Stream-mode `DiskTriples` / `DiskDict`; `backend` — RocksDB
+//!     (feature `rocksdb`)
+//!   * [`signature`] — entity signatures and the VS-tree candidate filter
+//!   * [`bulk`] — bulk builds (external sort, bottom-up, crash-safe install)
+//!   * [`db`] — the [`Database`] facade: build / open / save / query /
+//!     update / transactions / backups over every layout, directory locks,
+//!     id reclamation; [`concurrent`] — [`ConcurrentDb`], snapshot reads
+//!     beside a writer (library API)
+//! * **Languages**
+//!   * [`parser`] — RDF readers (N-Triples, N-Quads, Turtle, TriG, RDF/XML,
+//!     JSON-LD, RDFa) and SPARQL 1.1 Query + Update
+//!   * [`query`] — the [`Evaluator`](query::Evaluator) with its two
+//!     executors (materializing `eval_*` and streaming / Top-K `stream_*`),
+//!     the cost-based optimizer, candidates, FILTER and aggregates, result
+//!     sets; [`sparql_results`] — JSON / XML / CSV / TSV serializers
+//! * **Extensions**
+//!   * [`reason`] — upstream's `reasonManage` rules, RDFS materialization,
+//!     textual rules; [`pfn`] — per-user PFN functions (sandboxed
+//!     WebAssembly, feature `pfn-wasm`); [`analytics`] — CSR graph
+//!     algorithms and upstream's advanced graph functions
+//! * **Servers and tools**
+//!   * [`server`] — the single-database SPARQL-protocol server (`gserver
+//!     DIR`); [`http_api`] + [`gapi`] — the multi-database server (REST and
+//!     upstream's `/api` protocol) with [`http_users`] / [`sysdb`] (users,
+//!     privileges, logs), [`preauth`] and [`config`] (`conf.ini`);
+//!     [`console`] — `gconsole`; `src/bin/` — `gbuild`, `gquery`, `gserver`,
+//!     …
+//!   * [`cluster`] / [`rpc`] — an experimental sharded store and its wire
+//!     codec (library only)
 
 pub mod analytics;
 /// Persistent storage backends (feature-gated). Currently the RocksDB-backed

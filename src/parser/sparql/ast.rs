@@ -1,8 +1,11 @@
-//! SPARQL abstract syntax tree (the subset the engine supports).
+//! SPARQL abstract syntax tree: SPARQL 1.1 Query (SELECT, ASK, CONSTRUCT,
+//! DESCRIBE; the full graph-pattern algebra of [`GraphPattern`], aggregates,
+//! property paths, sub-queries) and SPARQL 1.1 Update ([`UpdateOp`]), plus
+//! gStore's extensions (advanced graph functions [`Expr::GraphFn`] and
+//! `PFN.name({…})` [`Expr::Pfn`]). Dataset clauses (`FROM` / `FROM NAMED`)
+//! are not supported.
 //!
-//! Corresponds to gStore's `QueryTree` / `SPARQLquery`. Deferred SPARQL 1.1
-//! features (OPTIONAL, UNION, aggregates, paths, sub-queries) are tracked in
-//! `docs/REFACTOR_BACKLOG.md` item D.
+//! Corresponds to gStore's `QueryTree` / `SPARQLquery`.
 
 use crate::model::Term;
 
@@ -293,17 +296,20 @@ pub enum GraphPattern {
     Graph(GraphTerm, Box<GraphPattern>),
     /// `SERVICE [SILENT] (<iri> | ?svc) { … }`: SPARQL 1.1 federated query — the
     /// inner pattern is shipped to a remote SPARQL endpoint and its returned
-    /// solutions are joined with the outer ones. `silent` swallows
-    /// connection/parse failures, yielding the join identity (so outer rows are
-    /// preserved).
+    /// solutions are joined with the outer ones. A failure (connection, HTTP
+    /// or parse error, a variable endpoint, an inner pattern that cannot be
+    /// shipped) is the query's error, naming the endpoint; `silent` swallows
+    /// it, yielding the join identity (so outer rows are preserved). Whether
+    /// an evaluation may contact remote endpoints at all is its
+    /// [`ServicePolicy`](crate::db::ServicePolicy) (servers deny `SERVICE`
+    /// unless configured otherwise); a refusal by policy is an error, `SILENT`
+    /// or not.
     ///
     /// Scope limitations (see `docs/REFACTOR_BACKLOG.md`): the inner pattern
     /// serialized to the remote is the BGP/UNION subset (FILTER/OPTIONAL/BIND/
     /// paths/sub-SELECT are not shipped); a constant `<iri>` endpoint is the
-    /// supported case; and because query evaluation is infallible, a *non*-SILENT
-    /// remote failure or an unsupported inner shape currently yields no rows
-    /// rather than raising an error. The whole inner relation is fetched and
-    /// joined locally (no bound-join pushdown).
+    /// supported case. The whole inner relation is fetched and joined locally
+    /// (no bound-join pushdown).
     Service {
         endpoint: ServiceRef,
         silent: bool,
