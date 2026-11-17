@@ -8,7 +8,10 @@
 //! - a VList record of the compacted `sp2o_vlist` index that does not decode,
 //!   or carries an unknown tag, is a read error (`InvalidData`) — it used to
 //!   read as "no objects", so `<s> <p> ?o` silently had no values although
-//!   contract C2 promises that a read error fails the statement;
+//!   contract C2 promises that a read error fails the statement; so is an
+//!   overflow record whose length no chain of the file can carry, or whose
+//!   chain ends before it (that length used to bound nothing: a chain that
+//!   cycles was followed for up to 4 GiB);
 //! - a damaged node of an out-of-core VS-tree makes the tree filter nothing
 //!   (sound), so queries still answer correctly — it used to panic or
 //!   overflow the stack.
@@ -16,8 +19,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use gstore::kvstore::overflow::CHAIN_PAYLOAD;
 use gstore::kvstore::{vlist, DiskStore, PAGE_SIZE};
 use gstore::query::{scoped_vs_policy, VsPolicy};
+use gstore::signature::{Signature, VsTree};
 use gstore::{Database, DiskQueryMode, OpenOptions, QueryResult, Term, Triple};
 
 /// A temporary directory, removed on drop (also when an assertion fails).
@@ -125,6 +130,88 @@ fn an_intact_vlist_record_still_reads() {
     assert_eq!(ds.try_o_by_sp(hub, p).unwrap(), objects);
 }
 
+/// A compacted store at `path` whose hub subject has so many objects under
+/// one predicate that their VList spills into an overflow chain; returns
+/// `(hub, p, objects)` and the VList's encoded length, the last four bytes
+/// of its 9-byte head-pointer record (tag 1, head page, length).
+fn compacted_overflow_hub(path: &Path) -> (u32, u32, Vec<u32>, u32) {
+    let mut ds = DiskStore::open(path, 256).unwrap();
+    for i in 0..3000 {
+        ds.insert_triple(&Triple::new(
+            Term::iri("http://ex/hub"),
+            Term::iri("http://ex/p"),
+            Term::iri(format!("http://ex/o{i}")),
+        ))
+        .unwrap();
+    }
+    ds.compact().unwrap();
+    ds.flush().unwrap();
+    let hub = ds.term_id(&Term::iri("http://ex/hub")).unwrap().unwrap();
+    let p = ds
+        .predicate_id(&Term::iri("http://ex/p").dict_key())
+        .unwrap()
+        .unwrap();
+    let objects = ds.try_o_by_sp(hub, p).unwrap();
+    assert_eq!(objects.len(), 3000);
+    assert_eq!(ds.compact_value_is_overflow(hub, p).unwrap(), Some(true));
+    let len = ds.compact_value_len(hub, p).unwrap().unwrap() as u32;
+    assert_eq!(len as usize, vlist::encode_u32s(&objects).len());
+    (hub, p, objects, len)
+}
+
+/// Rewrite the length of the one overflow record of length `len` in the
+/// file at `path` to `new_len`.
+fn damage_overflow_len(path: &Path, len: u32, new_len: u32) {
+    let mut bytes = fs::read(path).unwrap();
+    let at: Vec<usize> = bytes
+        .windows(9)
+        .enumerate()
+        .filter(|(_, w)| w[0] == 1 && w[5..9] == len.to_le_bytes())
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(at.len(), 1, "the overflow record is stored once: {at:?}");
+    bytes[at[0] + 5..at[0] + 9].copy_from_slice(&new_len.to_le_bytes());
+    fs::write(path, &bytes).unwrap();
+}
+
+#[test]
+fn a_vlist_overflow_record_whose_length_the_file_cannot_hold_is_a_read_error() {
+    let tmp = TempDir::new("vlist_overflow_len");
+    let path = tmp.0.join("kvstore.kv");
+    let (hub, p, objects, len) = compacted_overflow_hub(&path);
+    // The control: an intact record reads back.
+    damage_overflow_len(&path, len, len);
+    assert_eq!(
+        DiskStore::open(&path, 64)
+            .unwrap()
+            .try_o_by_sp(hub, p)
+            .unwrap(),
+        objects
+    );
+    // More bytes than every page of the file holds: refused before the
+    // chain is followed (a chain that cycles would otherwise be read for
+    // up to 4 GiB).
+    damage_overflow_len(&path, len, u32::MAX);
+    let e = DiskStore::open(&path, 64)
+        .unwrap()
+        .try_o_by_sp(hub, p)
+        .unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{e}");
+    assert!(
+        e.to_string().contains("of 4294967295 bytes in a file"),
+        "{e}"
+    );
+    // One byte more than the chain's pages hold: the chain ends first.
+    let chain = (len as usize).div_ceil(CHAIN_PAYLOAD) * CHAIN_PAYLOAD;
+    damage_overflow_len(&path, u32::MAX, chain as u32 + 1);
+    let e = DiskStore::open(&path, 64)
+        .unwrap()
+        .try_o_by_sp(hub, p)
+        .unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{e}");
+    assert!(e.to_string().contains("ends after"), "{e}");
+}
+
 /// The rows of `q`, sorted.
 fn rows(db: &mut Database, q: &str) -> Vec<Vec<Option<String>>> {
     match db.query(q) {
@@ -168,11 +255,28 @@ fn a_damaged_vstree_kv_node_filters_nothing_and_queries_stay_correct() {
     assert!(!expected.is_empty());
     // Give the root node of vstree.kv an entry count no page can hold.
     let vs = dir.join("vstree.kv");
+    // The bulk build's file passes the reader's validation: a scan of every
+    // node answers every entity.
+    {
+        let tree = VsTree::open_disk(&vs).unwrap();
+        assert!(tree.entity_count() > 0);
+        assert_eq!(
+            tree.candidates(&Signature::new()).map(|c| c.len()),
+            Some(tree.entity_count())
+        );
+    }
     let mut bytes = fs::read(&vs).unwrap();
     let root = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
     assert!(root > 0, "a non-empty tree");
     bytes[root * PAGE_SIZE + 1..root * PAGE_SIZE + 3].copy_from_slice(&40u16.to_le_bytes());
     fs::write(&vs, &bytes).unwrap();
+    assert_eq!(
+        VsTree::open_disk(&vs)
+            .unwrap()
+            .candidates(&Signature::new()),
+        None,
+        "the damaged tree filters nothing"
+    );
     for mode in [DiskQueryMode::Stream, DiskQueryMode::Materialize] {
         let mut db =
             Database::open_with(&dir, &OpenOptions::new().with_disk_query_mode(mode)).unwrap();

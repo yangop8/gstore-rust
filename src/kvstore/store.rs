@@ -2558,7 +2558,8 @@ fn encode_vlist_record(pager: &mut Pager, enc: &[u8]) -> Result<Vec<u8>> {
 
 /// Reassemble the encoded VList bytes from a `sp2o_vlist` value record, reading
 /// an [`overflow`] chain when the record is a head pointer. A malformed record
-/// (an unknown tag, a short head pointer) is a corruption error (review
+/// (an unknown tag, a short head pointer, a length no chain of the file can
+/// carry, a chain that ends before its length) is a corruption error (review
 /// robust#11: it used to yield empty bytes, read as an empty list).
 fn materialize_vlist(pager: &Pager, rec: &[u8]) -> Result<Vec<u8>> {
     match rec.first() {
@@ -2566,7 +2567,25 @@ fn materialize_vlist(pager: &Pager, rec: &[u8]) -> Result<Vec<u8>> {
         Some(&OVERFLOW_TAG) if rec.len() >= 9 => {
             let head = u32::from_le_bytes(rec[1..5].try_into().unwrap());
             let len = u32::from_le_bytes(rec[5..9].try_into().unwrap()) as usize;
-            overflow::read_chain(pager, head, len)
+            // The length comes from the file too. A chain holds each page
+            // once, so it carries at most the file's pages' payload; a
+            // larger length (with a damaged chain that cycles, `read_chain`
+            // would follow it for up to 4 GiB) is refused before reading.
+            let most = (pager.page_count() as usize).saturating_mul(overflow::CHAIN_PAYLOAD);
+            if len > most {
+                return Err(malformed(&format!(
+                    "a VList overflow record of {len} bytes in a file of {} pages",
+                    pager.page_count()
+                )));
+            }
+            let bytes = overflow::read_chain(pager, head, len)?;
+            if bytes.len() != len {
+                return Err(malformed(&format!(
+                    "a VList overflow chain from page {head} that ends after {} of its {len} bytes",
+                    bytes.len()
+                )));
+            }
+            Ok(bytes)
         }
         Some(&tag) => Err(malformed(&format!(
             "a VList record with tag {tag} and {} bytes",
