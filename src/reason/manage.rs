@@ -18,6 +18,10 @@
 //! A rule is *executed* while its status is `已执行` or its ledger (see
 //! below) holds a triple.
 //!
+//! A rule's conditions match the **default graph** only, and its inferred
+//! triples go into the default graph (as upstream, whose rules have no
+//! graph syntax): a named graph is never read or written (review ext#15).
+//!
 //! # Inferred triples, and retraction
 //!
 //! Executing a rule runs its compiled `INSERT … WHERE` through the
