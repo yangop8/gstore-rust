@@ -1741,41 +1741,127 @@ mod tests {
     fn concurrent_readers_never_see_torn_state() {
         // Writer alternates the store between 1 and 2 triples; every concurrent
         // reader must observe exactly 1 or 2 — never a partial/torn count.
-        let c = Arc::new(cdb());
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        //
+        // After each commit the writer waits until a read that began after
+        // it has finished — `READERS + 1` reads finished since, as at most
+        // `READERS` were in flight — so the readers run between all 400
+        // commits and see both states, whatever the scheduler does. (The
+        // writer used to commit back to back while the test required only
+        // that some read happened: on a loaded machine all 400 commits
+        // could finish before any reader thread ran, "readers should have
+        // run".)
+        const READERS: u64 = 4;
+        /// A wait that only guards against a hang (never the assertion).
+        const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(120);
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Condvar;
 
-        let readers: Vec<_> = (0..4)
+        /// The reads finished, by the count each saw, and whether a reader
+        /// failed (then the writer stops waiting for reads).
+        #[derive(Default)]
+        struct Reads {
+            finished: u64,
+            saw: [u64; 3],
+            reader_failed: bool,
+        }
+        type Shared = Arc<(Mutex<Reads>, Condvar)>;
+        fn reads(shared: &Shared) -> MutexGuard<'_, Reads> {
+            shared.0.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+        /// Held by a reader: marks it failed if it panics.
+        struct ReaderGuard(Shared);
+        impl Drop for ReaderGuard {
+            fn drop(&mut self) {
+                if thread::panicking() {
+                    reads(&self.0).reader_failed = true;
+                    self.0 .1.notify_all();
+                }
+            }
+        }
+        /// Held by the writer: stops the readers when it returns or panics.
+        struct StopReaders(Arc<AtomicBool>);
+        impl Drop for StopReaders {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let c = Arc::new(cdb());
+        let stop = Arc::new(AtomicBool::new(false));
+        let shared: Shared = Arc::default();
+
+        let readers: Vec<_> = (0..READERS)
             .map(|_| {
                 let c = Arc::clone(&c);
                 let stop = Arc::clone(&stop);
+                let shared = Arc::clone(&shared);
                 thread::spawn(move || {
-                    let mut reads = 0u64;
-                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _guard = ReaderGuard(Arc::clone(&shared));
+                    let mut mine = 0u64;
+                    while !stop.load(Ordering::Acquire) {
                         let n = count(&c, "SELECT ?o WHERE { ?s ?p ?o }");
                         assert!(n == 1 || n == 2, "torn read: {n}");
-                        reads += 1;
+                        mine += 1;
+                        let mut r = reads(&shared);
+                        r.finished += 1;
+                        r.saw[n] += 1;
+                        drop(r);
+                        shared.1.notify_all();
                     }
-                    reads
+                    mine
                 })
             })
             .collect();
 
         let writer = {
             let c = Arc::clone(&c);
+            let stop = Arc::clone(&stop);
+            let shared = Arc::clone(&shared);
             thread::spawn(move || {
+                let _stop = StopReaders(stop);
+                // Wait for a read that began after the last commit (false:
+                // a reader failed, and its panic fails the test).
+                let a_later_read_finished = || {
+                    let mut r = reads(&shared);
+                    let target = r.finished + READERS + 1;
+                    while !r.reader_failed && r.finished < target {
+                        let (next, waited) = shared
+                            .1
+                            .wait_timeout(r, HANG_GUARD)
+                            .unwrap_or_else(PoisonError::into_inner);
+                        r = next;
+                        assert!(!waited.timed_out(), "the readers stopped (hang guard)");
+                    }
+                    !r.reader_failed
+                };
                 for _ in 0..200 {
                     c.update("INSERT DATA { <http://ex/a> <http://ex/p> <http://ex/c> }")
                         .unwrap();
+                    if !a_later_read_finished() {
+                        return;
+                    }
                     c.update("DELETE DATA { <http://ex/a> <http://ex/p> <http://ex/c> }")
                         .unwrap();
+                    if !a_later_read_finished() {
+                        return;
+                    }
                 }
             })
         };
 
         writer.join().unwrap();
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let total: u64 = readers.into_iter().map(|h| h.join().unwrap()).sum();
-        assert!(total > 0, "readers should have run");
+        assert!(
+            total > 2 * 200,
+            "readers should have run between the commits"
+        );
+        let r = reads(&shared);
+        assert!(
+            r.saw[1] > 0 && r.saw[2] > 0,
+            "the readers saw both states: {:?}",
+            r.saw
+        );
+        drop(r);
         // 400 commits happened on top of the initial version.
         assert!(
             c.version() >= 401,
