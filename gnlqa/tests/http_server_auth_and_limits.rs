@@ -272,3 +272,47 @@ fn request_time_budget_is_enforced() {
     assert!(r.body.contains("time budget"), "{r:?}");
     assert_eq!(llm.call_count(), 0, "no LLM call after the deadline");
 }
+
+/// An LLM whose call runs into the request's deadline: it returns once the
+/// budget's time is up, with the transport error a real client reports when
+/// its network timeout (capped by the time left) fires.
+struct DeadlineLlm;
+impl gnlqa::LlmClient for DeadlineLlm {
+    fn complete(&self, _req: &gnlqa::LlmRequest) -> gnlqa::Result<String> {
+        // waits for wall-clock time to pass, not for another thread
+        while gnlqa::budget::remaining_time().is_some_and(|t| !t.is_zero()) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        Err(gnlqa::Error::Http("timed out reading response".into()))
+    }
+}
+
+#[test]
+fn a_call_cut_short_by_the_time_budget_reports_the_budget() {
+    // review (r5-gnlqa reviewer): the real clients cap their network timeout
+    // by the request's remaining time, so a request that runs out of time
+    // mid-call failed with that call's transport error — 500
+    // "upstream_unavailable", blaming a healthy provider. It is the time
+    // budget that ran out: 503 "limit_exceeded".
+    let kb = Arc::new(MockKb::new(vec![one_row()]));
+    let engine = Arc::new(SolveEngine::new(
+        Box::new(DeadlineLlm),
+        Box::new(Arc::clone(&kb)),
+    ));
+    let limits = HttpLimits {
+        cost: CostLimits {
+            timeout: Some(Duration::from_millis(200)),
+            ..HttpLimits::default().cost
+        },
+        ..HttpLimits::default()
+    };
+    let addr = serve(
+        HttpServer::bind(engine, "127.0.0.1:0")
+            .unwrap()
+            .with_token(TOKEN)
+            .with_limits(limits),
+    );
+    let r = post(addr, "/ask", Q, Some(TOKEN));
+    assert_eq!(r.status, 503, "{r:?}");
+    assert_eq!(r.json()["code"], "limit_exceeded", "{r:?}");
+}

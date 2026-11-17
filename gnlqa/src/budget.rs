@@ -150,6 +150,22 @@ pub fn charge_llm_call() -> Result<()> {
     })
 }
 
+/// A transport failure ([`Error::Http`]) of a call that ended at or after
+/// the request's deadline is reported as the exhausted time budget: the
+/// real clients cap their network timeout by the time left, so such a
+/// failure is usually that cap firing, not an outage of a healthy
+/// provider or KB (which would answer 500 "upstream unavailable" and blame
+/// it). Any other error is returned unchanged.
+fn attribute_to_deadline(e: Error) -> Error {
+    if matches!(e, Error::Http(_)) {
+        if let Err(limit) = check_deadline() {
+            eprintln!("gnlqa: a call ran into the request's time budget: {e}");
+            return limit;
+        }
+    }
+    e
+}
+
 /// Charge `rows` KB result rows (checked after the query returned).
 pub fn charge_kb_rows(rows: usize) -> Result<()> {
     CURRENT.with(|c| {
@@ -175,7 +191,7 @@ pub(crate) struct MeteredLlm(pub(crate) Box<dyn LlmClient>);
 impl LlmClient for MeteredLlm {
     fn complete(&self, req: &LlmRequest) -> Result<String> {
         charge_llm_call()?;
-        self.0.complete(req)
+        self.0.complete(req).map_err(attribute_to_deadline)
     }
 }
 
@@ -187,13 +203,13 @@ pub(crate) struct MeteredKb(pub(crate) Box<dyn KbClient>);
 impl KbClient for MeteredKb {
     fn query(&self, sparql: &str) -> Result<SparqlAnswer> {
         check_deadline()?;
-        let ans = self.0.query(sparql)?;
+        let ans = self.0.query(sparql).map_err(attribute_to_deadline)?;
         charge_kb_rows(ans.row_count())?;
         Ok(ans)
     }
     fn query_capped(&self, sparql: &str) -> Result<(SparqlAnswer, bool)> {
         check_deadline()?;
-        let (ans, truncated) = self.0.query_capped(sparql)?;
+        let (ans, truncated) = self.0.query_capped(sparql).map_err(attribute_to_deadline)?;
         charge_kb_rows(ans.row_count())?;
         Ok((ans, truncated))
     }
@@ -253,6 +269,26 @@ mod tests {
                 Duration::from_millis(1)
             );
         });
+    }
+
+    #[test]
+    fn a_transport_failure_at_the_deadline_is_the_time_budget() {
+        // review (r5-gnlqa reviewer): a call cut short by the budget-capped
+        // network timeout reports the budget, not an upstream outage.
+        let limits = CostLimits {
+            timeout: Some(Duration::ZERO),
+            ..CostLimits::unlimited()
+        };
+        with_limits(limits, || {
+            let e = attribute_to_deadline(Error::Http("timed out".into()));
+            assert!(matches!(e, Error::Limit(_)), "{e:?}");
+            // other errors keep their kind
+            let e = attribute_to_deadline(Error::GStore("HTTP 400: bad query".into()));
+            assert!(matches!(e, Error::GStore(_)), "{e:?}");
+        });
+        // before the deadline (or without a budget) an outage is an outage
+        let e = attribute_to_deadline(Error::Http("connection refused".into()));
+        assert!(matches!(e, Error::Http(_)), "{e:?}");
     }
 
     #[test]
