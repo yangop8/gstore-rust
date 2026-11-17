@@ -1091,6 +1091,7 @@ mod tests {
             limits: PfnLimits::default(),
             cancel: None,
             max_output: 100,
+            spent: None,
         };
         let e = r.call("u", "f", "{}", &g, &opts).unwrap_err().to_string();
         assert!(e.contains("pfn-wasm"), "{e}");
@@ -1171,6 +1172,7 @@ mod tests {
             limits: PfnLimits::default(),
             cancel: None,
             max_output: 100,
+            spent: None,
         };
         r.create(
             "u",
@@ -1210,6 +1212,7 @@ mod tests {
             limits: PfnLimits::default(),
             cancel: None,
             max_output: 100,
+            spent: None,
         };
         let emit = |n: i64| format!("(call $emit_i64 (i64.const {n})) (i32.const 1)");
         r.create("u", info("f", &emit(7))).unwrap();
@@ -1250,6 +1253,7 @@ mod tests {
             limits: PfnLimits::default(),
             cancel: None,
             max_output: 100,
+            spent: None,
         };
         r.create(
             "u",

@@ -310,6 +310,7 @@ pub const KNOWN_KEYS: &[(&str, &str)] = &[
     ("pfn", "pfn_max_memory_pages"),
     ("pfn", "pfn_max_module_bytes"),
     ("pfn", "pfn_max_functions"),
+    ("pfn", "pfn_fuel_per_query"),
     ("storage", "disk_query_mode"),
     ("storage", "disk_cache_mb"),
     ("storage", "dict_cache_mb"),
@@ -666,6 +667,11 @@ pub struct GStoreConfig {
     /// *(Rust extension)* The most PFN functions one user may own (default
     /// 100).
     pub pfn_max_functions: usize,
+    /// *(Rust extension)* The most fuel (instructions, host work and
+    /// instantiation) the PFN calls of one query may use together; `0` =
+    /// unlimited. Default [`crate::pfn::DEFAULT_FUEL_PER_QUERY`] (10^10;
+    /// review ext#1).
+    pub pfn_fuel_per_query: u64,
 
     // ---- [storage] (Rust extension) -------------------------------------
     /// *(Rust extension)* How an on-disk (`kvstore.kv`) database answers
@@ -804,6 +810,7 @@ impl Default for GStoreConfig {
             pfn_max_memory_pages: crate::pfn::DEFAULT_MAX_MEMORY_PAGES,
             pfn_max_module_bytes: crate::pfn::DEFAULT_MAX_MODULE_BYTES,
             pfn_max_functions: crate::pfn::DEFAULT_MAX_FUNCTIONS,
+            pfn_fuel_per_query: crate::pfn::DEFAULT_FUEL_PER_QUERY,
             disk_query_mode: crate::db::DEFAULT_DISK_QUERY_MODE,
             disk_cache_mb: (crate::db::DEFAULT_DISK_CACHE_PAGES * crate::kvstore::PAGE_SIZE) >> 20,
             dict_cache_mb: crate::db::DEFAULT_DICT_CACHE_BYTES >> 20,
@@ -1188,6 +1195,10 @@ impl GStoreConfig {
             "pfn_max_functions" => {
                 self.pfn_max_functions = parse_num(v).ok_or_else(|| bad("an integer"))?
             }
+            "pfn_fuel_per_query" => {
+                self.pfn_fuel_per_query =
+                    parse_num(v).ok_or_else(|| bad("a number of instructions (0 = unlimited)"))?
+            }
             "disk_query_mode" => {
                 self.disk_query_mode =
                     DiskQueryMode::parse(v).ok_or_else(|| bad("stream or memory"))?
@@ -1348,6 +1359,7 @@ impl GStoreConfig {
             "pfn_max_memory_pages" => self.pfn_max_memory_pages.to_string(),
             "pfn_max_module_bytes" => self.pfn_max_module_bytes.to_string(),
             "pfn_max_functions" => self.pfn_max_functions.to_string(),
+            "pfn_fuel_per_query" => self.pfn_fuel_per_query.to_string(),
             "disk_query_mode" => self.disk_query_mode.name().to_string(),
             "disk_cache_mb" => self.disk_cache_mb.to_string(),
             "dict_cache_mb" => self.dict_cache_mb.to_string(),
@@ -1521,6 +1533,7 @@ impl GStoreConfig {
                 max_memory_pages: self.pfn_max_memory_pages,
                 max_module_bytes: self.pfn_max_module_bytes,
                 max_functions: self.pfn_max_functions,
+                fuel_per_query: self.pfn_fuel_per_query,
             },
         }
     }
@@ -2103,7 +2116,7 @@ upload_allow_compress_packages = "zip"
                     early_termination=off\ntopk_bounded_heap=off\ntopk_dpb=always\n\
                     gfun_max_output_bytes=4096\n\
                     [pfn]\npfn_fuel_per_call=0\npfn_max_memory_pages=2\n\
-                    pfn_max_module_bytes=5000\npfn_max_functions=3\n\
+                    pfn_max_module_bytes=5000\npfn_max_functions=3\npfn_fuel_per_query=9\n\
                     [storage]\ndisk_query_mode=stream\ndisk_cache_mb=64\ndict_cache_mb=32\n\
                     vstree_on_open=on\ndefault_layout=disk\nrocksdb_block_cache_mb=64\n\
                     rocksdb_bloom=off\nrocksdb_max_open_files=512\n";
@@ -2243,6 +2256,7 @@ upload_allow_compress_packages = "zip"
                     max_memory_pages: 2,
                     max_module_bytes: 5000,
                     max_functions: 3,
+                    fuel_per_query: 9,
                 },
             }
         );

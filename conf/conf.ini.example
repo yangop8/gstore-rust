@@ -365,6 +365,9 @@ upload_user_quota = 0
 # pfn_max_module_bytes=1048576
 # the most functions one user may own
 # pfn_max_functions=100
+# the most WebAssembly instructions all the PFN calls of one query may run
+# together, the instantiation of each call included (0 = unlimited)
+# pfn_fuel_per_query=10000000000
 
 # ---- gstore-rust extension (not in upstream conf.ini) ----
 # How databases are opened. gserver installs these as the defaults when it

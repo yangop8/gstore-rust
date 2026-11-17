@@ -376,7 +376,8 @@ impl Snapshot {
             eval = eval.with_functions(self.functions.clone());
         }
         if let Some(caller) = &self.pfn {
-            eval = eval.with_pfn(caller.clone());
+            // A budget of its own per query (review ext#1).
+            eval = eval.with_pfn(caller.for_query());
         }
         evaluate_scoped(eval, &q)
     }
@@ -1213,7 +1214,8 @@ impl VersionView<'_> {
         // Like the user-defined functions, the PFN caller is the latest
         // snapshot's (functions are not versioned data).
         if let Some(caller) = &latest.pfn {
-            eval = eval.with_pfn(caller.clone());
+            // A budget of its own per query (review ext#1).
+            eval = eval.with_pfn(caller.for_query());
         }
         evaluate_scoped(eval, &q)
     }
