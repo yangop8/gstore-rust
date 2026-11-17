@@ -252,7 +252,10 @@ fn a_cancelled_execute_leaves_the_rule_as_it_was() {
     let e = manage::execute(&mut db, &mut store, "R", Some(cancelled))
         .expect_err("an execute whose cancel flag is raised must be cancelled")
         .to_string();
-    assert!(e.to_lowercase().contains("cancel"), "not a cancellation: {e}");
+    assert!(
+        e.to_lowercase().contains("cancel"),
+        "not a cancellation: {e}"
+    );
     assert_eq!(count(&mut db, q), 0, "{e}");
     assert_eq!(status(&mut db, "R"), "已编译");
     // Not "executed": compile is not refused.
