@@ -732,8 +732,11 @@ fn a_gserver_without_tls_refuses_the_tls_options() {
     let _ = waiter.join();
     let stderr = String::from_utf8_lossy(&out.stderr);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        !out.status.success(),
+    // An argument error: exit status 2, like every other bad argument
+    // (review bulkcli#18, which landed in the same round).
+    assert_eq!(
+        out.status.code(),
+        Some(2),
         "exit status {:?}; stderr: {stderr}",
         out.status
     );
