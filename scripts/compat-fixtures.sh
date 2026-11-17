@@ -47,8 +47,10 @@ done
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 DATA="$REPO/testdata/compat"
+OWN_WORK=0
 if [ -z "$WORK" ]; then
     WORK=$(mktemp -d "${TMPDIR:-/tmp}/gstore-compat.XXXXXX")
+    OWN_WORK=1
 fi
 mkdir -p "$WORK"
 WORK=$(cd "$WORK" && pwd)
@@ -61,7 +63,10 @@ fail() { echo "compat-fixtures: FAIL: $*" >&2; exit 1; }
 cleanup() {
     if [ "$KEEP" = 0 ]; then
         git -C "$REPO" worktree remove --force "$OLD_SRC" >/dev/null 2>&1 || true
-        rm -rf "$WORK"
+        # A --work DIR given by the caller keeps everything but what this
+        # script put there; a directory it made itself goes as a whole.
+        rm -rf "$OLD_SRC" "$OLD_TARGET" "$WORK/old-run" "$WORK/fixtures" "$WORK/new" "$WORK/export"
+        if [ "$OWN_WORK" = 1 ]; then rm -rf "$WORK"; else rmdir "$WORK" 2>/dev/null || true; fi
     fi
 }
 trap cleanup EXIT
