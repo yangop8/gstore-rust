@@ -3879,9 +3879,10 @@ impl Database {
     /// snapshot in place (no lock taken), any other layout through a copy
     /// beside it, in a directory of its own named
     /// `<base>.restore-tmp-<pid>-<seq>-<nonce>` and removed again (review
-    /// db#13; see [`read_backup_detached`](Self::read_backup_detached) for the
-    /// space it needs); the backup directories are never modified — then each delta's `incr.log` is replayed
-    /// onto it. Deltas are checked for contiguity: each must begin exactly where
+    /// db#13; the copy needs about the base's size of free space on the
+    /// base's file system, or in the system's temporary directory when the
+    /// base's parent cannot be written); the backup directories are never
+    /// modified — then each delta's `incr.log` is replayed onto it. Deltas are checked for contiguity: each must begin exactly where
     /// the previous one ended (starting from the base's recorded checkpoint), so
     /// an out-of-order or gapped chain is rejected rather than silently
     /// misapplied. The reasoning rules (and ledgers) of the last increment
