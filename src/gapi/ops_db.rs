@@ -1581,7 +1581,15 @@ fn inspect(ctx: &Ctx<'_>, db: &str) -> Result<Inspection, GResp> {
     }
     let _busy = claim(ctx, db)?;
     *locked(unloaded_reads()).entry(dir.clone()).or_insert(0) += 1;
-    let copy = if Database::storage_kind(&dir) == Some(crate::StorageKind::Snapshot) {
+    // A snapshot is read without the directory's lock (another process may
+    // have the database open): its files are fingerprinted before the read
+    // too, and the statistics are cached only when the read saw the files
+    // the print below describes (round-4 review of gapi#17: a save between
+    // the read and the print cached the old statistics under the new
+    // files' print).
+    let snapshot = Database::storage_kind(&dir) == Some(crate::StorageKind::Snapshot);
+    let before = snapshot.then(|| DirPrint::of(&dir));
+    let copy = if snapshot {
         Database::read_copy(&dir)
     } else {
         ctx.inner.open_db(&dir)
@@ -1602,20 +1610,34 @@ fn inspect(ctx: &Ctx<'_>, db: &str) -> Result<Inspection, GResp> {
     };
     // Keyed by the files as the read left them: opening a database may
     // write some (RocksDB's LOG, MANIFEST and OPTIONS), so they are walked
-    // once it is closed again.
+    // once it is closed again — with the directory's lock still held (this
+    // process's share of the lock the open took), so no other process
+    // writes between the close and the walk (round-4 review of gapi#17).
+    let held = (!snapshot).then(|| DirLock::acquire(&dir));
     drop(copy);
+    unloaded_stats_hook(&dir);
     let print = DirPrint::of(&dir);
+    let cacheable = match (&before, &held) {
+        (Some(before), _) => *before == print,
+        (None, Some(held)) => held.is_ok(),
+        (None, None) => false,
+    };
+    drop(held);
     // Neither map keeps a database directory that is gone.
     locked(unloaded_reads()).retain(|d, _| d.is_dir());
     let mut cache = locked(unloaded_stats());
     cache.retain(|d, _| d.is_dir());
-    cache.insert(
-        dir,
-        UnloadedStats {
-            print,
-            ins: ins.clone(),
-        },
-    );
+    if cacheable {
+        cache.insert(
+            dir,
+            UnloadedStats {
+                print,
+                ins: ins.clone(),
+            },
+        );
+    } else {
+        cache.remove(&dir);
+    }
     Ok(Inspection {
         disk_bytes: Some(print.bytes),
         ..ins
@@ -1712,6 +1734,31 @@ fn cached_unloaded(dir: &Path, print: &DirPrint) -> Option<Inspection> {
         disk_bytes: Some(print.bytes),
         ..c.ins.clone()
     })
+}
+
+/// A test hook [`set_unloaded_stats_hook`] installs.
+type UnloadedStatsHook = Arc<dyn Fn(&Path) + Send + Sync>;
+
+fn unloaded_hook() -> &'static Mutex<Option<UnloadedStatsHook>> {
+    static HOOK: OnceLock<Mutex<Option<UnloadedStatsHook>>> = OnceLock::new();
+    HOOK.get_or_init(|| Mutex::new(None))
+}
+
+/// Run the hook [`set_unloaded_stats_hook`] installed, if any.
+fn unloaded_stats_hook(dir: &Path) {
+    let hook = locked(unloaded_hook()).clone();
+    if let Some(hook) = hook {
+        hook(dir);
+    }
+}
+
+/// Install (or, with `None`, remove) a function that `monitor` / `schema`
+/// run with the directory of an unloaded database right after they read its
+/// statistics and closed it, before they fingerprint its files to cache
+/// them — the window in which another writer could change them. For tests.
+#[doc(hidden)]
+pub fn set_unloaded_stats_hook(hook: Option<UnloadedStatsHook>) {
+    *locked(unloaded_hook()) = hook;
 }
 
 /// How many times the statistics of the unloaded database in each

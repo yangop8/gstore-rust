@@ -85,7 +85,7 @@ pub use envelope::{GBody, GResp, Status};
 pub use ops_db::stats_refresh_hook;
 pub(crate) use ops_db::stop_stats_refreshes;
 #[doc(hidden)]
-pub use ops_db::unloaded_stats_reads;
+pub use ops_db::{set_unloaded_stats_hook, unloaded_stats_reads};
 pub use params::{Params, UploadedFile};
 
 use crate::http_api::{ApiInner, ApiState};
