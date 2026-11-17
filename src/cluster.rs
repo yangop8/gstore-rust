@@ -2959,7 +2959,9 @@ struct RecoveredState {
 /// (`u64` base index, `u64` base term, triples), 3 a log suffix (`u64` first
 /// index, entries; it replaces everything from that index on). Entries and
 /// triples use the [`crate::rpc`] encodings. A torn record at the tail (a
-/// crash mid-append, never acknowledged) is cut off on open.
+/// crash mid-append, never acknowledged) is cut off on open; an intact record
+/// that does not decode (a newer format, a damaged file) makes the open fail
+/// instead, so acknowledged state is never dropped silently.
 #[derive(Debug)]
 struct RaftJournal {
     file: std::fs::File,
@@ -2979,7 +2981,13 @@ impl RaftJournal {
     /// journal is open; a file system without advisory locks opens unlocked.
     fn open(dir: &std::path::Path, id: NodeId) -> io::Result<(RaftJournal, RecoveredState)> {
         use std::io::{Read as _, Write as _};
-        std::fs::create_dir_all(dir)?;
+        // A new state directory's own entry (and any new ancestor's) is
+        // synced too: a journal that vanished with its directory after a power
+        // loss would restart the node at term 0 with no vote.
+        crate::db::fsutil::create_dir_durable(dir).map_err(|e| match e {
+            GStoreError::Io(e) => e,
+            other => io::Error::other(other.to_string()),
+        })?;
         let path = dir.join(Self::FILE);
         let mut file = std::fs::OpenOptions::new()
             .read(true)
@@ -3032,8 +3040,20 @@ impl RaftJournal {
         let mut state = RecoveredState::default();
         let mut at = Self::HEADER_LEN;
         while let Some((payload, next)) = Self::record_at(&bytes, at) {
-            if Self::replay(&mut state, payload).is_err() {
-                break; // a record that does not decode ends the journal too
+            if let Err(e) = Self::replay(&mut state, payload) {
+                // A whole record (its CRC matches) that does not decode was
+                // not torn by a crash: it comes from a newer journal format or
+                // a damaged file. Cutting it off — with every record after it —
+                // would silently forget acknowledged state such as a vote, the
+                // very thing the journal exists to keep, so refuse to start.
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{}: the record at byte {at} is intact but cannot be read ({e}); \
+                         refusing to start from a raft journal this build does not understand",
+                        path.display()
+                    ),
+                ));
             }
             at = next;
         }
@@ -3047,10 +3067,16 @@ impl RaftJournal {
     }
 
     /// The well-formed record starting at `at`: its payload and the offset of
-    /// the next record. `None` at the end, or at a torn or corrupt record.
+    /// the next record. `None` at the end, or at a torn or corrupt record —
+    /// including a zero-length one, which [`RaftJournal::append`] never
+    /// writes but a crash can leave behind (a file grown, its new bytes still
+    /// zero), and whose CRC would otherwise match.
     fn record_at(bytes: &[u8], at: usize) -> Option<(&[u8], usize)> {
         let head = bytes.get(at..at.checked_add(8)?)?;
         let len = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
+        if len == 0 {
+            return None;
+        }
         let crc = u32::from_be_bytes([head[4], head[5], head[6], head[7]]);
         let end = (at + 8).checked_add(len)?;
         let payload = bytes.get(at + 8..end)?;
@@ -3329,11 +3355,20 @@ impl ClusterNode {
     /// produced — a reply, an outgoing message, a commit counting this node —
     /// can be seen; the caller holds the state lock, so journal order is state
     /// order. A no-op for an in-memory node. If the journal cannot be written
-    /// the node stops for good and the error is returned.
+    /// the node stops for good and the error is returned — then, and on every
+    /// later call: the failed batch is gone from `st`'s durability bookkeeping
+    /// (its delta was handed out), so a later step that changes nothing new
+    /// would otherwise look durable and could, say, grant again a vote that
+    /// never reached the disk.
     fn persist(&self, st: &mut RaftState) -> io::Result<()> {
         let Some(journal) = &self.journal else {
             return Ok(());
         };
+        if self.durable_failed.load(Ordering::SeqCst) {
+            return Err(io::Error::other(
+                "the raft journal could not be written earlier; this node has stopped",
+            ));
+        }
         let delta = st.take_durable_delta();
         if delta.is_empty() {
             return Ok(());
@@ -3871,8 +3906,18 @@ impl ClusterNode {
     }
 
     /// Drain and apply committed entries; the caller must hold `apply_lock`.
+    /// Nothing once the node's journal has failed: a single-node leader counts
+    /// an entry committed as it appends it, before the journal write that then
+    /// failed, and such an entry must never reach the store. (Checked under
+    /// the state lock, which the failing write holds while it sets the flag.)
     fn apply_actions_locked(&self) {
-        let actions = { self.state.lock().unwrap().drain_apply() };
+        let actions = {
+            let mut st = self.state.lock().unwrap();
+            if self.durable_failed.load(Ordering::SeqCst) {
+                return;
+            }
+            st.drain_apply()
+        };
         if actions.is_empty() {
             return;
         }
@@ -8106,5 +8151,210 @@ mod review_fix_tests {
         drop(first);
         ClusterNode::bind_persistent(3, vec![4], &dir.0, "127.0.0.1:0", cfg)
             .expect("released when the first node is gone");
+    }
+
+    /// Replace node `node`'s journal file handle: a read-only handle makes
+    /// every journal write fail (an injected disk failure), an append handle
+    /// makes them work again (the disk recovered).
+    fn swap_journal_file(node: &ClusterNode, file: std::fs::File) {
+        node.journal
+            .as_ref()
+            .expect("a persistent node")
+            .lock()
+            .unwrap()
+            .file = file;
+    }
+
+    /// review cluster-nlqa#11 (reviewer follow-up): once a journal write has
+    /// failed the node answers nothing more, even after the disk recovers.
+    /// The failed batch was already handed out by `take_durable_delta`, so
+    /// before this a retried vote request (same candidate, same term) found
+    /// nothing new to write and was *granted* — from a vote that never
+    /// reached the disk, which a restart forgets: a second vote in that term.
+    #[test]
+    fn a_vote_that_never_reached_the_journal_is_never_granted() {
+        let dir = TempDir::new("failstop_vote");
+        let cfg = RaftConfig::default();
+        let node = ClusterNode::bind_persistent(2, vec![0, 1], &dir.0, "127.0.0.1:0", cfg.clone())
+            .unwrap();
+        let path = dir.0.join(RaftJournal::FILE);
+        assert_eq!(
+            vote(&node, 5, 0),
+            Response::Vote {
+                term: 5,
+                granted: true
+            }
+        );
+
+        // The disk fails while the vote for candidate 1 in term 6 is written.
+        swap_journal_file(&node, std::fs::File::open(&path).unwrap());
+        assert!(
+            matches!(vote(&node, 6, 1), Response::Error(_)),
+            "a vote that could not be made durable is not granted"
+        );
+        assert!(!node.is_alive(), "the node stopped");
+        node.revive();
+        assert!(!node.is_alive(), "and stays stopped");
+
+        // The disk recovers; the candidate retries.
+        swap_journal_file(
+            &node,
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+        );
+        assert!(
+            matches!(vote(&node, 6, 1), Response::Error(_)),
+            "the retried vote must not be granted from state that is not on disk"
+        );
+        drop(node);
+
+        // What a restart sees is the last durable state, and the journal
+        // still opens: nothing was written after the failure.
+        let node = ClusterNode::bind_persistent(2, vec![0, 1], &dir.0, "127.0.0.1:0", cfg).unwrap();
+        assert_eq!(node.current_term(), 5);
+    }
+
+    /// A single-node leader counts an entry committed as it appends it, before
+    /// the journal write. When that write fails, the entry must never reach the
+    /// store — not through a concurrent waiter draining the log, and not
+    /// through a later proposal once the disk works again (which, before, was
+    /// accepted, applied the lost entry along with its own, and left a journal
+    /// with a hole in its log).
+    #[test]
+    fn a_failed_journal_write_stops_a_single_node_leader_before_anything_is_applied() {
+        let dir = TempDir::new("failstop_leader");
+        let cfg = RaftConfig::default();
+        let node =
+            ClusterNode::bind_persistent(1, vec![], &dir.0, "127.0.0.1:0", cfg.clone()).unwrap();
+        let path = dir.0.join(RaftJournal::FILE);
+        {
+            // Elect it by hand (no driver thread), journaling the new term.
+            let mut st = node.state.lock().unwrap();
+            while !st.is_leader() {
+                st.tick();
+            }
+            node.persist(&mut st).unwrap();
+        }
+        let (a, b, c) = (t(1, 1, 1), t(2, 2, 2), t(3, 3, 3));
+        node.propose_and_wait(LogOp::Insert(a), HANG_GUARD).unwrap();
+        assert!(node.store_contains(a));
+
+        swap_journal_file(&node, std::fs::File::open(&path).unwrap());
+        assert!(node.propose(LogOp::Insert(b)).is_err(), "b is not durable");
+        node.apply_actions(); // what a concurrent waiter's drain does
+        assert!(!node.store_contains(b), "a lost write reached the store");
+
+        swap_journal_file(
+            &node,
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+        );
+        assert!(
+            node.propose(LogOp::Insert(c)).is_err(),
+            "a stopped node accepts no more writes"
+        );
+        assert!(!node.store_contains(b));
+        assert!(!node.store_contains(c));
+        drop(node);
+
+        let node = ClusterNode::bind_persistent(1, vec![], &dir.0, "127.0.0.1:0", cfg).unwrap();
+        let log: Vec<LogOp> = node
+            .state
+            .lock()
+            .unwrap()
+            .log
+            .iter()
+            .map(|e| e.op)
+            .collect();
+        assert_eq!(
+            log,
+            vec![LogOp::Insert(a)],
+            "the journal holds exactly what was durable"
+        );
+    }
+
+    /// An intact journal record that this build cannot decode — a newer
+    /// format, a damaged file — is refused, not cut off with everything after
+    /// it (which silently forgot acknowledged votes); a zero-filled tail left
+    /// by a crash is still cut as torn.
+    #[test]
+    fn an_intact_journal_record_that_does_not_decode_is_refused_not_cut() {
+        use std::io::Write;
+        let dir = TempDir::new("undecodable");
+        let cfg = RaftConfig::default();
+        let node =
+            ClusterNode::bind_persistent(3, vec![4], &dir.0, "127.0.0.1:0", cfg.clone()).unwrap();
+        assert!(matches!(
+            vote(&node, 7, 4),
+            Response::Vote { granted: true, .. }
+        ));
+        drop(node);
+        let path = dir.0.join(RaftJournal::FILE);
+        let intact = std::fs::metadata(&path).unwrap().len();
+        let append = |bytes: &[u8]| {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(bytes).unwrap();
+        };
+
+        // A whole record (its CRC matches) with a tag this build does not know.
+        let payload = [9u8, 1, 2, 3];
+        let mut record = (payload.len() as u32).to_be_bytes().to_vec();
+        record.extend_from_slice(&crc32(&payload).to_be_bytes());
+        record.extend_from_slice(&payload);
+        append(&record);
+        let grown = std::fs::metadata(&path).unwrap().len();
+        let err = ClusterNode::bind_persistent(3, vec![4], &dir.0, "127.0.0.1:0", cfg.clone())
+            .expect_err("an intact record that does not decode is refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            grown,
+            "nothing was cut"
+        );
+
+        // Without it, a zero-filled tail (the file grew, its bytes never
+        // landed) is torn: cut, and the node starts with its vote.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(intact)
+            .unwrap();
+        append(&[0u8; 24]);
+        let node = ClusterNode::bind_persistent(3, vec![4], &dir.0, "127.0.0.1:0", cfg).unwrap();
+        assert_eq!(node.current_term(), 7);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), intact);
+        assert!(matches!(
+            vote(&node, 7, 5),
+            Response::Vote { granted: false, .. }
+        ));
+    }
+
+    /// A new state directory is created durably: the parent of every
+    /// directory `bind_persistent` creates is synced, so a power loss cannot
+    /// take the directory — and with it the journal and its vote — away.
+    #[test]
+    fn a_new_state_directory_is_created_durably() {
+        use crate::db::fsutil::DURABLE_DIR_PARENT_SYNCS;
+        let root = TempDir::new("mkdir");
+        let dir = root.0.join("a").join("b");
+        DURABLE_DIR_PARENT_SYNCS.with(|s| s.borrow_mut().clear());
+        let node =
+            ClusterNode::bind_persistent(1, vec![], &dir, "127.0.0.1:0", RaftConfig::default())
+                .unwrap();
+        drop(node);
+        let synced = DURABLE_DIR_PARENT_SYNCS.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        assert_eq!(
+            synced,
+            vec![root.0.join("a"), root.0.clone(), std::env::temp_dir()],
+            "the parent of each created directory, deepest first"
+        );
     }
 }
