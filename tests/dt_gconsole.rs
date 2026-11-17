@@ -1506,6 +1506,72 @@ fn the_local_mode_saves_acknowledged_updates_when_it_leaves_a_database() {
     assert_eq!(triples_in(&cwd.join("fresh.db")), 1, "{r:?}");
 }
 
+/// review ext#5, the rest of the rule: an `import` is kept like an update;
+/// an on-disk database writes each update through and is never saved by
+/// the console (in whichever `GSTORE_DISK_QUERY_MODE` it is opened); and a
+/// save the console cannot make is never passed over: it fails the script,
+/// and `load <other>` keeps the database whose updates it could not save.
+#[test]
+fn the_local_mode_keeps_imports_writes_disk_databases_through_and_reports_a_failed_save() {
+    let cwd = scratch("gc_local_save_rest");
+    let _cwd = DirGuard(cwd.clone());
+    let one = "<http://a> <http://p> <http://b> .\n";
+    let insert = "insert data { <http://a> <http://p> <http://c> };\n";
+    let nt = cwd.join("more.nt");
+    fs::write(&nt, "<http://x> <http://p> <http://y> .\n").unwrap();
+    let local = |db: &str, stdin: &str| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_gconsole"));
+        cmd.current_dir(&cwd).args(["--local", db]);
+        run(cmd, stdin)
+    };
+
+    // An import into a snapshot database, then the end of the input.
+    let kept = snapshot_db(&cwd, "kept", one);
+    let r = local("kept", &format!("import {}\n", path_str(&nt)));
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.out.contains("imported 1 new triple(s)"), "{r:?}");
+    assert!(r.out.contains("saved to "), "{r:?}");
+    assert_eq!(triples_in(&kept), 2, "the import is kept: {r:?}");
+
+    // An on-disk database: written through, not saved.
+    let disk = cwd.join("ondisk.db");
+    let base = cwd.join("one.nt");
+    fs::write(&base, one).unwrap();
+    gstore::Database::build_disk(&disk, &[&base]).unwrap();
+    assert_eq!(
+        gstore::Database::storage_kind(&disk),
+        Some(gstore::StorageKind::Disk)
+    );
+    let r = local("ondisk", &format!("{insert}quit;\n"));
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.out.contains("[updated 1 triple(s)]"), "{r:?}");
+    assert!(!r.out.contains("saved to"), "written through: {r:?}");
+    assert_eq!(triples_in(&disk), 2, "the insert is kept: {r:?}");
+
+    // A new in-memory database whose `<name>.db` cannot be written (a file
+    // is in its way).
+    fs::write(cwd.join("blocked.db"), "not a database").unwrap();
+    for (how, tail) in [
+        ("the end of the input", ""),
+        ("quit", "quit;\n"),
+        ("load <other>", "load kept\nstats\n"),
+    ] {
+        let r = local("blocked", &format!("{insert}{tail}"));
+        assert_eq!(r.code, 1, "{how}: the failed save fails the script: {r:?}");
+        assert!(r.err.contains("save failed"), "{how}: {r:?}");
+        assert!(!r.out.contains("saved to"), "{how}: {r:?}");
+        if how == "load <other>" {
+            assert!(r.err.contains("'blocked' stays loaded"), "{how}: {r:?}");
+            assert!(!r.out.contains("loaded 'kept'"), "{how}: {r:?}");
+            assert!(r.out.contains("name=blocked triples=1"), "{how}: {r:?}");
+        }
+    }
+    assert_eq!(
+        fs::read_to_string(cwd.join("blocked.db")).unwrap(),
+        "not a database"
+    );
+}
+
 /// review ext#9: `gconsole --local` ends a statement by the remote
 /// console's rule — at a `;` outside `{…}` groups, string literals and
 /// `<IRI>`s — not at any line ending in `;`: a multi-line SELECT with a
