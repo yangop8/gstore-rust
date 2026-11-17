@@ -72,10 +72,20 @@ pub fn encode_u32s(ids: &[u32]) -> Vec<u8> {
 }
 
 /// Decode a VList produced by [`encode_u32s`] back into the original id list.
-/// Returns `None` if the buffer is malformed (truncated / overlong varint).
+/// Returns `None` if the buffer is malformed (truncated / overlong varint, a
+/// delta that overflows `u32`, or a count the remaining bytes cannot hold).
+///
+/// The count is read from disk and not trusted: every element takes at least
+/// one byte, so a count above the remaining length is malformed before
+/// anything is allocated, and the allocation is bounded by the input (review
+/// robust#11: a garbage count of `u32::MAX` used to request 16 GiB up front
+/// and abort the process).
 pub fn decode_u32s(bytes: &[u8]) -> Option<Vec<u32>> {
     let mut pos = 0usize;
     let count = read_varint(bytes, &mut pos)? as usize;
+    if count > bytes.len() - pos {
+        return None;
+    }
     let mut out = Vec::with_capacity(count);
     let mut prev: u32 = 0;
     for _ in 0..count {
@@ -171,6 +181,23 @@ mod tests {
         let enc = encode_u32s(&ids);
         let decoded = decode_u32s(&enc).unwrap();
         assert_eq!(decoded, ids);
+    }
+
+    /// review robust#11: a garbage count is malformed before anything is
+    /// allocated (`u32::MAX` elements used to request 16 GiB and abort the
+    /// process with "memory allocation of 17179869180 bytes failed").
+    #[test]
+    fn decode_rejects_a_count_the_bytes_cannot_hold_without_allocating_it() {
+        assert_eq!(decode_u32s(&[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]), None);
+        let mut buf = Vec::new();
+        write_varint(&mut buf, u32::MAX);
+        buf.extend_from_slice(&[1; 64]);
+        assert_eq!(decode_u32s(&buf), None);
+        // A count exactly as large as the remaining bytes still decodes.
+        let mut buf = Vec::new();
+        write_varint(&mut buf, 3);
+        buf.extend_from_slice(&[1, 1, 1]);
+        assert_eq!(decode_u32s(&buf), Some(vec![1, 2, 3]));
     }
 
     #[test]

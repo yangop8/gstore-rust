@@ -1722,7 +1722,14 @@ impl DiskStore {
         if pager.root(ROOT_COMPACTED) != 0 {
             if let Some(rec) = io(self.sp2o_vlist.get(&pager, &cat(s, p)))? {
                 let bytes = io(materialize_vlist(&pager, &rec))?;
-                return Ok(vlist::decode_u32s(&bytes).unwrap_or_default());
+                // review robust#11: a record that does not decode is
+                // corruption, reported like any other read error (contract
+                // C2), not an empty list.
+                return vlist::decode_u32s(&bytes).ok_or_else(|| {
+                    to_io(malformed(&format!(
+                        "the VList of subject {s} and predicate {p} does not decode"
+                    )))
+                });
             }
         }
         let (lo, hi) = ((s, p, 0), (s, p, u32::MAX));
@@ -2528,7 +2535,8 @@ fn encode_vlist_record(pager: &mut Pager, enc: &[u8]) -> Result<Vec<u8>> {
 
 /// Reassemble the encoded VList bytes from a `sp2o_vlist` value record, reading
 /// an [`overflow`] chain when the record is a head pointer. A malformed record
-/// yields empty bytes (decodes to an empty list).
+/// (an unknown tag, a short head pointer) is a corruption error (review
+/// robust#11: it used to yield empty bytes, read as an empty list).
 fn materialize_vlist(pager: &Pager, rec: &[u8]) -> Result<Vec<u8>> {
     match rec.first() {
         Some(&INLINE_TAG) => Ok(rec[1..].to_vec()),
@@ -2537,7 +2545,11 @@ fn materialize_vlist(pager: &Pager, rec: &[u8]) -> Result<Vec<u8>> {
             let len = u32::from_le_bytes(rec[5..9].try_into().unwrap()) as usize;
             overflow::read_chain(pager, head, len)
         }
-        _ => Ok(Vec::new()),
+        Some(&tag) => Err(malformed(&format!(
+            "a VList record with tag {tag} and {} bytes",
+            rec.len()
+        ))),
+        None => Err(malformed("an empty VList record")),
     }
 }
 
