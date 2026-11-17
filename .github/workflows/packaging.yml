@@ -64,8 +64,10 @@ jobs:
           ls -l target/debian target/generate-rpm
       - name: the .deb holds exactly the binary targets
         run: |
+          # The files directly in ./usr/bin/ (not the directory's own
+          # entry, which would add an empty name).
           have=$(dpkg-deb -c target/debian/gstore_*.deb | awk '{ print $6 }' \
-            | sed -n 's#^\./usr/bin/##p' | sort | tr '\n' ' ')
+            | sed -n 's#^\./usr/bin/\([^/][^/]*\)$#\1#p' | sort | tr '\n' ' ')
           if [ "$have" != "$BINS" ]; then
             echo "the .deb's /usr/bin: $have"
             echo "the binary targets: $BINS"

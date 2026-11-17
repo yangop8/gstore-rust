@@ -190,7 +190,10 @@ if [ "$MODE" = image ]; then
     docker stop -t 120 "$name" >/dev/null
     [ "$(docker inspect -f '{{.State.ExitCode}}' "$name")" = 0 ] \
         || { docker logs "$name" >&2; fail "gserver did not exit 0 on docker stop"; }
-    docker logs "$name" 2>&1 | grep -q 'shut down' || fail "no graceful shutdown in the log"
+    # The logs are read whole before the search: `docker logs | grep -q`
+    # under pipefail fails when grep stops reading early (SIGPIPE).
+    logs=$(docker logs "$name" 2>&1) || fail "docker logs $name"
+    case "$logs" in *'shut down'*) ;; *) fail "no graceful shutdown in the log" ;; esac
     say "docker stop: graceful, exit 0"
     # Without a password the image's default command (listening on 0.0.0.0)
     # must refuse root's default password.
@@ -199,8 +202,11 @@ if [ "$MODE" = image ]; then
     docker run -d --name "$bare" "$IMAGE" >/dev/null
     rc=$(timeout 120 docker wait "$bare") || fail "the container without a password did not exit"
     [ "$rc" = 1 ] || fail "the container without a password exited $rc, not 1"
-    docker logs "$bare" 2>&1 | grep -q 'refusing to start' \
-        || { docker logs "$bare" >&2; fail "no default-password refusal in the log"; }
+    logs=$(docker logs "$bare" 2>&1) || fail "docker logs $bare"
+    case "$logs" in
+        *'refusing to start'*) ;;
+        *) printf '%s\n' "$logs" >&2; fail "no default-password refusal in the log" ;;
+    esac
     say "without a root password: refused (exit 1)"
     echo "package smoke: passed (image $IMAGE)"
     exit 0
