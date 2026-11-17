@@ -19,6 +19,11 @@
 //!   `restore` is sent as an absolute path when the server is on this
 //!   machine (its working directory may differ from the console's);
 //! * `backup` / `export` also print the path the server wrote;
+//! * `setpriv` refuses an answer that is not a list of privilege numbers
+//!   (a lone `0` sets none), and moves the user to exactly the given set
+//!   by granting what is missing, then revoking the rest — taking the
+//!   grant back when the revoke fails — where upstream revoked everything
+//!   first and skipped what it could not read (review ext#11);
 //! * upstream's typos in messages are kept, its crashes are not (a missing
 //!   or malformed JSON file, an unknown user).
 //!
@@ -1763,17 +1768,45 @@ fn privilege_list(bits: u32) -> String {
         .join(",")
 }
 
-/// Parse upstream's privilege numbers (`1 2 3`, `8` = all) into bits.
-pub fn parse_privilege_numbers(line: &str) -> u32 {
+/// Parse upstream's privilege numbers (`1 2 3`, `8` = all; a lone `0` =
+/// none, a gstore-rust extension) into bits. Anything else is an error
+/// naming it — review ext#11: a typo used to be skipped, and an answer
+/// with no valid number revoked every privilege.
+pub fn parse_privilege_numbers(line: &str) -> Result<u32, String> {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    if words.is_empty() {
+        return Err("no privilege number given".to_string());
+    }
     let mut bits = 0u32;
-    for word in line.split_whitespace() {
+    let mut none = false;
+    let mut bad = Vec::new();
+    for word in words {
         match word.parse::<u32>() {
+            Ok(0) => none = true,
             Ok(n @ 1..=7) => bits |= 1 << n,
             Ok(8) => bits |= 0xFE,
-            _ => {}
+            _ => bad.push(word),
         }
     }
-    bits
+    if !bad.is_empty() {
+        return Err(format!(
+            "not a privilege number (1-8, or 0 for none): {}",
+            table::printable(&bad.join(" "), false)
+        ));
+    }
+    if none && bits != 0 {
+        return Err("0 (no privilege) cannot be combined with other numbers".to_string());
+    }
+    Ok(bits)
+}
+
+/// The names of the privileges in `bits` (`"query,load"`).
+fn privilege_names(bits: u32) -> String {
+    (1..=7)
+        .filter(|i| bits & (1 << i) != 0)
+        .map(|i| PRIVILEGE_NAMES[i])
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn h_setpriv(c: &mut Console, args: &[String]) -> CmdResult {
@@ -1803,7 +1836,13 @@ fn h_setpriv(c: &mut Console, args: &[String]) -> CmdResult {
     let Some(line) = c.prompt_line(&prompt, false) else {
         return Err(Fail::Failed);
     };
-    let bits = parse_privilege_numbers(&line);
+    let bits = match parse_privilege_numbers(&line) {
+        Ok(bits) => bits,
+        Err(why) => {
+            say!(c, "{why}");
+            bail!(c, "Privilege set failed.");
+        }
+    };
     say!(c, "[will set priv:]{}", low_bits(bits));
     // The user's current privileges on the database (upstream `read_priv`).
     let users = show_users(c)?;
@@ -1819,25 +1858,59 @@ fn h_setpriv(c: &mut Console, args: &[String]) -> CmdResult {
             }
         }
     }
-    for (kind, set) in [("2", current), ("1", bits)] {
-        if set == 0 {
-            continue;
-        }
-        let r = c.request(
-            "userprivilegemanage",
-            vec![
-                ("type", Json::from(kind)),
-                ("op_username", Json::from(user.as_str())),
-                ("privileges", Json::from(privilege_list(set))),
-                ("db_name", Json::from(db.as_str())),
-            ],
-        )?;
+    // The protocol has no "set exactly": grant what is missing, then revoke
+    // what is left over — each one request, applied whole by the server —
+    // and take the grant back when the revoke fails, so a failure leaves
+    // the user with the privileges they had (review ext#11; upstream
+    // revoked everything first).
+    let (grant, revoke) = (bits & !current, current & !bits);
+    if grant != 0 {
+        let r = privilege_request(c, "1", &user, &db, grant)?;
         if !r.ok() {
-            bail!(c, "Privilege set failed {}", r.msg);
+            say!(c, "Privilege set failed {}", r.msg);
+            bail!(c, "The privileges of {user} on {db} are unchanged.");
+        }
+    }
+    if revoke != 0 {
+        let r = privilege_request(c, "2", &user, &db, revoke)?;
+        if !r.ok() {
+            say!(c, "Privilege set failed {}", r.msg);
+            if grant != 0 {
+                let back = privilege_request(c, "2", &user, &db, grant)?;
+                if !back.ok() {
+                    bail!(
+                        c,
+                        "Taking the grant back failed too ({}): {user} now also holds {} on {db}.",
+                        back.msg,
+                        privilege_names(grant)
+                    );
+                }
+            }
+            bail!(c, "The privileges of {user} on {db} are unchanged.");
         }
     }
     say!(c, "Privilege set successfully.");
     Ok(())
+}
+
+/// `userprivilegemanage` of `kind` (1 grant, 2 revoke) of the privileges in
+/// `bits` to `user` on `db`.
+fn privilege_request(
+    c: &mut Console,
+    kind: &str,
+    user: &str,
+    db: &str,
+    bits: u32,
+) -> Result<Resp, Fail> {
+    c.request(
+        "userprivilegemanage",
+        vec![
+            ("type", Json::from(kind)),
+            ("op_username", Json::from(user)),
+            ("privileges", Json::from(privilege_list(bits))),
+            ("db_name", Json::from(db)),
+        ],
+    )
 }
 
 fn h_clearpriv(c: &mut Console, args: &[String]) -> CmdResult {
@@ -2309,12 +2382,22 @@ mod tests {
 
     #[test]
     fn privilege_numbers_and_bits() {
-        assert_eq!(parse_privilege_numbers("1 2 3"), 0b1110);
-        assert_eq!(low_bits(parse_privilege_numbers("1 2 3")), "00001110");
-        assert_eq!(parse_privilege_numbers("8"), 0xFE);
-        assert_eq!(parse_privilege_numbers("9 x 0 7"), 1 << 7);
+        assert_eq!(parse_privilege_numbers("1 2 3"), Ok(0b1110));
+        assert_eq!(low_bits(0b1110), "00001110");
+        assert_eq!(parse_privilege_numbers("8"), Ok(0xFE));
+        // review ext#11: this used to be `1 << 7` — the unknown words were
+        // skipped silently, and an answer without a valid number revoked
+        // every privilege. Now each is an error, and a lone 0 means none.
+        assert_eq!(
+            parse_privilege_numbers("9 x 0 7"),
+            Err("not a privilege number (1-8, or 0 for none): 9 x".to_string())
+        );
+        assert!(parse_privilege_numbers("  ").is_err());
+        assert!(parse_privilege_numbers("0 7").is_err());
+        assert_eq!(parse_privilege_numbers("0"), Ok(0));
         assert_eq!(privilege_list(0xFE), "1,2,3,4,5,6,7");
         assert_eq!(privilege_list(0b1010), "1,3");
+        assert_eq!(privilege_names(0b1010), "query,unload");
     }
 
     #[test]

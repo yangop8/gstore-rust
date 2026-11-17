@@ -777,6 +777,98 @@ fn users_and_privileges() {
     assert_eq!(run(cmd, "").code, 1, "bob is gone");
 }
 
+/// `user`'s privileges on `db` by the server's `showuser`: the names of the
+/// `*_privilege` fields listing `db`, sorted.
+fn privileges_of(srv: &Server, user: &str, db: &str) -> Vec<String> {
+    let users = srv.op("showuser", &[]);
+    ok(&users);
+    let entry = users
+        .get("ResponseBody")
+        .and_then(Json::as_array)
+        .unwrap()
+        .iter()
+        .find(|u| u.get("username").and_then(Json::as_str) == Some(user))
+        .cloned()
+        .unwrap();
+    let mut privs: Vec<String> = entry
+        .as_object()
+        .unwrap()
+        .iter()
+        .filter(|(k, v)| {
+            k.ends_with("_privilege")
+                && v.as_str()
+                    .is_some_and(|l| l.split(',').any(|d| d.trim() == db))
+        })
+        .map(|(k, _)| k.trim_end_matches("_privilege").to_string())
+        .collect();
+    privs.sort();
+    privs
+}
+
+/// review ext#11: `setpriv` refuses an answer that is not a list of
+/// privilege numbers — a typo, an out-of-range number, an empty line —
+/// and changes nothing; a valid one moves the user's privileges on the
+/// database to exactly the given set (granting what is missing, then
+/// revoking the rest), and a lone `0` sets none.
+#[test]
+fn setpriv_refuses_invalid_numbers_and_sets_exactly_the_given_ones() {
+    let srv = Server::start("gc_setpriv");
+    ok(&srv.build("small", &data("small/small.nt")));
+    let cwd = scratch("gc_setpriv_cwd");
+    let _cwd = DirGuard(cwd.clone());
+    let setpriv = |answer: &str| {
+        script(
+            &srv,
+            &cwd,
+            &format!("setpriv bob small;\n{PASSWORD}\n{answer}\n"),
+        )
+    };
+    let r = script(&srv, &cwd, &format!("addusr bob;\n{PASSWORD}\nbobpw\n"));
+    assert_eq!(r.code, 0, "{r:?}");
+    let r = setpriv("1 2 3");
+    assert_eq!(r.code, 0, "{r:?}");
+    let granted = ["load", "query", "unload"];
+    assert_eq!(privileges_of(&srv, "bob", "small"), granted);
+    for (answer, why) in [
+        ("q", "not a privilege number (1-8, or 0 for none): q"),
+        ("", "no privilege number given"),
+        ("2 9", "not a privilege number (1-8, or 0 for none): 9"),
+        ("1 x 3", "not a privilege number (1-8, or 0 for none): x"),
+        (
+            "0 1",
+            "0 (no privilege) cannot be combined with other numbers",
+        ),
+    ] {
+        let r = setpriv(answer);
+        assert_eq!(r.code, 1, "{answer:?}: {r:?}");
+        assert!(
+            r.out.contains(&format!("{why}\nPrivilege set failed.\n")),
+            "{answer:?}: {r:?}"
+        );
+        assert!(!r.out.contains("successfully"), "{answer:?}: {r:?}");
+        assert_eq!(
+            privileges_of(&srv, "bob", "small"),
+            granted,
+            "{answer:?} changed nothing"
+        );
+    }
+    let r = setpriv("4 1");
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(
+        r.out
+            .contains("[will set priv:]00010010\nPrivilege set successfully.\n"),
+        "{r:?}"
+    );
+    assert_eq!(privileges_of(&srv, "bob", "small"), ["query", "update"]);
+    let r = setpriv("8");
+    assert_eq!(r.code, 0, "{r:?}");
+    assert_eq!(privileges_of(&srv, "bob", "small").len(), 7);
+    let r = setpriv("0");
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.out.contains("[will set priv:]00000000\n"), "{r:?}");
+    assert!(privileges_of(&srv, "bob", "small").is_empty());
+}
+
 #[test]
 fn help_version_and_unknown_commands() {
     let srv = Server::start("gc_help");
@@ -1921,6 +2013,59 @@ fn server_fields_cannot_drive_the_terminal() {
     assert!(!drives_the_terminal(&r.out), "{r:?}");
     assert!(!drives_the_terminal(&r.err), "{r:?}");
     assert!(r.err.contains("\\u001B]0;PWNED"), "{r:?}");
+}
+
+/// review ext#11: `setpriv` grants what is missing first and then revokes
+/// the rest; when the revoke fails it takes the grant back, so the user is
+/// left with the privileges they had, and says so.
+#[test]
+fn setpriv_rolls_back_its_grant_when_the_revoke_fails() {
+    let respond: Arc<Responder> = Arc::new(|req: &Json| {
+        Some(match field(req, "operation").as_str() {
+            "showuser" => success().with(
+                "ResponseBody",
+                Json::Arr(vec![Json::obj()
+                    .with("username", "bob")
+                    .with("query_privilege", "small,")
+                    .with("load_privilege", "small,")
+                    .with("unload_privilege", "small,")
+                    .with("update_privilege", "")]),
+            ),
+            "userprivilegemanage"
+                if field(req, "type") == "2" && field(req, "privileges") == "1,2,3" =>
+            {
+                Json::obj()
+                    .with("StatusCode", 1005)
+                    .with("StatusMsg", "delete privilege query,load,unload failed.")
+            }
+            _ => success(),
+        })
+    });
+    let fake = Fake::start(respond);
+    let cwd = scratch("gc_setpriv_rollback");
+    let _cwd = DirGuard(cwd.clone());
+    let mut cmd = gconsole(&fake.addr, &cwd);
+    cmd.args(["-u", "root", "-p", PASSWORD]);
+    let r = run(cmd, &format!("setpriv bob small;\n{PASSWORD}\n4\n"));
+    assert_eq!(r.code, 1, "{r:?}");
+    let steps: Vec<(String, String)> = fake
+        .ops("userprivilegemanage")
+        .iter()
+        .map(|q| (field(q, "type"), field(q, "privileges")))
+        .collect();
+    let step = |t: &str, p: &str| (t.to_string(), p.to_string());
+    assert_eq!(
+        steps,
+        [step("1", "4"), step("2", "1,2,3"), step("2", "4")],
+        "grant, the failed revoke, the grant taken back: {r:?}"
+    );
+    assert!(
+        r.out.contains(
+            "Privilege set failed delete privilege query,load,unload failed.\n\
+             The privileges of bob on small are unchanged.\n"
+        ),
+        "{r:?}"
+    );
 }
 
 fn sigint(child: &Child) {
