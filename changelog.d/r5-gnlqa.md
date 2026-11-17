@@ -18,10 +18,11 @@ Behaviour changes first:
   `allow_unauthenticated_loopback` or `with_auth` is called. `/health` stays
   open.
 - **Per-client rate limit, question size cap and per-request cost budget
-  (cluster-nlqa#13, sec#18).** Each client IP may send
-  `GNLQA_HTTP_RATE_PER_MIN` (default 30) question requests per minute —
-  counted before authentication, so token guessing is bounded too — and
-  gets `429` with `Retry-After` beyond that. A question longer than
+  (cluster-nlqa#13, sec#18).** Each client IP — an IPv6 client per /64
+  network, an IPv4-mapped address as its IPv4 address, the rule of gStore's
+  login lockout — may send `GNLQA_HTTP_RATE_PER_MIN` (default 30) question
+  requests per minute — counted before authentication, so token guessing
+  is bounded too — and gets `429` with `Retry-After` beyond that. A question longer than
   `GNLQA_MAX_QUESTION_BYTES` (4096) gets `413`. The engine work one request
   causes runs under the new thread-local `gnlqa::budget` (`CostLimits`):
   at most `GNLQA_MAX_LLM_CALLS` (16) LLM calls, `GNLQA_MAX_KB_ROWS` (200000)
@@ -29,7 +30,9 @@ Behaviour changes first:
   their network timeouts (and retry waits) by the time left. An exhausted
   budget is the new `Error::Limit`, which, like a transport outage, ends the
   request (`Error::is_fatal`): `/ask` answers `503`, `/gSolve`
-  `status:"error"`. MCP tool calls run under the same budget
+  `status:"error"`. A call whose (budget-capped) network timeout fires at
+  the deadline is reported as the spent time budget (`503`
+  `limit_exceeded`), not as an outage of a healthy upstream. MCP tool calls run under the same budget
   (`McpServer::with_limits`; `gnlqa mcp` uses the configured limits).
 - **Error responses are redacted (cluster-nlqa#18).** `/ask`, `/gSolve`
   and MCP tool errors no longer echo the internal error text (ureq printed
@@ -78,7 +81,8 @@ Behaviour changes first:
   intent call (a malformed intent still degrades, logged), the GraphRAG
   fallback (`graphrag::try_retrieve_subgraph`) and seeded analytics —
   instead of becoming an ungrounded guess or "no candidate query produced
-  an answer". Citation and explanation failures are logged. The linker is
+  an answer"; under graph-analytics routing a fatal error no longer falls
+  through to Text-to-SPARQL either. Citation and explanation failures are logged. The linker is
   built lazily (`SolveEngine::with_linker_builder`, `prepare_linker`): a KB
   unreachable at startup is logged and retried on a later request (at most
   once a minute in `gnlqa`), even after a panicking build.
@@ -109,8 +113,11 @@ Behaviour changes first:
   (`LinkerLabels::fetch`) — a capped index is a deterministic prefix, sizes
   and truncation are logged — and cached on disk per KB fingerprint
   (`kb_fingerprint`: endpoint, label settings and two predicate-bound
-  `COUNT`s; `LinkerCache`, 0600 files, one day maximum age;
-  `Linker::build_cached`). A repeated one-shot `gnlqa "<question>"` costs two
+  `COUNT`s; `LinkerCache`, 0600 files — a directory the cache creates is
+  0700, an existing one keeps its permissions, and a cache file that other
+  users can access is not trusted — one day maximum age;
+  `Linker::build_cached`). A capped entity index is the first entities in
+  IRI order. A repeated one-shot `gnlqa "<question>"` costs two
   `COUNT` queries instead of full-store `DISTINCT` scans. New keys
   `GNLQA_LINKER_MAX_LABELS` (10000), `GNLQA_LINKER_CACHE` (on),
   `GNLQA_LINKER_CACHE_DIR` (`$XDG_CACHE_HOME/gnlqa`).
@@ -130,7 +137,7 @@ New files and tests:
   mode), `config_trust.rs` (runs the binary with a planted `gnlqa.conf`),
   `provider_failures.rs`, `error_redaction.rs`, `answer_cache_bounds.rs`,
   `readonly_gate.rs` (SERVICE placements, repair proposing UPDATE),
-  `linker_cache.rs`. gnlqa now has 185 unit and 67 integration tests.
+  `linker_cache.rs`. gnlqa now has 187 unit and 73 integration tests.
 - Corrected tests (D6): `session::tests::auto_mode_rewrite_includes_prior_answer`
   asserted the cluster-nlqa#14 leak; it is now
   `auto_mode_rewrite_omits_prior_gstore_answer` (review comment), and the
@@ -138,6 +145,24 @@ New files and tests:
   `config::tests::default_has_cache_and_token_floor` pinned the old TTL
   default 0 (cluster-nlqa#19 comment). The in-module `http_server` tests
   now present a token (setup lines marked with cluster-nlqa#13 comments).
+- Review pass (each fix with a test that fails without it): IPv6 clients
+  rate-limited per /64 (`ipv6_clients_share_a_bucket_per_64_network`); a
+  call cut short by the time budget reports the budget
+  (`a_call_cut_short_by_the_time_budget_reports_the_budget`,
+  `budget::tests::a_transport_failure_at_the_deadline_is_the_time_budget`);
+  a fatal error under analytics routing ends the request
+  (`a_kb_outage_during_graph_analytics_ends_the_request`); the linker cache
+  no longer chmods an existing directory and ignores cache files other
+  users can access (`an_existing_cache_directory_keeps_its_permissions`,
+  `a_cache_file_readable_by_others_is_not_trusted`); the `gnlqa serve`
+  refusals are tested on the binary
+  (`gnlqa_serve_refuses_to_start_without_a_client_token`,
+  `gnlqa_serve_unauthenticated_mode_refuses_a_non_loopback_bind`).
+  `rate_limit_applies_per_client_before_authentication` tolerates a token
+  refilled during a slow burst. `gnlqa.conf.example` explains each
+  optional setting on its own line: `parse_config` keeps everything after
+  `=` as the value, so the former inline comments became part of a value
+  once a line was uncommented.
 
 ## GAP_PLAN status line
 
@@ -154,7 +179,7 @@ none
   the follow-up rewrite now honours the table (a locally computed answer is
   never replayed outside `graphrag` mode) and structured mode never sends
   supporting triples, even with `with_explain`. The test count line
-  ("incl. 159 for gNLQA") becomes 252 (185 unit + 67 integration).
+  ("incl. 159 for gNLQA") becomes 260 (187 unit + 73 integration).
 - **docs/DEPLOY.md** (secure defaults and switches table): `gnlqa serve`
   client authentication — secure default: refuses to start without
   `GNLQA_HTTP_TOKEN`; switch `GNLQA_HTTP_ALLOW_UNAUTHENTICATED=on` (an
@@ -170,9 +195,13 @@ none
 - **CHANGELOG.md**: the bullets above, behaviour changes first; the
   `gnlqa.conf` location and the serve token are upgrade notes.
 - **docs/REFACTOR_BACKLOG.md** (remaining, not refactors done here):
-  cluster-nlqa#13 — the rate limiter keys on the TCP peer address, so
-  behind a reverse proxy all clients share one bucket (gnlqa has no
-  trusted-proxy setting; use the proxy's own limits there). cluster-nlqa#22
+  cluster-nlqa#13 — the rate limiter keys on the TCP peer address (IPv6:
+  its /64), so behind a reverse proxy all clients share one bucket (gnlqa
+  has no trusted-proxy setting; use the proxy's own limits there); and its
+  table of at most 10000 clients is cleared when a flood from more
+  networks than that (e.g. the /64s of one IPv6 /48) fills it with
+  non-refilled buckets, which resets every client's bucket — bounded
+  memory was chosen over refusing new clients. cluster-nlqa#22
   — the KB fingerprint (two `COUNT`s) does not see a change that keeps the
   number of `rdfs:label` and `rdf:type` triples (e.g. a new predicate
   without labels or types); the one-day maximum age bounds that staleness,
