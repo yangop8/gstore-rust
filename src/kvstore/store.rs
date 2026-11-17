@@ -93,6 +93,25 @@ const OVERFLOW_TAG: u8 = 1;
 /// A per-predicate statistics record: `(num, distinct_subj, distinct_obj)`.
 type PredStat = (u32, u32, u32);
 
+/// A per-predicate triple count of `u32::MAX` is saturated: the record is a
+/// `u32` on disk (no format change, D7), so the count stops there — "at
+/// least this many", an unknown count — instead of wrapping to 0, which made
+/// the predicate look absent (review gap-accel-soundness#4, bulkcli#14). A
+/// delete leaves a saturated count where it is;
+/// [`rebuild_stats`](DiskStore::rebuild_stats) recounts.
+fn count_up(n: u32) -> u32 {
+    n.saturating_add(1)
+}
+
+/// One triple fewer; a saturated count stays saturated (see [`count_up`]).
+fn count_down(n: u32) -> u32 {
+    if n == u32::MAX {
+        n
+    } else {
+        n.saturating_sub(1)
+    }
+}
+
 /// The in-memory counters a write operation may change, restored if it fails.
 #[derive(Clone, Copy)]
 struct Counters {
@@ -1299,7 +1318,11 @@ impl DiskStore {
         self.set_pred_stat(
             pager,
             t.pred,
-            (num + 1, dsub + sp_is_new as u32, dobj + po_is_new as u32),
+            (
+                count_up(num),
+                dsub.saturating_add(sp_is_new as u32),
+                dobj.saturating_add(po_is_new as u32),
+            ),
         )?;
 
         if self.compacted {
@@ -1345,7 +1368,7 @@ impl DiskStore {
             pager,
             t.pred,
             (
-                num.saturating_sub(1),
+                count_down(num),
                 dsub.saturating_sub(sp_gone as u32),
                 dobj.saturating_sub(po_gone as u32),
             ),
@@ -1562,7 +1585,7 @@ impl DiskStore {
             subs.insert(t.sub);
             objs.insert(t.obj);
             if let Some(p) = num.get_mut(t.pred as usize) {
-                *p += 1;
+                *p = count_up(*p);
                 psub[t.pred as usize].insert(t.sub);
                 pobj[t.pred as usize].insert(t.obj);
             }
@@ -1728,7 +1751,14 @@ impl DiskStore {
         if pager.root(ROOT_COMPACTED) != 0 {
             if let Some(rec) = io(self.sp2o_vlist.get(&pager, &cat(s, p)))? {
                 let bytes = io(materialize_vlist(&pager, &rec))?;
-                return Ok(vlist::decode_u32s(&bytes).unwrap_or_default());
+                // review robust#11: a record that does not decode is
+                // corruption, reported like any other read error (contract
+                // C2), not an empty list.
+                return vlist::decode_u32s(&bytes).ok_or_else(|| {
+                    to_io(malformed(&format!(
+                        "the VList of subject {s} and predicate {p} does not decode"
+                    )))
+                });
             }
         }
         let (lo, hi) = ((s, p, 0), (s, p, u32::MAX));
@@ -2534,16 +2564,40 @@ fn encode_vlist_record(pager: &mut Pager, enc: &[u8]) -> Result<Vec<u8>> {
 
 /// Reassemble the encoded VList bytes from a `sp2o_vlist` value record, reading
 /// an [`overflow`] chain when the record is a head pointer. A malformed record
-/// yields empty bytes (decodes to an empty list).
+/// (an unknown tag, a short head pointer, a length no chain of the file can
+/// carry, a chain that ends before its length) is a corruption error (review
+/// robust#11: it used to yield empty bytes, read as an empty list).
 fn materialize_vlist(pager: &Pager, rec: &[u8]) -> Result<Vec<u8>> {
     match rec.first() {
         Some(&INLINE_TAG) => Ok(rec[1..].to_vec()),
         Some(&OVERFLOW_TAG) if rec.len() >= 9 => {
             let head = u32::from_le_bytes(rec[1..5].try_into().unwrap());
             let len = u32::from_le_bytes(rec[5..9].try_into().unwrap()) as usize;
-            overflow::read_chain(pager, head, len)
+            // The length comes from the file too. A chain holds each page
+            // once, so it carries at most the file's pages' payload; a
+            // larger length (with a damaged chain that cycles, `read_chain`
+            // would follow it for up to 4 GiB) is refused before reading.
+            let most = (pager.page_count() as usize).saturating_mul(overflow::CHAIN_PAYLOAD);
+            if len > most {
+                return Err(malformed(&format!(
+                    "a VList overflow record of {len} bytes in a file of {} pages",
+                    pager.page_count()
+                )));
+            }
+            let bytes = overflow::read_chain(pager, head, len)?;
+            if bytes.len() != len {
+                return Err(malformed(&format!(
+                    "a VList overflow chain from page {head} that ends after {} of its {len} bytes",
+                    bytes.len()
+                )));
+            }
+            Ok(bytes)
         }
-        _ => Ok(Vec::new()),
+        Some(&tag) => Err(malformed(&format!(
+            "a VList record with tag {tag} and {} bytes",
+            rec.len()
+        ))),
+        None => Err(malformed("an empty VList record")),
     }
 }
 

@@ -20,6 +20,12 @@
 //! `shared_len` is bounded to [`MAX_SHARED_PREFIX`] bytes (one byte on disk),
 //! mirroring gStore's bounded shared prefix; longer common prefixes simply leave
 //! a few bytes un-elided.
+//!
+//! **Library only** (review db#21): no on-disk structure uses this codec —
+//! the snapshot `dict.bin`, the out-of-core B+ tree dictionary and the
+//! RocksDB dictionary store whole keys. It stays public for library users
+//! (D2) and treats its input as untrusted: [`decode_block`] bounds every
+//! allocation by the bytes it was given.
 
 /// Maximum elided shared-prefix length (stored in a single byte), matching
 /// gStore's bounded shared prefix.
@@ -93,9 +99,16 @@ pub fn encode_block<S: AsRef<str>>(sorted: &[S]) -> Vec<u8> {
 
 /// Decode a block produced by [`encode_block`], reconstructing the exact strings
 /// in their original (sorted) order. `None` if the buffer is malformed.
+///
+/// The count prefix is not trusted (review db#21): every entry takes at least
+/// two bytes (its `shared_len` byte and a one-byte `suffix_len`), so a count
+/// the remaining bytes cannot hold is malformed before anything is allocated.
 pub fn decode_block(bytes: &[u8]) -> Option<Vec<String>> {
     let mut pos = 0usize;
     let count = read_varint(bytes, &mut pos)? as usize;
+    if count > (bytes.len() - pos) / 2 {
+        return None;
+    }
     let mut out: Vec<String> = Vec::with_capacity(count);
     let mut prev = String::new();
     for _ in 0..count {
@@ -195,6 +208,21 @@ mod tests {
         // (count=1B, entry0: 1B shared +1B suflen-ish, ...). Just verify the cap
         // via round-trip plus that no shared_len byte exceeds the bound.
         assert_eq!(decode_block(&enc).unwrap(), v);
+    }
+
+    /// review db#21: the count prefix no longer sizes an allocation before
+    /// the entries are read (`u32::MAX` entries asked for 96 GiB at once).
+    #[test]
+    fn decode_rejects_a_count_the_bytes_cannot_hold_without_allocating_it() {
+        let mut buf = Vec::new();
+        write_varint(&mut buf, u32::MAX);
+        buf.extend_from_slice(&[0, 0]);
+        assert_eq!(decode_block(&buf), None);
+        // Exactly as many two-byte entries as the count names still decode.
+        let mut buf = Vec::new();
+        write_varint(&mut buf, 2);
+        buf.extend_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(decode_block(&buf), Some(vec![String::new(), String::new()]));
     }
 
     #[test]

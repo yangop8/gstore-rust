@@ -1,0 +1,24 @@
+<http://example.org/alice> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Person> .
+<http://example.org/bob> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Person> .
+<http://example.org/carol> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Person> .
+<http://example.org/acme> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.org/Company> .
+<http://example.org/alice> <http://example.org/name> "Alice" .
+<http://example.org/alice> <http://example.org/name> "Alicia"@es .
+<http://example.org/bob> <http://example.org/name> "Bob" .
+<http://example.org/carol> <http://example.org/name> "Carol \"C\" O'Neil\nline two \\ tab\té" .
+<http://example.org/acme> <http://example.org/name> "ACME 株式会社"@ja .
+<http://example.org/alice> <http://example.org/knows> <http://example.org/bob> .
+<http://example.org/alice> <http://example.org/knows> <http://example.org/carol> .
+<http://example.org/bob> <http://example.org/knows> <http://example.org/carol> .
+<http://example.org/carol> <http://example.org/knows> _:anon .
+_:anon <http://example.org/name> "Anonymous" .
+<http://example.org/alice> <http://example.org/age> "34"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<http://example.org/bob> <http://example.org/age> "027"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<http://example.org/carol> <http://example.org/age> "41"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<http://example.org/alice> <http://example.org/height> "1.68"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<http://example.org/bob> <http://example.org/score> "9.5E1"^^<http://www.w3.org/2001/XMLSchema#double> .
+<http://example.org/carol> <http://example.org/active> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
+<http://example.org/alice> <http://example.org/born> "1990-04-01"^^<http://www.w3.org/2001/XMLSchema#date> .
+<http://example.org/alice> <http://example.org/worksFor> <http://example.org/acme> .
+<http://example.org/bob> <http://example.org/worksFor> <http://example.org/acme> .
+<http://example.org/acme> <http://example.org/note> "A long note: Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur." .

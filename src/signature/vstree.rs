@@ -340,7 +340,9 @@ impl VsTree {
     /// [`candidates`](Self::candidates)), reading only the nodes a query traverses.
     /// Equivalent (as a candidate filter) to [`build`](Self::build) over the same
     /// entries — the result set is identical; only the tree shape and residency
-    /// differ. An existing file at `path` is overwritten.
+    /// differ. An existing file at `path` is replaced, its write-ahead log
+    /// removed first (review disk#5: the old tree's pages used to stay in the
+    /// file and a stale log was replayed into it).
     pub fn build_disk<P: AsRef<Path>>(
         path: P,
         entries: Vec<(EntityLiteralId, Signature)>,
@@ -354,6 +356,15 @@ impl VsTree {
 
     /// Open an existing out-of-core VS-tree previously written by
     /// [`build_disk`](Self::build_disk).
+    ///
+    /// A missing or empty file is an error, and nothing is created at `path`
+    /// (review disk#15). A header naming a root outside the file, or more
+    /// entities than the file can hold, is refused as corrupt; a damaged
+    /// node page is found by the scan that reads it, and [`candidates`]
+    /// then answers `None` ("no filtering", sound) rather than panicking
+    /// (review disk#4).
+    ///
+    /// [`candidates`]: Self::candidates
     pub fn open_disk<P: AsRef<Path>>(path: P) -> Result<VsTree> {
         let disk = DiskTree::open(path.as_ref())?;
         Ok(VsTree {
