@@ -188,18 +188,25 @@ agents' builds:
 - Bench smoke gate (D9): not run — no hot path is touched (PFN runtime,
   reasoning, rule store and documentation only; `src/concurrent.rs` gets
   one call per query path changed from `clone()` to `for_query()`).
-- **Verification at the branch head** (before this fragment's commit):
+- **Verification at the branch head** (after the package's review):
   - `cargo fmt --all -- --check` clean.
   - `cargo clippy --workspace --all-targets -- -D warnings` clean;
     `cargo clippy -p gstore --all-targets --features "zip pfn-wasm
     readline" -- -D warnings` clean.
   - `RUSTDOCFLAGS='-D warnings' cargo doc -p gstore --no-deps --locked`
-    clean (also with `--features pfn-wasm --lib`).
-  - `cargo test --workspace`: 2925 passed, 0 failed, 9 ignored, both with
+    clean.
+  - `cargo test --workspace`: 2926 passed, 0 failed, 9 ignored, both with
     `GSTORE_DISK_QUERY_MODE=memory` and with `stream`.
-  - `cargo test -p gstore --features pfn-wasm`: 2724 passed, 0 failed, 8
+  - `cargo test -p gstore --features pfn-wasm`: 2726 passed, 0 failed, 8
     ignored (`reason_pfn_regressions` 10 passed, `dt_pfn`,
     `dt_phase4_review_fixes`, `dt_phase4_wiring` included).
+  - The review reverted every fix at once (the base `src/reason/mod.rs`
+    and `store.rs`, lazy translation, a free instantiation, `clone()`
+    instead of `for_query()` in `src/concurrent.rs`, compile from the
+    source file, execute ignoring its cancel flag): all 10
+    `reason_pfn_regressions` tests and the tests-b#5 test failed, among
+    them `the_calls_of_one_query_share_a_budget` in its loop of repeated
+    snapshot queries (`pfn_fuel_per_query` exhausted).
   - Every new regression test was run against the code before its fix
     (the fixes stashed): all failed there — RDFS export (`left: 4, right:
     2` inferred, gbuild exit 3), add_rule (panic at reason/mod.rs:706),
