@@ -236,7 +236,10 @@ pub(crate) fn check_before_body(
 /// Authenticate the request's `username` / `password` (`encryption=1`: the
 /// password's MD5 hex digest) and record the user in [`Ctx::user`].
 ///
-/// * no `password` but a session token ([`session_user`]) → that session;
+/// * no `password` but a session token of a `POST /login` (in
+///   `Authorization: Bearer`, `X-Session-Token` or the URL's `session=` /
+///   `token=`) → that session's user, if the token is live and `username`,
+///   when given, names that user; else `1001` (a gstore-rust extension);
 /// * either parameter missing (or the username empty) → `1003 "username or
 ///   password is empty"`;
 /// * otherwise [`verify`] (the system user is not accepted here).

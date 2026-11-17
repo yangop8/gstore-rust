@@ -19,7 +19,7 @@
 //!   upstream gserver): `username` / `password` in every request body.
 //!
 //! **HTTPS** (`--tls`, the `tls` cargo feature): the exchange runs over TLS
-//! ([`crate::http_client::tls_client_stream`]), the server's certificate
+//! (`http_client::tls_client_stream`), the server's certificate
 //! verified against `--ca-file` (else `$SSL_CERT_FILE` or the system
 //! bundle).
 //!
@@ -99,8 +99,9 @@ pub struct ApiClient {
     pub port: u16,
     pub username: String,
     /// Kept to log in again when a session ends, and for the commands that
-    /// ask the user to confirm it; sent only by [`open_session`]
-    /// (Self::open_session), unless the server has no sessions.
+    /// ask the user to confirm it; sent only by
+    /// [`open_session`](Self::open_session), unless the server has no
+    /// sessions.
     pub password: String,
     /// HTTPS (`--tls`; needs the `tls` feature).
     pub tls: bool,
@@ -230,9 +231,10 @@ impl ApiClient {
     }
 
     /// Log in as [`username`](Self::username) with
-    /// [`password`](Self::password): a session ([`open_session`]
-    /// (Self::open_session)) when the server offers one, else upstream's
-    /// `/api` `login` (the password then goes with every request).
+    /// [`password`](Self::password): a session
+    /// ([`open_session`](Self::open_session)) when the server offers one,
+    /// else upstream's `/api` `login` (the password then goes with every
+    /// request).
     pub fn log_in(&mut self) -> Result<(), LoginError> {
         match self.open_session().map_err(LoginError::Call)? {
             Login::Session => Ok(()),
