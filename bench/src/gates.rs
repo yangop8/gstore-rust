@@ -507,6 +507,64 @@ pub fn geomean_limit(t: &Thresholds, b: &BackendRun) -> (f64, f64) {
     (limit, spread)
 }
 
+/// Why `r` should not be a baseline (review infra#10): `bless` refuses such
+/// a result unless `--provisional`, and `ci` refuses to gate against such a
+/// baseline unless `--allow-provisional`. Empty when it is fit:
+///
+/// * a release build of the harness (the open, query and concurrency phases
+///   run in it) and of `gbuild` (not from a `debug` directory);
+/// * a clean work tree at a known commit (the baseline names what it
+///   measured);
+/// * every run built by the real `gbuild` (`cli`), not the library builder;
+/// * a machine that was not busy: the 1-minute load average when the run
+///   started at most `bless.max_load_per_cpu` per CPU, and every run's query
+///   processes within `geomean.max_spread` of each other ([`query_spread`]).
+pub fn baseline_problems(r: &BenchResult, t: &Thresholds) -> Vec<String> {
+    let mut v = Vec::new();
+    if r.env.debug_build {
+        v.push("a debug build of gstore-bench measured it (its phases run in-process)".to_string());
+    }
+    match (&r.env.git_commit, r.env.git_dirty) {
+        (None, _) | (_, None) => v.push("no git commit recorded".to_string()),
+        (Some(c), Some(true)) => v.push(format!("the work tree at {c} had uncommitted changes")),
+        _ => {}
+    }
+    if let Some(l) = r.env.loadavg {
+        let max = r.env.nproc.max(1) as f64 * t.bless.max_load_per_cpu;
+        if l[0] > max {
+            v.push(format!(
+                "a busy machine: load average {:.2} on {} CPUs when the run started (> {max:.2})",
+                l[0], r.env.nproc
+            ));
+        }
+    }
+    for s in r.sections() {
+        for run in s.runs {
+            let key = format!("{}{}", s.prefix(), run.key());
+            if run.config.builder != "cli" {
+                v.push(format!(
+                    "{key} was built by the '{}' builder, not gbuild (cli)",
+                    run.config.builder
+                ));
+            }
+            if let Some(dir) = &run.config.bin_dir {
+                if std::path::Path::new(dir).file_name() == Some("debug".as_ref()) {
+                    v.push(format!("{key} took gbuild from {dir}, a debug build"));
+                }
+            }
+            if let Some(cap) = t.geomean.max_spread {
+                let spread = query_spread(run, t);
+                if spread > cap {
+                    v.push(format!(
+                        "a noisy machine: {key}'s query processes spread {spread:.2} (> {cap})"
+                    ));
+                }
+            }
+        }
+    }
+    v
+}
+
 /// The calibration factor (measured machine time / baseline machine time,
 /// clamped) dividing measured times.
 fn calib_factor(

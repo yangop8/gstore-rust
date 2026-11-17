@@ -568,7 +568,9 @@ fn new_workloads_pass_check_and_labelled_runs_merge() {
         "1",
     ];
     let base = t.path("base.json");
-    let mut a = args(&["bless", "--to", &base]);
+    // review infra#10: bless refuses what a debug test build measures unless
+    // --provisional (check only warns about such a baseline).
+    let mut a = args(&["bless", "--to", &base, "--provisional"]);
     a.extend(args(&quick));
     a.extend(c.clone());
     ok(&bench(&a), "bless");

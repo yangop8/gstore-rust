@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use crate::gates::{evaluate, retry_targets, self_check, verdict, Thresholds, Verdict};
+use crate::gates::{
+    baseline_problems, evaluate, retry_targets, self_check, verdict, Thresholds, Verdict,
+};
 use crate::hash::hex;
 use crate::report;
 use crate::runner::conc::{ConcSettings, MixedSettings};
@@ -24,7 +26,8 @@ usage:
   gstore-bench run [--profile micro|smoke|reference] [RUN OPTIONS] [--out FILE]
   gstore-bench check [--baseline FILE] [--from RESULT] [--thresholds FILE] [--self-test-slowdown X]
                      [--summary FILE] [RUN OPTIONS] [--out FILE]
-  gstore-bench ci [--baseline bench/baselines/smoke.json] [--summary FILE] [RUN OPTIONS] [--out FILE]
+  gstore-bench ci [--baseline bench/baselines/smoke.json] [--allow-provisional] [--summary FILE]
+                  [RUN OPTIONS] [--out FILE]
   gstore-bench compare BASELINE RESULT [--thresholds FILE] [--self-test-slowdown X] [--backends a,b]
                        [--markdown] [--summary FILE]
   gstore-bench report RESULT... [--markdown] [--table KIND] [--compare BASELINE]...
@@ -34,7 +37,11 @@ usage:
   report --table: overview, queries, build, update, conc, mixed, gates, full (default); one
   --compare for all results or one per result. --update / --check regenerate / verify the
   tables between `<!-- gstore-bench report ARGS -->` and `<!-- /gstore-bench report -->`.
-  gstore-bench bless --to FILE [--from RESULT] [--provisional] [--note TEXT] [RUN OPTIONS]
+  gstore-bench bless --to FILE [--from RESULT] [--provisional] [--note TEXT] [--thresholds FILE]
+                     [RUN OPTIONS]
+  bless refuses a debug build, a dirty tree, the library builder, a busy or noisy machine (see
+  bench/thresholds.json) unless --provisional, which records why; ci refuses a provisional or
+  unfit baseline unless --allow-provisional, check warns.
   gstore-bench merge --out FILE RESULT RESULT...
   gstore-bench calibrate [--quick]
 
@@ -625,6 +632,27 @@ fn cmd_check(a: &mut Args, ci: bool) -> CmdResult {
         usage(a.value("--baseline"))?.unwrap_or_else(|| "bench/baselines/smoke.json".into());
     let mut baseline = failed(BenchResult::load(Path::new(&baseline_path)))?;
     let t = thresholds(a)?;
+    // A provisional baseline, or one `bless` would refuse, gates nothing in
+    // CI (review infra#10): its numbers are not the ones a quiet release
+    // build measures.
+    let allow_provisional = a.flag("--allow-provisional");
+    let mut unfit = baseline_problems(&baseline, &t);
+    if baseline.provisional {
+        unfit.insert(0, "it is marked provisional".into());
+    }
+    if !unfit.is_empty() {
+        let why = format!(
+            "the baseline {baseline_path} is not fit to gate against: {}",
+            unfit.join("; ")
+        );
+        if ci && !allow_provisional {
+            return Err(Error::Failed(format!(
+                "{why} (re-bless it with a release build on an idle machine, or pass \
+                 --allow-provisional)"
+            )));
+        }
+        eprintln!("[gstore-bench] warning: {why}");
+    }
     let slowdown: f64 = usage(a.parsed("--self-test-slowdown"))?.unwrap_or(1.0);
     let from = usage(a.value("--from"))?;
     // `--backends` also limits which of the baseline's backends are gated.
@@ -681,6 +709,9 @@ fn cmd_check(a: &mut Args, ci: bool) -> CmdResult {
         ]);
         let explicit_extra = given(&["--extra"]);
         let explicit_backends = given(&["--backends"]);
+        let explicit_reps = given(&["--reps"]);
+        let explicit_procs = given(&["--query-procs"]);
+        let explicit_builder = given(&["--builder"]);
         let default_profile = if profile(&baseline.profile).is_some() {
             baseline.profile.clone()
         } else {
@@ -692,6 +723,19 @@ fn cmd_check(a: &mut Args, ci: bool) -> CmdResult {
         }
         if !has_profile && !explicit_backends {
             o.profile.backends = backends_of(&baseline.runs);
+        }
+        // The statistics depend on these (the exact.config gate): measure
+        // them as the baseline did unless options say otherwise.
+        if let Some(c) = baseline.runs.first().map(|r| &r.config) {
+            if !has_profile && !explicit_reps && c.reps > 0 {
+                o.profile.reps = c.reps;
+            }
+            if !has_profile && !explicit_procs && c.query_procs > 0 {
+                o.profile.query_procs = c.query_procs;
+            }
+            if !explicit_builder && !c.builder.is_empty() {
+                o.builder = c.builder.clone();
+            }
         }
         usage(std::mem::replace(a, Args { items: Vec::new() }).finish())?;
         let mut runner = failed(Runner::prepare(o))?;
@@ -843,6 +887,7 @@ fn usage_or_failed<T>(r: Result<T, String>) -> Result<T, Error> {
 }
 
 fn cmd_bless(a: &mut Args) -> CmdResult {
+    let t = thresholds(a)?;
     let to = usage(a.value("--to"))?.ok_or_else(|| Error::Usage("bless needs --to FILE".into()))?;
     let from = usage(a.value("--from"))?;
     let provisional = a.flag("--provisional");
@@ -864,10 +909,31 @@ fn cmd_bless(a: &mut Args) -> CmdResult {
         eprintln!("gstore-bench: refusing to bless a result that fails its own exact checks");
         return Ok(ExitCode::from(1));
     }
+    // What a baseline must be (review infra#10): a release build on a clean
+    // tree, the real gbuild, a quiet machine. `--provisional` blesses anyway
+    // and records why; `ci` refuses such a baseline.
+    let problems = baseline_problems(&result, &t);
+    if !problems.is_empty() && !provisional {
+        for p in &problems {
+            eprintln!("gstore-bench: {p}");
+        }
+        eprintln!(
+            "gstore-bench: refusing to bless: measure with a release build of a clean tree \
+             on an idle machine, or pass --provisional (ci refuses a provisional baseline)"
+        );
+        return Ok(ExitCode::from(1));
+    }
     result.kind = "baseline".into();
     result.provisional = provisional;
     if note.is_some() {
         result.note = note;
+    }
+    if !problems.is_empty() {
+        let why = format!("provisional: {}", problems.join("; "));
+        result.note = Some(match result.note.take() {
+            Some(n) if !n.is_empty() => format!("{n} ({why})"),
+            _ => why,
+        });
     }
     failed(result.save(Path::new(&to)))?;
     eprintln!(

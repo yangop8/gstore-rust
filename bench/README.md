@@ -28,11 +28,11 @@ for data, databases and results) are relative paths.
 | `queries [--workload watdiv] [--scale N] [--seed S] [--shrink K] [--data-dir DIR] [--verify-data]` | print the workload's queries as the runs use them: the WatDiv-like templates bound against the (cached) data, with each binding and its ASK tries | 0 |
 | `run [--profile P] [RUN OPTIONS] [--out FILE] [--note TEXT]` | measure a profile, write the result JSON, print a Markdown report | 0, or 1 when the result fails its own exact checks |
 | `check [--baseline FILE] [--from RESULT] [--thresholds FILE] [--self-test-slowdown X] [--summary FILE] [RUN OPTIONS] [--out FILE]` | measure what the baseline measured (or take `--from` RESULT) and apply the gates; failing timing/memory gates re-run only those phases (2 retries, minimum of the medians); `--backends` also limits which baseline backends are gated; workloads, runs and queries the baseline lacks are reported as **new**, not gated | 0 pass, 1 fail |
-| `ci [same options]` | `check` with the smoke baseline, the summary appended to `$GITHUB_STEP_SUMMARY` | 0 pass, 1 fail |
+| `ci [same options] [--allow-provisional]` | `check` with the smoke baseline, the summary appended to `$GITHUB_STEP_SUMMARY`; refuses (exit 2, before measuring) a provisional baseline or one `bless` would refuse, unless `--allow-provisional` (`check` only warns) | 0 pass, 1 fail |
 | `compare BASELINE RESULT [--thresholds FILE] [--self-test-slowdown X] [--backends a,b] [--markdown] [--summary FILE]` | gate two existing files (`--backends`: only those backends or run keys) | 0 pass, 1 fail |
 | `report RESULT... [--markdown] [--table KIND] [--compare BASELINE]...` | Markdown: the full report of one result (ratios and the gate table against BASELINE), or with `--table` one compact table over several results (see [Reports](#reports-and-documentation-tables)) | 0 |
 | `report --update DOC... \| --check DOC...` | regenerate (`--update`) or verify (`--check`) the tables between `<!-- gstore-bench report ARGS -->` and `<!-- /gstore-bench report -->` in documents | 0, or 1 when `--check` finds a stale table |
-| `bless --to FILE [--from RESULT] [--provisional] [--note TEXT] [RUN OPTIONS]` | turn a result (or a fresh run) into a baseline; refuses one that fails its own exact checks | 0, or 1 when refused |
+| `bless --to FILE [--from RESULT] [--provisional] [--note TEXT] [--thresholds FILE] [RUN OPTIONS]` | turn a result (or a fresh run) into a baseline; refuses one that fails its own exact checks, and one measured by a debug build, from a dirty tree or no commit, with the library builder or a `gbuild` from a `debug` directory, on a busy machine (1-minute load above `bless.max_load_per_cpu` × CPUs) or with noisy query processes (spread above `geomean.max_spread`), unless `--provisional`, which blesses it marked provisional with the reasons in the note | 0, or 1 when refused |
 | `merge --out FILE RESULT RESULT...` | join results of the same workloads measured by different binaries or settings (RocksDB from a `--features rocksdb` build; the disk layout in both query modes under two `--label`s); a run key may appear once per workload | 0, or 1 on a failed self-check |
 | `calibrate [--quick]` | print this machine's calibration | 0 |
 
@@ -244,7 +244,9 @@ Further workloads of the run follow in `extra_workloads`, each with its own
 workload and runs. A run is keyed by its backend, or `backend@label` with
 `--label` (`BackendRun::key`). Times are ms, memory MiB, sizes bytes,
 hashes 16 hex digits. A baseline is the same document with `"kind":
-"baseline"`; `"provisional": true` marks one recorded on a busy machine.
+"baseline"`; `"provisional": true` marks one `bless --provisional` accepted
+although it was unfit (the note says why): `ci` refuses to gate against it
+(review infra#10).
 
 * `bench/baselines/smoke.json` — the CI baseline (re-bless it when a change
   makes things ≥ 1.5× faster, or after an intended format change).
