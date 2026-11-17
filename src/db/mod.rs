@@ -3617,7 +3617,10 @@ impl Database {
     ///
     /// Refused while committed redo records are owed to the log (their
     /// append failed and fails again now): the increment would miss them
-    /// (review robust#10).
+    /// (review robust#10). Refused, too, when the log's records since the
+    /// last backup do not replay (a corrupt record): such an increment
+    /// could never be restored; a full [`backup`](Self::backup) starts a
+    /// new chain past the damage.
     pub fn backup_incremental<P: AsRef<Path>>(&self, out_dir: P) -> Result<()> {
         let out_dir = out_dir.as_ref();
         let Some(log_path) = self.redo_log.clone() else {
@@ -3658,6 +3661,26 @@ impl Database {
             }
             (end, logs::read_range(&log_path, base, end)?)
         };
+        // The copy must replay as `restore_incremental` replays it: the
+        // appender's scan steps over a corrupt record of the live log, so
+        // a damaged commit would only be found at restore time, and every
+        // increment from this one on could never be restored (round-3
+        // review). The bytes are in memory already, so checking is cheap.
+        if let Err(e) =
+            logs::walk(&slice, LogKind::Redo, false, |_| Ok(())).and_then(|w| match w.torn {
+                None => Ok(()),
+                Some((at, why)) => Err(GStoreError::Database(format!(
+                    "redo.log is incomplete at byte {at}: {why}"
+                ))),
+            })
+        {
+            return Err(GStoreError::Database(format!(
+                "backup_incremental: the redo log since the last backup (bytes [{base}, {end}) \
+                 of '{}') cannot be restored — {e} (counted from byte {base}); no increment \
+                 was written: take a full backup to start a new chain",
+                log_path.display()
+            )));
+        }
         fsutil::atomic_write(&out_dir.join(INCREMENTAL_LOG_FILE), &slice)?;
         write_incremental_marker(&out_dir.join(INCREMENTAL_MARKER_FILE), base, end)?;
         self.backup_offset.store(end, Ordering::SeqCst);
@@ -3672,9 +3695,11 @@ impl Database {
     /// of `incr_dirs` is a directory produced by
     /// [`backup_incremental`](Self::backup_incremental), in chronological order.
     /// The base (any layout) is read into memory without being written — a
-    /// snapshot in place (no lock taken), any other layout through a copy in
-    /// the system's temporary directory, removed again (review db#13); the
-    /// backup directories are never modified — then each delta's `incr.log` is replayed
+    /// snapshot in place (no lock taken), any other layout through a copy
+    /// beside it, in a directory of its own named
+    /// `<base>.restore-tmp-<pid>-<seq>-<nonce>` and removed again (review
+    /// db#13; see [`read_backup_detached`](Self::read_backup_detached) for the
+    /// space it needs); the backup directories are never modified — then each delta's `incr.log` is replayed
     /// onto it. Deltas are checked for contiguity: each must begin exactly where
     /// the previous one ended (starting from the base's recorded checkpoint), so
     /// an out-of-order or gapped chain is rejected rather than silently
@@ -3748,9 +3773,18 @@ impl Database {
     /// The database in backup directory `dir`, in memory, read without
     /// writing `dir` (review db#13): a snapshot is read in place without
     /// taking its lock (as [`read_copy`](Self::read_copy)); any other layout
-    /// is copied into a scratch directory under the system's temporary
-    /// directory, opened and detached from there, and the copy removed.
-    /// The reasoning rules (and ledgers) come along, held in memory.
+    /// is copied into a scratch directory, opened and detached from there,
+    /// and the copy removed. The reasoning rules (and ledgers) come along,
+    /// held in memory.
+    ///
+    /// The scratch directory is created beside `dir` (on its file system:
+    /// the copy needs about the base's size of free space there, besides
+    /// the memory the restored database takes), or in the system's
+    /// temporary directory when `dir`'s parent cannot be written. It is
+    /// created exclusively under a fresh name, mode `0700` (round-3 review:
+    /// a predictable name in the shared temporary directory was removed and
+    /// recreated, so a directory or symlink another user had put there was
+    /// written into), and only a directory this call created is removed.
     fn read_backup_detached(dir: &Path) -> Result<Database> {
         match Database::storage_kind(dir) {
             Some(StorageKind::Snapshot) => {
@@ -3774,12 +3808,39 @@ impl Database {
             }
         }
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let scratch = Scratch(std::env::temp_dir().join(format!(
-            "gstore-restore-{}-{}",
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64);
+        let base_name = dir
+            .file_name()
+            .map_or_else(|| "backup".into(), |n| n.to_string_lossy().into_owned());
+        let stem = format!(
+            "{base_name}.restore-tmp-{}-{}-{nonce:x}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
-        )));
-        let _ = fs::remove_dir_all(&scratch.0);
+        );
+        let beside = match dir.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        let created = match create_private_dir(&beside, &stem) {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+                ) =>
+            {
+                create_private_dir(&std::env::temp_dir(), &stem)
+            }
+            other => other,
+        };
+        let scratch = Scratch(created.map_err(|e| {
+            GStoreError::Database(format!(
+                "reading backup '{}': cannot create a scratch directory beside it or in the \
+                 temporary directory: {e}",
+                dir.display()
+            ))
+        })?);
         Database::backup_dir(dir, &scratch.0)
             .and_then(|()| Database::open(&scratch.0)?.into_memory())
             .map_err(|e| {
@@ -4999,6 +5060,31 @@ fn write_backup_offset(path: &Path, offset: u64) -> Result<()> {
     )
 }
 
+/// Create a new directory `<parent>/<stem>` — or `<stem>-1`, `<stem>-2`, …
+/// when that name exists — exclusively (`mkdir`, which neither reuses an
+/// existing directory nor follows a symlink) and, on Unix, with mode
+/// `0700`. An existing entry of any of these names is left alone.
+fn create_private_dir(parent: &Path, stem: &str) -> std::io::Result<PathBuf> {
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    for attempt in 0u32..1000 {
+        let path = match attempt {
+            0 => parent.join(stem),
+            n => parent.join(format!("{stem}-{n}")),
+        };
+        match builder.create(&path) {
+            Ok(()) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("every name '{stem}-N' under '{}' exists", parent.display()),
+    ))
+}
+
 /// Read a full-backup checkpoint marker's `offset`.
 fn read_backup_offset(path: &Path) -> Result<u64> {
     let text = fs::read_to_string(path)?;
@@ -5081,6 +5167,46 @@ mod tests {
     use super::*;
     use crate::model::Term;
     use crate::query::QueryResult;
+
+    /// Round-3 review: the restore's scratch directory is made by `mkdir`
+    /// under a name nobody holds — an existing directory (with someone
+    /// else's file) or a symlink of that name is skipped, never reused,
+    /// followed or removed — with mode 0700.
+    #[test]
+    fn a_private_dir_is_created_exclusively() {
+        let parent =
+            std::env::temp_dir().join(format!("gstore-private-dir-test-{}", std::process::id()));
+        struct Rm(PathBuf);
+        impl Drop for Rm {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _rm = Rm(parent.clone());
+        let _ = fs::remove_dir_all(&parent);
+        fs::create_dir_all(parent.join("stem")).unwrap();
+        fs::write(parent.join("stem").join("theirs"), b"x").unwrap();
+        fs::create_dir_all(parent.join("elsewhere")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(parent.join("elsewhere"), parent.join("stem-1")).unwrap();
+        #[cfg(not(unix))]
+        fs::create_dir_all(parent.join("stem-1")).unwrap();
+        let made = create_private_dir(&parent, "stem").unwrap();
+        assert_eq!(made, parent.join("stem-2"));
+        assert_eq!(
+            fs::read_dir(&made).unwrap().count(),
+            0,
+            "a new, empty directory"
+        );
+        assert!(parent.join("stem").join("theirs").exists());
+        assert_eq!(fs::read_dir(parent.join("elsewhere")).unwrap().count(), 0);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&made).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+    }
 
     const SMALL: &str = "\
 <root> <name> \"Bookug Lobert\" .
