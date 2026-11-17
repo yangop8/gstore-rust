@@ -189,7 +189,10 @@ sudo systemctl restart gserver
   crashing stops being restarted after 5 starts within 5 minutes
   (`StartLimitIntervalSec=300`, `StartLimitBurst=5`; systemd's default,
   5 starts in 10 s, was never reached with `RestartSec=5s`); after fixing
-  the cause, `systemctl reset-failed gserver` and start it again.
+  the cause, `systemctl reset-failed gserver` and start it again. Manual
+  `systemctl start` / `restart` count toward the limit too: a sixth
+  (re)start within 5 minutes is refused ("start request repeated too
+  quickly") until `systemctl reset-failed gserver`.
 * `LimitNOFILE=65535`, as upstream raises it.
 * Hardening (`systemd-analyze security gserver` rates the unit about 1.2,
   "OK"): the server writes only below `/var/lib/gstore`

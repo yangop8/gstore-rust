@@ -21,10 +21,11 @@ Documentation=https://github.com/yangop8/gstore-rust
 After=network-online.target
 Wants=network-online.target
 # A server that keeps failing stops being restarted (review infra#12): at
-# most 5 starts within 5 minutes, then the unit stays failed until
-# `systemctl reset-failed gserver` (or a manual start). With systemd's
-# default (5 starts in 10 s) and RestartSec=5s below the limit was never
-# reached, so a crash loop restarted forever.
+# most 5 starts within 5 minutes, then the unit stays failed: a start is
+# refused until `systemctl reset-failed gserver` or until those 5 minutes
+# have passed. Manual starts and restarts count toward the limit too. With
+# systemd's default (5 starts in 10 s) and RestartSec=5s below the limit
+# was never reached, so a crash loop restarted forever.
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
