@@ -9,7 +9,9 @@
 //! (`gstore::exit_park`), and the shutdown must announce that it joins it
 //! (`wait_joining`) while it is parked — a thread left detached is never
 //! joined, and still parked when `serve_forever` returns. Timeouts are hang
-//! guards only.
+//! guards only. A thread counts as left over while it has not begun to exit
+//! (see [`threads_named`]: a joined thread's kernel task can still be
+//! listed for a moment after the join returns).
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -58,8 +60,20 @@ impl Drop for TmpDir {
     }
 }
 
-/// The threads of this process whose name (`comm`, 15 bytes) starts with
-/// `prefix`.
+/// The kernel's `PF_EXITING` task flag (`include/linux/sched.h`): the
+/// thread has begun to exit and never runs user code again.
+const PF_EXITING: u64 = 0x4;
+
+/// The live threads of this process whose name (`comm`, 15 bytes) starts
+/// with `prefix`.
+///
+/// A thread that has begun to exit is not counted. `JoinHandle::join`
+/// (`pthread_join`) returns once the exiting thread's kernel task has
+/// cleared its thread id — in the middle of its exit, after `PF_EXITING`
+/// is set and before the task is removed from `/proc/self/task` — so a
+/// joined thread can still be listed there for a moment (a loaded machine
+/// may preempt it in between). Such a thread has finished; a thread still
+/// running, or parked by `exit_park`, has no `PF_EXITING` and counts.
 fn threads_named(prefix: &str) -> usize {
     let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
         return 0;
@@ -70,7 +84,23 @@ fn threads_named(prefix: &str) -> usize {
             std::fs::read_to_string(t.path().join("comm"))
                 .is_ok_and(|name| name.trim_end().starts_with(prefix))
         })
+        .filter(|t| {
+            // Gone meanwhile (unreadable): exited.
+            std::fs::read_to_string(t.path().join("stat")).is_ok_and(|stat| !exiting(&stat))
+        })
         .count()
+}
+
+/// Whether `/proc/<pid>/task/<tid>/stat` text shows `PF_EXITING`: the
+/// `flags` field, the 9th — the 7th after the parenthesised `comm`, which
+/// may itself hold spaces and parentheses.
+fn exiting(stat: &str) -> bool {
+    let flags = stat
+        .rsplit_once(") ")
+        .and_then(|(_, rest)| rest.split_whitespace().nth(6))
+        .and_then(|f| f.parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("no flags field in {stat:?}"));
+    flags & PF_EXITING != 0
 }
 
 fn request(addr: SocketAddr, method: &str, target: &str, body: &str) -> (u16, String) {

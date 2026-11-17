@@ -625,8 +625,20 @@ fn api(srv: &Srv, pairs: &[(&str, &str)]) -> String {
     b
 }
 
-/// The threads of this process whose name starts with `prefix` (Linux:
-/// `/proc/self/task/*/comm`; elsewhere none are counted).
+/// The kernel's `PF_EXITING` task flag (`include/linux/sched.h`): the
+/// thread has begun to exit and never runs user code again.
+const PF_EXITING: u64 = 0x4;
+
+/// The live threads of this process whose name starts with `prefix`
+/// (Linux: `/proc/self/task/*/comm`; elsewhere none are counted).
+///
+/// A thread that has begun to exit is not counted. `JoinHandle::join`
+/// (`pthread_join`) returns once the exiting thread's kernel task has
+/// cleared its thread id — in the middle of its exit, after `PF_EXITING`
+/// is set and before the task is removed from `/proc/self/task` — so a
+/// joined thread can still be listed there for a moment (a loaded machine
+/// may preempt it in between). Such a thread has finished; a thread still
+/// running has no `PF_EXITING` and counts.
 fn threads_named(prefix: &str) -> usize {
     let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
         return 0;
@@ -637,7 +649,23 @@ fn threads_named(prefix: &str) -> usize {
             std::fs::read_to_string(t.path().join("comm"))
                 .is_ok_and(|name| name.trim_end().starts_with(prefix))
         })
+        .filter(|t| {
+            // Gone meanwhile (unreadable): exited.
+            std::fs::read_to_string(t.path().join("stat")).is_ok_and(|stat| !exiting(&stat))
+        })
         .count()
+}
+
+/// Whether `/proc/<pid>/task/<tid>/stat` text shows `PF_EXITING`: the
+/// `flags` field, the 9th — the 7th after the parenthesised `comm`, which
+/// may itself hold spaces and parentheses.
+fn exiting(stat: &str) -> bool {
+    let flags = stat
+        .rsplit_once(") ")
+        .and_then(|(_, rest)| rest.split_whitespace().nth(6))
+        .and_then(|f| f.parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("no flags field in {stat:?}"));
+    flags & PF_EXITING != 0
 }
 
 /// A background statistics refresh (started by `/api monitor` after a
