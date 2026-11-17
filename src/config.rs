@@ -268,10 +268,13 @@ fn comment_start(raw: &str) -> Option<usize> {
     while let Some((i, c)) = chars.next() {
         match c {
             '"' => in_quotes = !in_quotes,
-            '#' | ';' if !in_quotes && prev_ws && seen_content => {
-                if chars.peek().is_none_or(|(_, n)| n.is_whitespace()) {
-                    return Some(i);
-                }
+            '#' | ';'
+                if !in_quotes
+                    && prev_ws
+                    && seen_content
+                    && chars.peek().is_none_or(|(_, n)| n.is_whitespace()) =>
+            {
+                return Some(i);
             }
             _ => {}
         }

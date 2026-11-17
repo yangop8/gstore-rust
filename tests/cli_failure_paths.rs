@@ -184,7 +184,6 @@ fn a_database_opened_during_a_bulk_build_is_refused() {
     // parks there), then goes on.
     let input = format!("{NEW}<http://e/broken> <http://e/p> .\n");
     let report = bulk_text(&dir, &input, &mut log).unwrap();
-    drop(log);
     opener.join().unwrap();
     assert_eq!(report.import.failed, 1);
     match during.expect("the build parked at the bad statement") {
