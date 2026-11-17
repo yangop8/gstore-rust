@@ -16,7 +16,9 @@
 //!   or the user's password changed) answers `1001`, and the console logs in
 //!   again and repeats the request (see `Console::request`).
 //! * **upstream's protocol**, against a server without `POST /login` (an
-//!   upstream gserver): `username` / `password` in every request body.
+//!   upstream gserver), or whose `/api` does not take its sessions (a
+//!   gstore-rust gserver that predates them; see `ApiClient::log_in`):
+//!   `username` / `password` in every request body.
 //!
 //! **HTTPS** (`--tls`, the `tls` cargo feature): the exchange runs over TLS
 //! (`http_client::tls_client_stream`), the server's certificate
@@ -232,26 +234,38 @@ impl ApiClient {
 
     /// Log in as [`username`](Self::username) with
     /// [`password`](Self::password): a session
-    /// ([`open_session`](Self::open_session)) when the server offers one,
-    /// else upstream's `/api` `login` (the password then goes with every
-    /// request).
+    /// ([`open_session`](Self::open_session)) when the server offers one
+    /// and its `/api` takes it, else upstream's `/api` `login` (the
+    /// password then goes with every request).
+    ///
+    /// The session is checked with `/api` `login`: a gstore-rust gserver
+    /// older than the `/api` sessions has `POST /login` (its REST API) but
+    /// answers a password-less `/api` request `1003`, and must still be
+    /// served — with upstream's protocol.
     pub fn log_in(&mut self) -> Result<(), LoginError> {
         match self.open_session().map_err(LoginError::Call)? {
-            Login::Session => Ok(()),
-            Login::Refused(msg) => Err(LoginError::Refused(msg)),
-            Login::Unsupported => {
+            Login::Session => {
                 let body = self.body("login", vec![]);
                 let j = self.call_interruptible(&body).map_err(LoginError::Call)?;
                 if j.get("StatusCode").and_then(Json::as_i64) == Some(0) {
                     return Ok(());
                 }
-                let msg = j
-                    .get("StatusMsg")
-                    .and_then(Json::as_str)
-                    .unwrap_or_default();
-                Err(LoginError::Refused(msg.to_string()))
+                // Not taken: end it, and log in the upstream way below.
+                self.close_session();
             }
+            Login::Refused(msg) => return Err(LoginError::Refused(msg)),
+            Login::Unsupported => {}
         }
+        let body = self.body("login", vec![]);
+        let j = self.call_interruptible(&body).map_err(LoginError::Call)?;
+        if j.get("StatusCode").and_then(Json::as_i64) == Some(0) {
+            return Ok(());
+        }
+        let msg = j
+            .get("StatusMsg")
+            .and_then(Json::as_str)
+            .unwrap_or_default();
+        Err(LoginError::Refused(msg.to_string()))
     }
 
     /// End the session (`POST /logout`), if the client holds one; errors

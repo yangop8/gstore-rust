@@ -2512,7 +2512,9 @@ fn the_password_crosses_the_network_once_per_login() {
         .iter()
         .filter(|r| r.starts_with("POST /api "))
         .collect();
-    assert_eq!(api.len(), 3, "{requests:#?}");
+    // The session's check (`login`), then the three commands.
+    assert_eq!(api.len(), 4, "{requests:#?}");
+    assert!(api[0].contains("\"operation\":\"login\""), "{requests:#?}");
     for request in api {
         assert!(request.contains("\r\nAuthorization: Bearer "), "{request}");
         assert!(!request.contains("\"password\""), "{request}");
@@ -2540,6 +2542,105 @@ fn the_password_crosses_the_network_once_per_login() {
         .filter(|r| r.starts_with("POST /login ") && r.contains("new-pw"))
         .count();
     assert_eq!(logins, 1, "one login again, with the new password");
+}
+
+/// A gstore-rust gserver older than the `/api` sessions: `POST /login`
+/// gives a session (its REST API), but `/api` wants the password (`1003`
+/// without one). Every request is recorded as (path, body).
+struct PreSessionServer {
+    addr: SocketAddr,
+    requests: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+impl PreSessionServer {
+    fn start() -> PreSessionServer {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&requests);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let Some((path, body)) = read_raw_request(&mut stream) else {
+                    continue;
+                };
+                log.lock().unwrap().push((path.clone(), body.clone()));
+                let answer = match path.as_str() {
+                    "/login" => success().with("session", "rest-only-token"),
+                    "/api" => match json::parse(&body) {
+                        Ok(j) if j.get("password").is_none() => Json::obj()
+                            .with("StatusCode", 1003)
+                            .with("StatusMsg", "username or password is empty"),
+                        Ok(j) if field(&j, "password") != PASSWORD => Json::obj()
+                            .with("StatusCode", 1001)
+                            .with("StatusMsg", "Username or password is wrong."),
+                        Ok(_) => success().with(
+                            "ResponseBody",
+                            Json::Arr(vec![Json::obj().with("database", "small")]),
+                        ),
+                        Err(_) => Json::obj().with("StatusCode", 1003),
+                    },
+                    _ => success(),
+                };
+                reply(&mut stream, &answer);
+            }
+        });
+        PreSessionServer { addr, requests }
+    }
+}
+
+/// One HTTP request: its path and its body as text.
+fn read_raw_request(stream: &mut TcpStream) -> Option<(String, String)> {
+    let mut reader = BufReader::new(stream.try_clone().ok()?);
+    let mut first = String::new();
+    reader.read_line(&mut first).ok()?;
+    let path = first.split_whitespace().nth(1)?.to_string();
+    let mut len = 0usize;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).ok()? == 0 {
+            return None;
+        }
+        let line = line.trim_end();
+        if line.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            if k.eq_ignore_ascii_case("content-length") {
+                len = v.trim().parse().ok()?;
+            }
+        }
+    }
+    let mut body = vec![0u8; len];
+    reader.read_exact(&mut body).ok()?;
+    Some((path, String::from_utf8_lossy(&body).into_owned()))
+}
+
+/// review ext#12 (compatibility): a gserver whose `POST /login` gives a
+/// session its `/api` does not take — a gstore-rust release older than the
+/// `/api` sessions — is still served, with upstream's protocol (the
+/// password in every body); the session it did not take is ended.
+#[test]
+fn a_server_whose_api_takes_no_session_gets_the_password() {
+    let srv = PreSessionServer::start();
+    let cwd = scratch("gc_pre_session");
+    let _cwd = DirGuard(cwd.clone());
+    let r = script_at(&srv.addr, &cwd, "showdbs;\n");
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.out.contains("| small "), "{r:?}");
+    let requests = srv.requests.lock().unwrap().clone();
+    let paths: Vec<&str> = requests.iter().map(|(p, _)| p.as_str()).collect();
+    assert_eq!(
+        paths,
+        ["/login", "/api", "/logout", "/api", "/api"],
+        "the session tried, refused and ended; upstream's login; showdbs: {requests:#?}"
+    );
+    for (_, body) in &requests[3..] {
+        assert!(
+            body.contains(&format!("\"password\":\"{PASSWORD}\"")),
+            "{requests:#?}"
+        );
+    }
 }
 
 /// A self-signed certificate for `localhost` / `127.0.0.1` (the one
