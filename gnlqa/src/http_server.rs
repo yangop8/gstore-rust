@@ -19,11 +19,12 @@
 //! ([`HttpServer::allow_unauthenticated_loopback`], which serves only clients
 //! connecting from a loopback address). `/health` stays open: it does no work.
 //!
-//! Every `/ask` / `/gSolve` request is also rate-limited per client IP
-//! (counted *before* authentication, so token guessing is bounded too), its
-//! question length is capped, and the engine work it causes runs under a
-//! per-request [`CostLimits`] budget (LLM calls, KB rows, wall-clock time;
-//! see [`crate::budget`]). See [`HttpLimits`] for the defaults.
+//! Every `/ask` / `/gSolve` request is also rate-limited per client IP (an
+//! IPv6 client per /64 network), counted *before* authentication, so token
+//! guessing is bounded too; its question length is capped, and the engine
+//! work it causes runs under a per-request [`CostLimits`] budget (LLM
+//! calls, KB rows, wall-clock time; see [`crate::budget`]). See
+//! [`HttpLimits`] for the defaults.
 
 use std::collections::HashMap;
 use std::io::{BufReader, ErrorKind, Read, Write};
@@ -76,9 +77,9 @@ pub enum HttpAuth {
 /// Per-client and per-request limits of the HTTP server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HttpLimits {
-    /// `/ask` + `/gSolve` requests per client IP per minute (a token bucket
-    /// with that burst); 0 = unlimited. Excess requests get 429 with
-    /// `Retry-After`.
+    /// `/ask` + `/gSolve` requests per client IP (IPv6: per /64 network)
+    /// per minute (a token bucket with that burst); 0 = unlimited. Excess
+    /// requests get 429 with `Retry-After`.
     pub requests_per_minute: u32,
     /// Maximum question length in bytes; longer questions get 413.
     pub max_question_bytes: usize,
@@ -338,8 +339,26 @@ impl Ctx {
     }
 }
 
-/// A per-client-IP token bucket: `per_minute` requests of burst, refilled at
-/// `per_minute / 60` per second.
+/// The rate-limit key of a client address: an IPv4 address as it is, an
+/// IPv4-mapped IPv6 address as its IPv4 address, and any other IPv6 address
+/// as its /64 network — the block one subscriber is usually given, so
+/// rotating source addresses inside it gets no fresh bucket (the same rule
+/// as gStore's login lockout, `gapi::ipfilter::lockout_address`).
+fn client_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let s = v6.segments();
+                IpAddr::from([s[0], s[1], s[2], s[3], 0, 0, 0, 0])
+            }
+        },
+    }
+}
+
+/// A per-client token bucket (see [`client_key`]): `per_minute` requests of
+/// burst, refilled at `per_minute / 60` per second.
 struct RateLimiter {
     per_minute: u32,
     buckets: Mutex<HashMap<IpAddr, (f64, Instant)>>,
@@ -362,6 +381,7 @@ impl RateLimiter {
         if self.per_minute == 0 {
             return Ok(());
         }
+        let ip = client_key(ip);
         let cap = f64::from(self.per_minute);
         let per_sec = cap / 60.0;
         let refill = |tokens: f64, at: Instant| {
@@ -937,6 +957,31 @@ mod tests {
         for _ in 0..1000 {
             assert!(off.check_at(a, t0).is_ok());
         }
+    }
+
+    #[test]
+    fn ipv6_clients_share_a_bucket_per_64_network() {
+        // review (r5-gnlqa reviewer): keyed on the full address, every
+        // address of an IPv6 /64 (one subscriber's block) got a fresh bucket,
+        // so rotating source addresses defeated the per-client limit — and
+        // with it the bound on token guessing. Like gStore's login lockout
+        // (gapi::ipfilter::lockout_address), IPv6 clients count per /64 and
+        // an IPv4-mapped address as its IPv4 address.
+        let rl = RateLimiter::new(1);
+        let t0 = Instant::now();
+        let a: IpAddr = "2001:db8:1:2::7".parse().unwrap();
+        let same_64: IpAddr = "2001:db8:1:2:ffff:ffff:ffff:1".parse().unwrap();
+        let next_64: IpAddr = "2001:db8:1:3::7".parse().unwrap();
+        assert!(rl.check_at(a, t0).is_ok());
+        assert!(
+            rl.check_at(same_64, t0).is_err(),
+            "a fresh address inside the same /64 got a fresh bucket"
+        );
+        assert!(rl.check_at(next_64, t0).is_ok());
+        let v4: IpAddr = "192.0.2.1".parse().unwrap();
+        let mapped: IpAddr = "::ffff:192.0.2.1".parse().unwrap();
+        assert!(rl.check_at(v4, t0).is_ok());
+        assert!(rl.check_at(mapped, t0).is_err());
     }
 
     #[test]

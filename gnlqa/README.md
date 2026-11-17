@@ -211,8 +211,8 @@ userinfo (`user:password@`) is stripped from every error and log line; prefer
 `GSTORE_USER`/`GSTORE_PASSWORD` to credentials in `GSTORE_ENDPOINT` (gNLQA warns at
 startup).
 
-**Limits.** Each client IP may send `GNLQA_HTTP_RATE_PER_MIN` (default 30)
-question requests per minute — counted before authentication, so token guessing
+**Limits.** Each client IP (an IPv6 client: its /64 network) may send
+`GNLQA_HTTP_RATE_PER_MIN` (default 30) question requests per minute — counted before authentication, so token guessing
 is bounded too — and gets `429` with `Retry-After` beyond that. A question longer
 than `GNLQA_MAX_QUESTION_BYTES` (default 4096) gets `413`. The work one request
 may cause is budgeted: at most `GNLQA_MAX_LLM_CALLS` LLM calls (default 16),
@@ -296,7 +296,7 @@ over `http://` to a non-loopback host.
 | `GNLQA_CACHE_MAX_BYTES` | `67108864`                      | answer-cache byte budget (64 MiB); oldest entries are evicted beyond it, and an answer larger than an eighth of it is not cached |
 | `GNLQA_HTTP_TOKEN`   | — (required by `serve`)            | bearer token HTTP clients must send on `/ask` and `/gSolve` (redacted `Secret`) |
 | `GNLQA_HTTP_ALLOW_UNAUTHENTICATED` | `off`                | `on` = serve loopback clients without a token (refuses non-loopback binds) |
-| `GNLQA_HTTP_RATE_PER_MIN` | `30`                          | `/ask` + `/gSolve` requests per client IP per minute (`0` = unlimited) |
+| `GNLQA_HTTP_RATE_PER_MIN` | `30`                          | `/ask` + `/gSolve` requests per client IP (IPv6: per /64) per minute (`0` = unlimited) |
 | `GNLQA_MAX_QUESTION_BYTES` | `4096`                       | longest accepted question for `serve` (bytes) |
 | `GNLQA_MAX_LLM_CALLS` | `16`                              | LLM calls per `serve` request / MCP tool call (`0` = unlimited) |
 | `GNLQA_MAX_KB_ROWS`  | `200000`                           | KB rows fetched per `serve` request / MCP tool call (`0` = unlimited) |

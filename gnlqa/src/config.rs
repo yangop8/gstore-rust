@@ -61,8 +61,8 @@ pub struct Config {
     /// (`GNLQA_HTTP_ALLOW_UNAUTHENTICATED=on`, default off): the server then
     /// answers loopback clients only and refuses to bind a non-loopback address.
     pub http_allow_unauthenticated: bool,
-    /// `/ask` + `/gSolve` requests per client IP per minute
-    /// (`GNLQA_HTTP_RATE_PER_MIN`; 0 = unlimited).
+    /// `/ask` + `/gSolve` requests per client IP (IPv6: per /64 network) per
+    /// minute (`GNLQA_HTTP_RATE_PER_MIN`; 0 = unlimited).
     pub http_rate_per_min: u32,
     /// Maximum question length in bytes for `serve` (`GNLQA_MAX_QUESTION_BYTES`).
     pub max_question_bytes: usize,

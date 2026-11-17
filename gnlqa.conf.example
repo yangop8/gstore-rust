@@ -61,7 +61,7 @@ GSTORE_ENDPOINT=http://127.0.0.1:9000/sparql
 # GNLQA_HTTP_TOKEN=
 # Explicit opt-out: answer loopback clients only, without a token (default off).
 # GNLQA_HTTP_ALLOW_UNAUTHENTICATED=off
-# /ask + /gSolve requests per client IP per minute (0 = unlimited)
+# /ask + /gSolve requests per client IP (IPv6: per /64) per minute (0 = unlimited)
 # GNLQA_HTTP_RATE_PER_MIN=30
 # Longest accepted question (bytes)
 # GNLQA_MAX_QUESTION_BYTES=4096
