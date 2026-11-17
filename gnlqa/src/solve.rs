@@ -714,8 +714,8 @@ impl SolveEngine {
         // Graph-analytics routing: shortest path / centrality / PageRank /
         // communities / triangles aren't a single BGP — run gStore's analytics
         // engine over a retrieved edge sample. Gated by the abstain threshold for
-        // the same reason as the GraphRAG fallback. On any error, fall through to
-        // the normal Text-to-SPARQL pipeline.
+        // the same reason as the GraphRAG fallback. On a non-fatal error, fall
+        // through to the normal Text-to-SPARQL pipeline.
         if self.analytics
             && intent.qtype == QType::Analytics
             && ANALYTICS_CONFIDENCE >= self.abstain_below
@@ -748,6 +748,10 @@ impl SolveEngine {
                         provenance: Provenance::GStore,
                     });
                 }
+                // A KB outage or a spent request budget ends the request: the
+                // Text-to-SPARQL path would only pay for an LLM call and fail
+                // the same way (review cluster-nlqa#16).
+                Err(e) if e.is_fatal() => return Err(e),
                 // Don't mask the failure silently — surface it, then fall through
                 // to the Text-to-SPARQL path (which may still answer or abstain).
                 Err(e) => eprintln!("gnlqa: analytics routing failed, falling back to SPARQL: {e}"),

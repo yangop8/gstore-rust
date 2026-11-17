@@ -269,3 +269,36 @@ fn a_panicking_linker_build_does_not_disable_the_linker_for_good() {
     assert!(engine.linker().is_some(), "the next use builds it again");
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
+
+/// A KB whose endpoint is down: every query is a transport failure.
+struct DownKb;
+impl KbClient for DownKb {
+    fn query(&self, _sparql: &str) -> gnlqa::Result<SparqlAnswer> {
+        Err(Error::Http(
+            "gStore endpoint unreachable: connection refused".into(),
+        ))
+    }
+}
+
+#[test]
+fn a_kb_outage_during_graph_analytics_ends_the_request() {
+    // review (r5-gnlqa reviewer): an analytics failure was logged and the
+    // request fell through to Text-to-SPARQL even when the KB was down (or
+    // the request budget spent), paying for an ungrounded generation call
+    // that could only fail the same way. A fatal error now ends it, like on
+    // the intent call and the GraphRAG fallback.
+    let llm = Arc::new(MockLlm::new(vec![
+        r#"{"qtype":"analytics"}"#.to_string(),
+        r#"["SELECT ?x WHERE { ?x <http://ex/p> ?o }"]"#.to_string(),
+    ]));
+    let engine = SolveEngine::new(Box::new(Arc::clone(&llm)), Box::new(DownKb));
+    let err = engine
+        .ask("which node has the highest pagerank?")
+        .unwrap_err();
+    assert!(matches!(err, Error::Http(_)), "{err:?}");
+    assert_eq!(
+        llm.call_count(),
+        1,
+        "no SPARQL generation after the KB failed under analytics"
+    );
+}
