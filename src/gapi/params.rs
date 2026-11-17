@@ -14,6 +14,10 @@
 //!   named `file` also sets the `filename` parameter, like upstream);
 //! * the URL query string (`GET /api?operation=…&…`).
 //!
+//! A body labelled `application/sparql-query` or `application/sparql-update`
+//! carries no parameters (the SPARQL Protocol's raw statement): only the URL
+//! query string does then.
+//!
 //! The URL query and the body are merged; on a duplicated name the body wins
 //! (the last occurrence wins in general). Values keep their JSON type
 //! ([`Json`]) — `"tid": 1` and `"tid": "1"` both read as `"1"` through
@@ -140,7 +144,14 @@ impl Params {
             }
         };
         let trimmed = text.trim_start_matches('\u{FEFF}').trim();
-        if trimmed.is_empty() {
+        // A body labelled as a raw SPARQL statement is never read as
+        // parameters, whatever text it holds (review design#17: a `&sparql=`
+        // or `&db_name=` inside it replaced the URL's parameters).
+        let raw_sparql = matches!(
+            media.as_str(),
+            "application/sparql-query" | "application/sparql-update"
+        );
+        if trimmed.is_empty() || raw_sparql {
             // No body parameters.
         } else if media == "application/json" || trimmed.starts_with('{') {
             match json::parse_with_limits(trimmed, &BODY_JSON_LIMITS) {
