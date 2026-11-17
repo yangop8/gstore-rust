@@ -12,6 +12,10 @@
 //!   log rotates at [`TXN_LOG_MAX_BYTES`] and a `txnlog` read parses only
 //!   what was appended since the last one (review gapi#18).
 //!
+//! * `monitor` and `schema` of an unloaded database read its files once and
+//!   answer later requests from statistics cached until the files change,
+//!   instead of opening it on every request (review gapi#17).
+//!
 //! Every server here is in-process on `127.0.0.1:0` in a temp directory
 //! removed when the test ends (also when it fails). Synchronisation is by
 //! test hooks that park a step; a timeout only guards against a hang.
@@ -503,4 +507,80 @@ fn txnlog_reads_parse_only_what_was_appended_since_the_last_read() {
     logs.txn_begin(&root.0, "db", 202, "root");
     let page = logs.txn_page(&root.0, 1, 10).unwrap();
     assert_eq!(page.total_size, 1, "{:?}", page.items);
+}
+
+// ---- statistics of an unloaded database (gapi#17) ---------------------------
+
+/// `monitor` and `schema` of an unloaded database in `layout`: read from
+/// its files once, then answered from the statistics cached for its files
+/// until they change.
+fn unloaded_statistics_are_read_once(layout: &str) {
+    let srv = Srv::start(&format!("unloaded_{layout}"));
+    srv.ok(
+        "POST",
+        &format!("/build?db_name=cold&layout={layout}"),
+        DATA,
+    );
+    srv.ok("POST", "/unload?db_name=cold", "");
+    let dir = srv.db_dir("cold");
+    let reads = || gstore::gapi::unloaded_stats_reads(&dir);
+    let start = reads();
+    let monitor = || srv.api_ok(&[("operation", "monitor"), ("db_name", "cold")]);
+    let first = monitor();
+    assert_eq!(
+        first.get("tripleNum").and_then(Json::as_str),
+        Some("2"),
+        "{first}"
+    );
+    assert_eq!(reads() - start, 1, "the first monitor reads the database");
+    for _ in 0..3 {
+        let again = monitor();
+        assert_eq!(again.get("tripleNum"), first.get("tripleNum"), "{again}");
+        assert_eq!(
+            again.get("subjectList"),
+            first.get("subjectList"),
+            "{again}"
+        );
+        assert_eq!(again.get("diskUsed"), first.get("diskUsed"), "{again}");
+        let schema = srv.api_ok(&[("operation", "schema"), ("db_name", "cold")]);
+        assert_eq!(schema.get("ResponseBody"), first.get("schema"), "{schema}");
+    }
+    assert_eq!(
+        reads() - start,
+        1,
+        "monitor / schema of an unchanged unloaded database read it again"
+    );
+    // Its files change (loaded, written, unloaded): read again, once.
+    srv.ok("POST", "/load?db_name=cold", "");
+    srv.ok(
+        "POST",
+        "/update?db_name=cold",
+        "INSERT DATA { <http://ex/c> a <http://ex/K> }",
+    );
+    srv.ok("POST", "/unload?db_name=cold", "");
+    let changed = reads();
+    let after = monitor();
+    assert_eq!(
+        after.get("tripleNum").and_then(Json::as_str),
+        Some("3"),
+        "{after}"
+    );
+    monitor();
+    assert_eq!(reads() - changed, 1, "read once after the change");
+}
+
+#[test]
+fn unloaded_snapshot_statistics_are_read_once_until_the_files_change() {
+    unloaded_statistics_are_read_once("snapshot");
+}
+
+#[test]
+fn unloaded_disk_statistics_are_read_once_until_the_files_change() {
+    unloaded_statistics_are_read_once("disk");
+}
+
+#[cfg(feature = "rocksdb")]
+#[test]
+fn unloaded_rocksdb_statistics_are_read_once_until_the_files_change() {
+    unloaded_statistics_are_read_once("rocksdb");
 }
