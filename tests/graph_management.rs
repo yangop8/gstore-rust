@@ -12,8 +12,9 @@
 //! * COPY / MOVE / ADD copy triples by id instead of re-interning their
 //!   terms (db#16).
 //! * The library inference entry points report a store read error through
-//!   `try_materialize_rdfs` / `try_run_rules` instead of inferring less
-//!   (design#7).
+//!   `try_materialize_rdfs` / `try_run_rules` instead of inferring less, and
+//!   a `reasonManage` rule execution fails before it records or inserts
+//!   anything when it cannot read which derived triples exist (design#7).
 //! * The in-memory VS-tree is rebuilt after a clear of the default graph and
 //!   after reasoning, instead of staying unused for the rest of the session
 //!   (db#4).
@@ -663,6 +664,57 @@ fn rocksdb_inference_reports_a_read_error() {
     db.backend().as_rocks().unwrap().debug_fail_reads(false);
     assert_eq!(db.try_materialize_rdfs().unwrap(), 1);
     assert_eq!(db.try_run_rules().unwrap(), 1);
+}
+
+/// An inverse-relation rule (`reasonManage`): `?x :p ?y` derives
+/// `?y <Rule:inv> ?x`.
+const INVERSE_RULE: &str = r#"{"rulename": "inv", "description": "", "isenable": 1,
+    "type": 1, "logic": 1,
+    "conditions": [{"patterns": [{"subject": "?x", "predicate": "<http://ex/p>", "object": "?y"}],
+                    "filters": [], "count_info": {}}],
+    "return": {"source": "?y", "target": "?x", "label": "inv"}}"#;
+
+#[test]
+fn rule_execution_fails_before_recording_when_existence_cannot_be_read() {
+    // review design#7 (reason_infer): whether each derived triple already
+    // exists is read in a read scope. Here the SPO tree is unreadable, while
+    // the rule's WHERE pattern (predicate bound) reads the POS tree: the run
+    // must fail before the ledger or the store change. Read outside a scope,
+    // every derived triple counted as new, the insert went ahead on the
+    // failing store, broke it with a write error and left the rule marked
+    // executed.
+    const SPO: usize = 0; // header slot of the SPO tree
+    let tmp = TmpDir::new("rule_spo");
+    let data = tmp.write(
+        "relations.nt",
+        "<http://ex/a> <http://ex/p> <http://ex/b> .\n\
+         <http://ex/b> <Rule:inv> <http://ex/a> .\n\
+         <http://ex/c> <http://ex/p> <http://ex/d> .\n",
+    );
+    let dir = tmp.path("db");
+    Database::build_disk(&dir, &[&data]).unwrap();
+    corrupt_root(&dir.join("kvstore.kv"), SPO);
+    let stream = OpenOptions::new().with_disk_query_mode(DiskQueryMode::Stream);
+    let mut db = Database::open_with(&dir, &stream).unwrap();
+    db.reason_add(&gstore::json::parse(INVERSE_RULE).unwrap())
+        .unwrap();
+    db.reason_compile("inv").unwrap();
+    let e = db.reason_execute("inv").unwrap_err();
+    assert!(
+        e.message
+            .contains("a read from the store failed while checking which derived triples exist"),
+        "{e:?}"
+    );
+    let status = db.reason_show("inv").unwrap();
+    assert_eq!(
+        status.get("status").and_then(|s| s.as_str()),
+        Some("已编译"),
+        "the rule stays compiled, not executed"
+    );
+    // Nothing was written: the store still answers (through POS) and holds
+    // only the triple that was there.
+    let derived = col0(&mut db, "SELECT ?s WHERE { ?s <Rule:inv> ?o }");
+    assert_eq!(derived, vec!["<http://ex/b>"]);
 }
 
 // ---- db#15: the batched N-Triples build is linear ----------------------------

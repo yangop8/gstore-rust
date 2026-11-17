@@ -104,8 +104,12 @@
 - Tests and tools: `tests/graph_management.rs` (every layout: the existence
   rule, refused blank nodes, SECONDS, the grammar rules, the VS-tree after
   clears / copies / moves / transactions / reasoning, `try_*` on a Stream
-  store with a corrupt POS root and on RocksDB with failing reads, the
-  batched-build work counter, dictionary look-ups of a Stream-mode COPY);
+  store with a corrupt POS root and on RocksDB with failing reads, a rule
+  execution on a Stream store with a corrupt SPO root — before the fix it
+  counted every derived triple as new, inserted on the failing store, broke
+  it with a write error and marked the rule executed; now it fails before
+  recording anything —, the batched-build work counter, dictionary look-ups
+  of a Stream-mode COPY);
   W3C-style cases `tests/w3c/update-graph-management/` (16) and
   `tests/w3c/grammar/` (14). The W3C harness (`tests/w3c_subset.rs`) takes
   negative cases: a case may hold `expected.error` (first line `syntax`, or
@@ -174,7 +178,9 @@ none
   graph IRI only).
 - Fails-before check: the source of baeae13 plus the two `try_*` methods as
   plain delegations: 12 of the 15 tests of `tests/graph_management.rs`
-  fail (the three that pass guard unchanged behaviour), 12 of the 14
+  fail (the three that pass guard unchanged behaviour; the 16th, the rule
+  execution on a corrupt SPO root, added in review, fails with
+  `reason_infer`'s existence check read outside a scope), 12 of the 14
   `grammar/` cases and 4 of the 16 `update-graph-management/` cases fail
   (the others are positive regressions of SILENT, COPY / MOVE / ADD).
 - Bench smoke gate (`cargo +1.99.1 build --release --locked -p gstore -p
