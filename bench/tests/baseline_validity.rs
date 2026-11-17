@@ -199,7 +199,14 @@ fn ci_refuses_a_provisional_or_unfit_baseline() {
         );
         assert!(!Path::new(&t.path("data")).exists());
         // --allow-provisional gates anyway; check only warns.
-        let r = bench(&["ci", "--baseline", base, "--from", base, "--allow-provisional"]);
+        let r = bench(&[
+            "ci",
+            "--baseline",
+            base,
+            "--from",
+            base,
+            "--allow-provisional",
+        ]);
         assert_eq!(r.0, 0, "{}", r.2);
         let r = bench(&["check", "--baseline", base, "--from", base]);
         assert_eq!(r.0, 0, "{}", r.2);

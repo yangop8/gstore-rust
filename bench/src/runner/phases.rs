@@ -294,7 +294,12 @@ fn checkpoint_and_reopen(
 }
 
 /// The queries of `w` whose answers differ from `expected`.
-fn mismatched(db: &mut Database, w: &dyn Workload, expected: &Expected, tag: &str) -> Result<Vec<String>, String> {
+fn mismatched(
+    db: &mut Database,
+    w: &dyn Workload,
+    expected: &Expected,
+    tag: &str,
+) -> Result<Vec<String>, String> {
     let mut v = Vec::new();
     for q in w.queries() {
         let (_, rows, h) = run_query(db, &q, tag)?;

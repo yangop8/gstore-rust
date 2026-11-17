@@ -32,10 +32,17 @@ fn weekly() -> BenchResult {
 
 /// The query table's data rows of the WatDiv-like section.
 fn watdiv_rows(t: &str) -> Vec<&str> {
-    let start = t.find("**watdiv-like scale 10**").expect("a WatDiv-like table");
+    let start = t
+        .find("**watdiv-like scale 10**")
+        .expect("a WatDiv-like table");
     t[start..]
         .lines()
-        .filter(|l| l.starts_with("| L") || l.starts_with("| S") || l.starts_with("| F") || l.starts_with("| C"))
+        .filter(|l| {
+            l.starts_with("| L")
+                || l.starts_with("| S")
+                || l.starts_with("| F")
+                || l.starts_with("| C")
+        })
         .collect()
 }
 
@@ -78,7 +85,10 @@ fn the_lubm_runs_compare_with_the_lubm_result_run_by_run() {
     for l in o.lines().filter(|l| l.starts_with("| lubm-like univ 8 |")) {
         assert!(l.ends_with("| – | – | – |"), "{l}");
     }
-    for l in o.lines().filter(|l| l.starts_with("| watdiv-like scale 10 |")) {
+    for l in o
+        .lines()
+        .filter(|l| l.starts_with("| watdiv-like scale 10 |"))
+    {
         assert!(l.ends_with("| 1.00× | 1.00× | 1.00× |"), "{l}");
     }
 }

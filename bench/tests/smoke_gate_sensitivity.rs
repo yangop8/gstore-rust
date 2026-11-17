@@ -185,11 +185,18 @@ fn every_sub_millisecond_query_at_3_ms_fails() {
     let (v, o) = gate(&b, &m, 1.0);
     assert_eq!(v, Verdict::PerfFail);
     let f = failing(&o);
-    assert!(f.contains(&"time.query watdiv-like:snapshot/L4".to_string()), "{f:?}");
+    assert!(
+        f.contains(&"time.query watdiv-like:snapshot/L4".to_string()),
+        "{f:?}"
+    );
     assert!(f.contains(&"time.query snapshot/q1".to_string()), "{f:?}");
     // A query of a few ms slowed 4× fails too (q5: 2.3 → 9.2 ms passed).
     let mut m = b.clone();
-    let q5 = m.runs[0].queries.iter_mut().find(|q| q.name == "q5").unwrap();
+    let q5 = m.runs[0]
+        .queries
+        .iter_mut()
+        .find(|q| q.name == "q5")
+        .unwrap();
     q5.median_ms *= 4.0;
     let (v, o) = gate(&b, &m, 1.0);
     assert_eq!(v, Verdict::PerfFail);
@@ -205,8 +212,7 @@ fn the_canary_fails_at_2x_and_3x_and_1_3x_passes() {
     for x in [2.0, 3.0] {
         let (v, o) = gate(&b, &b, x);
         assert_eq!(v, Verdict::PerfFail, "canary {x}×");
-        let geomeans: Vec<&GateOutcome> =
-            o.iter().filter(|g| g.gate == "time.geomean").collect();
+        let geomeans: Vec<&GateOutcome> = o.iter().filter(|g| g.gate == "time.geomean").collect();
         assert_eq!(geomeans.len(), 4);
         assert!(
             geomeans.iter().all(|g| !g.pass),

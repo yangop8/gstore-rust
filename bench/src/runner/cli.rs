@@ -1283,8 +1283,14 @@ mod tests {
             run_options(&mut a, "smoke").unwrap_err()
         };
         for v in ["-1", "0", "NaN", "inf", "1e9"] {
-            assert!(err(&format!("--conc-secs {v}")).contains("--conc-secs"), "{v}");
-            assert!(err(&format!("--mixed-secs {v}")).contains("--mixed-secs"), "{v}");
+            assert!(
+                err(&format!("--conc-secs {v}")).contains("--conc-secs"),
+                "{v}"
+            );
+            assert!(
+                err(&format!("--mixed-secs {v}")).contains("--mixed-secs"),
+                "{v}"
+            );
         }
         assert!(err("--mixed-secs 3600 --mixed-write-ms 1").contains("writes per point"));
         assert!(err("--conc-clients 0").contains("--conc-clients"));

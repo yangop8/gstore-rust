@@ -1004,7 +1004,14 @@ mod tests {
 
     #[test]
     fn point_settings_are_validated() {
-        for bad in [-1.0, 0.0, f64::NAN, f64::INFINITY, 1e9, MAX_POINT_SECS * 1.01] {
+        for bad in [
+            -1.0,
+            0.0,
+            f64::NAN,
+            f64::INFINITY,
+            1e9,
+            MAX_POINT_SECS * 1.01,
+        ] {
             assert!(point_duration("--conc-secs", bad).is_err(), "{bad}");
         }
         assert_eq!(
@@ -1019,7 +1026,12 @@ mod tests {
             endpoints: vec!["sparql".into()],
         };
         assert!(c.validate().is_ok());
-        assert!(ConcSettings { secs: -1.0, ..c.clone() }.validate().is_err());
+        assert!(ConcSettings {
+            secs: -1.0,
+            ..c.clone()
+        }
+        .validate()
+        .is_err());
         assert!(ConcSettings {
             clients: vec![0],
             ..c.clone()
@@ -1036,10 +1048,20 @@ mod tests {
             begins: 0,
         };
         assert!(m.validate().is_ok());
-        assert!(MixedSettings { secs: f64::NAN, ..m.clone() }.validate().is_err());
+        assert!(MixedSettings {
+            secs: f64::NAN,
+            ..m.clone()
+        }
+        .validate()
+        .is_err());
         // An hour at one write per 100 ms fits a point's insert numbers; at
         // one per millisecond it does not.
-        assert!(MixedSettings { secs: 3600.0, ..m.clone() }.validate().is_ok());
+        assert!(MixedSettings {
+            secs: 3600.0,
+            ..m.clone()
+        }
+        .validate()
+        .is_ok());
         let e = MixedSettings {
             secs: 3600.0,
             write_ms: 1,

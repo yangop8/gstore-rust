@@ -1130,7 +1130,10 @@ mod tests {
         assert!((geomean_limit(&t, &run).0 - 1.65 / 1.05).abs() < 1e-12);
         run.queries = vec![q(vec![1.0, 9.0])];
         let s = query_spread(&run, &t);
-        assert!((s - 3.0).abs() < 1e-12, "clamped to the per-query limit: {s}");
+        assert!(
+            (s - 3.0).abs() < 1e-12,
+            "clamped to the per-query limit: {s}"
+        );
         assert_eq!(geomean_limit(&t, &run).0, 1.6);
         let old = Thresholds {
             geomean: GeomeanGate {

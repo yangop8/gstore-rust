@@ -69,7 +69,11 @@ fn stray_positional_arguments_are_usage_errors() {
     // gated against the default baseline.
     let other = "bench/results/phase6-final-lubm8.json";
     let mut a = vec!["check", "--baseline", &base, "--from", &base, other];
-    refused(&t, &a, "unexpected argument 'bench/results/phase6-final-lubm8.json'");
+    refused(
+        &t,
+        &a,
+        "unexpected argument 'bench/results/phase6-final-lubm8.json'",
+    );
     a.insert(0, "ci");
     a.remove(1);
     refused(&t, &a, "unexpected argument");
@@ -84,7 +88,16 @@ fn stray_positional_arguments_are_usage_errors() {
     let gen = t.path("gen.nt");
     refused(
         &t,
-        &["gen", "--scale", "1", "--departments", "1", "tiny", "--out", &gen],
+        &[
+            "gen",
+            "--scale",
+            "1",
+            "--departments",
+            "1",
+            "tiny",
+            "--out",
+            &gen,
+        ],
         "unexpected argument 'tiny'",
     );
     let mut a = vec!["queries", "watdiv"];
@@ -96,7 +109,11 @@ fn stray_positional_arguments_are_usage_errors() {
         &["bless", "--from", &base, "--to", &bl, "extra"],
         "unexpected argument 'extra'",
     );
-    refused(&t, &["calibrate", "--quick", "now"], "unexpected argument 'now'");
+    refused(
+        &t,
+        &["calibrate", "--quick", "now"],
+        "unexpected argument 'now'",
+    );
     // Commands with positionals keep them.
     let r = bench(&["compare", &base, &base]);
     assert_eq!(r.0, 0, "{}", r.1);
