@@ -1,0 +1,3 @@
+@prefix : <http://example.org/> .
+:f :p _:b ; :name "f" .
+_:b :q "blank" .

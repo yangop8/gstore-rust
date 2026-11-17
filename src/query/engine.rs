@@ -1566,6 +1566,19 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// Evaluate DESCRIBE: collect the resource ids (explicit terms + variable
     /// targets bound by the WHERE pattern) and return every triple having one of
     /// them as subject (the outgoing description), de-duplicated.
+    ///
+    /// SPARQL 1.1 §16.4 leaves the form of a description to the service;
+    /// this one is not a Concise Bounded Description: blank-node objects
+    /// are not followed, so `DESCRIBE :f` over `:f :p _:b . _:b :q "x"`
+    /// returns `:f :p _:b` only, and since a blank-node label cannot be
+    /// named in a later query, `_:b`'s own triples are reachable only
+    /// through a pattern (`SELECT … { :f :p ?b . ?b ?q ?o }`). Incoming
+    /// triples and named graphs are not described either (review
+    /// sparqlconf#19; CBD is in docs/REFACTOR_BACKLOG.md). A request's
+    /// syntax tree is bounded too ([`MAX_TREE_HEIGHT`](crate::parser::sparql::MAX_TREE_HEIGHT)
+    /// links, counting every `UNION` branch or `||` operand of a chain), so
+    /// a generated DESCRIBE — or any query — with more than about a
+    /// thousand chained alternatives is refused as nested too deeply.
     fn eval_describe(&self, d: &DescribeQuery) -> Result<Vec<Triple>> {
         // The resources in first-seen order, de-duplicated through a hash
         // set (a linear `contains` per solution was quadratic in the number

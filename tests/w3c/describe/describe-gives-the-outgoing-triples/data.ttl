@@ -1,0 +1,4 @@
+@prefix : <http://example.org/> .
+:alice :name "Alice" ; :knows :bob .
+:bob :name "Bob" ; :knows :alice .
+:carol :knows :alice .
