@@ -152,14 +152,30 @@ impl DebRoot {
     /// DPKG_ROOT set: dpkg --root), the scripts' `/run/systemd/system` moved
     /// into the root.
     fn run(&self, name: &str, text: &str, args: &[&str]) {
+        self.run_as(name, text, args, true);
+    }
+
+    /// `sh -c TEXT name ARGS` as dpkg runs a maintainer script on the live
+    /// system (no DPKG_ROOT), so its systemd steps run — against the
+    /// shims, which only record the call (prerm acts through systemctl /
+    /// deb-systemd-invoke alone; review infra#15: with DPKG_ROOT set, prerm
+    /// skips its systemd steps and a `systemctl disable` among them would go
+    /// unnoticed).
+    fn run_live(&self, name: &str, text: &str, args: &[&str]) {
+        self.run_as(name, text, args, false);
+    }
+
+    fn run_as(&self, name: &str, text: &str, args: &[&str], dpkg_root: bool) {
         let run_dir = self.root().join("run/systemd/system");
         let text = text.replace("/run/systemd/system", &run_dir.to_string_lossy());
-        let out = Command::new("/bin/sh")
-            .arg("-c")
-            .arg(&text)
-            .arg(name)
-            .args(args)
-            .env("DPKG_ROOT", self.root())
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(&text).arg(name).args(args);
+        if dpkg_root {
+            cmd.env("DPKG_ROOT", self.root());
+        } else {
+            cmd.env_remove("DPKG_ROOT");
+        }
+        let out = cmd
             .env("DPKG_MAINTSCRIPT_PACKAGE", "gstore")
             .env("DPKG_MAINTSCRIPT_NAME", name)
             .env("PATH", self.tmp.path_env())
@@ -221,17 +237,25 @@ fn removing_and_reinstalling_the_deb_keeps_an_enabled_unit_enabled() {
     assert!(!r.enabled(), "the package enabled the unit itself");
     // The administrator enables it (`systemctl enable gserver`).
     r.admin_enables();
-    // `apt remove gstore`: prerm, the files go, postrm.
-    r.run("prerm", &prerm, &["remove"]);
-    r.remove_unit();
-    r.run("postrm", &postrm, &["remove"]);
-    assert!(r.masked(), "postrm masks the removed unit");
-    // review infra#15: the old prerm ran `systemctl disable` here.
+    // `apt remove gstore`: prerm (on the live system: its systemd steps
+    // run, against the shims), the files go, postrm.
+    r.run_live("prerm", &prerm, &["remove"]);
+    // prerm stops the running server ...
+    assert!(
+        r.tmp.calls().contains("stop gserver.service"),
+        "prerm did not stop the server: {}",
+        r.tmp.calls()
+    );
+    // ... and (review infra#15) no longer runs `systemctl disable`.
     assert!(
         !r.tmp.calls().contains("disable"),
         "prerm disabled the unit: {}",
         r.tmp.calls()
     );
+    assert!(r.enabled(), "prerm dropped the enable link");
+    r.remove_unit();
+    r.run("postrm", &postrm, &["remove"]);
+    assert!(r.masked(), "postrm masks the removed unit");
     // `apt install gstore` again (dpkg passes the configured version).
     r.install_unit();
     r.run("postinst", &block, &["configure", "0.1.0"]);
@@ -241,7 +265,7 @@ fn removing_and_reinstalling_the_deb_keeps_an_enabled_unit_enabled() {
         "the unit the administrator enabled is enabled again"
     );
     // An upgrade of an enabled unit keeps it enabled too.
-    r.run("prerm", &prerm, &["upgrade", "0.1.0"]);
+    r.run_live("prerm", &prerm, &["upgrade", "0.1.0"]);
     r.run("postinst", &block, &["configure", "0.1.0"]);
     assert!(r.enabled());
 }
@@ -258,7 +282,7 @@ fn a_disabled_unit_stays_disabled_and_a_purge_forgets_it() {
     // Never enabled: remove + install leaves it disabled and unmasked.
     let r = DebRoot::new("disabled");
     r.run("postinst", &block, &["configure", ""]);
-    r.run("prerm", &prerm, &["remove"]);
+    r.run_live("prerm", &prerm, &["remove"]);
     r.remove_unit();
     r.run("postrm", &postrm, &["remove"]);
     r.install_unit();
@@ -277,7 +301,7 @@ fn a_disabled_unit_stays_disabled_and_a_purge_forgets_it() {
     let conf_link = r.root().join("var/lib/gstore/conf");
     fs::create_dir_all(conf_link.parent().unwrap()).unwrap();
     symlink("/etc/gstore", &conf_link).unwrap();
-    r.run("prerm", &prerm, &["remove"]);
+    r.run_live("prerm", &prerm, &["remove"]);
     r.remove_unit();
     r.run("postrm", &postrm, &["remove"]);
     r.run("postrm", &postrm, &["purge"]);
