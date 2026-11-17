@@ -432,13 +432,29 @@ impl TripleSource for ShardedStore {
 /// carry **many** requests (the [`RemoteShard`] client keeps one connection per
 /// shard and reuses it across a scatter-gather). The store is shared behind a
 /// [`Mutex`] so reads and routed inserts are serialized per node.
+///
+/// Every connection's reads and writes are bounded by an I/O timeout
+/// ([`ShardNode::DEFAULT_IO_TIMEOUT`], see [`ShardNode::with_io_timeout`]): a
+/// client that goes idle, stalls mid-frame or stops reading its replies is
+/// disconnected instead of pinning a thread forever (review cluster-nlqa#9).
+/// A [`RemoteShard`] whose idle connection was closed reconnects on its next
+/// call. The node is still unauthenticated and still spends one thread per
+/// open connection — trusted networks only (see [`crate::rpc`]).
 #[derive(Debug)]
 pub struct ShardNode {
     store: Arc<Mutex<TripleStore>>,
     listener: TcpListener,
+    io_timeout: Duration,
+    /// Largest reply payload sent; a bigger answer is replaced by a
+    /// [`Response::Error`] ([`rpc::MAX_FRAME`]; tests lower it).
+    reply_limit: usize,
 }
 
 impl ShardNode {
+    /// Default bound on each read from / write to a client connection — how
+    /// long a connection may sit idle between requests, or stall inside one.
+    pub const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(60);
+
     /// Bind to `addr` (e.g. `"127.0.0.1:0"` for an ephemeral port), taking
     /// ownership of this node's local shard.
     pub fn bind<A: ToSocketAddrs>(store: TripleStore, addr: A) -> io::Result<ShardNode> {
@@ -446,7 +462,17 @@ impl ShardNode {
         Ok(ShardNode {
             store: Arc::new(Mutex::new(store)),
             listener,
+            io_timeout: Self::DEFAULT_IO_TIMEOUT,
+            reply_limit: rpc::MAX_FRAME,
         })
+    }
+
+    /// Use `timeout` (clamped to at least 1 ms) instead of
+    /// [`ShardNode::DEFAULT_IO_TIMEOUT`] for every read and write on the
+    /// connections this node accepts.
+    pub fn with_io_timeout(mut self, timeout: Duration) -> ShardNode {
+        self.io_timeout = timeout.max(Duration::from_millis(1));
+        self
     }
 
     /// The actual bound address (useful after binding to port 0).
@@ -458,27 +484,35 @@ impl ShardNode {
     pub fn serve_forever(&self) {
         for stream in self.listener.incoming().flatten() {
             // Request/response traffic: push each small reply frame out at once
-            // rather than letting Nagle hold it for the client's delayed ACK.
-            let _ = stream.set_nodelay(true);
+            // rather than letting Nagle hold it for the client's delayed ACK;
+            // and bound every read/write so an idle or stalled client cannot
+            // hold its connection thread forever.
+            if rpc::tune_stream(&stream, Some(self.io_timeout)).is_err() {
+                continue;
+            }
             let store = Arc::clone(&self.store);
-            thread::spawn(move || serve_connection(store, stream));
+            let limit = self.reply_limit;
+            thread::spawn(move || serve_connection(store, stream, limit));
         }
     }
 }
 
 /// Serve one client connection: decode framed [`Request`]s and reply with framed
-/// [`Response`]s until the peer closes or an I/O error occurs.
-fn serve_connection(store: Arc<Mutex<TripleStore>>, mut stream: TcpStream) {
+/// [`Response`]s until the peer closes, a read or write times out, or an I/O
+/// error occurs. A reply larger than `reply_limit` is answered with a
+/// [`Response::Error`] naming its size, and the connection stays usable.
+fn serve_connection(store: Arc<Mutex<TripleStore>>, mut stream: TcpStream, reply_limit: usize) {
     loop {
         let bytes = match rpc::read_message(&mut stream) {
             Ok(b) => b,
-            Err(_) => return, // peer closed or framing error
+            Err(_) => return, // peer closed, timed out, or framing error
         };
         let resp = match Request::decode(&bytes) {
             Ok(req) => dispatch(&store, &req),
             Err(e) => Response::Error(e.to_string()),
         };
-        if rpc::write_message(&mut stream, &resp.encode()).is_err() {
+        let reply = rpc::encode_reply_within(&resp, reply_limit);
+        if rpc::write_message(&mut stream, &reply).is_err() {
             return;
         }
     }
@@ -2898,7 +2932,9 @@ impl ClusterNode {
                 return;
             }
             let resp = self.handle_request(req);
-            if rpc::write_message(&mut stream, &resp.encode()).is_err() {
+            // An answer too large for one frame is reported, not dropped with
+            // the connection (review cluster-nlqa#9).
+            if rpc::write_message(&mut stream, &rpc::encode_reply(&resp)).is_err() {
                 return;
             }
         }
@@ -6342,5 +6378,119 @@ mod replicated_shard_tests {
             );
         }
         assert_eq!(cluster.remove(a), Some(false), "removing an absent triple");
+    }
+}
+
+/// Regression tests for the review findings fixed in this module (review
+/// cluster-nlqa#1-#4, #9-#12): each one reproduces the reported failure
+/// through the public API and checks the fixed behaviour. Failures are
+/// injected deterministically — a [`test_support::Link`] that dies after an
+/// exact number of RPCs, a replica marked down, a forged message — and wall
+/// clocks only bound the waits (hang guards), never decide an assertion.
+#[cfg(test)]
+mod review_fix_tests {
+    use super::test_support::Link;
+    use super::*;
+    use std::time::Instant;
+
+    /// Upper bound on any wait in this module: a hang guard, not an assertion.
+    const HANG_GUARD: Duration = Duration::from_secs(30);
+
+    fn t(s: u32, p: u32, o: u32) -> IdTriple {
+        IdTriple::new(s, p, o)
+    }
+
+    /// A placeholder member address for an in-process (`Shard::Local`)
+    /// endpoint: the config needs one, nothing ever connects to it.
+    fn local_addr(host: u8) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, host], 0))
+    }
+
+    fn local_shard(triples: &[IdTriple]) -> Shard {
+        let mut s = TripleStore::new();
+        s.bulk_load(triples.iter().copied());
+        Shard::Local(s)
+    }
+
+    /// A [`ShardNode`] holding `initial` on an ephemeral port, served from a
+    /// background thread; returns its address.
+    fn start_shard(initial: &[IdTriple]) -> SocketAddr {
+        let mut store = TripleStore::new();
+        store.bulk_load(initial.iter().copied());
+        let node = ShardNode::bind(store, "127.0.0.1:0").expect("bind shard node");
+        let addr = node.local_addr().expect("shard addr");
+        thread::spawn(move || node.serve_forever());
+        addr
+    }
+
+    fn remote(addr: SocketAddr) -> Shard {
+        Shard::Remote(RemoteShard::connect(addr).expect("resolve shard addr"))
+    }
+
+    /// Whether member `id`'s own endpoint holds `tr`.
+    fn holds(cluster: &ShardCluster, id: NodeId, tr: IdTriple) -> bool {
+        cluster
+            .endpoint(id)
+            .expect("member endpoint")
+            .reader()
+            .read_exists(tr.sub, tr.pred, tr.obj)
+            .expect("endpoint answers")
+    }
+
+    // ----- review cluster-nlqa#9 (+ sec#19, conc#11, robust#15) ---------------
+
+    /// A [`ShardNode`] disconnects a client that stays idle, or stalls inside
+    /// a frame, past its I/O timeout; before, such a connection held its
+    /// thread forever.
+    #[test]
+    fn a_shard_node_disconnects_idle_and_stalled_clients() {
+        use std::io::{Read, Write};
+        let node = ShardNode::bind(TripleStore::new(), "127.0.0.1:0")
+            .unwrap()
+            .with_io_timeout(Duration::from_millis(100));
+        let addr = node.local_addr().unwrap();
+        thread::spawn(move || node.serve_forever());
+
+        let mut idle = TcpStream::connect(addr).unwrap();
+        idle.set_read_timeout(Some(HANG_GUARD)).unwrap();
+        assert_eq!(
+            idle.read(&mut [0u8; 1])
+                .expect("closed by the node, not timed out here"),
+            0
+        );
+
+        // Half a frame: the length prefix announces 10 bytes, one arrives.
+        let mut stalled = TcpStream::connect(addr).unwrap();
+        stalled.set_read_timeout(Some(HANG_GUARD)).unwrap();
+        stalled.write_all(&[0, 0, 0, 10, 1]).unwrap();
+        assert_eq!(stalled.read(&mut [0u8; 1]).expect("closed by the node"), 0);
+
+        // An active client is served as before.
+        let rs = RemoteShard::connect(addr).unwrap();
+        assert_eq!(rs.triple_count().unwrap(), 0);
+    }
+
+    /// A reply larger than the frame limit is answered with an error that
+    /// says so, and the connection stays usable; before, the node built the
+    /// reply, failed to send it and dropped the connection, so the client saw
+    /// a reset, retried, and reported a generic I/O error.
+    #[test]
+    fn an_oversized_shard_reply_is_reported_not_dropped() {
+        let triples: Vec<IdTriple> = (1..=100).map(|s| t(s, 1, s)).collect();
+        let mut store = TripleStore::new();
+        store.bulk_load(triples.iter().copied());
+        let mut node = ShardNode::bind(store, "127.0.0.1:0").unwrap();
+        node.reply_limit = 64; // 100 subject ids need 405 bytes
+        let addr = node.local_addr().unwrap();
+        thread::spawn(move || node.serve_forever());
+
+        let rs = RemoteShard::connect(addr).unwrap();
+        let err = rs.read_subject_keys().expect_err("the reply is too large");
+        assert!(err.to_string().contains("exceeds"), "{err}");
+        assert_eq!(
+            rs.triple_count().unwrap(),
+            100,
+            "the connection still serves"
+        );
     }
 }

@@ -172,9 +172,19 @@ pub fn tune_stream(
     Ok(())
 }
 
+/// The payload buffer [`read_message`] starts with; it grows (doubling) only
+/// as payload bytes actually arrive.
+const FIRST_READ_CAPACITY: usize = 64 * 1024;
+
 /// Read one length-prefixed message: a 4-byte big-endian length, then exactly
 /// that many payload bytes. Errors if the length exceeds [`MAX_FRAME`]. An EOF
-/// before the length prefix surfaces as [`io::ErrorKind::UnexpectedEof`].
+/// before the length prefix — or before the announced payload is complete —
+/// surfaces as [`io::ErrorKind::UnexpectedEof`].
+///
+/// The length prefix is unauthenticated, so it never sizes an allocation: the
+/// buffer grows with the bytes received (review robust#15 / sec#19, merged
+/// into cluster-nlqa#9). A peer announcing a 256 MiB frame and sending three
+/// bytes costs a few KiB, not 256 MiB.
 pub fn read_message<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf)?;
@@ -185,9 +195,38 @@ pub fn read_message<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
             "rpc frame exceeds MAX_FRAME",
         ));
     }
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf)?;
+    let mut buf = Vec::with_capacity(len.min(FIRST_READ_CAPACITY));
+    r.by_ref().take(len as u64).read_to_end(&mut buf)?;
+    if buf.len() != len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "rpc frame truncated: the peer closed before the announced payload arrived",
+        ));
+    }
     Ok(buf)
+}
+
+/// Encode `resp` as a reply payload — or, when the encoding is larger than
+/// [`MAX_FRAME`] (which [`write_message`] refuses to send), an encoded
+/// [`Response::Error`] saying so. Without this a server built the oversized
+/// answer, failed to send it and dropped the connection, so the client saw a
+/// reset (and retried the whole request) instead of the reason (review
+/// cluster-nlqa#9).
+pub fn encode_reply(resp: &Response) -> Vec<u8> {
+    encode_reply_within(resp, MAX_FRAME)
+}
+
+/// [`encode_reply`] against an explicit frame limit (tests use a small one).
+pub(crate) fn encode_reply_within(resp: &Response, limit: usize) -> Vec<u8> {
+    let bytes = resp.encode();
+    if bytes.len() <= limit {
+        return bytes;
+    }
+    Response::Error(format!(
+        "response of {} bytes exceeds the {limit}-byte rpc frame limit",
+        bytes.len()
+    ))
+    .encode()
 }
 
 // ---------------------------------------------------------------------------
@@ -1093,6 +1132,26 @@ mod tests {
         assert!(
             took < std::time::Duration::from_millis(1500),
             "40 loopback round trips took {took:?}; frames are being delayed"
+        );
+    }
+
+    /// review cluster-nlqa#9: an answer too large for one frame becomes an
+    /// encoded `Error` naming its size (the client learns why) instead of a
+    /// frame `write_message` refuses, which used to drop the connection.
+    #[test]
+    fn an_oversized_reply_is_encoded_as_an_error() {
+        let big = Response::Ids((0..100).collect());
+        let encoded = encode_reply_within(&big, 64);
+        match Response::decode(&encoded).unwrap() {
+            Response::Error(msg) => assert!(msg.contains("405 bytes exceeds"), "{msg}"),
+            other => panic!("expected an Error reply, got {other:?}"),
+        }
+        let small = Response::Count(7);
+        assert_eq!(encode_reply_within(&small, 64), small.encode());
+        assert_eq!(
+            encode_reply(&big),
+            big.encode(),
+            "within MAX_FRAME: unchanged"
         );
     }
 
