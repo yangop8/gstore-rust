@@ -13,11 +13,12 @@
 //!   (ext#1), and compiling builds what `data.json` records (ext#8).
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use gstore::reason::store::RuleStore;
 use gstore::{Database, QueryResult};
 
 /// A temp directory removed when dropped (also when the test fails).
@@ -229,4 +230,159 @@ fn textual_rule_joins_scale_linearly() {
         large < small * 24,
         "8x the edges: {small:?} -> {large:?} (a quadratic join takes 64x)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Rule directories under a failing write (durability#11)
+// ---------------------------------------------------------------------------
+
+/// The file-size limit and the signal it raises (Linux, 64-bit `rlim_t`).
+mod rlimit {
+    #[repr(C)]
+    struct RLimit {
+        cur: u64,
+        max: u64,
+    }
+
+    extern "C" {
+        fn setrlimit(resource: i32, rlim: *const RLimit) -> i32;
+        fn getrlimit(resource: i32, rlim: *mut RLimit) -> i32;
+        fn signal(sig: i32, handler: usize) -> usize;
+    }
+
+    const RLIMIT_FSIZE: i32 = 1;
+    const SIGXFSZ: i32 = 25;
+    const SIG_IGN: usize = 1;
+
+    /// Writes past `bytes` per file fail with `EFBIG` (`SIGXFSZ` ignored).
+    pub fn limit_file_size(bytes: u64) {
+        let mut cur = RLimit { cur: 0, max: 0 };
+        // SAFETY: plain syscall wrappers on a properly sized struct, and the
+        // predefined SIG_IGN disposition.
+        unsafe {
+            assert_ne!(signal(SIGXFSZ, SIG_IGN), usize::MAX);
+            assert_eq!(getrlimit(RLIMIT_FSIZE, &mut cur), 0);
+            let new = RLimit {
+                cur: bytes.min(cur.max),
+                max: cur.max,
+            };
+            assert_eq!(setrlimit(RLIMIT_FSIZE, &new), 0);
+        }
+    }
+}
+
+const CHILD_SCENARIO: &str = "GSTORE_RULE_DIR_CHILD";
+const CHILD_ROOT: &str = "GSTORE_RULE_DIR_ROOT";
+const CHILD_OK: &str = "rule-dir child: done";
+/// The file-size limit of the child: above every rule file, below the big
+/// ledger.
+const LIMIT: u64 = 64 * 1024;
+
+/// A database directory with rules `names`, each with a ledger; `big`'s
+/// ledger is larger than [`LIMIT`].
+fn db_with_rules(root: &Path, db: &str, names: &[&str], big: Option<&str>) -> PathBuf {
+    let dir = root.join(db);
+    fs::create_dir_all(&dir).unwrap();
+    let mut store = RuleStore::dir(&dir);
+    for &n in names {
+        assert!(store
+            .create(n, &format!("{{\"rulename\":\"{n}\"}}"))
+            .unwrap());
+        let lines = if big == Some(n) { 5_000 } else { 1 };
+        let ledger = (0..lines)
+            .map(|i| format!("<http://ex/{n}/{i}> <Rule:{n}> <http://ex/o> ."))
+            .collect();
+        store.set_ledger(n, Some(&ledger)).unwrap();
+    }
+    dir
+}
+
+/// The rules a database directory shows, each with whether it has its
+/// ledger — read under the rule lock, as every rule operation reads them.
+fn shown(db_dir: &Path) -> Vec<(String, bool)> {
+    let store = RuleStore::dir(db_dir);
+    let _lock = store.lock();
+    store
+        .names()
+        .unwrap()
+        .into_iter()
+        .map(|n| {
+            let has = store.ledger(&n).unwrap().is_some();
+            (n, has)
+        })
+        .collect()
+}
+
+/// The child: copies the rules of `src.db` into `dst.db` under the file-size
+/// limit, so the big ledger's copy fails with `EFBIG` part-way.
+#[test]
+#[ignore = "run by a_rule_directory_write_that_fails_part_way_changes_nothing"]
+fn child_rule_dir_write() {
+    let Ok(scenario) = std::env::var(CHILD_SCENARIO) else {
+        return;
+    };
+    let root = PathBuf::from(std::env::var(CHILD_ROOT).unwrap());
+    let (src, dst) = (root.join("src.db"), root.join("dst.db"));
+    let rules = gstore::reason::store::read_rule_dir(&src).unwrap();
+    rlimit::limit_file_size(LIMIT);
+    let r = match scenario.as_str() {
+        "copy" => gstore::reason::store::copy_rule_dir(&src, &dst),
+        "memory" => gstore::reason::store::write_memory_rules(&rules, &dst),
+        other => panic!("unknown scenario {other}"),
+    };
+    let e = r.expect_err("the big ledger is larger than the file-size limit");
+    println!("{CHILD_OK}: {e}");
+}
+
+/// Review durability#11: a backup's rule copy (and the save of a detached
+/// database's in-memory rules) removed the destination's rules and wrote the
+/// new ones file by file, so a write failing part-way (a full disk; a crash
+/// there leaves the same) lost the old rules and left rule files without
+/// their ledgers. Staged and swapped in as a whole, a failed write leaves
+/// the destination as it was.
+#[test]
+fn a_rule_directory_write_that_fails_part_way_changes_nothing() {
+    for scenario in ["copy", "memory"] {
+        let root = TmpDir::new(scenario);
+        // `a` sorts first: its rule file is copied before the ledgers.
+        db_with_rules(&root.0, "src.db", &["a", "big"], Some("big"));
+        let dst = db_with_rules(&root.0, "dst.db", &["old"], None);
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "child_rule_dir_write",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_SCENARIO, scenario)
+            .env(CHILD_ROOT, &root.0)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains(CHILD_OK),
+            "{scenario}: the child failed: {stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            shown(&dst),
+            [("old".to_string(), true)],
+            "{scenario}: the failed write changed the destination ({stdout})"
+        );
+        // Without the limit the same write goes through.
+        let src = root.path("src.db");
+        match scenario {
+            "copy" => gstore::reason::store::copy_rule_dir(&src, &dst).unwrap(),
+            _ => {
+                let rules = gstore::reason::store::read_rule_dir(&src).unwrap();
+                gstore::reason::store::write_memory_rules(&rules, &dst).unwrap();
+            }
+        }
+        assert_eq!(
+            shown(&dst),
+            [("a".to_string(), true), ("big".to_string(), true)]
+        );
+    }
 }

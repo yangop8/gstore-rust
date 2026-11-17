@@ -422,7 +422,10 @@ impl<'a> RuleStore<'a> {
 }
 
 /// Take the process-wide rule lock of the database in directory `db_dir`
-/// (see [`RuleStore::lock`]).
+/// (see [`RuleStore::lock`]). A replacement of its rule directory that a
+/// crash interrupted ([`copy_rule_dir`], [`write_memory_rules`]) is
+/// finished first, so every operation sees the old rule directory or the
+/// new one.
 fn lock_dir(db_dir: &Path) -> StoreLock {
     let state = dir_lock(db_dir);
     {
@@ -432,7 +435,17 @@ fn lock_dir(db_dir: &Path) -> StoreLock {
         }
         *held = true;
     }
-    StoreLock { state: Some(state) }
+    let lock = StoreLock { state: Some(state) };
+    let rules = db_dir.join(RULE_DIR);
+    if fsutil::STORE_SWAP.in_progress(&rules) {
+        if let Err(e) = fsutil::recover_dir_swap(&rules) {
+            crate::gs_warn!(
+                "reason: cannot finish the interrupted replacement of '{}': {e}",
+                rules.display()
+            );
+        }
+    }
+    lock
 }
 
 /// Make `dst_db_dir/reason_rule_files` a copy of `src_db_dir`'s (removing
@@ -440,6 +453,15 @@ fn lock_dir(db_dir: &Path) -> StoreLock {
 /// which carry a database's rules like upstream's whole-directory copies do.
 /// Both directories' rule locks are held throughout (taken in a fixed order),
 /// so a concurrent `reasonManage` operation is never copied half-done.
+///
+/// The copy is staged beside the destination (`reason_rule_files.tmp`),
+/// every file and directory of it fsynced, and swapped in as a whole
+/// ([`fsutil::StagedDir`]); a removal renames the directory aside durably
+/// before deleting it. So a crash or a failed write (a full disk) leaves the
+/// destination's previous rules or the new ones — never some rule files
+/// without their ledgers, which [`super::manage`] would take for upstream
+/// rules and retract by label (review durability#11). An interrupted swap is
+/// finished by the next operation that takes the destination's rule lock.
 pub fn copy_rule_dir(src_db_dir: &Path, dst_db_dir: &Path) -> crate::Result<()> {
     let (src, dst) = (src_db_dir.join(RULE_DIR), dst_db_dir.join(RULE_DIR));
     let key = |d: &Path| fs::canonicalize(d).unwrap_or_else(|_| d.to_path_buf());
@@ -459,18 +481,20 @@ pub fn copy_rule_dir(src_db_dir: &Path, dst_db_dir: &Path) -> crate::Result<()> 
     {
         return Ok(());
     }
-    fsutil::remove_dir_if_exists(&dst)?;
     if !src.is_dir() {
-        return Ok(());
+        return fsutil::discard_dir(&dst);
     }
-    copy_tree(&src, &dst)?;
-    fsutil::sync_dir(dst_db_dir)
+    let staged = fsutil::StagedDir::begin(&dst, &fsutil::STORE_SWAP)?;
+    copy_tree(&src, staged.path())?;
+    staged.install()?;
+    Ok(())
 }
 
 /// Copy the regular files of `src` (and of its sub-directories) into `dst`:
 /// the files first, then the sub-directories — so a rule file another
 /// process adds meanwhile (its ledger is written first) is never copied
-/// without its ledger.
+/// without its ledger. Nothing is fsynced here: the caller syncs the staged
+/// tree before it publishes it.
 fn copy_tree(src: &Path, dst: &Path) -> crate::Result<()> {
     fs::create_dir_all(dst)?;
     let mut dirs = Vec::new();
@@ -481,13 +505,15 @@ fn copy_tree(src: &Path, dst: &Path) -> crate::Result<()> {
         if ty.is_dir() {
             dirs.push((entry.path(), to));
         } else if ty.is_file() {
+            #[cfg(test)]
+            crash::point();
             fs::copy(entry.path(), &to)?;
         }
     }
     for (from, to) in dirs {
         copy_tree(&from, &to)?;
     }
-    fsutil::sync_dir(dst)
+    Ok(())
 }
 
 /// The rules (and ledgers) of the database in directory `db_dir`, read into
@@ -514,16 +540,24 @@ pub fn read_rule_dir(db_dir: &Path) -> crate::Result<MemoryRules> {
 }
 
 /// Write the in-memory rules `m` into `dst_db_dir/reason_rule_files` (the
-/// backup of a database that has no directory).
+/// backup or save of a database that has no directory), replacing what is
+/// there: staged, fsynced and swapped in as a whole under the destination's
+/// rule lock, like [`copy_rule_dir`] (review durability#11: the directory
+/// was removed first and the files written one by one, so a crash part-way
+/// left rule files without ledgers, or no rules at all).
 pub fn write_memory_rules(m: &MemoryRules, dst_db_dir: &Path) -> crate::Result<()> {
     let dir = dst_db_dir.join(RULE_DIR);
-    fsutil::remove_dir_if_exists(&dir)?;
+    let _lock = lock_dir(dst_db_dir);
     if m.is_empty() {
-        return Ok(());
+        return fsutil::discard_dir(&dir);
     }
-    fs::create_dir_all(dir.join(LEDGER_DIR))?;
+    let staged = fsutil::StagedDir::begin(&dir, &fsutil::STORE_SWAP)?;
+    let root = staged.path();
+    fs::create_dir_all(root.join(LEDGER_DIR))?;
     for (name, text) in &m.rules {
-        fsutil::atomic_write(&dir.join(format!("{name}.json")), text.as_bytes())?;
+        #[cfg(test)]
+        crash::point();
+        fs::write(root.join(format!("{name}.json")), text.as_bytes())?;
     }
     for (name, lines) in &m.ledgers {
         let mut text = String::new();
@@ -531,11 +565,11 @@ pub fn write_memory_rules(m: &MemoryRules, dst_db_dir: &Path) -> crate::Result<(
             text.push_str(l);
             text.push('\n');
         }
-        fsutil::atomic_write(
-            &dir.join(LEDGER_DIR).join(format!("{name}.nt")),
-            text.as_bytes(),
-        )?;
+        #[cfg(test)]
+        crash::point();
+        fs::write(root.join(LEDGER_DIR).join(format!("{name}.nt")), text)?;
     }
+    staged.install()?;
     Ok(())
 }
 
@@ -568,5 +602,142 @@ pub(crate) mod crash {
             Some(n) => a.set(Some(n - 1)),
             None => {}
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Tmp(PathBuf);
+
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tmp(tag: &str) -> Tmp {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!(
+            "gstore_rule_store_{tag}_{}_{n}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(&p).unwrap();
+        Tmp(p)
+    }
+
+    /// A database directory holding rules `names`, each with a ledger.
+    fn db_with_rules(root: &Path, db: &str, names: &[&str]) -> PathBuf {
+        let dir = root.join(db);
+        fs::create_dir_all(&dir).unwrap();
+        let mut store = RuleStore::dir(&dir);
+        for n in names {
+            assert!(store
+                .create(n, &format!("{{\"rulename\":\"{n}\"}}"))
+                .unwrap());
+            let ledger: BTreeSet<String> = [format!("<{n}> <p> <o> .")].into();
+            store.set_ledger(n, Some(&ledger)).unwrap();
+        }
+        dir
+    }
+
+    /// The rules (and whether each has its ledger) a database directory
+    /// shows — read under its rule lock, as every operation reads them.
+    fn shown(db_dir: &Path) -> Vec<(String, bool)> {
+        let store = RuleStore::dir(db_dir);
+        let _lock = store.lock();
+        store
+            .names()
+            .unwrap()
+            .into_iter()
+            .map(|n| {
+                let ledger = store.ledger(&n).unwrap().is_some();
+                (n, ledger)
+            })
+            .collect()
+    }
+
+    fn rules(names: &[&str]) -> Vec<(String, bool)> {
+        names.iter().map(|n| (n.to_string(), true)).collect()
+    }
+
+    /// Review durability#11: a backup's rule copy removed the destination's
+    /// rules and copied the new ones file by file, so a crash part-way left
+    /// no rules, or rule files without their ledgers (which `manage` takes
+    /// for upstream rules and retracts by label). Staged and swapped in, the
+    /// copy leaves the old rules or the new ones at every crash point.
+    #[test]
+    fn a_rule_directory_copy_is_all_or_nothing_at_every_crash_point() {
+        let root = tmp("copy");
+        let src = db_with_rules(&root.0, "src.db", &["a", "b", "c"]);
+        let dst = db_with_rules(&root.0, "dst.db", &["old"]);
+        let mut crashed = 0;
+        for n in 0.. {
+            crash::arm(n);
+            let r = std::panic::catch_unwind(|| copy_rule_dir(&src, &dst));
+            crash::disarm();
+            match r {
+                Err(_) => {
+                    crashed += 1;
+                    assert_eq!(shown(&dst), rules(&["old"]), "crash point {n}");
+                }
+                Ok(done) => {
+                    done.unwrap();
+                    break;
+                }
+            }
+        }
+        assert!(crashed >= 6, "every file copy is a crash point: {crashed}");
+        assert_eq!(shown(&dst), rules(&["a", "b", "c"]));
+        // Removing (the source has none) leaves no half-deleted directory.
+        let empty = root.0.join("empty.db");
+        fs::create_dir_all(&empty).unwrap();
+        copy_rule_dir(&empty, &dst).unwrap();
+        assert!(shown(&dst).is_empty());
+        assert!(!dst.join(RULE_DIR).exists());
+    }
+
+    /// The in-memory rules of a detached database are written the same way.
+    #[test]
+    fn writing_memory_rules_is_all_or_nothing_at_every_crash_point() {
+        let root = tmp("mem");
+        let src = db_with_rules(&root.0, "src.db", &["a", "b"]);
+        let mem = read_rule_dir(&src).unwrap();
+        let dst = db_with_rules(&root.0, "dst.db", &["old"]);
+        let mut crashed = 0;
+        for n in 0.. {
+            crash::arm(n);
+            let r = std::panic::catch_unwind(|| write_memory_rules(&mem, &dst));
+            crash::disarm();
+            match r {
+                Err(_) => {
+                    crashed += 1;
+                    assert_eq!(shown(&dst), rules(&["old"]), "crash point {n}");
+                }
+                Ok(done) => {
+                    done.unwrap();
+                    break;
+                }
+            }
+        }
+        assert_eq!(crashed, 4, "two rule files and two ledgers");
+        assert_eq!(shown(&dst), rules(&["a", "b"]));
+    }
+
+    /// A swap a crash interrupted after the old directory was moved aside
+    /// (only the complete `reason_rule_files.new` is left) is finished by
+    /// the next operation on the rules.
+    #[test]
+    fn an_interrupted_swap_is_finished_by_the_next_operation() {
+        let root = tmp("swap");
+        let dst = db_with_rules(&root.0, "dst.db", &["new"]);
+        let rules_dir = dst.join(RULE_DIR);
+        fs::rename(&rules_dir, fsutil::with_suffix(&rules_dir, ".new")).unwrap();
+        fs::create_dir_all(fsutil::with_suffix(&rules_dir, ".old")).unwrap();
+        assert_eq!(shown(&dst), rules(&["new"]));
+        assert!(!fsutil::STORE_SWAP.in_progress(&rules_dir));
     }
 }
