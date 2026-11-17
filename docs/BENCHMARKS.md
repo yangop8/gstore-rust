@@ -13,7 +13,7 @@
 - **open**:`Database::open` 一次(给了 `--drop-caches` 时先清页缓存,即"冷"打开),再在新进程里打开 `--open-reps` 次,取中位数为"热"打开;记打开后的 RSS 与词计数,`triple_num` 必须等于生成器的去重三元组数。
 - **query**:在 `--query-procs` 个新进程里各自打开、关掉查询缓存,每条查询先跑一次、再热跑 `reps` 次;每条查询取**各进程热中位数的最小值**。要多个进程,是因为每个进程的哈希种子和堆布局不同:在 Phase 6 之前的引擎上,univ 8 的某些查询在一个进程里能比下一个进程慢约 1.5 倍,单进程中位数让 Q1–Q14 几何均值在两次运行之间漂移 ±10%(R1-BENCH 的记录)。每次运行、每个进程、每个后端的行数和行哈希(`rows_fnv64`,与行序无关的多重集哈希)都必须相同。
 - **conc**:进程内的单库 `Server`(`GET /sparql`,TSV)和多库 `ApiServer`(`GET /api?operation=query`,JSON),闭环 keep-alive 客户端,qps、平均与 p95 延迟;同一端点同一查询的所有响应体必须相同。
-- **update**(会写,排在后面):单条 `INSERT DATA` / `DELETE DATA`(每条必须恰好改动一个三元组)、一个与数据不相交的更新块的插入与删除(`triple_num` 精确变化)、之后重跑全部查询(答案必须不变)、checkpoint、重新打开。
+- **update**(会写,排在后面):单条 `INSERT DATA` / `DELETE DATA`(每条必须恰好改动一个三元组)、插入一个与数据不相交的更新块(`triple_num` 精确增长)、带着它 checkpoint 并重新打开(必须是原数加块的三元组数)、再删除它(必须删掉块的每个三元组,回到原数)、重跑全部查询(答案必须不变)、checkpoint、重新打开(原数),并在重新打开的库上再跑一遍全部查询(答案必须不变)。评审 infra#9 之前所有写都在唯一一次 checkpoint 之前撤销,重开后也不复核答案,所以一个把待写的插入和删除一起丢掉的 checkpoint 也能通过;测试钩子 `--inject lose-writes:update` 现在使 `exact.update_round_trip` 失败。
 - **mixed**(也会写):每个端点(`/sparql`、`/api`)和 `check_point` 设置(off、on)下,若干闭环读者跑一条查询(LUBM `q4`,WatDiv-like `F5`),同时一个写者每 100 ms 发一条单三元组 `INSERT DATA`;读者 qps 与延迟、已确认的写及其延迟。每个读者拿到的答案必须相同(按行的多重集比较:写入会改变规划器用来估计连接代价的计数,从而改变行序),每次写都必须报告改动一个三元组。同一阶段还取 20 个 `/api begin` 样本(每个都回滚):延迟,以及持有事务快照时服务器进程的 RSS 增长(G4 的 `/begin` 一行)。
 - **校准**(`calib/1`:排序 2 Mi 个 `u64`、1 Mi 键的 `HashMap`、格式化 500 Ki 个 IRI,各取五次的最小值,外加一次 fsync 探测)最先运行,也在子进程里;计时闸门用它归一化。
 
@@ -51,21 +51,21 @@
 
 `gstore-bench check` / `compare` / `ci` 按 `bench/thresholds.json`(`gstore-bench-gates/1`)判定一个结果相对基线是否通过:
 
-- **精确闸门**(从不重试):生成器版本与数据哈希、查询文本哈希(也对固定值)、`triple_num == unique_triples`、每条查询的行数与行哈希等于基线且跨后端相同、跨运行稳定且非空、更新往返、并发响应体相同、混合负载的答案相同与写入确认、基线里的每个后端和阶段都在。
-- **计时**(单侧,按校准归一化:测得时间除以校准比,校准比截在 [0.5, 2]):单条查询 `(m + 2 ms) / (b + 2 ms) > 3.0` 失败;每个后端热中位数的几何均值 `> 1.5` 失败(只计基线中位数 ≥ 1 ms 的查询,不足三条时计全部);构建 `> 2.0`(磁盘 `> 2.5`,下限 100 ms);热打开 `> 2.5`(下限 20 ms)。
+- **精确闸门**(从不重试):生成器版本与数据哈希、查询文本哈希(也对固定值)、`triple_num == unique_triples`、每条查询的行数与行哈希等于基线且跨后端相同、跨运行稳定且非空、更新往返、并发响应体相同、混合负载的答案相同与写入确认、基线里的每个后端和阶段都在,以及与基线运行相同的构建器、热重复次数和查询进程数(`exact.config`,评审 infra#10;`check` 未指定时就取基线的这些设置)。
+- **计时**(单侧,按校准归一化:测得时间除以校准比,校准比截在 [0.5, 2]):单条查询 `(m + 0.1 ms) / (b + 0.1 ms) > 3.0` 失败;每个后端对**全部**查询取 `(m + 0.05 ms) / (b + 0.05 ms)`、每个比值截在 `[1/3, 3]` 的几何均值,超过 `max(1.5, s)` 失败,`s` 是基线运行自身的进程间离散度(每条查询最慢进程中位数对最快进程中位数的同一比值的几何均值,`gates::query_spread`),上限 `max_spread` 1.6;构建 `> 2.0`(磁盘 `> 2.5`,下限 100 ms);热打开 `> 2.5`(下限 20 ms)。评审 infra#2 / #4 之前单条查询的下限是 2 ms、几何均值只计基线 ≥ 1 ms 的查询:smoke 基线 68 条查询里有 41 条低于 1 ms(0.01–0.7 ms),它们慢 50–300 倍 CI 仍然通过(验证者把每条亚毫秒查询调到 3 ms,456 个闸门全过);而 1.5 的几何均值上限落在基线自身的进程间离散度之内(LUBM 快照 1.68)。`bench/tests/smoke_gate_sensitivity.rs` 在 smoke 基线的量级上固定新的灵敏度:基线对它自己最慢的进程通过,任何一条查询单独慢 50 倍失败(包括 0.01 ms 的),约 0.02 ms 的查询慢 20 倍失败,金丝雀 2 倍时每个负载的几何均值都失败,均匀 1.3 倍通过。
 - **内存**:`(m + 32 MiB) / (b + 32 MiB) > 1.5` 失败(构建峰值、打开后、查询高水位)。
 - **大小**:库字节数 `> 1.10 ×` 失败。在 Phase 6 收尾之前是 1.25;字节数是确定的(最终的三次 CI 运行里每个对象都恰为 1.00),所以收紧不需要噪声余量。
 - 并发与混合负载的吞吐、`/begin` 延迟和更新时间只报告(`info.*`),不判失败。
 - **新的条目只报告**(`info.new`):基线没有的负载、运行或查询不判失败;基线有而结果缺的仍然失败。每个负载对基线中同 id 的负载单独判定;未加标签的基线运行与它的后端的每个带标签运行比较(`disk@stream` 与 `disk@materialize` 都对 pre-Phase-6 的 `disk` 判定)。
 - **重试**:计时或内存闸门失败时只重跑失败的阶段,至多 2 次,取中位数的最小值;重跑的 open / query 阶段先重建被 update / mixed 阶段改过的库。
-- **金丝雀**:`--self-test-slowdown 3` 把结果自身的每个时间乘 3 再对自己判定,必须失败(退出码 1)。`bench/tests/gates.rs` 固定了闸门的灵敏度:均匀慢 1.3 倍通过、1.6 倍失败,一条 ≥ 20 ms 的查询慢 4 倍失败,内存 1.32 倍通过,行哈希改变不经重试直接失败。
+- **金丝雀**:`--self-test-slowdown 2` 与 `3` 把结果自身的每个时间乘 2 / 3 再对自己判定,都必须失败(退出码 1)。`bench/tests/gates.rs` 固定了闸门的灵敏度:均匀慢 1.3 倍通过、1.6 倍失败,一条 ≥ 20 ms 的查询慢 4 倍失败,一条 0.2 ms 的查询慢 50 倍失败,内存 1.32 倍通过,行哈希改变不经重试直接失败。
 
-CI(`.github/workflows/bench.yml`):`smoke` 任务(push 与 PR)做 release 构建、文档表格检查 `report --check README.md CHANGELOG.md`、`gstore-bench ci`(LUBM-like univ 1 与 WatDiv-like 规模 1,快照与磁盘布局,对 `bench/baselines/smoke.json`)和金丝雀;`rocksdb-correctness` 任务跑 `cargo test -p gstore-bench --features rocksdb`;`reference` 任务(手动或每周)只报告。`ci.yml` 的 test 任务也跑 `report --check README.md CHANGELOG.md`(bench.yml 忽略只改 Markdown 的提交)。
+CI(`.github/workflows/bench.yml`):`smoke` 任务(push 与 PR)做 release 构建、文档表格检查(每个行首有标记的已跟踪 Markdown 文件:README.md、CHANGELOG.md、本文与 bench/README.md;评审 infra#6 之前只查前两个)、`gstore-bench ci`(LUBM-like univ 1 与 WatDiv-like 规模 1,快照与磁盘布局,对 `bench/baselines/smoke.json`)和 2 倍、3 倍两个金丝雀;`rocksdb-correctness` 任务跑 `cargo test -p gstore-bench --features rocksdb`(端到端测试要求一个比所有 gstore 源文件都新、带 RocksDB 的 `gbuild`,缺失或过期即失败,不再悄悄退回库构建器,评审 infra#18);`reference` 任务(手动或每周)只报告:按 Phase 6 收尾的方式记录(快照与 RocksDB,再用 `--label materialize` / `--label stream` 各测一次磁盘布局,合并),先对最新的 `bench/results/phase6-final-lubm<规模>.json` 比较,WatDiv-like 一节对 `phase6-final-watdiv10.json` 比较,pre-Phase-6 的总览放在后面(评审 infra#8:原来只对 pre-Phase-6 比较,Phase 6 收尾之后的退化看不见,WatDiv-like 一节总是"新的")。`ci.yml` 的 test 任务也做同样的文档表格检查(bench.yml 忽略只改 Markdown 的提交),并用 `--profile test` 运行测试步骤已构建的 gstore-bench(评审 infra#13:原来在 dev profile 下把 gstore 再编译一遍)。
 
 ## 5. 基线与 bless 规则
 
 - `bench/baselines/smoke.json` 是 CI 的基线;`bench/results/pre-phase6-lubm{8,38}.json` 是 Phase 6 每个验收比值的参照,**不再改写**。
-- **何时重新 bless `smoke.json`**:一个改动让结果快了 ≥ 1.5 倍,或者有意改变了格式 / 库大小(计划 §5.6(d))。bless 只从一次通过的结果做(`gstore-bench bless --from RESULT`),拒绝没通过自身精确检查的结果;在忙的机器上记录的基线标为 `"provisional": true`。
+- **何时重新 bless `smoke.json`**:一个改动让结果快了 ≥ 1.5 倍,或者有意改变了格式 / 库大小(计划 §5.6(d))。bless 只从一次通过的结果做(`gstore-bench bless --from RESULT`),拒绝没通过自身精确检查的结果,也拒绝(评审 infra#10)debug 构建测得的结果、脏工作树或没有提交号的结果、用库构建器或 `debug` 目录里的 `gbuild` 构建的运行、运行开始时 1 分钟负载高于每 CPU `bless.max_load_per_cpu`(1.0)的忙机器,以及查询进程间离散度超过 `geomean.max_spread`(1.6)的噪声机器;`--provisional` 仍然 bless,但标为 `"provisional": true` 并把原因写进 note。`ci` 拒绝对 provisional 或不合格的基线判定(退出码 2,不做测量),除非 `--allow-provisional`;`check` 只警告。现在提交的 `smoke.json` 满足全部条件(release、干净的 `769c627`、`cli`、负载 3.16 / 4 CPU、最大离散度 1.56),不需要重新 bless。
 - **Phase 6 收尾时的 bless**(R4-CLOSURE 安静阶段):对第 2 轮的基线(`0c9bdb6`)跑两次 `ci`,均 PASS(307 个闸门,"1 new workload(s) not in the baseline",即 WatDiv-like 一节);磁盘布局的查询几何均值是基线的 0.59 / 0.60(快 1.5 倍以上),新负载、混合负载和 `/begin` 点都还没被判定,所以用第一次通过的结果(校准 72.1 ms)重新 bless(提交 `5faf215`)。新基线是 `gstore-bench/2`,含 LUBM-like univ 1 与 WatDiv-like 规模 1、快照与磁盘布局、混合负载与 `/api begin` 点;R4 之前的 harness 读不了它(有意为之)。之后对新基线 `ci` 四次 PASS(456 个闸门),金丝雀退出码 1。
 - **阈值只在测得的波动允许时收紧**:空闲机上三次运行的最大闸门比值是几何均值 1.42(WatDiv-like 快照的一次运行)、单条查询 1.41、热打开 1.28、构建 1.17、内存 1.07、大小恰为 1.00。所以只把大小闸门从 1.25 收紧到 1.10(提交 `85686e5`),计时和内存闸门不变(它们还被 `bench/tests/gates.rs` 的上述灵敏度固定)。等有 CI runner 上的波动数据再考虑计时闸门。
 
