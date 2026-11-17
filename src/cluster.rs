@@ -1875,6 +1875,21 @@ impl Default for RaftConfig {
     }
 }
 
+/// The furthest one message may move a node's term forward. Raft terms grow
+/// by one per election round, so a real peer is never billions of terms
+/// ahead; a larger jump can only be forged (the protocol is unauthenticated),
+/// and adopting it let one message push every node to the last representable
+/// term, after which the next election overflowed — a panic that poisoned the
+/// node's state in debug builds, a wrap to 0 in release, and in either case a
+/// cluster that never elected a leader again (review cluster-nlqa#2). With
+/// this bound reaching `u64::MAX` would take billions of forged messages.
+const MAX_TERM_STEP: u64 = 1 << 32;
+
+/// The largest log index a peer may claim (snapshot base, match index): far
+/// beyond any real log, and far enough from `u64::MAX` that index arithmetic
+/// (`index + 1`, `base + len`) cannot overflow (review cluster-nlqa#2).
+const MAX_LOG_INDEX: u64 = 1 << 62;
+
 /// The pure Raft state machine for one node. It owns the replicated log and all
 /// election/replication bookkeeping but **not** the [`TripleStore`]: committed
 /// mutations are handed out via [`RaftState::drain_apply`]. Every input is an
@@ -2060,6 +2075,13 @@ impl RaftState {
         }
     }
 
+    /// Whether `term`, carried by a message from a peer, is one a real peer
+    /// could hold: at most [`MAX_TERM_STEP`] ahead of ours. A message with a
+    /// larger term is forged and is answered without being adopted.
+    fn plausible_term(&self, term: u64) -> bool {
+        term <= self.current_term.saturating_add(MAX_TERM_STEP)
+    }
+
     // --- driver input: a logical clock tick ---------------------------------
 
     /// Advance one logical tick. A follower/candidate that exceeds its election
@@ -2085,7 +2107,15 @@ impl RaftState {
     }
 
     fn start_election(&mut self) -> Vec<Outgoing> {
-        self.current_term += 1;
+        let Some(next_term) = self.current_term.checked_add(1) else {
+            // The term space is used up — only forged terms get here. Never
+            // wrap to 0 (every peer would then refuse us forever): stay a
+            // follower that can still vote and follow (review cluster-nlqa#2).
+            self.role = Role::Follower;
+            self.reset_election_timeout();
+            return Vec::new();
+        };
+        self.current_term = next_term;
         self.role = Role::Candidate;
         self.voted_for = Some(self.id);
         self.votes_granted.clear();
@@ -2190,7 +2220,7 @@ impl RaftState {
         last_log_index: u64,
         last_log_term: u64,
     ) -> RaftReply {
-        if term < self.current_term {
+        if term < self.current_term || !self.plausible_term(term) {
             return RaftReply::Vote {
                 term: self.current_term,
                 granted: false,
@@ -2224,9 +2254,10 @@ impl RaftState {
         leader_commit: u64,
         entries: Vec<LogEntry>,
     ) -> RaftReply {
-        if term < self.current_term {
+        if term < self.current_term || !self.plausible_term(term) {
             // Stale leader: reject and advertise our (higher) term so it steps
-            // down. This is the split-brain guard.
+            // down. This is the split-brain guard. A forged far-future term is
+            // refused the same way, without adopting it.
             return RaftReply::Append {
                 term: self.current_term,
                 success: false,
@@ -2296,7 +2327,12 @@ impl RaftState {
         last_included_term: u64,
         triples: Vec<IdTriple>,
     ) -> RaftReply {
-        if term < self.current_term {
+        if term < self.current_term
+            || !self.plausible_term(term)
+            || last_included_index > MAX_LOG_INDEX
+        {
+            // Stale, or forged (a far-future term, or an index no real log
+            // reaches — installing it overflowed the node's next election).
             return RaftReply::Snapshot {
                 term: self.current_term,
             };
@@ -2334,7 +2370,9 @@ impl RaftState {
         match reply {
             RaftReply::Vote { term, granted } => {
                 if term > self.current_term {
-                    self.observe_term(term);
+                    if self.plausible_term(term) {
+                        self.observe_term(term);
+                    }
                     return Vec::new();
                 }
                 if self.role != Role::Candidate || term < self.current_term {
@@ -2354,12 +2392,18 @@ impl RaftState {
                 match_index,
             } => {
                 if term > self.current_term {
-                    self.observe_term(term);
+                    if self.plausible_term(term) {
+                        self.observe_term(term);
+                    }
                     return Vec::new();
                 }
                 if self.role != Role::Leader || term < self.current_term {
                     return Vec::new();
                 }
+                // A follower cannot hold more of our log than we do: a larger
+                // claim is a lie that would wrap `next_index` (review
+                // cluster-nlqa#2).
+                let match_index = match_index.min(self.last_log_index());
                 if success {
                     // Within one term a follower's agreed prefix only grows, so
                     // a late reply to an older AppendEntries must not move
@@ -2386,14 +2430,18 @@ impl RaftState {
                 } else {
                     // Log mismatch: back up next_index and retry.
                     let cur = *self.next_index.get(&from).unwrap_or(&1);
-                    let next = (match_index + 1).min(cur.saturating_sub(1)).max(1);
+                    let next = (match_index.saturating_add(1))
+                        .min(cur.saturating_sub(1))
+                        .max(1);
                     self.next_index.insert(from, next);
                     self.replicate_to(from).into_iter().collect()
                 }
             }
             RaftReply::Snapshot { term } => {
                 if term > self.current_term {
-                    self.observe_term(term);
+                    if self.plausible_term(term) {
+                        self.observe_term(term);
+                    }
                     return Vec::new();
                 }
                 if self.role != Role::Leader {
@@ -6492,5 +6540,218 @@ mod review_fix_tests {
             100,
             "the connection still serves"
         );
+    }
+
+    // ----- review cluster-nlqa#2: forged and overflowing terms ----------------
+
+    /// A forged `RequestVote` at `u64::MAX` must not be adopted: before the fix
+    /// the node granted it, jumped to the last representable term, and the next
+    /// election overflowed (`attempt to add with overflow` in debug builds, a
+    /// wrap to 0 in release).
+    #[test]
+    fn a_forged_max_term_vote_is_refused_and_elections_continue() {
+        let cfg = RaftConfig::default();
+        let mut a = RaftState::new(0, vec![1, 2], &cfg);
+        let reply = a.handle(RaftMsg::RequestVote {
+            term: u64::MAX,
+            candidate_id: 99,
+            last_log_index: u64::MAX,
+            last_log_term: u64::MAX,
+        });
+        assert_eq!(
+            reply,
+            RaftReply::Vote {
+                term: 0,
+                granted: false
+            }
+        );
+        assert_eq!(a.current_term(), 0, "the forged term is not adopted");
+
+        let mut outs = Vec::new();
+        for _ in 0..1000 {
+            outs = a.tick();
+            if !outs.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(a.current_term(), 1, "the node still campaigns normally");
+        assert!(matches!(outs[0].msg, RaftMsg::RequestVote { term: 1, .. }));
+
+        // Forged AppendEntries / InstallSnapshot at the maximum are refused too.
+        let reply = a.handle(RaftMsg::AppendEntries {
+            term: u64::MAX,
+            leader_id: 99,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            leader_commit: 0,
+            entries: vec![],
+        });
+        assert!(
+            matches!(
+                reply,
+                RaftReply::Append {
+                    term: 1,
+                    success: false,
+                    ..
+                }
+            ),
+            "{reply:?}"
+        );
+        let reply = a.handle(RaftMsg::InstallSnapshot {
+            term: u64::MAX,
+            leader_id: 99,
+            last_included_index: 5,
+            last_included_term: u64::MAX,
+            triples: vec![t(1, 2, 3)],
+        });
+        assert_eq!(reply, RaftReply::Snapshot { term: 1 });
+        assert_eq!(a.current_term(), 1);
+        assert_eq!(a.base_index(), 0, "the forged snapshot was not installed");
+    }
+
+    /// Term arithmetic is checked: a node already at the largest term stops
+    /// campaigning instead of panicking (debug) or wrapping to 0 (release).
+    #[test]
+    fn a_node_at_the_largest_term_does_not_overflow() {
+        let cfg = RaftConfig::default();
+        let mut a = RaftState::new(0, vec![1, 2], &cfg);
+        a.current_term = u64::MAX;
+        for _ in 0..1000 {
+            assert!(a.tick().is_empty(), "no election past the last term");
+        }
+        assert_eq!(a.current_term(), u64::MAX, "never wraps");
+        assert_ne!(a.role(), Role::Leader);
+    }
+
+    /// A lying `AppendAck` (match index `u64::MAX`) must not wrap the leader's
+    /// `next_index` or commit beyond its own log.
+    #[test]
+    fn a_lying_append_ack_cannot_wrap_next_index() {
+        let cfg = RaftConfig::default();
+        let mut a = RaftState::new(0, vec![1, 2], &cfg);
+        while a.role() != Role::Candidate {
+            a.tick();
+        }
+        let term = a.current_term();
+        let _ = a.handle_reply(
+            1,
+            RaftReply::Vote {
+                term,
+                granted: true,
+            },
+        );
+        assert!(a.is_leader());
+        a.propose(LogOp::Insert(t(1, 2, 3))).unwrap();
+        for success in [true, false] {
+            let _ = a.handle_reply(
+                1,
+                RaftReply::Append {
+                    term,
+                    success,
+                    match_index: u64::MAX,
+                },
+            );
+            assert!(a.commit_index() <= a.log_len(), "commit past the log");
+            assert!(a.next_index.values().all(|&n| n <= a.log_len() + 1));
+        }
+    }
+
+    /// A forged snapshot claiming the last representable index is refused;
+    /// before the fix it was installed and the node's next election overflowed
+    /// computing `last_log_index + 1`.
+    #[test]
+    fn a_forged_snapshot_index_is_refused() {
+        let cfg = RaftConfig::default();
+        let mut a = RaftState::new(0, vec![], &cfg);
+        let _ = a.handle(RaftMsg::InstallSnapshot {
+            term: 1,
+            leader_id: 9,
+            last_included_index: u64::MAX,
+            last_included_term: 1,
+            triples: vec![t(1, 2, 3)],
+        });
+        assert_eq!(a.base_index(), 0, "the forged snapshot was not installed");
+        for _ in 0..1000 {
+            a.tick();
+            if a.is_leader() {
+                break;
+            }
+        }
+        assert!(a.is_leader(), "the single node still elects itself");
+        assert!(a.propose(LogOp::Insert(t(4, 5, 6))).is_some());
+    }
+
+    /// A single-node [`ClusterNode`] on an ephemeral port with fast ticks,
+    /// shut down when dropped (also when the test fails).
+    struct LiveNode(Arc<ClusterNode>);
+
+    impl LiveNode {
+        fn start(store: TripleStore) -> LiveNode {
+            let cfg = RaftConfig {
+                election_timeout_min: 3,
+                election_timeout_max: 6,
+                heartbeat_timeout: 1,
+                tick_interval: Duration::from_millis(5),
+            };
+            let node = ClusterNode::bind(0, vec![], store, "127.0.0.1:0", cfg).expect("bind");
+            let _ = node.start();
+            LiveNode(node)
+        }
+
+        fn addr(&self) -> SocketAddr {
+            self.0.local_addr().unwrap()
+        }
+
+        /// Wait (bounded by the hang guard) until the node leads.
+        fn wait_leader(&self) {
+            let start = Instant::now();
+            while !self.0.is_leader() {
+                assert!(start.elapsed() < HANG_GUARD, "no leader");
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+
+    impl Drop for LiveNode {
+        fn drop(&mut self) {
+            self.0.shutdown();
+        }
+    }
+
+    /// The reviewer's wire experiment on a live node: one forged max-term
+    /// `RequestVote` used to panic the tick driver and poison the state mutex
+    /// (every later call panicked) — the node must keep serving writes.
+    #[test]
+    fn a_forged_max_term_vote_does_not_wedge_a_live_cluster_node() {
+        let node = LiveNode::start(TripleStore::new());
+        node.wait_leader();
+        let mut s = TcpStream::connect(node.addr()).unwrap();
+        s.set_read_timeout(Some(HANG_GUARD)).unwrap();
+        let reply = rpc::round_trip(
+            &mut s,
+            &Request::RequestVote {
+                term: u64::MAX,
+                candidate_id: 99,
+                last_log_index: 0,
+                last_log_term: 0,
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(reply, Response::Vote { granted: false, term } if term < u64::MAX),
+            "{reply:?}"
+        );
+        let start = Instant::now();
+        loop {
+            match node
+                .0
+                .propose_and_wait(LogOp::Insert(t(1, 2, 3)), Duration::from_secs(2))
+            {
+                Ok(_) => break,
+                Err(e) => assert!(start.elapsed() < HANG_GUARD, "never committed: {e}"),
+            }
+        }
+        assert!(node.0.current_term() < u64::MAX);
+        assert!(node.0.store_contains(t(1, 2, 3)));
     }
 }
