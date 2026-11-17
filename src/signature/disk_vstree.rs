@@ -37,11 +37,18 @@
 //! holds is trusted. Every node a scan reads is checked: its kind byte is 0 or
 //! 1, its entry count at most [`DISK_FANOUT`], every child id lies in
 //! `1..page_count` and below the parent's id (both writers write children
-//! before their parent, so a tree is acyclic by construction), every leaf
-//! lies at the same depth, and no path is longer than [`MAX_DEPTH`] nodes.
+//! before their parent, so a tree is acyclic by construction), its node
+//! signature is the union of its entries' and equals the union its
+//! parent's entry stores for it (both writers store exactly those unions),
+//! every leaf lies at the same depth, no path is longer than [`MAX_DEPTH`]
+//! nodes, and no scan visits more nodes than the file holds (in a tree
+//! every node has one parent, so a node reached twice is corruption).
 //! [`open`](DiskTree::open) checks the header (root id, entity count). A
 //! violation is a [`GStoreError::Serialize`] error ("corrupt"); as a
 //! [`SigFilter`] the tree then degrades to "no filtering", which is sound.
+//! Without a page checksum some damage stays invisible: an entity id
+//! changed in a leaf, or a bit lost from one leaf entry that another entry
+//! of the same leaf also sets, can still hide a match.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -268,26 +275,45 @@ impl DiskTree {
         if self.root == 0 {
             return Ok(None);
         }
-        let mut out = Vec::new();
-        let mut leaf_depth = None;
-        self.search(self.root, 1, query, &mut leaf_depth, &mut out)?;
-        Ok(Some(out))
+        let mut scan = Scan {
+            leaf_depth: None,
+            visited: 0,
+            out: Vec::new(),
+        };
+        self.search(self.root, 1, None, query, &mut scan)?;
+        Ok(Some(scan.out))
     }
 
-    /// Visit node `page` at `depth` (the root is at 1). `leaf_depth` is the
-    /// depth of the first leaf reached; every other leaf must lie there too.
+    /// Visit node `page` at `depth` (the root is at 1); `expect` is the
+    /// union signature its parent's entry stores for it (`None` for the
+    /// root).
     fn search(
         &self,
         page: PageId,
         depth: usize,
+        expect: Option<&Signature>,
         query: &Signature,
-        leaf_depth: &mut Option<usize>,
-        out: &mut Vec<EntityLiteralId>,
+        scan: &mut Scan,
     ) -> Result<()> {
         if depth > MAX_DEPTH {
             return Err(self.corrupt_page(
                 page,
                 &format!("the path to it is longer than {MAX_DEPTH} nodes"),
+            ));
+        }
+        // Every node but the header page has one parent, so a scan of a
+        // tree visits each at most once. More visits mean some node is the
+        // child of several entries: a damaged file whose scan could
+        // otherwise grow exponentially with the depth (32 entries naming
+        // one child, on each of 8 levels, is 32^8 visits).
+        scan.visited += 1;
+        if scan.visited >= u64::from(self.pager.page_count()) {
+            return Err(self.corrupt_page(
+                page,
+                &format!(
+                    "a node of a scan that visited more nodes than the file's {}",
+                    self.pager.page_count().saturating_sub(1)
+                ),
             ));
         }
         self.reads.fetch_add(1, Ordering::Relaxed);
@@ -304,30 +330,58 @@ impl DiskTree {
                 &format!("{count} entries (at most {DISK_FANOUT} fit in a node)"),
             ));
         }
-        if is_leaf && *leaf_depth.get_or_insert(depth) != depth {
+        if is_leaf && *scan.leaf_depth.get_or_insert(depth) != depth {
             return Err(self.corrupt_page(
                 page,
                 &format!(
                     "a leaf at depth {depth}, another at depth {}",
-                    leaf_depth.unwrap_or(depth)
+                    scan.leaf_depth.unwrap_or(depth)
                 ),
             ));
         }
         let nsig = Signature::read_le(&buf[OFF_NODE_SIG..OFF_NODE_SIG + SIG_BYTES]);
+        // The parent's entry stores this node's union: a child id redirected
+        // to another node of the same depth would otherwise hide the
+        // subtree it used to name (false negatives) and pass every check
+        // above.
+        if expect.is_some_and(|e| *e != nsig) {
+            return Err(self.corrupt_page(
+                page,
+                "a node signature that differs from its parent's entry for it",
+            ));
+        }
+        let entry_sig = |i: usize| {
+            let off = OFF_ENTRIES + i * ENTRY_SIZE;
+            Signature::read_le(&buf[off..off + SIG_BYTES])
+        };
+        // And the node signature is the union of the entries' (both writers
+        // store exactly that): a bit lost from it would prune a subtree that
+        // holds matches, and a bit flipped in an entry changes the union
+        // unless another entry of the node has the same bit.
+        let mut union = Signature::new();
+        for i in 0..count {
+            union.union_with(&entry_sig(i));
+        }
+        if union != nsig {
+            return Err(self.corrupt_page(
+                page,
+                "a node signature that is not the union of its entries'",
+            ));
+        }
         // Prune: a subtree can hold a match only if its union contains the query.
         if !nsig.contains(query) {
             return Ok(());
         }
         for i in 0..count {
             let off = OFF_ENTRIES + i * ENTRY_SIZE;
-            let sig = Signature::read_le(&buf[off..off + SIG_BYTES]);
+            let sig = entry_sig(i);
             let at = off + SIG_BYTES;
             let value = u32::from_le_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]);
             if !sig.contains(query) {
                 continue;
             }
             if is_leaf {
-                out.push(value); // value = entity id; its exact sig contains query
+                scan.out.push(value); // value = entity id; its exact sig contains query
             } else {
                 // value = child page id: never the header, inside the file,
                 // and below its parent (children are written first).
@@ -337,7 +391,7 @@ impl DiskTree {
                         &format!("child node id {value} (a child lies in 1..{page})"),
                     ));
                 }
-                self.search(value, depth + 1, query, leaf_depth, out)?;
+                self.search(value, depth + 1, Some(&sig), query, scan)?;
             }
         }
         Ok(())
@@ -347,6 +401,16 @@ impl DiskTree {
     fn corrupt_page(&self, page: PageId, what: &str) -> GStoreError {
         corrupt(&self.path, &format!("node page {page} holds {what}"))
     }
+}
+
+/// The state of one [`DiskTree::candidates`] scan.
+struct Scan {
+    /// The depth of the first leaf reached; every other leaf must lie there.
+    leaf_depth: Option<usize>,
+    /// Nodes visited so far (at most the file's node count in a tree).
+    visited: u64,
+    /// The candidates found so far.
+    out: Vec<EntityLiteralId>,
 }
 
 /// A corruption error for the VS-tree file at `path` (review disk#4).
@@ -835,6 +899,12 @@ mod validation_tests {
         let deep = tmp.path("deep.kv");
         drop(DiskTree::build(&deep, entries(32 * 32 + 1)).unwrap());
         assert_eq!(scan(&deep).unwrap().unwrap().len(), 32 * 32 + 1);
+        // And the file of the streaming (bulk-build) writer.
+        let streamed = tmp.path("streamed.kv");
+        let mut sorted = entries(32 * 32 + 1);
+        sort_entries(&mut sorted);
+        write_sorted_stream(&streamed, sorted.into_iter().map(Ok)).unwrap();
+        assert_eq!(scan(&streamed).unwrap().unwrap().len(), 32 * 32 + 1);
     }
 
     #[test]
@@ -962,6 +1032,88 @@ mod validation_tests {
         assert_eq!(tree.candidates(&q), None);
     }
 
+    /// The union signature stored in node page `page` of the file at `path`.
+    fn node_sig(path: &Path, page: u32) -> Signature {
+        let bytes = std::fs::read(path).unwrap();
+        let at = page as usize * PAGE_SIZE + OFF_NODE_SIG;
+        Signature::read_le(&bytes[at..at + SIG_BYTES])
+    }
+
+    #[test]
+    fn a_child_redirected_to_another_subtree_is_an_error_not_a_false_negative() {
+        // The root's second entry names the first leaf instead of the
+        // second: the id lies below the root, the leaf at the right depth,
+        // so the other checks pass, and the scan used to answer the first
+        // leaf's entities twice and none of the second leaf's (a false
+        // negative, not the "no filtering" a damaged tree must give). The
+        // parent's entry stores the second leaf's union, which differs.
+        let tmp = Tmp::new("redirect");
+        let path = two_level(&tmp, "t10.kv");
+        assert_ne!(node_sig(&path, 1), node_sig(&path, 2), "precondition");
+        patch_page(&path, 3, |b| set_child(b, 1, 1));
+        assert_corrupt(scan(&path), "a child redirected to its sibling");
+    }
+
+    #[test]
+    fn a_node_signature_that_is_not_the_union_of_its_entries_is_an_error() {
+        // The root's signature loses every bit: a scan used to prune the
+        // whole tree for any query with a bit (no candidates: false
+        // negatives) and answer every entity for the empty query, without
+        // noticing.
+        let tmp = Tmp::new("nodesig");
+        let path = two_level(&tmp, "t11.kv");
+        patch_page(&path, 3, |b| {
+            b[OFF_NODE_SIG..OFF_NODE_SIG + SIG_BYTES].fill(0);
+        });
+        assert_corrupt(scan(&path), "an empty root signature");
+        // A leaf entry gains every bit: the leaf's signature no longer is
+        // the union of its entries'.
+        let path = two_level(&tmp, "t12.kv");
+        patch_page(&path, 1, |b| {
+            b[OFF_ENTRIES..OFF_ENTRIES + SIG_BYTES].fill(0xff);
+        });
+        assert_corrupt(scan(&path), "a leaf entry with every bit");
+    }
+
+    #[test]
+    fn a_child_named_by_every_entry_is_an_error_not_an_exponential_scan() {
+        // Pages 2..=4 are internal nodes whose 32 entries all name the page
+        // below (with its own signature), page 1 a full leaf: acyclic, one
+        // leaf depth, matching signatures — but the scan visits the leaf
+        // 32^3 times. It used to answer 32^4 = 1,048,576 candidates from a
+        // file of five pages; with 8 such levels it would be 32^8 (about
+        // 10^12) and abort the process when the list cannot be allocated.
+        let tmp = Tmp::new("dag");
+        let path = tmp.path("dag.kv");
+        {
+            let mut pager = Pager::open(&path, 16).unwrap();
+            let mut sig = Signature::new();
+            sig.encode_edge(1, 1, EdgeDir::Out);
+            for page in 1..=4u32 {
+                assert_eq!(pager.alloc().unwrap(), page);
+                let node = if page == 1 {
+                    build_node(true, &sig, (0..DISK_FANOUT as u32).map(|e| (sig, e)))
+                } else {
+                    build_node(false, &sig, (0..DISK_FANOUT).map(|_| (sig, page - 1)))
+                };
+                pager.write_page(page, &node).unwrap();
+            }
+            pager.set_root(ROOT_SLOT, 4);
+            pager.set_root(COUNT_SLOT, DISK_FANOUT as u64);
+            pager.flush().unwrap();
+        }
+        match scan(&path) {
+            Err(e @ GStoreError::Serialize(_)) => {
+                assert!(e.to_string().contains("corrupt"), "{e}")
+            }
+            Err(e) => panic!("expected a corruption error, got {e}"),
+            Ok(c) => panic!(
+                "expected a corruption error, got {:?} candidates",
+                c.map(|c| c.len())
+            ),
+        }
+    }
+
     #[test]
     fn building_over_an_existing_file_replaces_it() {
         // review disk#5: three builds at one path used to grow the file
@@ -996,6 +1148,32 @@ mod validation_tests {
         std::fs::write(&wal, b"not a log of this file").unwrap();
         drop(super::super::VsTree::build_disk(&path, entries(10)).unwrap());
         assert!(!wal.exists(), "the stale log outlived the build");
+        assert_eq!(
+            super::super::VsTree::open_disk(&path)
+                .unwrap()
+                .entity_count(),
+            10
+        );
+        // review disk#5 (reviewer): any open discards a torn log like the
+        // one above, so it cannot show the replay. A complete log can: a
+        // build of 5,000 entities whose log could not be removed leaves its
+        // whole batch in `<path>.wal`; the file goes, the log stays. A build
+        // at the path used to replay that batch into the new file and
+        // append the new tree after it.
+        {
+            use crate::kvstore::pager::failpoints;
+            let _fp = failpoints::fail_wal_delete();
+            assert!(DiskTree::build(&path, entries(5000)).is_err());
+        }
+        assert!(wal.exists(), "the build left its complete log");
+        std::fs::remove_file(&path).unwrap();
+        drop(super::super::VsTree::build_disk(&path, entries(10)).unwrap());
+        assert!(!wal.exists(), "the stale log outlived the build");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            2 * PAGE_SIZE as u64,
+            "the stale batch was replayed into the new file"
+        );
         assert_eq!(
             super::super::VsTree::open_disk(&path)
                 .unwrap()

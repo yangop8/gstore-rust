@@ -25,6 +25,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use gstore::query::{scoped_vs_policy, VsPolicy};
+use gstore::signature::{Signature, VsTree};
 use gstore::{Database, DiskQueryMode, OpenOptions, QueryResult};
 
 /// A temporary directory, removed on drop (also when an assertion fails).
@@ -252,6 +253,18 @@ fn a_disk_database_written_by_eaf5320_opens_in_both_modes_and_stays_version_1() 
     let tmp = TempDir::new("disk");
     let dir = copy_fixture(&tmp, "disk-v1");
     assert_eq!(kv_magic(&dir), b"GSTOREKV", "the fixture is version 1");
+    // The old binary's vstree.kv passes today's validation (review disk#4):
+    // a scan of every node answers every entity. (A tree refused as corrupt
+    // would only filter nothing, which the answers below cannot tell.)
+    {
+        let tree = VsTree::open_disk(dir.join("vstree.kv")).unwrap();
+        assert!(tree.entity_count() > 0);
+        assert_eq!(
+            tree.candidates(&Signature::new()).map(|c| c.len()),
+            Some(tree.entity_count()),
+            "the eaf5320 vstree.kv validates"
+        );
+    }
     for mode in [DiskQueryMode::Stream, DiskQueryMode::Materialize] {
         let mut db = open_mode(&dir, mode);
         assert!(
