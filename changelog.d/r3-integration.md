@@ -405,8 +405,55 @@ limiter, other worktrees building and testing throughout — load average
   `scripts/conformance.sh` (no compat switch, no wire-format change).
 - `/tmp` leak check: listed before the workspace runs and after both: 50
   and 51 entries; the one added, `gstore_cancellation_snapshot_<pid>_2`,
-  is no name a test of this tree uses (another worktree's run, pid not
-  ours).
+  is not from these runs (pid not ours). Correction (final check below):
+  the name is `tests/cancellation.rs`'s `TempDir` pattern (tag
+  `snapshot`, the process's third directory), so it comes from a run of
+  that binary — this tree's or a round-4 worktree's, which carry the same
+  file — that ended without unwinding (the directory is empty and its
+  `Drop` never ran); none of the final check's nine full runs left it
+  again.
+
+Final check of the round (3da9353, branch `fix-r3`; the same machine, at
+most two heavy jobs at once through the slot limiter, round-4 worktrees
+building and testing meanwhile — load average 2-8; toolchain 1.99.1,
+`CARGO_PROFILE_{DEV,TEST}_DEBUG=0`, `CARGO_INCREMENTAL=0`):
+
+- `RUSTDOCFLAGS='-D warnings' cargo doc -p gstore --no-deps --locked`
+  failed at 9fd4428: `Database::restore_incremental`'s public docs (from
+  the restore fix 39147e3) linked the private `read_backup_detached`
+  (`rustdoc::private_intra_doc_links`). 3da9353 states the scratch copy's
+  space need inline; clean since.
+- `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets
+  -- -D warnings`: clean.
+- `cargo test --workspace`: `GSTORE_DISK_QUERY_MODE=memory` 184 test
+  binaries, 2938 passed, 0 failed, 8 ignored; `GSTORE_DISK_QUERY_MODE=stream`
+  the same.
+- Feature entries (each in a fresh target directory, deleted afterwards;
+  `cargo build --locked --profile test -p gstore --all-targets`, clippy
+  `-D warnings`, `cargo test -p gstore`, all with `--features …`; 173 test
+  binaries each, 0 failed, 7 ignored, build and clippy clean): gzip 2714
+  passed, tls 2720, zip 2726, readline 2710, pfn-wasm 2732, `zip pfn-wasm
+  readline` 2748.
+- RocksDB (shared target directory, gstore compiled from this tree, under
+  the rocksdb lock): clippy `-D warnings` clean; `cargo test -p gstore
+  --features rocksdb` 173 binaries, 2801 passed, 0 failed, 8 ignored;
+  `cargo build --profile test --locked -p gstore --bin gbuild --features
+  rocksdb` then `cargo test -p gstore-bench --features rocksdb` 69 passed,
+  0 failed, 1 ignored.
+- `scripts/conformance.sh` (TMPDIR in the scratch directory): all six
+  suites pass (parser with the known failing cases 15 and 17, python
+  49/49).
+- Bench smoke gate: release build clean; `gstore-bench report --check
+  README.md CHANGELOG.md` clean; `gstore-bench ci --baseline
+  bench/baselines/smoke.json` PASS, 456 gates checked, 0 failed; time
+  geomean vs the committed baseline: LUBM-like snapshot 0.97, disk 1.00,
+  WatDiv-like snapshot 1.00, disk 1.01 (bound 1.50); calibration score
+  61.34 ms (load average 7.4 at the start); the canary (the result
+  slowed down 3x) exits 1, as it must.
+- `/tmp` leak check: listed before the memory-mode workspace run, after it,
+  before and after the stream-mode run, and after the feature, RocksDB,
+  conformance and bench runs: 51 entries each time, none added, none
+  removed.
 
 ## Requests/Not yet
 
