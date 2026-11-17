@@ -190,6 +190,16 @@ curl -H "Authorization: Bearer $GNLQA_HTTP_TOKEN" -d '{"question":"who directed 
      http://127.0.0.1:9100/ask
 ```
 
+**Errors.** A failed request answers with a generic message, a stable `code`
+(`upstream_unavailable`, `kb_error`, `llm_error`, `no_answer`, `limit_exceeded`,
+`config_error`) and a `request_id`; the detailed error (endpoint, provider reply,
+gStore message) is only written to the server's stderr log under that id. The same
+holds for MCP tool errors, except that `run_sparql` keeps the text of a SPARQL
+validation or gStore query error (the feedback needed to fix the query). URL
+userinfo (`user:password@`) is stripped from every error and log line; prefer
+`GSTORE_USER`/`GSTORE_PASSWORD` to credentials in `GSTORE_ENDPOINT` (gNLQA warns at
+startup).
+
 **Limits.** Each client IP may send `GNLQA_HTTP_RATE_PER_MIN` (default 30)
 question requests per minute — counted before authentication, so token guessing
 is bounded too — and gets `429` with `Retry-After` beyond that. A question longer

@@ -28,7 +28,7 @@
 use std::collections::HashMap;
 use std::io::{BufReader, ErrorKind, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -211,6 +211,7 @@ impl HttpServer {
             limits: self.limits,
             limiter: RateLimiter::new(self.limits.requests_per_minute),
             read_deadline: self.read_deadline,
+            failures: AtomicU64::new(0),
         });
         let active = Arc::new(AtomicUsize::new(0));
         for stream in self.listener.incoming() {
@@ -319,6 +320,22 @@ struct Ctx {
     limiter: RateLimiter,
     /// Wall-clock cap on reading one request (anti-slowloris).
     read_deadline: Duration,
+    /// Numbers failed requests, so a client-visible `request_id` can be
+    /// matched with the detailed server-log line.
+    failures: AtomicU64,
+}
+
+impl Ctx {
+    /// Log an engine error in full on the server side and return the id the
+    /// client sees with the redacted message (review cluster-nlqa#18: the
+    /// client gets [`Error::client_message`], never the internal detail —
+    /// endpoint URLs, provider error bodies, gStore error text).
+    fn log_failure(&self, endpoint: &str, e: &Error) -> String {
+        let n = self.failures.fetch_add(1, Ordering::Relaxed) + 1;
+        let id = format!("err-{n}");
+        eprintln!("gnlqa: {endpoint} request {id} failed: {e}");
+        id
+    }
 }
 
 /// A per-client-IP token bucket: `per_minute` requests of burst, refilled at
@@ -529,10 +546,18 @@ fn route(ctx: &Ctx, peer: Option<IpAddr>, req: &Request) -> Reply {
                 ),
                 // Native endpoint: a real failure is a 5xx (proxies/monitoring
                 // can detect it), unlike the gAnswer-compat /gSolve below.
-                Err(e) => Reply::json(
-                    error_status(&e),
-                    json!({"status":"error","message": e.to_string()}),
-                ),
+                Err(e) => {
+                    let id = ctx.log_failure("/ask", &e);
+                    Reply::json(
+                        error_status(&e),
+                        json!({
+                            "status": "error",
+                            "code": e.code(),
+                            "message": e.client_message(),
+                            "request_id": id,
+                        }),
+                    )
+                }
             },
             Err(r) => r,
         },
@@ -551,10 +576,19 @@ fn route(ctx: &Ctx, peer: Option<IpAddr>, req: &Request) -> Reply {
                         "confidence": round3(a.confidence),
                     }),
                 ),
-                Err(e) => Reply::json(
-                    200,
-                    json!({"status":"error","question": q, "message": e.to_string()}),
-                ),
+                Err(e) => {
+                    let id = ctx.log_failure("/gSolve", &e);
+                    Reply::json(
+                        200,
+                        json!({
+                            "status": "error",
+                            "question": q,
+                            "code": e.code(),
+                            "message": e.client_message(),
+                            "request_id": id,
+                        }),
+                    )
+                }
             },
             Err(r) => r,
         },
@@ -934,6 +968,7 @@ mod tests {
             limits: HttpLimits::default(),
             limiter: RateLimiter::new(0),
             read_deadline: REQUEST_DEADLINE,
+            failures: AtomicU64::new(0),
         }
     }
 

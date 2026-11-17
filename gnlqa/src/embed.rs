@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::error::{Error, Result};
+use crate::error::{redact_userinfo, Error, Result};
 use crate::secret::Secret;
 
 /// Anything that turns text into fixed-dimension vectors.
@@ -205,11 +205,11 @@ impl Embedder for HttpEmbedder {
             },
         )
         .map_err(|e| match e {
-            ureq::Error::Status(code, r) => Error::Http(format!(
+            ureq::Error::Status(code, r) => Error::Http(redact_userinfo(&format!(
                 "HTTP {code}: {}",
                 r.into_string().unwrap_or_default()
-            )),
-            other => Error::Http(other.to_string()),
+            ))),
+            other => Error::Http(redact_userinfo(&other.to_string())),
         })?;
         let resp = crate::net::refuse_redirect(resp, "the embeddings endpoint")?;
         let v: Value = resp.into_json().map_err(|e| Error::Json(e.to_string()))?;

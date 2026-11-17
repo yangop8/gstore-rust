@@ -184,9 +184,22 @@ impl Config {
 
     /// Configuration that works but puts credentials at risk, one line each
     /// (printed by the CLI at startup): a credential sent in clear text over
-    /// `http://` to a non-loopback host.
+    /// `http://` to a non-loopback host, or credentials embedded in an
+    /// endpoint URL.
     pub fn security_warnings(&self) -> Vec<String> {
         let mut out = Vec::new();
+        for (key, url) in [
+            ("GSTORE_ENDPOINT", &self.gstore_endpoint),
+            ("OPENAI_BASE_URL", &self.openai_base_url),
+            ("ANTHROPIC_BASE_URL", &self.anthropic_base_url),
+        ] {
+            if has_userinfo(url) {
+                out.push(format!(
+                    "{key} carries credentials in the URL (user:password@); use GSTORE_USER / \
+                     GSTORE_PASSWORD or the API-key settings instead (review cluster-nlqa#18)"
+                ));
+            }
+        }
         let mut check = |key: &str, url: &str, credential: Option<&str>| {
             let Some(cred) = credential else { return };
             if let Some(host) = plain_http_remote_host(url) {
@@ -250,6 +263,15 @@ impl Default for Config {
             retries: RetryPolicy::default().max_retries,
         }
     }
+}
+
+/// Whether a URL's authority has a userinfo part (`user[:password]@host`).
+fn has_userinfo(url: &str) -> bool {
+    url.split_once("://").is_some_and(|(_, rest)| {
+        rest.split(['/', '?', '#'])
+            .next()
+            .is_some_and(|authority| authority.contains('@'))
+    })
 }
 
 /// The host of an `http://` URL whose host is not a loopback address (`None`
@@ -610,5 +632,18 @@ mod tests {
             ..Config::default()
         };
         assert!(anon.security_warnings().is_empty());
+    }
+
+    #[test]
+    fn credentials_in_endpoint_urls_are_flagged() {
+        assert!(has_userinfo("http://admin:s3cret@kb:9000/sparql"));
+        assert!(!has_userinfo("http://kb:9000/sparql?x=a@b"));
+        let c = Config {
+            gstore_endpoint: "http://admin:s3cret@127.0.0.1:9000/sparql".into(),
+            ..Config::default()
+        };
+        let w = c.security_warnings();
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("GSTORE_ENDPOINT") && !w[0].contains("s3cret"));
     }
 }

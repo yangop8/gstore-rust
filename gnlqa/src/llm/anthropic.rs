@@ -5,7 +5,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::config::Config;
-use crate::error::{Error, Result};
+use crate::error::{redact_userinfo, Error, Result};
 use crate::secret::Secret;
 
 use super::{LlmClient, LlmRequest};
@@ -149,9 +149,11 @@ impl LlmClient for AnthropicClient {
         .map_err(|e| match e {
             ureq::Error::Status(code, resp) => {
                 let body = resp.into_string().unwrap_or_default();
-                Error::Http(format!("HTTP {code}: {body}"))
+                Error::Http(redact_userinfo(&format!("HTTP {code}: {body}")))
             }
-            other => Error::Http(other.to_string()),
+            // ureq prints the request URL, userinfo included (review
+            // cluster-nlqa#18).
+            other => Error::Http(redact_userinfo(&other.to_string())),
         })?;
         let resp = crate::net::refuse_redirect(resp, "the Anthropic API endpoint")?;
         let v: Value = resp.into_json().map_err(|e| Error::Json(e.to_string()))?;

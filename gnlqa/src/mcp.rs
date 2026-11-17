@@ -202,7 +202,10 @@ impl McpServer {
 
     fn tool_ask_kg(&self, args: &Value) -> Result<String, String> {
         let q = str_arg(args, "question")?;
-        let a = self.engine.ask(q).map_err(|e| e.to_string())?;
+        let a = self
+            .engine
+            .ask(q)
+            .map_err(|e| tool_error("ask_kg", &e, false))?;
         let mut out = a.text;
         if let Some(s) = a.sparql {
             out.push_str(&format!("\n\n[sparql] {s}"));
@@ -229,14 +232,14 @@ impl McpServer {
         // The query text comes straight from an (untrusted, prompt-injectable) MCP
         // client, so enforce the SAME read-only gate every generated-query path
         // uses — an UPDATE/DELETE/LOAD/DROP must never reach the store.
-        crate::kb::validate_readonly_sparql(q).map_err(|e| e.to_string())?;
+        crate::kb::validate_readonly_sparql(q).map_err(|e| tool_error("run_sparql", &e, true))?;
         // A partial result is useful here, but only with a visible signal
         // (review cluster-nlqa#17).
         let (ans, truncated) = self
             .engine
             .kb()
             .query_capped(q)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| tool_error("run_sparql", &e, true))?;
         let mut out = render_sparql_answer(&ans);
         if truncated {
             out.push_str(&format!(
@@ -265,7 +268,9 @@ impl McpServer {
             text: mention.to_string(),
             kind,
         };
-        let cands = linker.link_mention(&m, k).map_err(|e| e.to_string())?;
+        let cands = linker
+            .link_mention(&m, k)
+            .map_err(|e| tool_error("link_entity", &e, false))?;
         if cands.is_empty() {
             return Ok("(no candidates)".to_string());
         }
@@ -288,8 +293,24 @@ impl McpServer {
             })
             .unwrap_or_default();
         let res = run_analytics(self.engine.kb(), q, &seeds, self.engine.analytics_cfg())
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| tool_error("graph_analytics", &e, false))?;
         Ok(res.text)
+    }
+}
+
+/// The text of a tool-level error (review cluster-nlqa#18). The full error
+/// goes to the server log (stderr; the protocol runs on stdout). The client
+/// gets [`Error::client_message`] — except that `query_feedback` tools
+/// (`run_sparql`) keep the text of a SPARQL validation or gStore query error,
+/// which is the feedback a client needs to fix its query (endpoint userinfo
+/// is already redacted from it). Transport, provider and configuration
+/// detail is never echoed.
+fn tool_error(tool: &str, e: &crate::error::Error, query_feedback: bool) -> String {
+    use crate::error::Error;
+    eprintln!("gnlqa: MCP tool {tool} failed: {e}");
+    match e {
+        Error::Sparql(_) | Error::GStore(_) if query_feedback => e.to_string(),
+        _ => e.client_message(),
     }
 }
 

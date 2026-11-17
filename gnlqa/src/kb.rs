@@ -10,7 +10,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::config::Config;
-use crate::error::{Error, Result};
+use crate::error::{redact_userinfo, Error, Result};
 use crate::secret::Secret;
 
 /// The kind of an RDF term in a result binding.
@@ -305,11 +305,15 @@ impl GStoreClient {
             // TLS, timeout) means the endpoint is unreachable — a distinct
             // `Http` error so callers can fail fast instead of "repairing" a dead
             // socket (see solve::best_of / repair::solve_with_repair).
-            ureq::Error::Status(code, r) => Error::GStore(format!(
+            ureq::Error::Status(code, r) => Error::GStore(redact_userinfo(&format!(
                 "HTTP {code}: {}",
                 r.into_string().unwrap_or_default()
-            )),
-            other => Error::Http(format!("gStore endpoint unreachable: {other}")),
+            ))),
+            // ureq prints the request URL, userinfo included (review
+            // cluster-nlqa#18).
+            other => Error::Http(redact_userinfo(&format!(
+                "gStore endpoint unreachable: {other}"
+            ))),
         })?;
         let resp = crate::net::refuse_redirect(resp, "the gStore endpoint")?;
         // SELECT/ASK come back as Results JSON; CONSTRUCT/DESCRIBE as an RDF
