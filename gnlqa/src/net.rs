@@ -82,6 +82,9 @@ fn retry_after(resp: &ureq::Response) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
+/// A ureq result with the (large) error boxed.
+pub(crate) type Sent = std::result::Result<ureq::Response, Box<ureq::Error>>;
+
 /// Send with `send`, retrying an HTTP status in `retryable` per `policy`.
 /// Transport errors and other statuses are returned at once. Each wait is
 /// logged; a wait that would outlast the current request's time budget is
@@ -90,19 +93,23 @@ pub(crate) fn send_with_retry(
     policy: &RetryPolicy,
     what: &str,
     retryable: &[u16],
-    mut send: impl FnMut() -> std::result::Result<ureq::Response, ureq::Error>,
-) -> std::result::Result<ureq::Response, ureq::Error> {
+    mut send: impl FnMut() -> Sent,
+) -> Sent {
     let mut attempt = 0u32;
     loop {
-        match send() {
-            Err(ureq::Error::Status(code, resp))
+        let err = match send() {
+            Ok(resp) => return Ok(resp),
+            Err(e) => e,
+        };
+        match *err {
+            ureq::Error::Status(code, ref resp)
                 if retryable.contains(&code) && attempt < policy.max_retries =>
             {
-                let wait = retry_after(&resp)
+                let wait = retry_after(resp)
                     .unwrap_or_else(|| policy.backoff(attempt))
                     .min(policy.max_backoff);
                 if crate::budget::remaining_time().is_some_and(|left| wait >= left) {
-                    return Err(ureq::Error::Status(code, resp));
+                    return Err(err);
                 }
                 attempt += 1;
                 eprintln!(
@@ -112,7 +119,7 @@ pub(crate) fn send_with_retry(
                 );
                 std::thread::sleep(wait);
             }
-            other => return other,
+            _ => return Err(err),
         }
     }
 }

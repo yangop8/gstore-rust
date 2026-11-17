@@ -202,9 +202,10 @@ impl Embedder for HttpEmbedder {
                     .set("content-type", "application/json")
                     .timeout(crate::budget::cap_timeout(self.timeout))
                     .send_json(body.clone())
+                    .map_err(Box::new)
             },
         )
-        .map_err(|e| match e {
+        .map_err(|e| match *e {
             ureq::Error::Status(code, r) => Error::Http(redact_userinfo(&format!(
                 "HTTP {code}: {}",
                 r.into_string().unwrap_or_default()

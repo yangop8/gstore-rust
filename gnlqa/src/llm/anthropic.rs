@@ -142,11 +142,12 @@ impl LlmClient for AnthropicClient {
                     // never wait past the current request's time budget
                     .timeout(crate::budget::cap_timeout(self.timeout))
                     .send_json(body.clone())
+                    .map_err(Box::new)
             },
         )
         // On a non-2xx, ureq returns Status(code, response); the Anthropic
         // JSON error body holds the real reason, so surface it.
-        .map_err(|e| match e {
+        .map_err(|e| match *e {
             ureq::Error::Status(code, resp) => {
                 let body = resp.into_string().unwrap_or_default();
                 Error::Http(redact_userinfo(&format!("HTTP {code}: {body}")))

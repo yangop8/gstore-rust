@@ -365,7 +365,7 @@ impl GStoreClient {
             if let Some(auth) = &self.auth_header {
                 req = req.set("Authorization", auth.expose());
             }
-            req.send_string(sparql)
+            req.send_string(sparql).map_err(Box::new)
         };
         let resp = crate::net::send_with_retry(
             &self.retry,
@@ -373,7 +373,7 @@ impl GStoreClient {
             crate::net::KB_RETRYABLE,
             send,
         )
-        .map_err(|e| match e {
+        .map_err(|e| match *e {
             // An HTTP status (4xx/5xx) is a *query/server* error — repairable, so
             // keep it as `GStore`. A transport failure (connection refused, DNS,
             // TLS, timeout) means the endpoint is unreachable — a distinct
