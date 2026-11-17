@@ -94,7 +94,11 @@
   value an inline comment cuts is reported as a warning ("… is read as a
   comment (upstream gStore reads it as part of the value; quote the value
   to keep it)"). Upstream files, which have no inline comments, parse as
-  before. New `Ini::inline_comments()`.
+  before. New `Ini::inline_comments()`. The shipped example's header
+  illustrates the rule with a `thread_num` line: upstream's test scripts
+  take the port from the first line containing `port=`, so no comment may
+  contain `port=` above `[server] port` (a first draft did, and broke every
+  shell suite of `scripts/conformance.sh`; a unit test now guards it).
 - **conf.ini: settings that cannot take effect are reported** (reviews
   design#11, bulkcli#8): `resource_check=on` (gstore-rust performs no
   resource check; `min_memory`, `min_million_disk`, `min_million_memory`
@@ -145,7 +149,10 @@
   zipped `gexport`, output destinations that are links, FIFOs, private or
   read-only files, `gserver`'s usage status, the failpoint report) and
   `tests/zip_central_directory_bound.rs` (peak resident set before a
-  400,000-entry package is refused; its own binary). The kill test of
+  400,000-entry package is refused; its own binary); unit tests in
+  `src/config.rs` (the shipped example keeps `port=9000` the first
+  `port=` line), `src/zipio.rs` (end-record parsing) and
+  `src/bulk/kvimage.rs` (range check). The kill test of
   `tests/dt_bulk_crash.rs` no longer depends on a 25 s wall-clock budget
   (review bulkcli#17, below).
 
@@ -234,6 +241,10 @@ none
     replaces the staging area anyway).
 
 ## Measured numbers
+
+- `scripts/conformance.sh --no-build` (dev binaries of this branch): all
+  six suites pass (basic, update, transaction, api, parser with its known
+  cases 15 and 17, python 49/49).
 
 - bulkcli#5: a hand-written zip64 package of 400,000 empty stored entries
   (36.8 MB) passed to `zipio::unpack` with the default limits:
