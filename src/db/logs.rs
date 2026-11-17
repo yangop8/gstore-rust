@@ -26,12 +26,12 @@
 //! they read new records unchanged (they apply them one by one).
 //!
 //! **Torn tails.** A crash can leave the last append torn: a record that
-//! runs past the end of the file with no whole record after it (text inside
-//! its body that looks like a record header does not count), one whose
-//! checksum or terminator is wrong with no record header after it, or a
-//! commit whose `e=` record is missing at the end of the file. That tail is ignored by replay and cut off
-//! by the next append (or backup), which therefore always starts on a commit
-//! boundary. An append that fails (`ENOSPC`, `EFBIG`, a failed `fdatasync`)
+//! runs past the end of the file, or whose checksum or terminator is wrong,
+//! with no whole record after it (text inside it that looks like a record
+//! header does not count), or a commit whose `e=` record is missing at the
+//! end of the file. That tail is ignored by replay and cut off at its
+//! first record's start by the next append (or backup), which therefore
+//! always starts on a commit boundary. An append that fails (`ENOSPC`, `EFBIG`, a failed `fdatasync`)
 //! is cut off again at once and its records are kept for the next append.
 //! Any other malformed record is corruption, which replay reports instead
 //! of skipping (lengths are checked arithmetic: a crafted length is an
@@ -384,11 +384,15 @@ fn record_at(bytes: &[u8], pos: usize, kind: LogKind) -> Result<Step<'_>> {
     match parse_at(bytes, pos, kind) {
         Parsed::Record(r) => Ok(Step::Record(r)),
         Parsed::End => Ok(Step::End),
-        Parsed::Defect(why) => torn_or_corrupt(bytes, pos, kind, why, false),
-        // A record that runs past the end is the torn tail, unless a whole
-        // record comes after it (its length field was damaged). Any header
-        // inside its declared body is not enough: that is the torn
-        // record's own text.
+        // A defective record — damaged, or running past the end — is the
+        // torn tail, unless a whole record comes after it (then it was
+        // damaged in place: a flipped byte, a damaged length field). Text
+        // after its start that merely looks like a record header is not
+        // enough: that is the torn record's own text — an update-log
+        // statement may hold a line that starts with `REC `, and a crash
+        // can leave the last record's blocks zero-filled or stale, not only
+        // cut short (round-3 review).
+        Parsed::Defect(why) => torn_or_corrupt(bytes, pos, kind, why, true),
         Parsed::Incomplete => torn_or_corrupt(bytes, pos, kind, "incomplete record".into(), true),
         Parsed::OutOfRange(why) => Err(corrupt(kind, pos, &why)),
     }
@@ -396,9 +400,12 @@ fn record_at(bytes: &[u8], pos: usize, kind: LogKind) -> Result<Step<'_>> {
 
 /// Walk the whole commits of a log buffer in order, handing each to
 /// `commit`, up to the end or a torn tail. Corruption fails the walk —
-/// unless `skip_corrupt`, which goes on at the next record header (the
-/// scan that finds where an append may start: corruption earlier in a log
-/// is replay's to report, the tail is the appender's to repair).
+/// unless `skip_corrupt`, which goes on at the next whole record (the scan
+/// that finds where an append may start: corruption earlier in a log is
+/// replay's to report, the tail is the appender's to repair). Without a
+/// whole record after it, a corrupt record is where the log is torn: the
+/// appender cuts there, at the record's start, never at header-like text
+/// inside it, so nothing it appends lands behind bytes replay refuses.
 pub(super) fn walk<'a>(
     bytes: &'a [u8],
     kind: LogKind,
@@ -412,13 +419,24 @@ pub(super) fn walk<'a>(
         let step = match record_at(bytes, pos, kind) {
             Ok(step) => step,
             Err(e) if !skip_corrupt => return Err(e),
-            Err(_) => {
-                // Corrupt: resume at the next header (there is one).
-                group.clear();
-                pos = header_after(bytes, pos, kind, false).unwrap_or(bytes.len());
-                group_start = pos;
-                continue;
-            }
+            Err(e) => match header_after(bytes, pos, kind, true) {
+                // Corrupt: resume at the next whole record.
+                Some(next) => {
+                    group.clear();
+                    pos = next;
+                    group_start = pos;
+                    continue;
+                }
+                // Nothing whole after it (a length no write produces at
+                // the end of the log): the log is torn there.
+                None => {
+                    let at = if group.is_empty() { pos } else { group_start };
+                    return Ok(Walk {
+                        end: at,
+                        torn: Some((at, e.to_string())),
+                    });
+                }
+            },
         };
         match step {
             Step::End if group.is_empty() => {
@@ -798,6 +816,114 @@ mod tests {
             assert_eq!(sizes, [1], "cut at {cut}");
             assert_eq!(w.end, first.len(), "cut at {cut}");
             assert!(w.torn.is_some(), "cut at {cut}");
+        }
+    }
+
+    /// An update-log commit whose statement holds lines that start with
+    /// `REC ` (a long literal), after one whole commit.
+    fn statement_with_record_lines() -> (Vec<u8>, Vec<u8>) {
+        let mut first = Vec::new();
+        frame_update(&mut first, 1, 1, "CLEAR ALL", true);
+        let mut second = Vec::new();
+        let filler = "z".repeat(200);
+        frame_update(
+            &mut second,
+            2,
+            1,
+            &format!("INSERT DATA {{ <a> <b> \"\"\"x\nREC 1 2 3\ny\nREC 0 0 4 c=00000000\n{filler}\"\"\" }}"),
+            true,
+        );
+        (first, second)
+    }
+
+    /// Round-3 review: the last record damaged in place — its last bytes
+    /// zero-filled (a crash after the file grew, before its last block
+    /// reached the disk) or one byte changed — is a torn tail even when its
+    /// statement holds lines that look like record headers: replay skips
+    /// it, and the appender's scan ends at its start (it used to resume at
+    /// the fake header inside it, so the next append landed behind the
+    /// damaged bytes and replay refused the log for good).
+    #[test]
+    fn a_damaged_last_record_holding_header_lines_is_a_torn_tail() {
+        let (first, second) = statement_with_record_lines();
+        let log = [first.clone(), second.clone()].concat();
+        let fake = first.len()
+            + 1
+            + log[first.len()..]
+                .windows(5)
+                .position(|w| w == b"\nREC ")
+                .unwrap();
+        let mut damaged: Vec<(String, Vec<u8>)> = Vec::new();
+        for zeros in 1..log.len() - fake {
+            let mut l = log.clone();
+            let n = l.len();
+            l[n - zeros..].fill(0);
+            damaged.push((format!("last {zeros} bytes zero-filled"), l));
+        }
+        for at in first.len() + 30..log.len() - 1 {
+            let mut l = log.clone();
+            l[at] ^= 0x20;
+            damaged.push((format!("byte {at} changed"), l));
+        }
+        for (what, l) in &damaged {
+            let (sizes, w) = commits(l, LogKind::Update).unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!(sizes, [1], "{what}");
+            assert_eq!(w.end, first.len(), "{what}");
+            assert!(w.torn.is_some(), "{what}");
+            let scan = walk(l, LogKind::Update, true, |_| Ok(())).unwrap();
+            assert_eq!(scan.end, first.len(), "{what}: the appender cuts here");
+        }
+        // The same damage with a whole commit after it is corruption.
+        let mut l = log.clone();
+        l[log.len() - 5] ^= 0x20;
+        l.extend_from_slice(&first);
+        let err = commits(&l, LogKind::Update).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("corrupt at byte {}", first.len())),
+            "{err}"
+        );
+        let scan = walk(&l, LogKind::Update, true, |_| Ok(())).unwrap();
+        assert_eq!(scan.end, l.len(), "the scan resumes at the whole record");
+    }
+
+    /// Round-3 review: the next append after such a tail cuts it off at
+    /// the record's start, so the log replays both commits.
+    #[test]
+    fn an_append_after_a_damaged_tail_holding_header_lines_replays() {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Scratch(std::env::temp_dir().join(format!(
+            "gstore-logs-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )));
+        fs::create_dir_all(&dir.0).unwrap();
+        let path = dir.0.join("update.log");
+        let (first, second) = statement_with_record_lines();
+        for damage in ["zero-filled", "changed"] {
+            let mut log = [first.clone(), second.clone()].concat();
+            let n = log.len();
+            match damage {
+                "zero-filled" => log[n - 40..].fill(0),
+                _ => log[n - 5] ^= 0x20,
+            }
+            fs::write(&path, &log).unwrap();
+            let mut third = Vec::new();
+            frame_update(&mut third, 3, 1, "INSERT DATA { <c> <d> <e> }", true);
+            let mut writer = LogWriter::default();
+            writer.append(&path, LogKind::Update, &third, true).unwrap();
+            let bytes = fs::read(&path).unwrap();
+            assert_eq!(bytes, [first.clone(), third].concat(), "{damage}");
+            let (sizes, w) = commits(&bytes, LogKind::Update).unwrap();
+            assert_eq!(
+                (sizes, w.end, w.torn.is_none()),
+                (vec![1, 1], bytes.len(), true)
+            );
         }
     }
 
