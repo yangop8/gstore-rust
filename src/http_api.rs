@@ -1742,8 +1742,11 @@ struct DiskMeasure {
 }
 
 /// The total size of the files under `dir`, in bytes (`0` when it cannot
-/// be read).
+/// be read). A walk (a readdir and a stat per file): never called with the
+/// server-wide state lock held (review http#13/conc#7), nor with a
+/// database's guard held while others wait for it.
 pub(crate) fn dir_size(dir: &Path) -> u64 {
+    dir_size_park(dir);
     let mut total = 0;
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
@@ -1757,6 +1760,103 @@ pub(crate) fn dir_size(dir: &Path) -> u64 {
         }
     }
     total
+}
+
+/// The directory-size parks armed by tests (normally none: one atomic read
+/// per measurement).
+static DIR_SIZE_PARKS: Mutex<Vec<(PathBuf, Arc<ParkGate>)>> = Mutex::new(Vec::new());
+static DIR_SIZE_PARKS_ARMED: AtomicBool = AtomicBool::new(false);
+
+/// A parked directory measurement ([`debug_park_dir_size`]): released and
+/// unregistered when dropped.
+#[doc(hidden)]
+pub struct DirSizePark {
+    dir: PathBuf,
+    gate: Arc<ParkGate>,
+}
+
+/// Test hook: park every thread that starts measuring the size of `dir`
+/// (the walk behind a served database's `diskUsed`, taken when its handle
+/// is created and after a write) until the returned handle is released or
+/// dropped — so a test can prove what does not wait for the walk.
+#[doc(hidden)]
+pub fn debug_park_dir_size(dir: &Path) -> DirSizePark {
+    let gate = Arc::new(ParkGate::default());
+    let mut parks = DIR_SIZE_PARKS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    parks.push((dir.to_path_buf(), Arc::clone(&gate)));
+    DIR_SIZE_PARKS_ARMED.store(true, Ordering::SeqCst);
+    DirSizePark {
+        dir: dir.to_path_buf(),
+        gate,
+    }
+}
+
+impl DirSizePark {
+    /// Wait (at most `hang_guard`) until a thread is parked here.
+    pub fn wait_parked(&self, hang_guard: Duration) -> bool {
+        let g = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let (g, _) = self
+            .gate
+            .changed
+            .wait_timeout_while(g, hang_guard, |(reached, _)| *reached < 1)
+            .unwrap_or_else(PoisonError::into_inner);
+        g.0 >= 1
+    }
+
+    /// Let the parked thread (and every later one) go on.
+    pub fn release(&self) {
+        let mut g = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        g.1 = true;
+        self.gate.changed.notify_all();
+    }
+}
+
+impl Drop for DirSizePark {
+    fn drop(&mut self) {
+        self.release();
+        let mut parks = DIR_SIZE_PARKS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        parks.retain(|(d, g)| !(d == &self.dir && Arc::ptr_eq(g, &self.gate)));
+        if parks.is_empty() {
+            DIR_SIZE_PARKS_ARMED.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Park here if a test armed a measurement of `dir` ([`debug_park_dir_size`]).
+fn dir_size_park(dir: &Path) {
+    if !DIR_SIZE_PARKS_ARMED.load(Ordering::SeqCst) {
+        return;
+    }
+    let gate = {
+        let parks = DIR_SIZE_PARKS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        parks
+            .iter()
+            .find(|(d, _)| d == dir)
+            .map(|(_, g)| Arc::clone(g))
+    };
+    let Some(gate) = gate else {
+        return;
+    };
+    let mut g = gate.state.lock().unwrap_or_else(PoisonError::into_inner);
+    g.0 += 1;
+    gate.changed.notify_all();
+    while !g.1 {
+        g = gate.changed.wait(g).unwrap_or_else(PoisonError::into_inner);
+    }
 }
 
 thread_local! {
@@ -1865,7 +1965,9 @@ impl Drop for SlotWrite<'_> {
 }
 
 impl DbCell {
-    fn new(slot: DbSlot) -> DbCell {
+    /// The cell of `slot`, whose directory measured `disk_bytes` (by
+    /// [`DbSlot::prepare`], before the state lock was taken).
+    fn new(slot: DbSlot, disk_bytes: u64) -> DbCell {
         let counters = DbCounters::default();
         publish_slot(&counters, &slot);
         DbCell {
@@ -1873,7 +1975,7 @@ impl DbCell {
             csr: slot.db.csr_status(),
             counters,
             unpublished: AtomicBool::new(false),
-            disk_bytes: AtomicU64::new(dir_size(&slot.dir)),
+            disk_bytes: AtomicU64::new(disk_bytes),
             disk_measured: Mutex::new(DiskMeasure {
                 asked: (slot.db.mutation_count(), slot.last_save),
                 seq: 0,
@@ -2024,22 +2126,84 @@ fn publish_slot(counters: &DbCounters, slot: &DbSlot) {
 /// A shared handle to one loaded database.
 pub(crate) type DbHandle = Arc<DbCell>;
 
+/// A database made ready to be served ([`DbSlot::prepare`]) — its
+/// directory locked and measured — that [`serve`](Self::serve) registers
+/// under the state lock.
+pub(crate) struct PreparedSlot {
+    db: Database,
+    dir: PathBuf,
+    dirty: bool,
+    disk_bytes: u64,
+}
+
+impl PreparedSlot {
+    /// The handle that serves the prepared database, with the server's
+    /// `LOAD` policy and query-evaluation settings installed. Cheap (no
+    /// I/O): it runs under the state lock the handle is registered under,
+    /// so policy and settings installed meanwhile reach it (see the
+    /// `/upload` path) and a request sees the database only once it is
+    /// fully set up.
+    pub(crate) fn serve(self, policy: &LoadPolicy, query: &QuerySettings) -> DbHandle {
+        let PreparedSlot {
+            mut db,
+            dir,
+            dirty,
+            disk_bytes,
+        } = self;
+        db.set_load_policy(policy.clone());
+        db.apply_query_settings(query);
+        Arc::new(DbCell::new(
+            DbSlot {
+                db,
+                dir,
+                dirty,
+                txn: None,
+                next_tid: 1,
+                load_gen: {
+                    static LOAD_GEN: AtomicU64 = AtomicU64::new(1);
+                    LOAD_GEN.fetch_add(1, Ordering::Relaxed)
+                },
+                retired: false,
+                settings_gen: 0,
+                last_save: 0,
+            },
+            disk_bytes,
+        ))
+    }
+}
+
 impl DbSlot {
-    /// A freshly loaded / built / created / restored database: clean when it
-    /// matches what is on disk at `dir`. The server's `LOAD` policy is
-    /// installed on it (clients must not make the server read arbitrary local
-    /// files), and so are its query-evaluation settings (`conf.ini`'s
-    /// `[query]` section: integer division, query cache, Top-K, graph-function
-    /// output bound). Every database the server serves passes through here.
+    /// The handle of a freshly loaded / built / created / restored database
+    /// in one step: [`prepare`](Self::prepare), then
+    /// [`PreparedSlot::serve`] (for tests; the server calls the two itself,
+    /// `prepare` with the state lock released).
+    #[cfg(test)]
     pub(crate) fn handle(
-        mut db: Database,
+        db: Database,
         dir: PathBuf,
         dirty: bool,
         policy: &LoadPolicy,
         query: &QuerySettings,
     ) -> DbHandle {
-        db.set_load_policy(policy.clone());
-        db.apply_query_settings(query);
+        Self::prepare(db, dir, dirty).serve(policy, query)
+    }
+
+    /// Make a freshly loaded / built / created / restored database ready to
+    /// be served from `dir` (clean when it matches what is on disk there):
+    /// every database the server serves passes through here and then
+    /// [`PreparedSlot::serve`], which installs the server's `LOAD` policy
+    /// (clients must not make the server read arbitrary local files) and
+    /// its query-evaluation settings (`conf.ini`'s `[query]` section:
+    /// integer division, query cache, Top-K, graph-function output bound).
+    ///
+    /// This part does the I/O — locking `dir` against other processes and
+    /// measuring its size (a readdir and a stat per file: thousands of
+    /// files for a RocksDB store) — and needs none of the server's state:
+    /// it runs with the state lock released, so no other request
+    /// (`/status`, `/cancel`, a login) waits for it (review
+    /// http#13/conc#7). `serve` finishes the handle under the lock it is
+    /// registered under.
+    pub(crate) fn prepare(mut db: Database, dir: PathBuf, dirty: bool) -> PreparedSlot {
         // Its reasoning rules (`reasonManage`) are those of the directory it
         // is served from — also for a database built or created in memory,
         // which has no home directory — so that its own backups (REST
@@ -2057,20 +2221,13 @@ impl DbSlot {
         if dir.is_dir() {
             let _ = db.hold_dir_lock(&dir);
         }
-        Arc::new(DbCell::new(DbSlot {
+        let disk_bytes = dir_size(&dir);
+        PreparedSlot {
             db,
             dir,
             dirty,
-            txn: None,
-            next_tid: 1,
-            load_gen: {
-                static LOAD_GEN: AtomicU64 = AtomicU64::new(1);
-                LOAD_GEN.fetch_add(1, Ordering::Relaxed)
-            },
-            retired: false,
-            settings_gen: 0,
-            last_save: 0,
-        }))
+            disk_bytes,
+        }
     }
 
     /// Retire this slot (its database is being unloaded, dropped or replaced):
@@ -2522,7 +2679,7 @@ pub(crate) struct ApiState {
     /// (default [`LoadPolicy::restricted`]: SPARQL `LOAD` reads nothing).
     pub(crate) load_policy: LoadPolicy,
     /// The query-evaluation settings installed on every database this server
-    /// serves ([`DbSlot::handle`]; `conf.ini`'s `[query]` section, default
+    /// serves ([`PreparedSlot::serve`]; `conf.ini`'s `[query]` section, default
     /// [`GStoreConfig::query_settings`] of the default configuration).
     pub(crate) query_settings: QuerySettings,
     /// Databases with a lifecycle operation (`/build`, `/load`, `/unload`,
@@ -2962,7 +3119,7 @@ impl ApiInner {
 
     /// Install `settings` as the query-evaluation settings of every database
     /// this server serves: recorded for the databases it opens from now on
-    /// ([`DbSlot::handle`]) and applied to those already loaded. Never waits
+    /// ([`PreparedSlot::serve`]) and applied to those already loaded. Never waits
     /// for a database (nor holds the state lock while locking one): a
     /// database busy with a statement, a CSR build or a batch takes them
     /// the next time it is used ([`sync_query_settings`](Self::sync_query_settings)).
@@ -4997,8 +5154,11 @@ impl ApiInner {
         creator: &str,
     ) -> Resp {
         let triples = db.triple_num();
+        // The directory is locked and measured before the state lock is
+        // taken (review http#13/conc#7).
+        let prepared = DbSlot::prepare(db, dir, false);
         let mut st = locked(&self.state);
-        let slot = DbSlot::handle(db, dir, false, &st.load_policy, &st.query_settings);
+        let slot = prepared.serve(&st.load_policy, &st.query_settings);
         st.dbs.insert(name.to_string(), slot);
         register_built(&mut st, name, vanished, creator);
         Resp::ok(&format!("database '{name}' built ({triples} triples)"))
@@ -5010,14 +5170,9 @@ impl ApiInner {
     /// stays unloaded.
     fn serve_again(&self, name: &str, dir: &Path) {
         if let Ok(db) = self.open_db(dir) {
+            let prepared = DbSlot::prepare(db, dir.to_path_buf(), false);
             let mut st = locked(&self.state);
-            let slot = DbSlot::handle(
-                db,
-                dir.to_path_buf(),
-                false,
-                &st.load_policy,
-                &st.query_settings,
-            );
+            let slot = prepared.serve(&st.load_policy, &st.query_settings);
             st.dbs.insert(name.to_string(), slot);
         }
     }
@@ -5223,9 +5378,9 @@ impl ApiInner {
                 crate::gs_warn!("{warning}");
                 match inner.open_db(&dir) {
                     Ok(db) => {
+                        let prepared = DbSlot::prepare(db, dir, false);
                         let mut st = locked(&inner.state);
-                        let slot =
-                            DbSlot::handle(db, dir, false, &st.load_policy, &st.query_settings);
+                        let slot = prepared.serve(&st.load_policy, &st.query_settings);
                         st.dbs.insert(name.clone(), slot);
                         Resp::ok_with_warning(&format!("database '{name}' reopened"), &warning)
                     }
@@ -5257,8 +5412,11 @@ impl ApiInner {
             // RocksDB database keeps writing its updates through to `dir`.
             match inner.open_db(&dir) {
                 Ok(db) => {
+                    // Locked and measured before the state lock is taken
+                    // (review http#13/conc#7): no request waits for the walk.
+                    let prepared = DbSlot::prepare(db, dir, false);
                     let mut st = locked(&inner.state);
-                    let slot = DbSlot::handle(db, dir, false, &st.load_policy, &st.query_settings);
+                    let slot = prepared.serve(&st.load_policy, &st.query_settings);
                     st.dbs.insert(name.clone(), slot);
                     Resp::ok(&format!("database '{name}' loaded"))
                 }
@@ -5347,13 +5505,15 @@ impl ApiInner {
                         // A fresh database exists only in memory so far: dirty,
                         // so it is persisted even if nothing ends up inserted.
                         Ok(db) => {
-                            // The policy and settings in effect now, read
-                            // under the lock the slot is registered under:
-                            // ones installed while the body was parsed
-                            // reach it (`apply_query_settings`).
+                            // The directory is locked and measured first,
+                            // with the state lock released (review
+                            // http#13/conc#7); the policy and settings in
+                            // effect now are read under the lock the slot
+                            // is registered under: ones installed while the
+                            // body was parsed reach it (`apply_query_settings`).
+                            let prepared = DbSlot::prepare(db, dir, fresh);
                             let mut st = locked(&inner.state);
-                            let h =
-                                DbSlot::handle(db, dir, fresh, &st.load_policy, &st.query_settings);
+                            let h = prepared.serve(&st.load_policy, &st.query_settings);
                             st.dbs.insert(name.clone(), Arc::clone(&h));
                             if fresh {
                                 register_built(&mut st, &name, vanished, &creator);
@@ -7006,8 +7166,9 @@ impl ApiInner {
             let reopened = inner.open_db(&dir);
             match (installed, reopened) {
                 (Ok(()), Ok(db)) => {
+                    let prepared = DbSlot::prepare(db, dir, false);
                     let mut st = locked(&inner.state);
-                    let slot = DbSlot::handle(db, dir, false, &st.load_policy, &st.query_settings);
+                    let slot = prepared.serve(&st.load_policy, &st.query_settings);
                     st.dbs.insert(name.clone(), slot);
                     // A database restored under a new name joins the
                     // registry with the restoring user as its creator (best
@@ -7034,9 +7195,9 @@ impl ApiInner {
                 (Err(e), reopened) => {
                     Database::discard_staged_restore(&staged);
                     if let (Ok(db), true) = (reopened, loaded.is_some()) {
+                        let prepared = DbSlot::prepare(db, dir, false);
                         let mut st = locked(&inner.state);
-                        let slot =
-                            DbSlot::handle(db, dir, false, &st.load_policy, &st.query_settings);
+                        let slot = prepared.serve(&st.load_policy, &st.query_settings);
                         st.dbs.insert(name.clone(), slot);
                     }
                     fail_with(&e, OpErrorKind::Failed, &format!("restore failed: {e}"))

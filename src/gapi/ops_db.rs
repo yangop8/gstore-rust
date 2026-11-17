@@ -938,14 +938,9 @@ fn load(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
                     crate::gs_warn!("{warning}");
                     match ctx.inner.open_db(&dir) {
                         Ok(opened) => {
+                            let prepared = DbSlot::prepare(opened, dir, false);
                             let mut st = ctx.state();
-                            let slot = DbSlot::handle(
-                                opened,
-                                dir,
-                                false,
-                                &st.load_policy,
-                                &st.query_settings,
-                            );
+                            let slot = prepared.serve(&st.load_policy, &st.query_settings);
                             st.dbs.insert(db.clone(), slot);
                         }
                         Err(e) => {
@@ -1009,8 +1004,11 @@ fn load(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     progress("loading", 0);
     match ctx.inner.open_db(&dir) {
         Ok(opened) => {
+            // The directory is locked and measured with the state lock
+            // released (review http#13/conc#7).
+            let prepared = DbSlot::prepare(opened, dir, false);
             let mut st = ctx.state();
-            let slot = DbSlot::handle(opened, dir, false, &st.load_policy, &st.query_settings);
+            let slot = prepared.serve(&st.load_policy, &st.query_settings);
             st.dbs.insert(db.clone(), slot);
         }
         Err(e) => {
@@ -2620,9 +2618,9 @@ fn restore(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         Database::discard_staged_restore(&staged);
         if loaded.is_some() {
             if let Ok(old) = ctx.inner.open_db(&dir) {
+                let prepared = DbSlot::prepare(old, dir.clone(), false);
                 let mut st = ctx.state();
-                let slot =
-                    DbSlot::handle(old, dir.clone(), false, &st.load_policy, &st.query_settings);
+                let slot = prepared.serve(&st.load_policy, &st.query_settings);
                 st.dbs.insert(db.clone(), slot);
             }
         }
@@ -2631,14 +2629,9 @@ fn restore(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
     if loaded.is_some() {
         match ctx.inner.open_db(&dir) {
             Ok(restored) => {
+                let prepared = DbSlot::prepare(restored, dir.clone(), false);
                 let mut st = ctx.state();
-                let slot = DbSlot::handle(
-                    restored,
-                    dir.clone(),
-                    false,
-                    &st.load_policy,
-                    &st.query_settings,
-                );
+                let slot = prepared.serve(&st.load_policy, &st.query_settings);
                 st.dbs.insert(db.clone(), slot);
             }
             Err(e) => return fail(format!("the restored copy could not be opened: {e}")),
