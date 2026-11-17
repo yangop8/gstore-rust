@@ -51,15 +51,23 @@ Fallbacks and routing layered on top:
 
 gNLQA reads a **`gnlqa.conf`** file at startup (a simple `KEY=VALUE` list; real env
 vars override it), so you configure once instead of exporting every session. The
-default backend is **DeepSeek** (an OpenAI-compatible endpoint):
+file lives in your per-user config directory — `$GNLQA_CONFIG` if set, else
+`$XDG_CONFIG_HOME/gnlqa/gnlqa.conf`, else `~/.config/gnlqa/gnlqa.conf`. A
+`gnlqa.conf` in the **current directory is not read** (an untrusted checkout could
+ship one that points the endpoints, and so your API key and gStore password, at
+another host); `GNLQA_CONFIG=./gnlqa.conf` opts in for a directory you trust. A
+world-writable config file is refused. The default backend is **DeepSeek** (an
+OpenAI-compatible endpoint):
 
 ```sh
 cargo build -p gnlqa --release
-cp gnlqa.conf.example gnlqa.conf     # then edit gnlqa.conf: set OPENAI_API_KEY=<your key>
+mkdir -p ~/.config/gnlqa
+cp gnlqa.conf.example ~/.config/gnlqa/gnlqa.conf   # then set OPENAI_API_KEY=<your key>
+chmod 600 ~/.config/gnlqa/gnlqa.conf
 ```
 
-`gnlqa.conf` is git-ignored (it holds your key); only the fake `gnlqa.conf.example`
-is committed. It presets:
+Only the fake `gnlqa.conf.example` is committed (a `gnlqa.conf` in the checkout is
+git-ignored). It presets:
 
 ```ini
 GNLQA_LLM_PROVIDER=openai
@@ -213,11 +221,17 @@ convention), macro-averaged over the questions:
 
 ## Configuration
 
-Settings come from **`gnlqa.conf`** (a `KEY=VALUE` file; path overridable with
-`GNLQA_CONFIG`) with **environment variables taking precedence** — so you can keep
-your defaults in the file and still override one for a single run
-(`GNLQA_MODEL=… gnlqa …`). Copy `gnlqa.conf.example` to `gnlqa.conf` to start. The
-same names work as env vars.
+Settings come from **`gnlqa.conf`** (a `KEY=VALUE` file read from `$GNLQA_CONFIG`,
+else `$XDG_CONFIG_HOME/gnlqa/gnlqa.conf`, else `~/.config/gnlqa/gnlqa.conf` — never
+from the current directory) with **environment variables taking precedence** — so
+you can keep your defaults in the file and still override one for a single run
+(`GNLQA_MODEL=… gnlqa …`). Copy `gnlqa.conf.example` there to start. The same names
+work as env vars.
+
+The clients never follow HTTP redirects, so an API key or the gStore password is
+only ever sent to the configured host (a redirecting endpoint is an error: configure
+its final URL). At startup gNLQA warns when a credential would travel in clear text
+over `http://` to a non-loopback host.
 
 | Variable             | Default                            | Meaning |
 |----------------------|------------------------------------|---------|

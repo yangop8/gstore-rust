@@ -29,6 +29,7 @@ pub mod lang;
 pub mod link;
 pub mod llm;
 pub mod mcp;
+mod net;
 pub mod pipeline;
 pub mod repair;
 pub mod schema;

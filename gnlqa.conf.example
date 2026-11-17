@@ -1,11 +1,15 @@
-# gNLQA configuration — copy this file to `gnlqa.conf` and fill in your API key.
+# gNLQA configuration — copy this file to your per-user config directory and
+# fill in your API key:
 #
-#   cp gnlqa.conf.example gnlqa.conf   &&   $EDITOR gnlqa.conf
+#   mkdir -p ~/.config/gnlqa
+#   cp gnlqa.conf.example ~/.config/gnlqa/gnlqa.conf   &&   $EDITOR ~/.config/gnlqa/gnlqa.conf
 #
-# gNLQA reads `gnlqa.conf` (or the path in $GNLQA_CONFIG) at startup, so you
-# configure once instead of exporting env vars every session. Real env vars
-# still override the file. `gnlqa.conf` is git-ignored (it holds your key);
-# only this fake example is committed. See gnlqa/README.md.
+# gNLQA reads $GNLQA_CONFIG if set, else $XDG_CONFIG_HOME/gnlqa/gnlqa.conf,
+# else ~/.config/gnlqa/gnlqa.conf. It does NOT read a gnlqa.conf in the current
+# directory (an untrusted checkout could ship one that redirects your keys);
+# use GNLQA_CONFIG=./gnlqa.conf to opt in for a directory you trust. A
+# world-writable file is refused. Real env vars still override the file. Keep
+# the file private (chmod 600): it holds your key. See gnlqa/README.md.
 
 # ---- LLM backend: DeepSeek (OpenAI-compatible) — the default ----
 GNLQA_LLM_PROVIDER=openai

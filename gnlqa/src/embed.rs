@@ -177,7 +177,10 @@ impl Embedder for HttpEmbedder {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        let resp = ureq::post(&self.url)
+        // No redirects: the key must only reach the configured URL (review
+        // cluster-nlqa#15).
+        let resp = crate::net::agent()
+            .post(&self.url)
             .set(
                 "Authorization",
                 &format!("Bearer {}", self.api_key.expose()),
@@ -192,6 +195,7 @@ impl Embedder for HttpEmbedder {
                 )),
                 other => Error::Http(other.to_string()),
             })?;
+        let resp = crate::net::refuse_redirect(resp, "the embeddings endpoint")?;
         let v: Value = resp.into_json().map_err(|e| Error::Json(e.to_string()))?;
         let vecs = HttpEmbedder::parse_response(&v)?;
         if vecs.len() != texts.len() {

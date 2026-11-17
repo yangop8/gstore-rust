@@ -235,7 +235,10 @@ impl GStoreClient {
     /// Execute a SPARQL query (POST, `application/sparql-query`), requesting
     /// SPARQL Results JSON, and parse the response.
     pub fn query(&self, sparql: &str) -> Result<SparqlAnswer> {
-        let mut req = ureq::post(&self.endpoint)
+        // No redirects: the Basic credential must only reach the configured
+        // endpoint (review cluster-nlqa#15).
+        let mut req = crate::net::agent()
+            .post(&self.endpoint)
             .set("Content-Type", "application/sparql-query")
             .set("Accept", "application/sparql-results+json")
             .timeout(self.timeout);
@@ -254,6 +257,7 @@ impl GStoreClient {
             )),
             other => Error::Http(format!("gStore endpoint unreachable: {other}")),
         })?;
+        let resp = crate::net::refuse_redirect(resp, "the gStore endpoint")?;
         // SELECT/ASK come back as Results JSON; CONSTRUCT/DESCRIBE as an RDF
         // graph (N-Triples). Branch on the content type so a graph response is
         // returned as `Graph(..)` rather than failing JSON parsing.

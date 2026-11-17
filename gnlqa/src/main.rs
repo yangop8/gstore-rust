@@ -205,6 +205,9 @@ fn run_eval_cmd(cfg: &Config, args: &[String]) {
 
 fn main() {
     let cfg = Config::from_env();
+    for w in cfg.security_warnings() {
+        eprintln!("gnlqa: warning: {w}");
+    }
     let mode = Mode::parse(&cfg.mode).unwrap_or_else(|| {
         eprintln!(
             "gnlqa: warning: unknown GNLQA_MODE {:?}; using 'auto' \

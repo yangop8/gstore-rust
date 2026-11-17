@@ -238,3 +238,34 @@ pub fn closed_port() -> u16 {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     l.local_addr().unwrap().port()
 }
+
+/// A uniquely named temporary directory, removed (recursively) on drop —
+/// also when the test panics.
+pub struct TempDir(pub std::path::PathBuf);
+
+impl TempDir {
+    pub fn new(tag: &str) -> TempDir {
+        use std::sync::atomic::AtomicUsize;
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let p = std::env::temp_dir().join(format!(
+            "gnlqa-test-{tag}-{}-{}-{nanos}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        TempDir(p)
+    }
+    pub fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}

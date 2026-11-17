@@ -125,7 +125,10 @@ impl LlmClient for OpenAiClient {
     fn complete(&self, req: &LlmRequest) -> Result<String> {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let body = self.request_body(req);
-        let resp = ureq::post(&url)
+        // No redirects: the key must only reach the configured base URL
+        // (review cluster-nlqa#15).
+        let resp = crate::net::agent()
+            .post(&url)
             .set(
                 "Authorization",
                 &format!("Bearer {}", self.api_key.expose()),
@@ -140,6 +143,7 @@ impl LlmClient for OpenAiClient {
                 }
                 other => Error::Http(other.to_string()),
             })?;
+        let resp = crate::net::refuse_redirect(resp, "the OpenAI-compatible API endpoint")?;
         let v: Value = resp.into_json().map_err(|e| Error::Json(e.to_string()))?;
         OpenAiClient::extract_text(&v)
     }

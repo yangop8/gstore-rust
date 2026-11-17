@@ -111,7 +111,11 @@ impl LlmClient for AnthropicClient {
     fn complete(&self, req: &LlmRequest) -> Result<String> {
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let body = self.request_body(req);
-        let resp = ureq::post(&url)
+        // No redirects: `x-api-key` is not an Authorization header, so ureq
+        // would carry it to whatever host a redirect names (review
+        // cluster-nlqa#15).
+        let resp = crate::net::agent()
+            .post(&url)
             .set("x-api-key", self.api_key.expose())
             .set("anthropic-version", "2023-06-01")
             .set("content-type", "application/json")
@@ -126,6 +130,7 @@ impl LlmClient for AnthropicClient {
                 }
                 other => Error::Http(other.to_string()),
             })?;
+        let resp = crate::net::refuse_redirect(resp, "the Anthropic API endpoint")?;
         let v: Value = resp.into_json().map_err(|e| Error::Json(e.to_string()))?;
         AnthropicClient::extract_text(&v)
     }
