@@ -97,9 +97,10 @@
 //!   query cache budget, 100 MB, is a constant in `QueryCache.h`);
 //! * `[pfn]`: the sandbox limits of PFN user functions (applied the same
 //!   way, `crate::pfn`) — `pfn_fuel_per_call`, `pfn_max_memory_pages`,
-//!   `pfn_max_module_bytes` and `pfn_max_functions`. Upstream's only PFN key
-//!   is `[system]`'s `pfn_base_path`, the directory the functions live in —
-//!   read here too.
+//!   `pfn_max_module_bytes`, `pfn_max_functions` and `pfn_fuel_per_query`
+//!   (the fuel budget of all PFN calls of one query, review ext#1).
+//!   Upstream's only PFN key is `[system]`'s `pfn_base_path`, the directory
+//!   the functions live in — read here too.
 //!
 //! They are documented on the fields below and in the example file.
 
