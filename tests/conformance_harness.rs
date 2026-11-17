@@ -30,8 +30,10 @@ impl TmpDir {
     fn new(tag: &str) -> TmpDir {
         static CTR: AtomicU64 = AtomicU64::new(0);
         let n = CTR.fetch_add(1, Ordering::Relaxed);
-        let p = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("conformance_harness_{tag}_{}_{n}", std::process::id()));
+        let p = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+            "conformance_harness_{tag}_{}_{n}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(p.join("shim")).unwrap();
         fs::create_dir_all(p.join("tmp")).unwrap();
@@ -43,9 +45,9 @@ impl TmpDir {
     /// the way the script used to pick its port.
     fn python3_shim(&self, probe_port: Option<u16>) {
         let body = match probe_port {
-            Some(p) => format!(
-                "#!/bin/sh\ncase \"$*\" in *socket*) echo {p}; exit 0 ;; esac\nexit 1\n"
-            ),
+            Some(p) => {
+                format!("#!/bin/sh\ncase \"$*\" in *socket*) echo {p}; exit 0 ;; esac\nexit 1\n")
+            }
             None => "#!/bin/sh\nexit 1\n".to_string(),
         };
         let shim = self.0.join("shim/python3");
