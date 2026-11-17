@@ -158,7 +158,7 @@ mod tests {
         for s in 0..3 {
             st.on_spo(s, 1, 9);
         }
-        assert_eq!(u64::from(st.preds[1].0), u64::from(u32::MAX) + 2);
+        assert_eq!(st.preds[1].0, u64::from(u32::MAX) + 2);
         let recs = st.pred_records();
         assert_eq!(recs.len(), 1);
         let (p, rec) = recs[0];

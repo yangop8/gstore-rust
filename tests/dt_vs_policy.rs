@@ -829,7 +829,7 @@ fn ordered_limits_are_exact_under_extreme_keys_and_every_topk_setting() {
                     let again = run_topk(l.db(), &full_q, policy, TopKOptions::ALL);
                     assert_eq!(again, full, "{:?} {policy:?}: {full_q}", l.kind);
                     let mut tiled = Vec::new();
-                    for page in 0..(full.len() + 2) / 3 + 1 {
+                    for page in 0..full.len().div_ceil(3) + 1 {
                         let q = format!("{full_q} LIMIT 3 OFFSET {}", page * 3);
                         tiled.extend(run_topk(l.db(), &q, policy, TopKOptions::ALL));
                     }
