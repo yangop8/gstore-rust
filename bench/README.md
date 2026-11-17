@@ -360,20 +360,37 @@ Documents embed generated tables between markers whose first line holds
 
 `gstore-bench report --update README.md CHANGELOG.md` regenerates every
 marked table from the committed results; `report --check …` exits 1 when
-one is stale (the smoke CI job runs it).
+one is stale. CI (ci.yml's test job and bench.yml's smoke job) checks every
+tracked Markdown file with a marker at the start of a line (`git grep -l -E
+'^[[:space:]]*<!-- gstore-bench report ' -- '*.md'`: README.md,
+CHANGELOG.md, docs/BENCHMARKS.md and this file; review infra#6 — the
+listed README.md and CHANGELOG.md used to be all).
+
+A report compares each workload section of a result with the baseline's
+section of the same id and workload, else with the baseline's section of
+the same workload and parameters wherever it sits: the WatDiv-like section
+of a reference run compares with `phase6-final-watdiv10.json`, whose main
+workload it is.
 
 ## CI (`.github/workflows/bench.yml`)
 
-* `smoke` (push, PR): release build, the documentation-table check
-  (`report --check README.md CHANGELOG.md`), `gstore-bench ci` (LUBM-like
-  univ 1 and WatDiv-like scale 1, both gated since the Phase 6 closure
-  re-blessed `smoke.json` with them), the canary, results and phase logs as
-  an artifact.
+* `smoke` (push, PR): release build, the documentation-table check (every
+  marked Markdown file, see above), `gstore-bench ci` (LUBM-like univ 1 and
+  WatDiv-like scale 1, both gated since the Phase 6 closure re-blessed
+  `smoke.json` with them), the canary at 2× and at 3×, results and phase
+  logs as an artifact.
 * `rocksdb-correctness` (push, PR): `cargo test -p gstore-bench --features
   rocksdb` after building `gbuild` with RocksDB; the RocksDB build cache is
   shared with ci.yml's rocksdb job.
 * `reference` (manual with a `scale` input, weekly): report-only run of the
-  reference profile with RocksDB, compared with the pre-Phase-6 file.
+  reference profile with RocksDB, recorded as the Phase 6 closure was
+  (snapshot and RocksDB, then the disk layout under `--label materialize`
+  and `--label stream`, merged), so its run keys match
+  `phase6-final-lubm<scale>.json`, which it is compared with; its
+  WatDiv-like section is compared with `phase6-final-watdiv10.json`, and the
+  pre-Phase-6 file follows as a second table (review infra#8: only the
+  pre-Phase-6 file was used, so a regression since the Phase 6 closure did
+  not show, and the WatDiv-like section was always new).
 
 ## Recording a reference (for example the pre-Phase-6 one)
 
