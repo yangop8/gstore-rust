@@ -5248,32 +5248,28 @@ impl Database {
 
     // ---- bulk / parallel loaders -----------------------------------------
 
-    /// Build a database from an N-Triples file in bounded-memory batches
-    /// (gStore RDFParser's chunked import): triples are streamed and flushed to
-    /// the store every `batch` triples, so the transient encode buffer never
-    /// exceeds `batch` entries — suitable for files too large to buffer whole.
-    // `drain(..).collect()` (not `mem::take`) is deliberate: it hands the
-    // batch's triples to `bulk_load` while keeping `buf`'s allocation for reuse.
-    #[allow(clippy::drain_collect)]
+    /// Build a database from an N-Triples file with bounded transient memory
+    /// (gStore RDFParser's chunked import): the file is streamed and each
+    /// triple is encoded to ids as it is read — never more than one triple's
+    /// terms are held as text — so it suits files too large to buffer
+    /// whole. The encoded triples (12 bytes each, about half of what the
+    /// store will hold for them) are indexed in one bulk load at the end, in
+    /// time linear in the file: loading every `batch` triples into the
+    /// growing store re-sorted the whole store each time, quadratic in the
+    /// file (review db#15). `batch` now only sizes the first allocation of
+    /// the id buffer (at most 2^20 entries); it is kept for compatibility.
     pub fn build_from_ntriples_batched<P: AsRef<Path>>(
         name: impl Into<String>,
         path: P,
         batch: usize,
     ) -> Result<Database> {
-        let batch = batch.max(1);
         let mut db = Database::new(name);
-        let mut buf: Vec<IdTriple> = Vec::with_capacity(batch.min(1 << 20));
+        let mut ids: Vec<IdTriple> = Vec::with_capacity(batch.clamp(1, 1 << 20));
         crate::parser::ntriples::for_each_triple_file(path, |t| {
-            let id = db.encode_triple(&t)?;
-            buf.push(id);
-            if buf.len() >= batch {
-                db.store.bulk_load(buf.drain(..).collect());
-            }
+            ids.push(db.encode_triple(&t)?);
             Ok(())
         })?;
-        if !buf.is_empty() {
-            db.store.bulk_load(buf.drain(..).collect());
-        }
+        db.store.bulk_load(ids);
         db.rebuild_index();
         Ok(db)
     }

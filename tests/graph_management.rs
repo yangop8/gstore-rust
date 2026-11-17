@@ -17,6 +17,7 @@
 //! * The in-memory VS-tree is rebuilt after a clear of the default graph and
 //!   after reasoning, instead of staying unused for the rest of the session
 //!   (db#4).
+//! * `build_from_ntriples_batched` does work linear in the file (db#15).
 //!
 //! The W3C-style cases of `tests/w3c/update-graph-management/` and
 //! `tests/w3c/grammar/` check the same rules against the specification text.
@@ -662,6 +663,46 @@ fn rocksdb_inference_reports_a_read_error() {
     db.backend().as_rocks().unwrap().debug_fail_reads(false);
     assert_eq!(db.try_materialize_rdfs().unwrap(), 1);
     assert_eq!(db.try_run_rules().unwrap(), 1);
+}
+
+// ---- db#15: the batched N-Triples build is linear ----------------------------
+
+/// The triples a batched build of `n` generated triples sorted into the
+/// store's indexes, and the database.
+fn batched_build_work(tmp: &TmpDir, n: usize, batch: usize) -> (u64, Database) {
+    let mut text = String::new();
+    for i in 0..n {
+        text.push_str(&format!(
+            "<http://ex/s{i}> <http://ex/p{}> <http://ex/o{}> .\n",
+            i % 8,
+            i % 997
+        ));
+    }
+    let file = tmp.write(&format!("batched_{n}.nt"), &text);
+    let before = gstore::store::bulk_load_sorted();
+    let db = Database::build_from_ntriples_batched("b", &file, batch).unwrap();
+    (gstore::store::bulk_load_sorted() - before, db)
+}
+
+#[test]
+fn the_batched_ntriples_build_sorts_each_triple_a_bounded_number_of_times() {
+    let tmp = TmpDir::new("batched");
+    let (w1, db1) = batched_build_work(&tmp, 3_000, 100);
+    let (w2, db2) = batched_build_work(&tmp, 6_000, 100);
+    assert_eq!(db1.triple_num(), 3_000);
+    assert_eq!(db2.triple_num(), 6_000);
+    // Linear: a constant number of sorts per triple, whatever the batch
+    // (loading every batch into the growing store re-sorted all of it:
+    // 3000 triples in batches of 100 cost ~46 500 triple sorts).
+    assert!(w1 <= 2 * 3_000, "work {w1} for 3000 triples");
+    assert!(w2 <= 2 * 6_000, "work {w2} for 6000 triples");
+    assert!(
+        w2 <= 2 * w1 + 100,
+        "doubling the input more than doubled the work: {w1} -> {w2}"
+    );
+    // Same answers as the whole-file build.
+    let whole = Database::build_from_files("w", &[tmp.path("batched_3000.nt")]).unwrap();
+    assert_eq!(dataset(&db1), dataset(&whole));
 }
 
 // ---- db#16: COPY / MOVE / ADD by id -------------------------------------------
