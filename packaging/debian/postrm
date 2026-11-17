@@ -4,15 +4,28 @@
 # first-start root password file.
 set -e
 
-if [ -d /run/systemd/system ]; then
-    systemctl daemon-reload >/dev/null 2>&1 || true
+# The unit's enablement survives a remove (review infra#15): its enable links
+# stay, recorded by deb-systemd-helper, and the unit is masked while its file
+# is gone; postinst unmasks it on the next install and enables it again if it
+# was enabled. A purge forgets both (dh_installsystemd's protocol).
+if command -v deb-systemd-helper >/dev/null 2>&1; then
+    if [ "$1" = "remove" ]; then
+        deb-systemd-helper mask gserver.service >/dev/null || true
+    fi
+    if [ "$1" = "purge" ]; then
+        deb-systemd-helper purge gserver.service >/dev/null || true
+        deb-systemd-helper unmask gserver.service >/dev/null || true
+    fi
 fi
-if [ "$1" = "purge" ] && [ -L /var/lib/gstore/conf ]; then
-    rm -f /var/lib/gstore/conf
+if [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
+    systemctl --system daemon-reload >/dev/null 2>&1 || true
 fi
-# The first-start root password file postinst created (not a conffile).
 if [ "$1" = "purge" ]; then
-    rm -f /etc/gstore/root_password
+    if [ -L "${DPKG_ROOT:-}/var/lib/gstore/conf" ]; then
+        rm -f "${DPKG_ROOT:-}/var/lib/gstore/conf"
+    fi
+    # The first-start root password file postinst created (not a conffile).
+    rm -f "${DPKG_ROOT:-}/etc/gstore/root_password"
 fi
 
 exit 0

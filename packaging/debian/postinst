@@ -65,13 +65,37 @@ if [ "$1" = "configure" ]; then
     chgrp gstore /etc/gstore /etc/gstore/conf.ini
     chmod 0750 /etc/gstore
     chmod 0640 /etc/gstore/conf.ini
-    if [ -d /run/systemd/system ]; then
-        systemctl daemon-reload >/dev/null 2>&1 || true
-        # An upgrade restarts a running server on the new binaries.
-        if [ -n "$2" ]; then
-            systemctl try-restart gserver.service >/dev/null 2>&1 || true
-        fi
-    fi
 fi
+
+case "$1" in
+    configure | abort-upgrade | abort-deconfigure | abort-remove)
+        # >>> unit enablement (tests/packaging_scripts.rs runs this block).
+        # The package never enables the unit itself; whether it is enabled
+        # is the administrator's choice and survives a remove followed by an
+        # install (review infra#15): postrm masks the unit on remove, and
+        # here a unit deb-systemd-helper tracked before is unmasked and, if
+        # its enable links were all still there, enabled again. This is the
+        # protocol dh_installsystemd --no-enable generates; deb-systemd-helper
+        # (init-system-helpers) works on the files only, so it needs no
+        # running systemd, and honours DPKG_ROOT.
+        if command -v deb-systemd-helper >/dev/null 2>&1; then
+            if deb-systemd-helper debian-installed gserver.service; then
+                deb-systemd-helper unmask gserver.service >/dev/null || true
+                if deb-systemd-helper --quiet was-enabled gserver.service; then
+                    deb-systemd-helper enable gserver.service >/dev/null || true
+                fi
+            fi
+            deb-systemd-helper update-state gserver.service >/dev/null || true
+        fi
+        # <<< unit enablement
+        if [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
+            systemctl --system daemon-reload >/dev/null 2>&1 || true
+            # An upgrade restarts a running server on the new binaries.
+            if [ "$1" = "configure" ] && [ -n "$2" ]; then
+                systemctl try-restart gserver.service >/dev/null 2>&1 || true
+            fi
+        fi
+        ;;
+esac
 
 exit 0

@@ -1,13 +1,9 @@
 # %post of the gstore .rpm (cargo-generate-rpm `post_install_script`): create
-# the gstore system user and /var/lib/gstore, let the user read the
-# configuration, and make systemd see the unit. The service is not enabled or
-# started automatically: `systemctl enable --now gserver` (docs/DEPLOY.md).
-if command -v systemd-sysusers >/dev/null 2>&1; then
-    systemd-sysusers gstore.conf || :
-elif ! getent passwd gstore >/dev/null; then
-    useradd --system --user-group --home-dir /var/lib/gstore --no-create-home \
-        --shell /sbin/nologin --comment "gStore database server" gstore || :
-fi
+# /var/lib/gstore, let the gstore group into /etc/gstore and make systemd see
+# the unit. The gstore user was created by %pre
+# (packaging/rpm/pre_install.sh), and the package header gives conf.ini its
+# group gstore (review infra#15). The service is not enabled or started
+# automatically: `systemctl enable --now gserver` (docs/DEPLOY.md).
 if command -v systemd-tmpfiles >/dev/null 2>&1; then
     systemd-tmpfiles --create gstore.conf || :
 else
@@ -58,9 +54,10 @@ if [ "$1" = 1 ] && [ ! -e "$GSTORE_PKG_DATA/dbhome/users.db" ] \
     unset gstore_pw gstore_tmp
 fi
 # <<< first-start root password
-chgrp gstore /etc/gstore /etc/gstore/conf.ini || :
+# /etc/gstore is not a package entry (rpm creates it 0755 root:root); its
+# conf.ini already has its group from the package header.
+chgrp gstore /etc/gstore || :
 chmod 0750 /etc/gstore || :
-chmod 0640 /etc/gstore/conf.ini || :
 if [ -d /run/systemd/system ]; then
     systemctl daemon-reload >/dev/null 2>&1 || :
     # $1 > 1: an upgrade; restart a running server on the new binaries.

@@ -270,7 +270,10 @@ fn the_unit_hands_the_password_file_to_gserver() {
             s.name
         );
     }
-    assert!(DEB_POSTRM.contains(&format!("rm -f {PWFILE}")));
+    // review infra#15: postrm's paths honour DPKG_ROOT (dpkg --root), as its
+    // deb-systemd-helper calls do; the purge still removes this very file
+    // (tests/packaging_scripts.rs runs it).
+    assert!(DEB_POSTRM.contains(&format!("rm -f \"${{DPKG_ROOT:-}}{PWFILE}\"")));
 }
 
 /// A `gserver -s` child, killed and reaped when dropped.
