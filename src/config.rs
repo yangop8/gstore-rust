@@ -2162,6 +2162,21 @@ upload_allow_compress_packages = "zip"
         );
     }
 
+    /// Upstream's test scripts (`tests/upstream_scripts/*.sh`, run by
+    /// `scripts/conformance.sh`) take the server's port from the first line
+    /// of `conf.ini` that contains `port=` (`grep -m 1 'port='`), and the
+    /// harness sets the port by replacing the line `port=9000`: in the
+    /// shipped example that line must come first, so no comment above it
+    /// may contain `port=` (review bulkcli#9: the inline-comment example
+    /// added to the header once did, and every upstream suite then talked
+    /// to port "9000  # the HTTP port …").
+    #[test]
+    fn the_shipped_example_names_the_http_port_first() {
+        let text = include_str!("../conf/conf.ini.example");
+        let first = text.lines().find(|l| l.contains("port="));
+        assert_eq!(first, Some("port=9000"));
+    }
+
     /// The shipped example documents every key the code reads, in the
     /// section the code reads it from — set, or commented out with an
     /// example value — and every commented-out example parses; in the

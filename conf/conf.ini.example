@@ -10,7 +10,7 @@
 # is trimmed and double quotes are removed from values. Lines starting with '#'
 # or ';' are comments. After a value, a '#' or ';' that stands as a word of its
 # own (whitespace before and after it, or the end of the line) starts a
-# comment:  port=9000  # the HTTP port  reads 9000 (gstore-rust only, reported
+# comment:  thread_num=30  # workers  reads 30 (gstore-rust only, reported
 # as a warning: upstream reads it as part of the value). A marker glued to
 # more text stays in the value (Tr0ub4dor #3 reads "Tr0ub4dor #3"), nothing
 # inside double quotes is a comment, and root_password is never cut. An empty
