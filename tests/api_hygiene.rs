@@ -7,6 +7,11 @@
 //!   the server-wide state lock released, so `/status`, `/cancel` and every
 //!   other request go on meanwhile (review http#13, conc#7).
 //!
+//! * The API logs: a torn last line (a crash, a full disk) never swallows
+//!   the record appended after it (review durability#13); the transaction
+//!   log rotates at [`TXN_LOG_MAX_BYTES`] and a `txnlog` read parses only
+//!   what was appended since the last one (review gapi#18).
+//!
 //! Every server here is in-process on `127.0.0.1:0` in a temp directory
 //! removed when the test ends (also when it fails). Synchronisation is by
 //! test hooks that park a step; a timeout only guards against a hang.
@@ -20,6 +25,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use gstore::config::GStoreConfig;
+use gstore::gapi::apilog::{self, AccessLogRecord, ApiLogs, TxnState, TXN_LOG_MAX_BYTES};
 use gstore::http_api::{debug_park_dir_size, ApiServer};
 use gstore::json::{self, Json};
 use gstore::server::ShutdownReport;
@@ -315,4 +322,185 @@ fn restores_measure_the_directory_with_the_state_lock_released() {
         move |a| send(a, "POST", "/api", None, &body)
     });
     assert_eq!(code(&r.json()), 0, "/api restore: {}", r.body);
+}
+
+// ---- the API logs (durability#13, gapi#18) ----------------------------------
+
+/// Append raw bytes to `path` (what a crash or a full disk leaves).
+fn append_raw(path: &Path, bytes: &[u8]) {
+    let mut f = fs::OpenOptions::new().append(true).open(path).unwrap();
+    f.write_all(bytes).unwrap();
+}
+
+/// The `TID`s of the transaction log's records (one per transaction).
+fn txn_ids(root: &Path) -> Vec<String> {
+    apilog::txn_records(root)
+        .iter()
+        .map(|r| r.get("TID").and_then(Json::as_str).unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn a_torn_last_line_of_the_transaction_log_does_not_swallow_the_next_record() {
+    let root = TmpDir::new("torn_txnlog");
+    let logs = ApiLogs::new();
+    logs.txn_begin(&root.0, "db", 1, "root");
+    // A record cut short by a crash or a full disk: no newline.
+    append_raw(&apilog::txnlog_path(&root.0), b"{\"TID\":\"1_2\",\"db_na");
+    logs.txn_begin(&root.0, "db", 3, "root");
+    let ids = txn_ids(&root.0);
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    assert!(
+        ids[1].ends_with("_3"),
+        "the record after the torn line: {ids:?}"
+    );
+    let page = logs.txn_page(&root.0, 1, 10).unwrap();
+    assert_eq!(page.total_size, 2, "{:?}", page.items);
+    // A zero-filled tail (power loss) likewise.
+    append_raw(&apilog::txnlog_path(&root.0), &[0; 16]);
+    logs.txn_end(&root.0, "db", 3, "root", TxnState::Committed);
+    let recs = apilog::txn_records(&root.0);
+    let last = recs.last().unwrap();
+    assert_eq!(
+        last.get("state").and_then(Json::as_str),
+        Some("COMMITED"),
+        "{recs:?}"
+    );
+}
+
+#[test]
+fn a_torn_last_line_of_a_daily_log_does_not_swallow_the_next_record() {
+    let root = TmpDir::new("torn_access");
+    let mut config = GStoreConfig::default();
+    config.accesslog_mode = true;
+    let logs = ApiLogs::new();
+    let rec = |msg: &str| AccessLogRecord {
+        ip: "127.0.0.1".into(),
+        operation: "show".into(),
+        msg: msg.into(),
+        createtime: "2026-01-02 03:04:05".into(),
+        ..AccessLogRecord::default()
+    };
+    logs.write_access(&config, &root.0, &rec("first"));
+    let dir = apilog::accesslog_dir(&config, &root.0);
+    let day = apilog::log_dates(&dir).remove(0);
+    let path = dir.join(format!("{day}.log"));
+    append_raw(&path, b"{\"code\":0,\"ms");
+    logs.write_access(&config, &root.0, &rec("second"));
+    let msgs: Vec<String> = apilog::read_records(&path)
+        .iter()
+        .map(|r| r.get("msg").and_then(Json::as_str).unwrap().to_string())
+        .collect();
+    assert_eq!(msgs, ["first", "second"]);
+}
+
+#[test]
+fn the_transaction_log_rotates_at_its_size_cap_and_keeps_open_transactions() {
+    let root = TmpDir::new("rotate");
+    let logs = ApiLogs::new();
+    // Open across the rotation.
+    logs.txn_begin(&root.0, "db", 1, "root");
+    let path = apilog::txnlog_path(&root.0);
+    {
+        // Finished transactions, as the server writes them, up to the cap.
+        let mut w =
+            std::io::BufWriter::new(fs::OpenOptions::new().append(true).open(&path).unwrap());
+        let mut len = fs::metadata(&path).unwrap().len();
+        let mut i = 0u64;
+        while len + 300 < TXN_LOG_MAX_BYTES {
+            let line = format!(
+                "{{\"TID\":\"5_{i}\",\"begin_time\":\"5\",\"db_name\":\"old\",\"end_time\":\"6\",\
+                 \"state\":\"COMMITED\",\"user\":\"root\"}}\n"
+            );
+            w.write_all(line.as_bytes()).unwrap();
+            len += line.len() as u64;
+            i += 1;
+        }
+    }
+    let before = fs::metadata(&path).unwrap().len();
+    logs.txn_begin(&root.0, "db", 2, "root");
+    logs.txn_end(&root.0, "db", 2, "root", TxnState::Committed);
+    let after = fs::metadata(&path).unwrap().len();
+    let rotated = path.with_file_name("transaction.json.1");
+    assert!(
+        after <= TXN_LOG_MAX_BYTES,
+        "the log grew past its cap: {after} bytes"
+    );
+    assert!(
+        after < before,
+        "the log was not rotated at its cap ({before} -> {after} bytes)"
+    );
+    assert!(
+        fs::metadata(&rotated).map(|m| m.len()).unwrap_or(0) >= before,
+        "the previous generation is kept as {}",
+        rotated.display()
+    );
+    // The open transaction is still listed, and its end lands on it.
+    logs.txn_end(&root.0, "db", 1, "root", TxnState::RolledBack);
+    let recs = apilog::txn_records(&root.0);
+    let states: Vec<(String, String)> = recs
+        .iter()
+        .map(|r| {
+            let f = |k: &str| r.get(k).and_then(Json::as_str).unwrap().to_string();
+            (f("db_name"), f("state"))
+        })
+        .collect();
+    assert_eq!(
+        states,
+        [
+            ("db".to_string(), "ROLLBACK".to_string()),
+            ("db".to_string(), "COMMITED".to_string())
+        ],
+        "only the current generation's transactions, the open one carried over"
+    );
+    let page = logs.txn_page(&root.0, 1, 10).unwrap();
+    assert_eq!(page.total_size, 2);
+}
+
+#[test]
+fn txnlog_reads_parse_only_what_was_appended_since_the_last_read() {
+    let root = TmpDir::new("incremental");
+    let logs = ApiLogs::new();
+    for tid in 1..=200 {
+        logs.txn_begin(&root.0, "db", tid, "root");
+        logs.txn_end(&root.0, "db", tid, "root", TxnState::Committed);
+    }
+    let path = apilog::txnlog_path(&root.0);
+    let size = fs::metadata(&path).unwrap().len();
+    let page = logs.txn_page(&root.0, 1, 10).unwrap();
+    assert_eq!((page.total_size, page.items.len()), (200, 10));
+    let first = logs.txn_log_bytes_parsed();
+    // Nothing appended: nothing parsed.
+    let again = logs.txn_page(&root.0, 2, 10).unwrap();
+    assert_eq!(again.total_size, 200);
+    assert_eq!(
+        logs.txn_log_bytes_parsed(),
+        first,
+        "a read with nothing new"
+    );
+    // One record appended: only it is parsed.
+    logs.txn_begin(&root.0, "db", 201, "root");
+    let grown = fs::metadata(&path).unwrap().len() - size;
+    let page = logs.txn_page(&root.0, 1, 10).unwrap();
+    assert_eq!(page.total_size, 201);
+    let newest = &page.items[0];
+    assert!(
+        newest
+            .get("TID")
+            .and_then(Json::as_str)
+            .unwrap()
+            .ends_with("_201"),
+        "{newest}"
+    );
+    assert_eq!(newest.get("state").and_then(Json::as_str), Some("RUNNING"));
+    let parsed = logs.txn_log_bytes_parsed() - first;
+    assert!(
+        parsed <= grown,
+        "{parsed} bytes parsed for a {grown}-byte append to a {size}-byte log"
+    );
+    // A log replaced behind the reader's back (removed here) is read anew.
+    fs::remove_file(&path).unwrap();
+    logs.txn_begin(&root.0, "db", 202, "root");
+    let page = logs.txn_page(&root.0, 1, 10).unwrap();
+    assert_eq!(page.total_size, 1, "{:?}", page.items);
 }

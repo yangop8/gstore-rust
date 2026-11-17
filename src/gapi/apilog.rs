@@ -32,7 +32,15 @@
 //!   `begin_time` and `end_time` (ms, `INF` while running). Upstream rewrites
 //!   a transaction's record in place when it ends; here the final record is
 //!   appended (crash-safe, O(1)) and the reader keeps the last record of each
-//!   `TID`.
+//!   `TID`. Unlike upstream's, the file is rotated at [`TXN_LOG_MAX_BYTES`]
+//!   (to `transaction.json.1`, one older generation kept; the transactions
+//!   still running are carried over), so `txnlog` lists the transactions of
+//!   the current generation.
+//!
+//! Every record is appended as one line in one write. A line a crash, a full
+//! disk or a power loss left without its newline is ended before the next
+//! record is appended (review durability#13), so it never swallows that
+//! record; readers skip it.
 //!
 //! Relative log directories (`querylog_path`, `accesslog_path` of
 //! `conf.ini`) are resolved against the server's root directory. When a day's
@@ -47,7 +55,11 @@
 //! `totalPage`, `pageNo`, `pageSize` and the `list` of records, **newest
 //! first** (page 1 holds the latest records). A `pageNo` beyond the last page
 //! is `1005 "… fail: more then max page number N"` (upstream's text);
-//! `pageNo` below 1 is 1 and `pageSize` below 1 is 10. `querylog` and
+//! `pageNo` below 1 is 1 and `pageSize` below 1 is 10. A `txnlog` read
+//! parses only the lines appended since the previous one (the server keeps
+//! where each transaction's last record is, not the records), then the
+//! records of its page (review gapi#18); a daily log is read whole, as it is
+//! bounded by its day. `querylog` and
 //! `accesslog` may also filter by `db_name`, `accesslog` by `db_operation` —
 //! here before paging, so pages are full (upstream filters while paging).
 //!
@@ -59,8 +71,10 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Write};
+use std::hash::BuildHasher;
+use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
@@ -74,6 +88,14 @@ use crate::sysdb::clock;
 
 /// The transaction log, relative to the server root.
 pub const TXN_LOG_FILE: &str = "logs/transaction.json";
+
+/// The size at which the transaction log is rotated (review gapi#18): an
+/// append that would make [`TXN_LOG_FILE`] larger moves it to
+/// `transaction.json.1` (replacing an older one) and starts a new file
+/// holding the records of the transactions still open. So the log takes at
+/// most about twice this on disk, and `txnlog` lists the transactions of
+/// the current file (about 120 000 at 256 bytes per begin + end).
+pub const TXN_LOG_MAX_BYTES: u64 = 32 << 20;
 
 /// Upstream's default page size.
 const DEFAULT_PAGE_SIZE: i64 = 10;
@@ -212,6 +234,41 @@ pub struct ApiLogs {
     io: Mutex<()>,
     /// When each open transaction began (ms), for its final record.
     txn_begun: Mutex<HashMap<(String, u64), u128>>,
+    /// The transaction log as far as it was read (review gapi#18). Lock
+    /// order: `io` → `txn_index`.
+    txn_index: Mutex<TxnIndex>,
+    /// Bytes of the transaction log parsed into `txn_index` so far.
+    txn_parsed: AtomicU64,
+}
+
+/// Where in the transaction log one transaction's last record is.
+#[derive(Debug, Clone, Copy)]
+struct TxnEntry {
+    offset: u64,
+    len: u32,
+    /// That record's `state` is `RUNNING`.
+    running: bool,
+}
+
+/// What a read of the transaction log learnt (review gapi#18): for each
+/// transaction, in the order they began, where its last record is — so a
+/// `txnlog` read parses only the lines appended since the previous read,
+/// and then only the records of the page it answers. About 40 bytes per
+/// transaction: never the records themselves.
+#[derive(Debug, Default)]
+struct TxnIndex {
+    /// The file indexed (device and inode); `None` before the first read.
+    file: Option<(u64, u64)>,
+    /// How much of it was read: whole lines only.
+    offset: u64,
+    /// The transactions in the order they began.
+    entries: Vec<TxnEntry>,
+    /// Each transaction's place in `entries`, by a 128-bit fingerprint of
+    /// its database and `TID` (ids are numbered per database).
+    by_key: HashMap<u128, u32>,
+    /// The two keys of the fingerprint (random per process: the index
+    /// lives in memory only).
+    hashers: (std::hash::RandomState, std::hash::RandomState),
 }
 
 impl ApiLogs {
@@ -254,8 +311,7 @@ impl ApiLogs {
             .unwrap_or_else(|e| e.into_inner())
             .insert((db.to_string(), tid), begun);
         let rec = txn_record(db, tid, user, TxnState::Running, begun, None);
-        let _guard = self.io();
-        let _ = append_line(&txnlog_path(root), &record_line(rec));
+        let _ = self.append_txn(root, &[record_line(rec)]);
     }
 
     /// Record that transaction `tid` (of `user`, on `db`) ended in `state`.
@@ -269,8 +325,7 @@ impl ApiLogs {
             .remove(&(db.to_string(), tid))
             .unwrap_or(ended);
         let rec = txn_record(db, tid, user, state, begun, Some(ended));
-        let _guard = self.io();
-        let _ = append_line(&txnlog_path(root), &record_line(rec));
+        let _ = self.append_txn(root, &[record_line(rec)]);
     }
 
     /// Mark every transaction the log still shows `RUNNING` as `ABORTED`
@@ -286,21 +341,130 @@ impl ApiLogs {
             return 0;
         }
         let ended = clock::unix_millis();
-        let mut lines = Vec::new();
-        for rec in txn_records(root) {
-            if rec.get("state").and_then(Json::as_str) != Some(TxnState::Running.as_str()) {
-                continue;
-            }
-            let mut rec = rec;
-            rec.set("state", TxnState::Aborted.as_str());
-            rec.set("end_time", ended.to_string());
-            lines.push(record_line(rec));
-        }
-        let _guard = self.io();
-        lines
+        let lines: Vec<String> = self
+            .running_records(&path)
+            .into_iter()
+            .map(|mut rec| {
+                rec.set("state", TxnState::Aborted.as_str());
+                rec.set("end_time", ended.to_string());
+                record_line(rec)
+            })
+            .collect();
+        self.append_txn(root, &lines).unwrap_or(0)
+    }
+
+    /// The last records of the transactions the log shows `RUNNING`, in
+    /// the order they began (read through the index: the log is not held
+    /// in memory).
+    fn running_records(&self, path: &Path) -> Vec<Json> {
+        let Ok(mut file) = fs::File::open(path) else {
+            return Vec::new();
+        };
+        let mut index = self.txn_index();
+        index.refresh(&mut file, &self.txn_parsed);
+        let running: Vec<TxnEntry> = index
+            .entries
             .iter()
-            .filter(|line| append_line(&path, line).is_ok())
-            .count()
+            .copied()
+            .filter(|e| e.running)
+            .collect();
+        running
+            .iter()
+            .filter_map(|e| read_entry(&mut file, e))
+            .collect()
+    }
+
+    /// Append `lines` (records) to the transaction log, rotating it first
+    /// when they would take it past [`TXN_LOG_MAX_BYTES`] (review
+    /// gapi#18). Returns how many were appended.
+    fn append_txn(&self, root: &Path, lines: &[String]) -> io::Result<usize> {
+        let path = txnlog_path(root);
+        let _guard = self.io();
+        let len = fs::metadata(&path).map_or(0, |m| m.len());
+        let adding: u64 = lines.iter().map(|l| l.len() as u64 + 2).sum();
+        if len > 0 && len.saturating_add(adding) > TXN_LOG_MAX_BYTES {
+            if let Err(e) = self.rotate_txn_log(&path) {
+                crate::gs_warn!(
+                    "could not rotate the transaction log {}: {e}",
+                    path.display()
+                );
+            }
+        }
+        let mut appended = 0;
+        for line in lines {
+            append_line(&path, line)?;
+            appended += 1;
+        }
+        Ok(appended)
+    }
+
+    /// Move the transaction log to `transaction.json.1` (replacing an older
+    /// generation) and start a new one holding the records of the
+    /// transactions still running, so their ends still find them. Run under
+    /// the `io` lock. A crash part-way leaves the old log in place or the
+    /// new one complete (it is written beside and renamed over).
+    fn rotate_txn_log(&self, path: &Path) -> io::Result<()> {
+        let running = self.running_records(path);
+        let fresh = path.with_file_name("transaction.json.tmp");
+        let rotated = path.with_file_name("transaction.json.1");
+        {
+            let mut f = fs::File::create(&fresh)?;
+            let mut text = String::new();
+            for rec in running {
+                text.push_str(&record_line(rec));
+                text.push('\n');
+            }
+            f.write_all(text.as_bytes())?;
+            f.sync_all()?;
+        }
+        let mut index = self.txn_index();
+        *index = TxnIndex::default();
+        // The old generation is linked under its new name first, so the
+        // log is never missing; a file system without hard links moves it.
+        let _ = fs::remove_file(&rotated);
+        if fs::hard_link(path, &rotated).is_err() {
+            if let Err(e) = fs::rename(path, &rotated) {
+                let _ = fs::remove_file(&fresh);
+                return Err(e);
+            }
+        }
+        fs::rename(&fresh, path)
+    }
+
+    fn txn_index(&self) -> MutexGuard<'_, TxnIndex> {
+        self.txn_index.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// One page of the transaction log, newest first: one record per
+    /// transaction (its last), as [`txn_records`] lists them. Parses only
+    /// the lines appended since the previous read, then the page's records
+    /// (review gapi#18).
+    pub fn txn_page(&self, root: &Path, page_no: i64, page_size: i64) -> Result<Page, String> {
+        let Ok(mut file) = fs::File::open(txnlog_path(root)) else {
+            return paginate(Vec::new(), page_no, page_size);
+        };
+        let mut index = self.txn_index();
+        index.refresh(&mut file, &self.txn_parsed);
+        let b = page_bounds(index.entries.len(), page_no, page_size)?;
+        let items = index.entries[b.start..b.end]
+            .iter()
+            .rev()
+            .filter_map(|e| read_entry(&mut file, e))
+            .collect();
+        Ok(Page {
+            total_size: b.total_size,
+            total_page: b.total_page,
+            page_no: b.page_no,
+            page_size: b.page_size,
+            items,
+        })
+    }
+
+    /// How many bytes of the transaction log were parsed into the index
+    /// `txnlog` reads from (for tests: a read parses what was appended).
+    #[doc(hidden)]
+    pub fn txn_log_bytes_parsed(&self) -> u64 {
+        self.txn_parsed.load(Ordering::Relaxed)
     }
 
     /// Append `line` to today's file in `dir`; when that file is new, delete
@@ -316,6 +480,88 @@ impl ApiLogs {
         }
         Ok(())
     }
+}
+
+impl TxnIndex {
+    /// Bring the index up to date with `file` (the transaction log, opened
+    /// now): parse the whole lines appended since the last read — all of
+    /// it when it is another file than the one indexed (rotated, replaced)
+    /// or shorter than what was read. A line without its newline yet (being
+    /// written, or torn: the next append ends it) is left for later.
+    fn refresh(&mut self, file: &mut fs::File, parsed: &AtomicU64) {
+        let Ok(meta) = file.metadata() else {
+            return;
+        };
+        let id = file_id(&meta);
+        if self.file != Some(id) || meta.len() < self.offset {
+            *self = TxnIndex {
+                file: Some(id),
+                hashers: std::mem::take(&mut self.hashers),
+                ..TxnIndex::default()
+            };
+        }
+        if meta.len() == self.offset || file.seek(SeekFrom::Start(self.offset)).is_err() {
+            return;
+        }
+        let mut reader = io::BufReader::new(file.take(meta.len() - self.offset));
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            match reader.read_until(b'\n', &mut line) {
+                Ok(n) if n > 0 && line.ends_with(b"\n") => {}
+                _ => break,
+            }
+            let at = self.offset;
+            self.offset += line.len() as u64;
+            parsed.fetch_add(line.len() as u64, Ordering::Relaxed);
+            let Some(rec) = std::str::from_utf8(&line).ok().and_then(parse_record) else {
+                continue;
+            };
+            let field = |k: &str| rec.get(k).and_then(Json::as_str).unwrap_or_default();
+            let key = self.fingerprint(field("db_name"), field("TID"));
+            let entry = TxnEntry {
+                offset: at,
+                len: u32::try_from(line.len()).unwrap_or(u32::MAX),
+                running: field("state") == TxnState::Running.as_str(),
+            };
+            match self.by_key.get(&key) {
+                Some(&i) => self.entries[i as usize] = entry,
+                None => {
+                    let i = u32::try_from(self.entries.len()).unwrap_or(u32::MAX);
+                    self.by_key.insert(key, i);
+                    self.entries.push(entry);
+                }
+            }
+        }
+    }
+
+    fn fingerprint(&self, db: &str, tid: &str) -> u128 {
+        let key = (db, tid);
+        (u128::from(self.hashers.0.hash_one(key)) << 64) | u128::from(self.hashers.1.hash_one(key))
+    }
+}
+
+/// The identity of an open file (device and inode; on other systems none:
+/// a rotation by this server resets the index itself).
+fn file_id(meta: &fs::Metadata) -> (u64, u64) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        (meta.dev(), meta.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        (0, 0)
+    }
+}
+
+/// The record `entry` locates in `file`.
+fn read_entry(file: &mut fs::File, entry: &TxnEntry) -> Option<Json> {
+    file.seek(SeekFrom::Start(entry.offset)).ok()?;
+    let mut buf = vec![0; entry.len as usize];
+    file.read_exact(&mut buf).ok()?;
+    parse_record(std::str::from_utf8(&buf).ok()?)
 }
 
 fn txn_record(
@@ -343,19 +589,39 @@ fn record_line(rec: Json) -> String {
     rec.into_sorted().to_string()
 }
 
-/// Append `line` and a newline in one write (`O_APPEND`).
+/// Append `line` and a newline in one write (`O_APPEND`). A file whose last
+/// byte is not a newline — a record torn by a crash or a full disk, a tail
+/// a power loss filled with zeros — first gets one (review durability#13):
+/// the torn line stays one line of its own, which readers skip, instead of
+/// swallowing this record.
 fn append_line(path: &Path, line: &str) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
     let mut f = fs::OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
         .open(path)?;
-    let mut buf = Vec::with_capacity(line.len() + 1);
+    let mut buf = Vec::with_capacity(line.len() + 2);
+    if ends_unterminated(&mut f)? {
+        buf.push(b'\n');
+    }
     buf.extend_from_slice(line.as_bytes());
     buf.push(b'\n');
     f.write_all(&buf)
+}
+
+/// Whether `f` is non-empty and its last byte is not a newline.
+fn ends_unterminated(f: &mut fs::File) -> io::Result<bool> {
+    let len = f.metadata()?.len();
+    if len == 0 {
+        return Ok(false);
+    }
+    f.seek(SeekFrom::Start(len - 1))?;
+    let mut last = [0u8; 1];
+    f.read_exact(&mut last)?;
+    Ok(last[0] != b'\n')
 }
 
 /// Delete the oldest `YYYYMMDD.log` files in `dir` beyond the newest `keep`.
@@ -542,40 +808,58 @@ pub struct Page<T = Json> {
 /// 10) of `records` (oldest first), newest first — upstream
 /// `get_file_lines`. A page beyond the last is an error naming the last.
 pub fn paginate<T>(records: Vec<T>, page_no: i64, page_size: i64) -> Result<Page<T>, String> {
+    let b = page_bounds(records.len(), page_no, page_size)?;
+    let mut items = records;
+    items.truncate(b.end);
+    let mut items: Vec<T> = items.drain(b.start..).collect();
+    items.reverse();
+    Ok(Page {
+        total_size: b.total_size,
+        total_page: b.total_page,
+        page_no: b.page_no,
+        page_size: b.page_size,
+        items,
+    })
+}
+
+/// A page of `total_size` records (oldest first): which of them it holds
+/// (`start..end`, listed in reverse), with the normalized paging figures.
+struct PageBounds {
+    total_size: usize,
+    total_page: usize,
+    page_no: usize,
+    page_size: usize,
+    start: usize,
+    end: usize,
+}
+
+/// The bounds of page `page_no` (see [`paginate`]).
+fn page_bounds(total_size: usize, page_no: i64, page_size: i64) -> Result<PageBounds, String> {
     let page_no = usize::try_from(page_no.max(1)).unwrap_or(1);
     let page_size = if page_size < 1 {
         DEFAULT_PAGE_SIZE as usize
     } else {
         usize::try_from(page_size).unwrap_or(usize::MAX)
     };
-    let total_size = records.len();
     let total_page = total_size.div_ceil(page_size);
+    let mut b = PageBounds {
+        total_size,
+        total_page,
+        page_no,
+        page_size,
+        start: 0,
+        end: 0,
+    };
     if total_size == 0 {
-        return Ok(Page {
-            total_size,
-            total_page,
-            page_no,
-            page_size,
-            items: Vec::new(),
-        });
+        return Ok(b);
     }
     if page_no > total_page {
         return Err(format!("more then max page number {total_page}"));
     }
     // Newest first: page 1 is the last `page_size` records, reversed.
-    let end = total_size - page_size.saturating_mul(page_no - 1);
-    let start = end.saturating_sub(page_size);
-    let mut items = records;
-    items.truncate(end);
-    let mut items: Vec<T> = items.drain(start..).collect();
-    items.reverse();
-    Ok(Page {
-        total_size,
-        total_page,
-        page_no,
-        page_size,
-        items,
-    })
+    b.end = total_size - page_size.saturating_mul(page_no - 1);
+    b.start = b.end.saturating_sub(page_size);
+    Ok(b)
 }
 
 // ---------------------------------------------------------------------------
@@ -864,7 +1148,11 @@ pub(super) fn txnlog(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         Ok(pg) => pg,
         Err(r) => return r,
     };
-    match paginate(txn_records(ctx.root_dir()), page_no, page_size) {
+    match ctx
+        .inner
+        .apilogs
+        .txn_page(ctx.root_dir(), page_no, page_size)
+    {
         Ok(page) => page_response("Get transaction log success.", page),
         Err(e) => GResp::error(
             Status::OperationFailed,
