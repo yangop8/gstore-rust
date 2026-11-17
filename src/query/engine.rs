@@ -3873,11 +3873,26 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             }
         } else {
             let key = plans_key(&plans);
-            self.plan_cache
-                .borrow_mut()
-                .entry(key)
-                .or_insert_with(|| optimizer::optimize(&plans, &counts, &candidates, layout.len()))
-                .clone()
+            let cached = self.plan_cache.borrow().get(&key).cloned();
+            match cached {
+                Some(plan) => plan,
+                None => {
+                    // The search of a large BGP is bounded and polls the
+                    // cancel check (review query#13); a plan it cut short
+                    // is not cached — the caller reports the cancel.
+                    let plan = optimizer::optimize_until(
+                        &plans,
+                        &counts,
+                        &candidates,
+                        layout.len(),
+                        &|| self.cancelled(),
+                    );
+                    if !self.cancelled() {
+                        self.plan_cache.borrow_mut().insert(key, plan.clone());
+                    }
+                    plan
+                }
+            }
         };
         PreparedBgp::Plan(topk::BgpPlan {
             plans,
