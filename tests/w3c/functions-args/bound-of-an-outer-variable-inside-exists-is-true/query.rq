@@ -1,0 +1,6 @@
+# spec: SPARQL 1.1 Query §18.6 Evaluation of EXISTS — exists(substitute(pattern, μ)): every
+# occurrence of ?s inside the EXISTS pattern is replaced by μ(?s), a value, so the inner
+# FILTER(BOUND(?s)) holds for each outer solution (§17.4.1.1 BOUND); with the :q triple
+# present both rows pass (review query#14: it was always false)
+PREFIX : <http://example.com/>
+SELECT ?s WHERE { ?s :p :o FILTER EXISTS { ?y :q ?w FILTER(BOUND(?s)) } }

@@ -5111,12 +5111,20 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             return None;
         }
         // BOUND inspects binding state directly (its arg may be unbound).
+        // §17.4.1.1: a variable the pattern never binds has no value, so
+        // BOUND is false, not an error; inside EXISTS a variable the outer
+        // solution binds was substituted by its term, which is bound
+        // (review query#14).
         if name == "BOUND" {
-            if let [Expr::Var(v)] = args {
-                let idx = *l.index.get(v)?;
-                return Some(Value::Bool(b[idx].is_some()));
-            }
-            return None;
+            return match args {
+                [Expr::Var(v)] => Some(Value::Bool(
+                    l.index
+                        .get(v)
+                        .is_some_and(|&idx| b.get(idx).is_some_and(Option::is_some)),
+                )),
+                [Expr::Const(_)] => Some(Value::Bool(true)),
+                _ => None,
+            };
         }
         match name {
             // The term's own lexical form ("05"^^xsd:unsignedByte is "05").

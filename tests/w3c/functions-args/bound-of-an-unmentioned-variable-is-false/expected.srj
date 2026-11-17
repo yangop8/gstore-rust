@@ -1,0 +1,11 @@
+{
+  "head": {"vars": ["s", "b", "nb"]},
+  "results": {"bindings": [
+    {"s": {"type": "uri", "value": "http://example.com/s1"},
+     "b": {"type": "literal", "value": "false", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"},
+     "nb": {"type": "literal", "value": "true", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"}},
+    {"s": {"type": "uri", "value": "http://example.com/s2"},
+     "b": {"type": "literal", "value": "false", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"},
+     "nb": {"type": "literal", "value": "true", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"}}
+  ]}
+}

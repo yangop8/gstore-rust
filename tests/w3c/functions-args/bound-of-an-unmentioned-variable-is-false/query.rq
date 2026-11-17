@@ -1,0 +1,5 @@
+# spec: SPARQL 1.1 Query §17.4.1.1 BOUND: "Returns true if var is bound to a value. Returns
+# false otherwise" — ?z occurs nowhere in the pattern, so it has no value: false, not an
+# error (review query#14), and a SELECT expression keeps it as a bound false
+PREFIX : <http://example.com/>
+SELECT ?s (BOUND(?z) AS ?b) (!BOUND(?z) AS ?nb) WHERE { ?s :p :o }
