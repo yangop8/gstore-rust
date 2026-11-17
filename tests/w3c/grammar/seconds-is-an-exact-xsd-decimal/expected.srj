@@ -1,0 +1,4 @@
+{"head":{"vars":["s","d","n"]},"results":{"bindings":[
+  {"s":{"type":"literal","value":"13.815","datatype":"http://www.w3.org/2001/XMLSchema#decimal"},
+   "d":{"type":"uri","value":"http://www.w3.org/2001/XMLSchema#decimal"},
+   "n":{"type":"literal","value":"true","datatype":"http://www.w3.org/2001/XMLSchema#boolean"}}]}}

@@ -399,10 +399,18 @@ impl<'s> Parser<'s> {
             match self.keyword().as_deref() {
                 Some("PREFIX") => {
                     self.bump();
-                    let (pfx, _) = match self.bump() {
-                        Token::PName(p, l) if l.is_empty() => (p, l),
-                        // Lexer emits `foaf:` as PName("foaf","")
-                        Token::PName(p, l) => (p, l),
+                    // `PNAME_NS`: the lexer emits `foaf:` as PName("foaf", "").
+                    // A local part (`PREFIX foaf:knows <…>`) is an error, not
+                    // a declaration of `foaf:` that drops it (review
+                    // parser#13): a typo must not silently rebind a prefix.
+                    let pfx = match self.bump() {
+                        Token::PName(p, l) if l.is_empty() => p,
+                        Token::PName(p, l) => {
+                            return Err(self.err(format!(
+                                "PREFIX declares a prefix name ending in ':' (e.g. PREFIX {p}: \
+                                 <…>), found '{p}:{l}' with a local part"
+                            )))
+                        }
                         other => {
                             return Err(self.err(format!("expected 'prefix:' , found {other:?}")))
                         }
@@ -735,6 +743,9 @@ impl<'s> Parser<'s> {
         let mut filters: Vec<Expr> = Vec::new();
         let mut pending: Vec<TriplePattern> = Vec::new();
         let mut pending_paths: Vec<GraphPattern> = Vec::new();
+        // The element just parsed was a triples statement: another one may
+        // only follow after a '.' (see `require_triples_separator`).
+        let mut after_triples = false;
 
         // Flush accumulated triples (as one BGP) and any path patterns into
         // `current`, joined on.
@@ -753,6 +764,7 @@ impl<'s> Parser<'s> {
         }
 
         loop {
+            let follows_triples = std::mem::take(&mut after_triples);
             match self.peek() {
                 Token::RBrace => {
                     self.bump();
@@ -840,7 +852,9 @@ impl<'s> Parser<'s> {
                 }
                 Token::Eof => return Err(self.err("unexpected end of query inside '{ }'")),
                 _ => {
+                    self.require_triples_separator(follows_triples)?;
                     self.parse_triples_same_subject(&mut pending, &mut pending_paths)?;
+                    after_triples = true;
                 }
             }
         }
@@ -852,6 +866,23 @@ impl<'s> Parser<'s> {
         }
         self.chain_end(chain);
         Ok(current)
+    }
+
+    /// The cursor is at the start of a triples statement (`TriplesSameSubject`):
+    /// when the element before it was one too (`follows_triples`), fail. In
+    /// a `TriplesBlock` (and the `TriplesTemplate` / `ConstructTriples` of
+    /// templates and DATA blocks) statements are separated by `.`, so
+    /// `{ ?s ?p ?o ?a ?b ?c }` is a syntax error, not two patterns (review
+    /// parser#13). A `.` stays optional after the last statement and around
+    /// the other elements of a group (`FILTER`, `OPTIONAL`, `{ … }`, …).
+    fn require_triples_separator(&self, follows_triples: bool) -> Result<()> {
+        if follows_triples {
+            return Err(self.err(format!(
+                "expected '.' between two triple patterns, found {} directly after one",
+                describe_token(self.peek())
+            )));
+        }
+        Ok(())
     }
 
     /// `{…} ( UNION {…} )*` — a group, optionally unioned with more groups.
@@ -1069,7 +1100,9 @@ impl<'s> Parser<'s> {
         let mut triples = Vec::new();
         let mut paths = Vec::new();
         self.expect(&Token::LBrace, "'{'")?;
+        let mut after_triples = false;
         loop {
+            let follows_triples = std::mem::take(&mut after_triples);
             match self.peek() {
                 Token::RBrace => {
                     self.bump();
@@ -1092,7 +1125,11 @@ impl<'s> Parser<'s> {
                         w.to_ascii_uppercase()
                     )))
                 }
-                _ => self.parse_triples_same_subject(&mut triples, &mut paths)?,
+                _ => {
+                    self.require_triples_separator(follows_triples)?;
+                    self.parse_triples_same_subject(&mut triples, &mut paths)?;
+                    after_triples = true;
+                }
             }
         }
         if !paths.is_empty() {
@@ -2448,11 +2485,29 @@ impl<'s> Parser<'s> {
     fn parse_solution_modifiers(
         &mut self,
     ) -> Result<(Vec<OrderCondition>, Option<usize>, Option<usize>)> {
+        // `OrderClause? LimitOffsetClauses?`, where `LimitOffsetClauses ::=
+        // LimitClause OffsetClause? | OffsetClause LimitClause?`: each clause
+        // at most once, ORDER BY before LIMIT/OFFSET, which come in either
+        // order. A repeated or misplaced clause is an error rather than
+        // the last one silently winning (review parser#13).
         let mut order_by = Vec::new();
         let mut limit = None;
         let mut offset = None;
         loop {
-            match self.keyword().as_deref() {
+            let kw = self.keyword();
+            let misplaced = match kw.as_deref() {
+                Some("ORDER") if !order_by.is_empty() => Some("ORDER BY may appear only once"),
+                Some("ORDER") if limit.is_some() || offset.is_some() => {
+                    Some("ORDER BY must come before LIMIT and OFFSET")
+                }
+                Some("LIMIT") if limit.is_some() => Some("LIMIT may appear only once"),
+                Some("OFFSET") if offset.is_some() => Some("OFFSET may appear only once"),
+                _ => None,
+            };
+            if let Some(why) = misplaced {
+                return Err(self.err(format!("misplaced solution modifier: {why}")));
+            }
+            match kw.as_deref() {
                 Some("ORDER") => {
                     self.bump();
                     self.expect_keyword("BY")?;
@@ -2722,7 +2777,9 @@ impl<'s> Parser<'s> {
         let mut patterns = Vec::new();
         let mut paths = Vec::new();
         self.expect(&Token::LBrace, "'{'")?;
+        let mut after_triples = false;
         loop {
+            let follows_triples = std::mem::take(&mut after_triples);
             match self.peek() {
                 Token::RBrace => {
                     self.bump();
@@ -2732,7 +2789,11 @@ impl<'s> Parser<'s> {
                     self.bump();
                 }
                 Token::Eof => return Err(self.err("unexpected end of template block")),
-                _ => self.parse_triples_same_subject(&mut patterns, &mut paths)?,
+                _ => {
+                    self.require_triples_separator(follows_triples)?;
+                    self.parse_triples_same_subject(&mut patterns, &mut paths)?;
+                    after_triples = true;
+                }
             }
         }
         if !paths.is_empty() {
@@ -2809,7 +2870,9 @@ impl<'s> Parser<'s> {
     fn parse_quad_template_block(&mut self) -> Result<Vec<QuadPattern>> {
         self.expect(&Token::LBrace, "'{'")?;
         let mut out = Vec::new();
+        let mut after_triples = false;
         loop {
+            let follows_triples = std::mem::take(&mut after_triples);
             match self.peek() {
                 Token::RBrace => {
                     self.bump();
@@ -2830,6 +2893,8 @@ impl<'s> Parser<'s> {
                 }
                 Token::Eof => return Err(self.err("unexpected end of template block")),
                 _ => {
+                    self.require_triples_separator(follows_triples)?;
+                    after_triples = true;
                     let mut patterns = Vec::new();
                     let mut paths = Vec::new();
                     self.parse_triples_same_subject(&mut patterns, &mut paths)?;
@@ -2900,7 +2965,9 @@ impl<'s> Parser<'s> {
     fn parse_ground_block(&mut self) -> Result<Vec<GroundTriple>> {
         self.expect(&Token::LBrace, "'{'")?;
         let mut out = Vec::new();
+        let mut after_triples = false;
         loop {
+            let follows_triples = std::mem::take(&mut after_triples);
             match self.peek() {
                 Token::RBrace => {
                     self.bump();
@@ -2920,7 +2987,9 @@ impl<'s> Parser<'s> {
                         }
                     };
                     self.expect(&Token::LBrace, "'{'")?;
+                    let mut inner_after_triples = false;
                     loop {
+                        let follows_triples = std::mem::take(&mut inner_after_triples);
                         match self.peek() {
                             Token::RBrace => {
                                 self.bump();
@@ -2930,12 +2999,20 @@ impl<'s> Parser<'s> {
                                 self.bump();
                             }
                             Token::Eof => return Err(self.err("unterminated GRAPH block")),
-                            _ => self.parse_ground_subject(&mut out, Some(g.as_str()))?,
+                            _ => {
+                                self.require_triples_separator(follows_triples)?;
+                                self.parse_ground_subject(&mut out, Some(g.as_str()))?;
+                                inner_after_triples = true;
+                            }
                         }
                     }
                 }
                 Token::Eof => return Err(self.err("unexpected end of query in DATA block")),
-                _ => self.parse_ground_subject(&mut out, None)?,
+                _ => {
+                    self.require_triples_separator(follows_triples)?;
+                    self.parse_ground_subject(&mut out, None)?;
+                    after_triples = true;
+                }
             }
         }
         Ok(out)
@@ -3016,7 +3093,16 @@ impl<'s> Parser<'s> {
         match tok {
             Token::Iri(s) => Ok(Term::Iri(self.resolve_iri(s))),
             Token::PName(p, l) => Ok(Term::Iri(self.expand_pname(p, l)?)),
-            Token::Blank(l) => Ok(Term::Blank(l.clone())),
+            // A labelled blank node is as forbidden as `[]` where SPARQL 1.1
+            // Update forbids blank nodes (DELETE DATA, DELETE WHERE, DELETE
+            // templates; review parser#13 / sparqlconf#16).
+            Token::Blank(l) => match self.bnode_mode {
+                BnodeMode::Forbidden(ctx) => Err(self.err(format!(
+                    "blank nodes are not allowed in {ctx} (SPARQL 1.1 Update), but _:{l} \
+                     denotes one"
+                ))),
+                BnodeMode::Var | BnodeMode::Fresh => Ok(Term::Blank(l.clone())),
+            },
             Token::Integer(s) => Ok(Term::typed_literal(s.clone(), xsd::INTEGER)),
             Token::Decimal(s) => Ok(Term::typed_literal(s.clone(), xsd::DECIMAL)),
             Token::Double(s) => Ok(Term::typed_literal(s.clone(), xsd::DOUBLE)),

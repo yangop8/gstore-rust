@@ -1,0 +1,2 @@
+failure
+DROP GRAPH of a graph that does not exist (review sparqlconf#16)

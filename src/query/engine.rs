@@ -5348,13 +5348,26 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             "DAY" => self.datetime_field(args, b, l, |p| p.day),
             "HOURS" => self.datetime_field(args, b, l, |p| p.hour),
             "MINUTES" => self.datetime_field(args, b, l, |p| p.minute),
+            // `xsd:decimal SECONDS(xsd:dateTime)` (§17.4.5.7): exactly the
+            // seconds of the lexical form (`13.815` stays `13.815`, never a
+            // binary double; `07` is `7`) — review sparqlconf#16. A value
+            // without a time (an `xsd:date`) has no seconds: an error.
             "SECONDS" => {
-                let p = parse_datetime_parts(&self.eval_value(args.first()?, b, l)?.lexical())?;
-                if p.frac == 0.0 {
-                    Some(Value::Int(p.second))
+                let lexical = self.eval_value(args.first()?, b, l)?.lexical();
+                parse_datetime_parts(&lexical)?;
+                // Validated: `…Thh:mm:` is followed by `ss(.s+)?`.
+                let (_, time) = lexical.trim().split_once('T')?;
+                let secs = time.get(6..)?;
+                let end = secs
+                    .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+                    .unwrap_or(secs.len());
+                let secs = secs[..end].trim_start_matches('0');
+                let secs = if secs.is_empty() || secs.starts_with('.') {
+                    format!("0{secs}")
                 } else {
-                    Some(Value::Double(p.second as f64 + p.frac))
-                }
+                    secs.to_string()
+                };
+                Some(Value::from_term(&Term::typed_literal(secs, xsd::DECIMAL)))
             }
             "TIMEZONE" => {
                 let p = parse_datetime_parts(&self.eval_value(args.first()?, b, l)?.lexical())?;

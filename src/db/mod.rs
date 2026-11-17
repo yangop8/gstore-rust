@@ -720,6 +720,10 @@ impl GraphTransfer {
     }
 }
 
+/// How many triples [`Database::transfer_graph`] inserts into the
+/// destination per chunk (one insert batch on an in-memory default graph).
+const TRANSFER_CHUNK: usize = 1 << 16;
+
 /// The query-evaluation settings a server applies to every database it opens,
 /// builds, creates or restores ([`Database::apply_query_settings`]); `gserver`
 /// reads them from `conf.ini`'s `[query]` section
@@ -1627,6 +1631,13 @@ impl Database {
         let Some((_, id)) = self.intern_for_insert(t, None)? else {
             return Ok(None);
         };
+        Ok(self.insert_default_id(id)?.then_some(id))
+    }
+
+    /// Insert the default-graph triple `id`, whose terms are interned (and
+    /// persisted) already, with its VS-tree and book-keeping; `true` if it
+    /// was newly added.
+    fn insert_default_id(&mut self, id: IdTriple) -> Result<bool> {
         // Stream mode: by id, into the open transaction's overlay or at once;
         // a write error breaks the store and fails this insert.
         let (changed, disk) = match self.store.as_disk_mut() {
@@ -1652,7 +1663,7 @@ impl Database {
             }
             self.inserted_default(id, disk);
         }
-        Ok(changed.then_some(id))
+        Ok(changed)
     }
 
     /// The book-keeping of a newly added default-graph triple, the VS-tree
@@ -2476,6 +2487,13 @@ impl Database {
         let Some((Some(gid), id)) = self.intern_for_insert(t, Some(g))? else {
             return Ok(None);
         };
+        Ok(self.insert_named_id(gid, id).then_some((Some(gid), id)))
+    }
+
+    /// Add statement `id` to named graph `gid`, whose terms are interned (and
+    /// persisted) already; `true` if it was newly added (the mirror of
+    /// [`remove_named_id`](Self::remove_named_id)).
+    fn insert_named_id(&mut self, gid: u32, id: IdTriple) -> bool {
         let present = self
             .named
             .get(&gid)
@@ -2484,7 +2502,7 @@ impl Database {
         // all (so a retry writes it again), and the error is reported at the
         // next commit point.
         if present || !self.persist_named_quad(true, gid, id) {
-            return Ok(None);
+            return false;
         }
         self.named.insert(gid, id);
         self.touched();
@@ -2493,7 +2511,7 @@ impl Database {
         }
         self.record_redo(b'I', Some(gid), id);
         self.persist_mutation(true, Some(gid), id);
-        Ok(Some((Some(gid), id)))
+        true
     }
 
     /// Remove a triple from a named graph (`None` ⇒ default graph). Returns
@@ -3073,14 +3091,29 @@ impl Database {
                 Err(e) if silent && !matches!(e, GStoreError::Cancelled) => Ok(0),
                 Err(e) => Err(e),
             },
-            UpdateOp::Clear { target, .. } | UpdateOp::Drop { target, .. } => match target {
-                GraphTarget::Default => self.clear_default(),
-                GraphTarget::All => Ok(self.clear_default()? + self.clear_all_named()),
-                GraphTarget::AllNamed => Ok(self.clear_all_named()),
-                GraphTarget::Named(g) => Ok(self.clear_named(&g)),
-            },
-            // CREATE GRAPH only declares an (empty) graph; data ops create it.
-            UpdateOp::Create { .. } => Ok(0),
+            // The graph-management operations share one existence rule
+            // (SPARQL 1.1 Update §3.2; review sparqlconf#16): a named graph
+            // exists while it holds a triple — this store keeps no empty
+            // named graphs — and the default graph always exists. An
+            // operation on a graph that must exist but does not (CLEAR /
+            // DROP GRAPH, the source of ADD / MOVE / COPY), or that must not
+            // exist but does (CREATE GRAPH), fails, changing nothing, unless
+            // SILENT, which makes it a successful no-op.
+            UpdateOp::Clear { target, silent } => self.clear_target("CLEAR", target, silent),
+            UpdateOp::Drop { target, silent } => self.clear_target("DROP", target, silent),
+            // CREATE GRAPH declares an empty graph, and this store keeps
+            // none: creating a graph that does not exist changes nothing
+            // (data operations create it), one that exists is an error.
+            UpdateOp::Create { name, silent } => {
+                if silent || !self.named_graph_exists(&name) {
+                    Ok(0)
+                } else {
+                    Err(GStoreError::Query(format!(
+                        "CREATE GRAPH failed: the graph <{name}> already exists (it holds \
+                         triples); use CREATE SILENT GRAPH to ignore an existing graph"
+                    )))
+                }
+            }
             UpdateOp::Add { from, to, silent } => {
                 self.transfer_graph(GraphTransfer::Add, from, to, silent)
             }
@@ -3098,12 +3131,21 @@ impl Database {
     /// triples changed: those cleared from the destination (COPY/MOVE), added
     /// to it, and dropped from the source (MOVE).
     ///
-    /// * The same graph on both sides is a no-op, whatever the operation.
+    /// * The same graph on both sides is a no-op, whatever the operation
+    ///   (the operation has no effect), even for a graph that does not exist.
+    /// * The source must exist — the existence rule of every graph-management
+    ///   operation (see [`exec_update_op`](Self::exec_update_op)): a named
+    ///   source that holds no triples fails the operation, changing nothing,
+    ///   unless SILENT, which makes it a successful no-op. The default graph
+    ///   always exists.
     /// * The destination is created as needed.
-    /// * A named source graph that holds no triples does not exist — this
-    ///   store keeps no empty named graphs (CREATE GRAPH declares nothing) —
-    ///   and the operation fails, as the spec allows, unless SILENT, which
-    ///   makes it a successful no-op. The default graph always exists.
+    /// * The triples are copied by id — every graph shares the dictionary —
+    ///   in chunks of [`TRANSFER_CHUNK`]: the source is read once, as ids (12
+    ///   bytes a triple, in a read scope: a read error fails the operation
+    ///   before anything changes), and never turned into terms that are
+    ///   interned again one by one (review db#16). Only the first triple into
+    ///   a named destination takes the term path, which interns the
+    ///   destination graph's IRI (on RocksDB writing it to the store first).
     fn transfer_graph(
         &mut self,
         op: GraphTransfer,
@@ -3114,7 +3156,7 @@ impl Database {
         if from == to {
             return Ok(0);
         }
-        let Some(triples) = self.graph_triples(from.as_deref())? else {
+        let Some(ids) = self.graph_triples(from.as_deref())? else {
             if silent {
                 return Ok(0);
             }
@@ -3133,9 +3175,7 @@ impl Database {
                 Some(g) => self.clear_named(g),
             };
         }
-        let mut added = Vec::new();
-        self.insert_statements(triples.iter().map(|t| (t, to.as_deref())), &mut added)?;
-        changed += added.len();
+        changed += self.insert_graph_ids(to.as_deref(), &ids)?;
         if op == GraphTransfer::Move {
             changed += match from.as_deref() {
                 None => self.clear_default()?,
@@ -3145,10 +3185,39 @@ impl Database {
         Ok(changed)
     }
 
+    /// `CLEAR` / `DROP` (`keyword`) `[SILENT] target` (SPARQL 1.1 Update
+    /// §3.1.5 / §3.2.2; this store keeps no empty graphs, so the two are the
+    /// same): the number of triples cleared. `GRAPH <g>` of a graph that does
+    /// not exist (holds no triples) fails, changing nothing, unless SILENT —
+    /// the existence rule of [`exec_update_op`](Self::exec_update_op);
+    /// `DEFAULT`, `NAMED` and `ALL` always succeed.
+    fn clear_target(&mut self, keyword: &str, target: GraphTarget, silent: bool) -> Result<usize> {
+        match target {
+            GraphTarget::Default => self.clear_default(),
+            GraphTarget::All => Ok(self.clear_default()? + self.clear_all_named()),
+            GraphTarget::AllNamed => Ok(self.clear_all_named()),
+            GraphTarget::Named(g) if self.named_graph_exists(&g) => Ok(self.clear_named(&g)),
+            GraphTarget::Named(_) if silent => Ok(0),
+            GraphTarget::Named(g) => Err(GStoreError::Query(format!(
+                "{keyword} GRAPH failed: the graph <{g}> does not exist (it holds no triples); \
+                 use {keyword} SILENT GRAPH to ignore a missing graph"
+            ))),
+        }
+    }
+
+    /// Whether named graph `<g>` exists: it holds a triple (this store keeps
+    /// no empty named graphs; review sparqlconf#16).
+    fn named_graph_exists(&self, g: &str) -> bool {
+        self.dict
+            .entity_id(&Term::iri(g).dict_key())
+            .and_then(|gid| self.named.get(&gid))
+            .is_some_and(|s| s.triple_count() > 0)
+    }
+
     /// Every triple of the default graph (`None`) or of a named graph, as
-    /// terms; `Ok(None)` for a named graph that holds no triples. Reads in a
-    /// read scope: a store or dictionary read error fails it (C2).
-    fn graph_triples(&self, graph: Option<&str>) -> Result<Option<Vec<Triple>>> {
+    /// ids; `Ok(None)` for a named graph that holds no triples. Reads in a
+    /// read scope: a store read error fails it (C2).
+    fn graph_triples(&self, graph: Option<&str>) -> Result<Option<Vec<IdTriple>>> {
         let scope = ReadScope::enter();
         let triples = self.graph_triples_unscoped(graph);
         match scope.take_error() {
@@ -3158,30 +3227,107 @@ impl Database {
     }
 
     /// [`graph_triples`](Self::graph_triples) without the read scope.
-    fn graph_triples_unscoped(&self, graph: Option<&str>) -> Option<Vec<Triple>> {
-        let ids = match graph {
-            None => self.store.iter_all(),
+    fn graph_triples_unscoped(&self, graph: Option<&str>) -> Option<Vec<IdTriple>> {
+        match graph {
+            None => Some(self.store.iter_all()),
             Some(g) => {
                 let gid = self.dict.entity_id(&Term::iri(g).dict_key())?;
                 let ids: Vec<IdTriple> = self.named.get(&gid)?.iter_all().collect();
-                if ids.is_empty() {
-                    return None;
+                (!ids.is_empty()).then_some(ids)
+            }
+        }
+    }
+
+    /// Insert `ids` — triples of another graph of this database, so their
+    /// terms are interned and persisted already — into the default graph
+    /// (`None`) or named graph `<g>` (see
+    /// [`transfer_graph`](Self::transfer_graph)): by id, in chunks of
+    /// [`TRANSFER_CHUNK`] (an in-memory default graph takes each chunk as one
+    /// batch, [`insert_default_batch`](Self::insert_default_batch)). Returns
+    /// how many were newly added; on an error the triples before stay
+    /// inserted, as with any failing operation.
+    fn insert_graph_ids(&mut self, graph: Option<&str>, ids: &[IdTriple]) -> Result<usize> {
+        let mut added = 0;
+        let mut rest = ids;
+        let gid = match graph {
+            None => None,
+            Some(g) => {
+                // The first triple interns the graph's IRI the way every
+                // insert does (RocksDB: written before the quad).
+                let Some((&first, tail)) = ids.split_first() else {
+                    return Ok(0);
+                };
+                let t = self.id_triple_terms(first)?;
+                added += usize::from(self.insert_quad_id(&t, Some(g))?.is_some());
+                rest = tail;
+                match self.persisted_graph_id(g) {
+                    Some(gid) => Some(gid),
+                    None => {
+                        // The IRI could not be persisted (RocksDB; reported
+                        // at the next commit point): every triple takes the
+                        // term path, which writes it again first.
+                        for &id in rest {
+                            let t = self.id_triple_terms(id)?;
+                            added += usize::from(self.insert_quad_id(&t, Some(g))?.is_some());
+                        }
+                        return Ok(added);
+                    }
                 }
-                ids
             }
         };
+        let batched = self.store.as_memory().is_some();
+        for chunk in rest.chunks(TRANSFER_CHUNK) {
+            match gid {
+                Some(gid) => {
+                    for &id in chunk {
+                        added += usize::from(self.insert_named_id(gid, id));
+                    }
+                }
+                None if batched => added += self.insert_default_batch(chunk).len(),
+                None => {
+                    for &id in chunk {
+                        added += usize::from(self.insert_default_id(id)?);
+                    }
+                }
+            }
+        }
+        Ok(added)
+    }
+
+    /// The id of named graph `<g>`'s IRI when the dictionary knows it and
+    /// (RocksDB) its write did not fail: quads may then reference it.
+    fn persisted_graph_id(&self, g: &str) -> Option<u32> {
+        let gid = self.dict.entity_id(&Term::iri(g).dict_key())?;
+        #[cfg(feature = "rocksdb")]
+        if self
+            .unpersisted_terms
+            .contains(&(crate::backend::rocks::TermSpace::Entity, gid))
+        {
+            return None;
+        }
+        Some(gid)
+    }
+
+    /// The terms of triple `id` (read in a read scope: a dictionary read
+    /// error fails it, C2).
+    fn id_triple_terms(&self, id: IdTriple) -> Result<Triple> {
+        let scope = ReadScope::enter();
         let term = |s: Option<TermStr<'_>>| s.and_then(|s| Term::from_dict_key(&s));
-        Some(
-            ids.into_iter()
-                .filter_map(|id| {
-                    Some(Triple::new(
-                        term(self.dict.term(id.sub))?,
-                        term(self.dict.pred(id.pred))?,
-                        term(self.dict.term(id.obj))?,
-                    ))
-                })
-                .collect(),
-        )
+        let (s, p, o) = (
+            term(self.dict.term(id.sub)),
+            term(self.dict.pred(id.pred)),
+            term(self.dict.term(id.obj)),
+        );
+        if let Some(e) = scope.take_error() {
+            return Err(read_failure("reading the source graph", e));
+        }
+        match (s, p, o) {
+            (Some(s), Some(p), Some(o)) => Ok(Triple::new(s, p, o)),
+            _ => Err(GStoreError::Database(format!(
+                "a triple of the source graph ({id:?}) references an id missing from the \
+                 dictionary"
+            ))),
+        }
     }
 
     /// Clear the default graph, returning the count cleared. Stream mode:

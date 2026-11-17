@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §19.8 Grammar, rule [6] PrefixDecl ::= 'PREFIX' PNAME_NS IRIREF:
+# PNAME_NS is a prefix name ending in ":" with no local part, so foaf:knows is not one
+PREFIX foaf:knows <http://xmlns.com/foaf/0.1/>
+SELECT ?n WHERE { ?s foaf:name ?n }

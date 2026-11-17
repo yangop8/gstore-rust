@@ -1,0 +1,2 @@
+syntax
+a PNAME_LN where PNAME_NS is required (review parser#13)

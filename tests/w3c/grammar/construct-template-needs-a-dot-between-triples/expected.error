@@ -1,0 +1,2 @@
+syntax
+two template triples without a "." (review parser#13)
