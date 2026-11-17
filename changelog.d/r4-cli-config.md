@@ -57,9 +57,19 @@
   declares more entries than the limit is refused with the same error as
   before (`ZipCode` 3, "the package holds N entries, more than M
   (unzip_max_entries)"). A zip64 end record that is not where its locator
-  says is refused as unsupported (code 1). `zipio::read_entry` (the
-  backup-owner lookup of `/api` backup listings) is bounded by the default
-  entry limit (10,000).
+  says, or that fails any of the zip reader's own consistency checks on
+  that record (disk number 0, entries on this disk = entries in all, the
+  locator's disk with the directory, the minimum record size, room for
+  46 bytes per directory header before it), is refused as unsupported
+  (code 1): the reader would otherwise scan on towards the locator for
+  another zip64 record, and one hidden in the first record's extensible
+  data could declare the whole directory while the first declared one
+  entry. (The review of the first version of this fix found that bypass —
+  the reader decoded every record of such a package — and a check that
+  assumed 50 instead of 46 bytes per header, which refused valid zip64
+  packages with entry names under four bytes; both fixed with tests.)
+  `zipio::read_entry` (the backup-owner lookup of `/api` backup listings)
+  is bounded by the default entry limit (10,000).
 - **`gquery -f` and `gexport` replace their output only with a complete
   one** (reviews bulkcli#10, #11). `gquery -f FILE` truncated `FILE` before
   it opened the database or parsed the query, so a mistyped database name
@@ -93,8 +103,14 @@
   quotes is a comment; the value of `root_password` is never cut. Every
   value an inline comment cuts is reported as a warning ("… is read as a
   comment (upstream gStore reads it as part of the value; quote the value
-  to keep it)"). Upstream files, which have no inline comments, parse as
-  before. New `Ini::inline_comments()`. The shipped example's header
+  to keep it)"). **Behaviour change for existing gstore-rust files:** a
+  `root_password` value followed by a note (`root_password="s3cret"  ;
+  the root password`) used to read `s3cret` and now reads the whole text,
+  as upstream reads it — it only seeds a new user store, and such a value
+  is now a startup warning that does not quote the password ("the value
+  of 'root_password' holds a '#' or ';' standing as a word of its own; all
+  of it is the value …"). Upstream files, which have no inline comments,
+  parse as before. New `Ini::inline_comments()`. The shipped example's header
   illustrates the rule with a `thread_num` line: upstream's test scripts
   take the port from the first line containing `port=`, so no comment may
   contain `port=` above `[server] port` (a first draft did, and broke every
@@ -151,7 +167,8 @@
   `tests/zip_central_directory_bound.rs` (peak resident set before a
   400,000-entry package is refused; its own binary); unit tests in
   `src/config.rs` (the shipped example keeps `port=9000` the first
-  `port=` line), `src/zipio.rs` (end-record parsing) and
+  `port=` line), `src/zipio.rs` (end-record parsing; a zip64 record the
+  reader would skip is not counted; short entry names) and
   `src/bulk/kvimage.rs` (range check). The kill test of
   `tests/dt_bulk_crash.rs` no longer depends on a 25 s wall-clock budget
   (review bulkcli#17, below).
@@ -167,7 +184,10 @@ none
     word of its own after a value starts a comment; glued markers stay in
     the value; quoted text is never a comment; `root_password` is never
     cut; each cut is a startup warning). Quote a value that must contain
-    ` # ` or ` ; ` as a word.
+    ` # ` or ` ; ` as a word. Upgrade note: a `root_password` line with a
+    note after the value (`root_password="pw"  # …`) now sets the whole
+    text, as upstream does (it seeds a new user store only; a startup
+    warning says so without quoting it) — remove such notes.
   - Precedence: command-line flag > `conf.ini` > built-in default — except
     that the environment variables `GSTORE_DISK_QUERY_MODE`,
     `GSTORE_DISK_CACHE_MB`, `GSTORE_VSTREE_ON_OPEN`, `GSTORE_ID_RECLAIM` and
@@ -245,6 +265,8 @@ none
 - `scripts/conformance.sh --no-build` (dev binaries of this branch): all
   six suites pass (basic, update, transaction, api, parser with its known
   cases 15 and 17, python 49/49).
+  Re-run in review after the two follow-up fixes (zip64 record checks,
+  `root_password` warning): all six pass again.
 
 - bulkcli#5: a hand-written zip64 package of 400,000 empty stored entries
   (36.8 MB) passed to `zipio::unpack` with the default limits:
