@@ -32,15 +32,28 @@ GSTORE_ENDPOINT=http://127.0.0.1:9000/sparql
 # GSTORE_PASSWORD=
 
 # ---- optional ----
-# GNLQA_MODE=auto            # auto | structured | graphrag | open (applies to CLI, chat, serve, mcp)
-# GNLQA_CACHE=256            # answer-cache capacity (0 disables)
-# GNLQA_CACHE_TTL_SECS=3600  # cache entry lifetime in seconds (0 = no expiry)
-# GNLQA_CACHE_MAX_BYTES=67108864  # answer-cache byte budget; answers above 1/8 of it are not cached
-# GNLQA_MAX_TOKENS=1024      # minimum completion-token budget per request (raise for reasoning models)
-# GNLQA_LINKER_MAX_LABELS=10000  # entity labels the linker indexes (in label order)
-# GNLQA_LINKER_CACHE=on          # cache the linker's label index per KB fingerprint (off = rebuild every start)
-# GNLQA_LINKER_CACHE_DIR=        # default $XDG_CACHE_HOME/gnlqa or ~/.cache/gnlqa
-# GNLQA_RETRIES=3            # retries of a transient LLM/gStore failure (429, 5xx) with back-off (0 = none)
+# Values run to the end of the line (there are no inline comments), so each
+# setting below is explained on the line above it; uncomment the setting line
+# alone.
+#
+# Answering mode for CLI, chat, serve and mcp: auto | structured | graphrag | open
+# GNLQA_MODE=auto
+# Answer-cache capacity in questions (0 disables the cache)
+# GNLQA_CACHE=256
+# Cache entry lifetime in seconds (0 = no expiry)
+# GNLQA_CACHE_TTL_SECS=3600
+# Answer-cache byte budget; answers above 1/8 of it are not cached
+# GNLQA_CACHE_MAX_BYTES=67108864
+# Minimum completion-token budget per request (raise for reasoning models)
+# GNLQA_MAX_TOKENS=1024
+# Entity labels the linker indexes (in label order)
+# GNLQA_LINKER_MAX_LABELS=10000
+# Cache the linker's label index per KB fingerprint (off = rebuild every start)
+# GNLQA_LINKER_CACHE=on
+# Where that cache lives (default $XDG_CACHE_HOME/gnlqa, else ~/.cache/gnlqa)
+# GNLQA_LINKER_CACHE_DIR=/path/to/cache/dir
+# Retries of a transient LLM/gStore failure (429, 5xx) with back-off (0 = none)
+# GNLQA_RETRIES=3
 
 # ---- gnlqa serve / mcp (HTTP authentication and per-request limits) ----
 # `gnlqa serve` refuses to start without a client token; clients send
@@ -48,8 +61,13 @@ GSTORE_ENDPOINT=http://127.0.0.1:9000/sparql
 # GNLQA_HTTP_TOKEN=
 # Explicit opt-out: answer loopback clients only, without a token (default off).
 # GNLQA_HTTP_ALLOW_UNAUTHENTICATED=off
-# GNLQA_HTTP_RATE_PER_MIN=30      # /ask + /gSolve requests per client IP per minute (0 = unlimited)
-# GNLQA_MAX_QUESTION_BYTES=4096   # longest accepted question (bytes)
-# GNLQA_MAX_LLM_CALLS=16          # LLM calls per request / MCP tool call (0 = unlimited)
-# GNLQA_MAX_KB_ROWS=200000        # KB rows per request / MCP tool call (0 = unlimited)
-# GNLQA_REQUEST_TIMEOUT_SECS=120  # wall-clock budget per request / MCP tool call (0 = none)
+# /ask + /gSolve requests per client IP per minute (0 = unlimited)
+# GNLQA_HTTP_RATE_PER_MIN=30
+# Longest accepted question (bytes)
+# GNLQA_MAX_QUESTION_BYTES=4096
+# LLM calls per request / MCP tool call (0 = unlimited)
+# GNLQA_MAX_LLM_CALLS=16
+# KB rows per request / MCP tool call (0 = unlimited)
+# GNLQA_MAX_KB_ROWS=200000
+# Wall-clock budget per request / MCP tool call in seconds (0 = none)
+# GNLQA_REQUEST_TIMEOUT_SECS=120

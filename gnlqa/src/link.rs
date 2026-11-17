@@ -426,8 +426,8 @@ pub fn kb_fingerprint(
 }
 
 /// The on-disk cache of linker label lists, one JSON file per KB
-/// fingerprint. Files are private to the user (mode 0600 in a 0700
-/// directory on Unix): the labels are KB data.
+/// fingerprint. Files are private to the user (mode 0600 on Unix, in a
+/// 0700 directory when the cache creates it): the labels are KB data.
 #[derive(Debug, Clone)]
 pub struct LinkerCache {
     dir: PathBuf,
@@ -473,13 +473,29 @@ impl LinkerCache {
     }
 
     /// The cached labels for `fingerprint`, if present, readable, current
-    /// (younger than the maximum age) and well-formed.
+    /// (younger than the maximum age), private and well-formed.
+    ///
+    /// On Unix a file that grants group or other users any access is not
+    /// trusted: [`store`](Self::store) only writes `0600` files, so such a
+    /// file was not written by this user's gnlqa (for example, it was
+    /// planted in a shared cache directory) and its labels would steer
+    /// entity linking.
     pub fn load(&self, fingerprint: &str) -> Option<LinkerLabels> {
         let path = self.path(fingerprint);
-        let age = std::fs::metadata(&path)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.elapsed().ok())?;
+        let meta = std::fs::metadata(&path).ok()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if meta.permissions().mode() & 0o077 != 0 {
+                eprintln!(
+                    "gnlqa: warning: ignoring the linker cache file {}: it is accessible to \
+                     other users (gnlqa writes these files with mode 0600)",
+                    path.display()
+                );
+                return None;
+            }
+        }
+        let age = meta.modified().ok().and_then(|t| t.elapsed().ok())?;
         if age >= self.max_age {
             return None;
         }
@@ -497,16 +513,21 @@ impl LinkerCache {
 
     /// Store `labels` under `fingerprint` (write to a temporary file, then
     /// rename, so a reader never sees a partial file).
+    ///
+    /// Directories the cache has to create are made `0700`; an existing
+    /// directory (e.g. a `GNLQA_LINKER_CACHE_DIR` shared with other data)
+    /// keeps its permissions — the cache files themselves are `0600`.
     pub fn store(&self, fingerprint: &str, labels: &LinkerLabels) -> Result<()> {
         let io =
             |e: std::io::Error| Error::Config(format!("linker cache {}: {e}", self.dir.display()));
-        std::fs::create_dir_all(&self.dir).map_err(io)?;
+        let mut mkdir = std::fs::DirBuilder::new();
+        mkdir.recursive(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700))
-                .map_err(io)?;
+            use std::os::unix::fs::DirBuilderExt;
+            mkdir.mode(0o700);
         }
+        mkdir.create(&self.dir).map_err(io)?;
         let body = serde_json::to_vec(&CachedLabels {
             format: 1,
             fingerprint: fingerprint.to_string(),
@@ -515,8 +536,12 @@ impl LinkerCache {
         let tmp = self
             .dir
             .join(format!(".linker-{fingerprint}.{}.tmp", std::process::id()));
+        // A fresh file every time (O_EXCL): a leftover temporary file, or a
+        // symlink planted in a shared directory, is removed — never followed
+        // or reused with its old permissions.
+        let _ = std::fs::remove_file(&tmp);
         let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
+        opts.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;

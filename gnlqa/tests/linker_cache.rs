@@ -222,3 +222,49 @@ fn cache_files_are_private_to_the_user() {
         assert_eq!(mode, 0o600);
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn an_existing_cache_directory_keeps_its_permissions() {
+    // review (r5-gnlqa reviewer): the cache used to chmod its directory to
+    // 0700 even when it already existed, so GNLQA_LINKER_CACHE_DIR pointing
+    // at a shared directory (or one owned by a project) silently changed
+    // its permissions. Only a directory the cache creates is made private.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new("linker-cache-existing");
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    build(&PagedKb::new(10), &LinkerCache::new(dir.path()));
+    let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o755,
+        "the cache changed an existing directory's mode"
+    );
+    for e in std::fs::read_dir(dir.path()).unwrap() {
+        let mode = e.unwrap().metadata().unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the cache file itself stays private");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_cache_file_readable_by_others_is_not_trusted() {
+    // review (r5-gnlqa reviewer): the cache only ever writes 0600 files, so
+    // a cache file that grants group/other access was not written by this
+    // user's gnlqa (e.g. planted in a shared GNLQA_LINKER_CACHE_DIR); its
+    // labels would steer entity linking, so it is rebuilt, not reused.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new("linker-cache-planted");
+    let cache = LinkerCache::new(dir.path());
+    build(&PagedKb::new(10), &cache);
+    for e in std::fs::read_dir(dir.path()).unwrap() {
+        let p = e.unwrap().path();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    let kb = PagedKb::new(10);
+    assert_eq!(build(&kb, &cache).sizes().0, 10);
+    assert_eq!(
+        kb.label_queries().len(),
+        3,
+        "a cache file other users can read or write was reused"
+    );
+}
