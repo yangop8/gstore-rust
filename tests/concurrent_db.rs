@@ -290,3 +290,120 @@ fn a_transaction_a_closure_leaves_open_on_return_stays_open() {
     c.write(|db| db.commit().unwrap());
     assert!(published(&c, "open", "txn"));
 }
+
+// ---- the incremental GC never collects what a live view reads ---------------
+
+/// A deterministic random walk of transactions (inserts and deletes over a
+/// small key pool, some of them base triples), commits, aborts, conflicts and
+/// version views opened and dropped in any order, checked against a model of
+/// the committed state at every version: each live view must see exactly its
+/// version's state on every key, however the incremental GC interleaves
+/// (review conc#2). Once nothing is pinned, the chains left are exactly the
+/// keys whose state differs from the construction-time base, one record each.
+#[test]
+fn version_views_match_a_model_under_incremental_gc() {
+    use std::collections::{BTreeSet, HashMap};
+
+    const KEYS: usize = 10;
+    const BASE_KEYS: usize = 4;
+    let data: String = (0..BASE_KEYS)
+        .map(|i| format!("<http://ex/m{i}> <http://ex/p> <http://ex/v> .\n"))
+        .collect();
+    let c = ConcurrentDb::build_from_str("model", &data).unwrap();
+    let key = |i: usize| t(&format!("m{i}"), "v");
+    let base: BTreeSet<usize> = (0..BASE_KEYS).collect();
+
+    // Committed state at each version (transactions only: version views do
+    // not track the legacy update()/write() path).
+    let mut states: HashMap<u64, BTreeSet<usize>> = HashMap::new();
+    states.insert(c.version(), base.clone());
+    let mut latest = c.version();
+
+    let mut rng: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = |n: u64| {
+        rng = rng
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (rng >> 33) % n
+    };
+
+    let mut txns: Vec<(gstore::concurrent::Txn<'_>, Vec<(usize, bool)>)> = Vec::new();
+    let mut views: Vec<gstore::concurrent::VersionView<'_>> = Vec::new();
+    for step in 0..3_000 {
+        match next(6) {
+            // Begin a transaction with 1-3 buffered writes.
+            0 | 1 if txns.len() < 4 => {
+                let mut txn = c.begin();
+                let mut ops = Vec::new();
+                for _ in 0..=next(3) {
+                    let k = next(KEYS as u64) as usize;
+                    let insert = next(2) == 0;
+                    if insert {
+                        txn.insert(key(k));
+                    } else {
+                        txn.delete(key(k));
+                    }
+                    ops.push((k, insert));
+                }
+                txns.push((txn, ops));
+            }
+            // Commit (or, one time in four, abort) an open transaction.
+            0..=2 if !txns.is_empty() => {
+                let (txn, ops) = txns.swap_remove(next(txns.len() as u64) as usize);
+                if next(4) == 0 {
+                    txn.abort();
+                } else {
+                    match txn.commit() {
+                        Ok(v) => {
+                            let mut state = states[&latest].clone();
+                            for (k, insert) in ops {
+                                if insert {
+                                    state.insert(k);
+                                } else {
+                                    state.remove(&k);
+                                }
+                            }
+                            assert!(v > latest, "step {step}");
+                            states.insert(v, state);
+                            latest = v;
+                        }
+                        Err(GStoreError::Conflict(_)) => {}
+                        Err(e) => panic!("step {step}: {e}"),
+                    }
+                }
+            }
+            // Pin a version view, or let one go.
+            3 if views.len() < 3 => views.push(c.version_view()),
+            _ if !views.is_empty() => {
+                drop(views.swap_remove(next(views.len() as u64) as usize));
+            }
+            _ => {}
+        }
+        for view in &views {
+            let expected = &states[&view.version()];
+            for k in 0..KEYS {
+                assert_eq!(
+                    view.contains(&key(k)),
+                    expected.contains(&k),
+                    "step {step}: key m{k} at pinned version {} (latest {latest})",
+                    view.version()
+                );
+            }
+        }
+    }
+    drop(views);
+    drop(txns);
+    drop(c.begin()); // one more GC with nothing pinned
+
+    let differing = states[&latest].symmetric_difference(&base).count();
+    let s = c.version_chain_stats();
+    assert_eq!(
+        (s.chains, s.records),
+        (differing, differing),
+        "only the keys whose state differs from the base keep a chain: {s:?}"
+    );
+    let view = c.version_view();
+    for k in 0..KEYS {
+        assert_eq!(view.contains(&key(k)), states[&latest].contains(&k), "m{k}");
+    }
+}
