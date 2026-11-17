@@ -540,9 +540,10 @@ pub fn baseline_problems(r: &BenchResult, t: &Thresholds) -> Vec<String> {
         v.push("a debug build of gstore-bench measured it (its phases run in-process)".to_string());
     }
     match (&r.env.git_commit, r.env.git_dirty) {
-        (None, _) | (_, None) => v.push("no git commit recorded".to_string()),
+        (None, _) => v.push("no git commit recorded".to_string()),
+        (Some(c), None) => v.push(format!("the work tree state at {c} is not recorded")),
         (Some(c), Some(true)) => v.push(format!("the work tree at {c} had uncommitted changes")),
-        _ => {}
+        (Some(_), Some(false)) => {}
     }
     if let Some(l) = r.env.loadavg {
         let max = r.env.nproc.max(1) as f64 * t.bless.max_load_per_cpu;

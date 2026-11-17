@@ -85,6 +85,11 @@ fn spoilers() -> Vec<(&'static str, Spoil, &'static str)> {
             "no git commit",
         ),
         (
+            "tree state unknown",
+            |r| r.env.git_dirty = None,
+            "work tree state at 769c627",
+        ),
+        (
             "library builder",
             |r| r.extra_workloads[0].runs[1].config.builder = "lib".into(),
             "watdiv-like:disk was built by the 'lib' builder",
