@@ -26,7 +26,8 @@
 //!
 //! A bounded history of `version → written-key-set` backs validation; entries
 //! older than the oldest live transaction's start version are garbage-collected
-//! on every commit/abort, so the history never grows unbounded.
+//! on every commit/abort (from the oldest end: the cost is the entries
+//! dropped), so the history never grows unbounded.
 //!
 //! Cost model: publishing a [`Snapshot`] of an in-memory database is O(1) in
 //! the data: the dictionary (an `Arc`'d interner), the default graph's
@@ -62,6 +63,21 @@
 //! materializes the visible state only on demand. Records below the oldest live
 //! reader's version are garbage-collected, so each chain collapses to one record
 //! per key in steady state.
+//!
+//! The version-chain GC is incremental (review conc#2, http#8): each commit
+//! queues the keys it wrote under its version, and a GC — on every commit,
+//! conflict, [`Txn`] or [`VersionView`] drop — examines only the keys of the
+//! versions the oldest live pin has passed since the previous one. Its cost
+//! is the records it can collect, not the number of chains (it used to walk
+//! every chain each time, 8 ms per commit after 20,000 transactional
+//! inserts); a transaction or view dropped with nothing to collect does no
+//! chain work. Memory: a chain whose single remaining record agrees with the
+//! base snapshot is dropped, but a key whose committed state *differs* from
+//! the construction-time base — every triple a transaction inserted, every
+//! base triple it deleted — keeps a one-record chain for the wrapper's life
+//! (the base is never re-based; `docs/REFACTOR_BACKLOG.md`).
+//! [`ConcurrentDb::version_chain_stats`] reports the chains, their records
+//! and the GC work.
 //!
 //! Scope note: the legacy `update()`/`write()` path stays snapshot-consistent for
 //! readers and records its commit version, so a [`Txn`] whose lifetime overlaps a
@@ -437,9 +453,16 @@ impl OccState {
     /// Drop history entries no live transaction can still need. A txn that
     /// started at `s` only validates versions `> s`, so anything at or below the
     /// smallest live start is unreachable; with no live txns, all of it is.
+    /// Pops from the oldest end: the cost is the entries dropped, not the
+    /// history's length (review conc#2).
     fn gc(&mut self) {
         let floor = self.gc_floor();
-        self.history.retain(|&v, _| v > floor);
+        while let Some(oldest) = self.history.first_entry() {
+            if *oldest.key() > floor {
+                break;
+            }
+            oldest.remove();
+        }
     }
 }
 
@@ -478,9 +501,22 @@ impl Chain {
 /// A per-key version-chain store shared (behind an `RwLock`) by every
 /// version-pinned reader. Maps each triple key to its [`Chain`]; readers filter
 /// by version instead of cloning the store.
+///
+/// Garbage collection is incremental (review conc#2, http#8): a record can
+/// only become collectable once the GC floor (the oldest live pin) reaches
+/// its version, so every record's key is queued under its version in
+/// `pending`, and a GC examines just the keys of the versions the floor has
+/// passed since the previous GC — each record once, whatever the number of
+/// chains. A chain left with one record that differs from the base snapshot
+/// is then not looked at again until a later commit writes its key.
 #[derive(Debug, Default)]
 struct VersionedStore {
     chains: HashMap<TripleKey, Chain>,
+    /// `version → keys a commit at that version appended a record to`, not
+    /// yet examined by a GC (the floor has not reached the version).
+    pending: BTreeMap<u64, Vec<TripleKey>>,
+    /// Work counter: chains examined by [`gc`](Self::gc) so far.
+    gc_visits: u64,
 }
 
 impl VersionedStore {
@@ -488,9 +524,11 @@ impl VersionedStore {
         VersionedStore::default()
     }
 
-    /// Append a version record for `triple`'s key at `version`.
+    /// Append a version record for `triple`'s key at `version` (queued for
+    /// the GC that the floor passing `version` runs).
     fn record(&mut self, version: u64, triple: Triple, op: ChainOp) {
         let key = triple.to_string();
+        self.pending.entry(version).or_default().push(key.clone());
         self.chains
             .entry(key)
             .or_insert_with(|| Chain {
@@ -561,27 +599,62 @@ impl VersionedStore {
     /// the `base` snapshot is then dropped from the map entirely: a read would
     /// fall back to `base` and get the same answer, so keeping the entry only
     /// grows memory without bound under a churny insert/delete workload.
+    ///
+    /// Only the chains of the `pending` versions `<= floor` are examined:
+    /// a chain whose records are all older than the last floor was already
+    /// collapsed to its anchor, and one with a record newer than `floor` is
+    /// queued under that record's version, so it is examined again when the
+    /// floor gets there (see the type docs).
     fn gc(&mut self, floor: u64, base: &Snapshot) {
-        self.chains.retain(|_key, chain| {
-            if let Some(anchor) = chain.records.iter().rposition(|r| r.version <= floor) {
-                chain.records.drain(0..anchor);
+        while let Some(oldest) = self.pending.first_entry() {
+            if *oldest.key() > floor {
+                break;
             }
-            match chain.records.as_slice() {
-                // No surviving record ⇒ nothing to observe; drop it.
-                [] => false,
-                // A single surviving record that agrees with the base snapshot is
-                // redundant (a base fallback yields the same present/absent
-                // answer) and every live reader is at/after it, so drop the entry.
-                // A base that cannot be read (an out-of-core dictionary's
-                // read error) cannot tell: keep the record.
-                [only] => base
-                    .try_contains(&chain.triple)
-                    .is_none_or(|present| (only.op == ChainOp::Insert) != present),
-                // Multiple versions are still distinguishable by live readers.
-                _ => true,
+            for key in oldest.remove() {
+                self.gc_visits += 1;
+                // Already dropped (a key queued under several versions).
+                let Some(chain) = self.chains.get_mut(&key) else {
+                    continue;
+                };
+                if let Some(anchor) = chain.records.iter().rposition(|r| r.version <= floor) {
+                    chain.records.drain(0..anchor);
+                }
+                let redundant = match chain.records.as_slice() {
+                    // No surviving record ⇒ nothing to observe; drop it.
+                    [] => true,
+                    // A single surviving record (at or below `floor`, so every
+                    // live reader is at/after it) that agrees with the base
+                    // snapshot is redundant: a base fallback yields the same
+                    // present/absent answer. A base that cannot be read (an
+                    // out-of-core dictionary's read error) cannot tell: keep
+                    // the record.
+                    [only] => base
+                        .try_contains(&chain.triple)
+                        .is_some_and(|present| (only.op == ChainOp::Insert) == present),
+                    // Multiple versions are still distinguishable by live readers.
+                    _ => false,
+                };
+                if redundant {
+                    self.chains.remove(&key);
+                }
             }
-        });
+        }
     }
+}
+
+/// The size of a [`ConcurrentDb`]'s per-key version chains and the work their
+/// garbage collection has done ([`ConcurrentDb::version_chain_stats`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VersionChainStats {
+    /// Triple keys that have a version chain: the keys a version-pinned
+    /// reader still needs to tell apart, plus every key whose committed
+    /// state differs from the construction-time base snapshot.
+    pub chains: usize,
+    /// Version records over all chains.
+    pub records: usize,
+    /// Chains the garbage collection has examined since the wrapper was
+    /// created — a work counter.
+    pub gc_visits: u64,
 }
 
 /// A thread-safe database wrapper offering concurrent snapshot-isolated reads,
@@ -815,6 +888,17 @@ impl ConcurrentDb {
     /// while holding the OCC lock, preserving the writer → occ → versioned order.
     fn gc_versions(&self, floor: u64) {
         self.versioned.write().unwrap().gc(floor, &self.base);
+    }
+
+    /// The size of the per-key version chains and the work their garbage
+    /// collection has done so far (diagnostics; see [`VersionChainStats`]).
+    pub fn version_chain_stats(&self) -> VersionChainStats {
+        let vs = self.versioned.read().unwrap();
+        VersionChainStats {
+            chains: vs.chains.len(),
+            records: vs.chains.values().map(|c| c.records.len()).sum(),
+            gc_visits: vs.gc_visits,
+        }
     }
 
     /// Number of retained history entries (used by tests to assert GC bounds).
