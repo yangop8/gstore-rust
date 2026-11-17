@@ -37,7 +37,11 @@ Fallbacks and routing layered on top:
   subgraph around the linked entities and answer from it (cited, or "I don't
   know").
 - **Multi-turn** — follow-ups are rewritten into standalone questions against the
-  conversation history.
+  conversation history. The rewrite is an LLM call, so an earlier answer is
+  only included when the current mode allows its data to leave the machine:
+  `gStore` answers (locally computed result rows) only in `graphrag` mode,
+  GraphRAG answers in every mode but `structured`, open-mode (`LLM`) answers
+  always; prior questions are always sent.
 - **Multilingual** — the answer comes back in the question's language; entity
   linking can index labels in multiple languages.
 - **Confidence & abstention** — a ranking-derived confidence; below a configurable

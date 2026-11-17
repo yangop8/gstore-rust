@@ -278,7 +278,7 @@ gAnswer 的核心是**数据驱动消歧**:为实体/谓语保留多个候选计
 - **`gStore+LLM (GraphRAG)`**:答案由 LLM 从 gStore 取回的**私域三元组**综合而来(这些三元组发给了 LLM)。
 - **`LLM`**:LLM 用自身世界知识作答,**不涉及任何 KB 数据**。
 
-CLI 打 `[provided by …]`,HTTP `/ask` 返回 `provenance` 字段,MCP `ask_kg` 附带来源。这让"用本地存储保护私域数据"的初衷有了**可观测、可审计**的边界。多轮改写:`structured` 模式下 follow-up 改写(一次 LLM 调用)会**剔除历史里的答案文本**(只带历史问题),以免把上一轮的 KB 结果值带出域。
+CLI 打 `[provided by …]`,HTTP `/ask` 返回 `provenance` 字段,MCP `ask_kg` 附带来源。这让"用本地存储保护私域数据"的初衷有了**可观测、可审计**的边界。多轮改写(review cluster-nlqa#14):follow-up 改写(一次 LLM 调用)按**当前模式**与**每条历史答案的 provenance** 决定是否把该答案发给 LLM——`gStore` 答案(本地计算的结果行)只在 `graphrag` 模式下重放(唯一按契约把 KB 数据发给 LLM 的模式;`auto` 只在 GraphRAG 兜底时出域,改写时无法预知);`GraphRAG` 答案(LLM 已见过其三元组)在除 `structured` 外的模式下重放;`LLM`(open)答案不含 KB 数据,总可重放。被扣下的答案置空,历史问题(用户自己输入)照常发送。
 
 ### 12.3 可插拔 LLM 后端(§6 技术选型的落地)
 `LlmClient` trait 之下现有两个实现:`AnthropicClient`(Claude Messages API)与 `OpenAiClient`(OpenAI 兼容 `/chat/completions`,适配 OpenAI / **DeepSeek** / Together / 本地 vLLM 等)。经 `GNLQA_LLM_PROVIDER` 选择;推荐/默认后端为 DeepSeek(OpenAI 兼容)。注意点:推理型模型(如 `deepseek-v4-pro`)会先花 completion token 做隐藏推理再产出可见答案,故 `OpenAiClient` 对 `max_tokens` 设了下限(`MIN_MAX_TOKENS`)以免答案为空。

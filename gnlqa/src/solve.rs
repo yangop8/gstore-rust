@@ -409,6 +409,12 @@ impl SolveEngine {
 
     /// Answer a follow-up given prior `(question, answer)` turns: rewrite the
     /// (possibly elliptical) question into a standalone one, then [`ask`](Self::ask).
+    ///
+    /// Data-egress: every `(question, answer)` pair in `history` is sent to the
+    /// LLM as given. A caller that keeps KB answers in it must drop the ones
+    /// the mode does not allow to leave the machine;
+    /// [`Session`](crate::session::Session) does that per answer provenance
+    /// (review cluster-nlqa#14).
     pub fn ask_followup(&self, history: &[(String, String)], question: &str) -> Result<Answer> {
         let standalone = self.rewrite_followup_question(history, question);
         self.ask(&standalone)
