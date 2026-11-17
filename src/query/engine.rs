@@ -1701,10 +1701,12 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             // One map per solution: a `[ … ]` / `( … )` node of the
             // templates is the same fresh blank node across this solution's
             // quads, and a new one for the next solution. A labelled `_:v`
-            // is fresh in the INSERT template only: in the DELETE template
-            // (where SPARQL forbids blank nodes) it names the stored node,
-            // as in the WHERE pattern and `DELETE DATA`, so `DELETE WHERE
-            // { … _:v }` deletes what it matched.
+            // is fresh in the INSERT template only. SPARQL forbids blank
+            // nodes in a DELETE template, `DELETE WHERE` and `DELETE DATA`,
+            // and the parser refuses them there (review sparqlconf#16 /
+            // parser#13), so only an operation built in code reaches this
+            // with one: in its DELETE template a labelled `_:v` names the
+            // stored node, as in the WHERE pattern.
             let mut fresh = HashMap::new();
             for (templates, out, seen, fresh_labels) in [
                 (delete, &mut dels, &mut seen_d, false),
