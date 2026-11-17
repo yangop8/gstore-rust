@@ -211,15 +211,23 @@ fn one_slow_query_of_20ms_or_more_fails() {
             vec![RetryTarget::main("snapshot", Phase::Query)]
         );
     }
-    // A sub-millisecond query slowed 4× stays under the 2 ms floor.
+    // review infra#2: this case asserted that a sub-millisecond query slowed
+    // 4× stays under the 2 ms floor, and the next one that four of them 5×
+    // slower stay out of the geomean (which covered the queries of ≥ 1 ms
+    // only) — the blindness the review found, not a property to keep. With
+    // the 0.1 ms floor a 0.2 ms query slowed 50× fails on its own …
     let mut r = result(1.0);
-    r.runs[0].queries[11].median_ms *= 4.0;
-    assert_eq!(check(&b, &r, 1.0).0, Verdict::Pass);
-    // Sub-millisecond jitter (all four of them 5× slower) stays out of the
-    // geomean, which covers the queries of ≥ 1 ms only.
+    r.runs[0].queries[11].median_ms *= 50.0;
+    let (v, o) = check(&b, &r, 1.0);
+    assert_eq!(v, Verdict::PerfFail);
+    assert!(o
+        .iter()
+        .any(|g| !g.pass && g.gate == "time.query" && g.subject == "snapshot/q12"));
+    // … while their jitter (all four sub-millisecond queries 2× slower)
+    // passes, inside a geomean that now covers every query.
     let mut r = result(1.0);
     for i in [0, 2, 10, 11] {
-        r.runs[0].queries[i].median_ms *= 5.0;
+        r.runs[0].queries[i].median_ms *= 2.0;
     }
     let (v, o) = check(&b, &r, 1.0);
     assert_eq!(v, Verdict::Pass, "{o:#?}");
@@ -227,7 +235,8 @@ fn one_slow_query_of_20ms_or_more_fails() {
         .iter()
         .find(|g| g.gate == "time.geomean" && g.subject == "snapshot")
         .unwrap();
-    assert!((g.ratio.unwrap() - 1.0).abs() < 1e-9);
+    assert!(g.detail.starts_with("geomean of 14 "), "{}", g.detail);
+    assert!(g.ratio.unwrap() > 1.1 && g.ratio.unwrap() < 1.5, "{g:?}");
 }
 
 #[test]

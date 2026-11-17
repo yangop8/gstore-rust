@@ -264,11 +264,21 @@ hashes 16 hex digits. A baseline is the same document with `"kind":
   concurrent bodies, every baseline backend and phase present.
 * **Timing**, one-sided and calibration-normalized (measured times are
   divided by the calibration ratio, clamped to [0.5, 2]): per query
-  `(m + 2 ms) / (b + 2 ms) > 3.0` fails; the per-backend geomean of the raw
-  warm medians `> 1.5` fails (it covers the queries whose baseline median is
-  ≥ 1 ms, all of them when fewer than three are: sub-millisecond jitter
-  would dominate it, and the per-query gate covers those); build `> 2.0` (`> 2.5` for disk, 100 ms floor);
-  warm open `> 2.5` (20 ms floor).
+  `(m + 0.1 ms) / (b + 0.1 ms) > 3.0` fails; the per-backend geomean over
+  **every** query of `(m + 0.05 ms) / (b + 0.05 ms)`, each ratio clamped to
+  `[1/3, 3]`, fails above `max(1.5, s)`, where `s` is the baseline run's
+  own process-to-process spread (the same geomean of each query's slowest
+  process median against its fastest, `gates::query_spread`) and the limit
+  never exceeds `max_spread` 1.6; build `> 2.0` (`> 2.5` for disk, 100 ms
+  floor); warm open `> 2.5` (20 ms floor). Until review infra#2/#4 the
+  per-query floor was 2 ms and the geomean left out queries under 1 ms, so
+  most smoke queries (0.01–0.7 ms) could regress 50–300× with CI green,
+  while the 1.5 limit sat inside the baseline's own spread (1.68 for the
+  LUBM snapshot run): `tests/smoke_gate_sensitivity.rs` pins both at the
+  smoke baseline's magnitudes.
+* **Configuration** (exact): every run is measured with the baseline run's
+  builder, warm repetitions and query processes (`exact.config`; `check`
+  takes `--reps` and `--query-procs` from the baseline unless given).
 * **Memory**: `(m + 32 MiB) / (b + 32 MiB) > 1.5` fails (build peak, after
   open, query high-water mark). **Size**: database bytes `> 1.10×` fails
   (1.25× until the Phase 6 closure; the bytes are deterministic, so the
@@ -296,9 +306,15 @@ the medians. The gates run after the update and mixed phases, so a retried
 open or query phase first rebuilds the database those phases changed (and
 a retried open must see the first attempt's term counts).
 `--self-test-slowdown X` multiplies every measured time by X: CI checks that
-the run's own result, slowed 3× and checked against itself, fails (exit 1). A uniform 1.3× slowdown passes, 1.6× fails, one query of
+the run's own result, slowed 2× and 3× and checked against itself, fails
+(exit 1). A uniform 1.3× slowdown passes, 1.6× fails, one query of
 ≥ 20 ms slowed 4× fails, and a row-hash change fails without a retry
-(`tests/gates.rs`).
+(`tests/gates.rs`); on `bench/baselines/smoke.json` itself
+(`tests/smoke_gate_sensitivity.rs`) the baseline against its own slowest
+query processes passes, any single query slowed 50× fails (also a 0.01 ms
+one), a 0.02 ms query slowed 20× fails, every sub-millisecond query
+regressed to 3 ms fails, and the canary fails at 2× in every workload's
+geomean.
 
 ## Reports and documentation tables
 

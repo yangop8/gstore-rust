@@ -8,9 +8,18 @@
 //!   (and, in the mixed workload, identical reader bodies and acknowledged
 //!   writes).
 //! * **Timing gates** (one-sided, calibration-normalized): per query
-//!   `(m+floor)/(b+floor) > 3.0` fails, the per-backend geomean of the raw
-//!   medians `> 1.5` fails (over the queries whose baseline median is at
-//!   least `min_base_ms`), build `> 2.0` (`> 2.5` for disk), warm open `> 2.5`.
+//!   `(m+0.1 ms)/(b+0.1 ms) > 3.0` fails (the floor is far below the 2 ms it
+//!   used to be, so a 0.01-0.7 ms query slowed 50x fails instead of hiding
+//!   under it, review infra#2); the per-backend geomean over every query of
+//!   `(m+0.05 ms)/(b+0.05 ms)`, each ratio clamped to `[1/3, 3]`, fails above
+//!   `max(1.5, s)` where `s` is the baseline run's own process-to-process
+//!   spread ([`query_spread`]) capped at `max_spread` (1.6), so the limit sits
+//!   outside the variance the baseline itself shows (review infra#4); build
+//!   `> 2.0` (`> 2.5` for disk), warm open `> 2.5`.
+//! * **Configuration** (exact): a run is measured with the baseline run's
+//!   builder, warm repetitions and query processes (a lib-builder build time
+//!   or a min over more processes is not the same statistic, review
+//!   infra#10).
 //! * **Memory**: `(m+32 MiB)/(b+32 MiB) > 1.5` fails (build peak, after open,
 //!   query high-water mark). **Size**: directory bytes `> 1.10` fails (sizes
 //!   are deterministic: identical data and code give identical bytes).
@@ -56,19 +65,58 @@ pub struct Ratio {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GeomeanGate {
+    /// The limit for a quiet baseline (see `max_spread`).
     pub max_ratio: f64,
+    /// Guards the ratio of a zero time.
     #[serde(default = "default_eps")]
     pub epsilon_ms: f64,
+    /// Added to both times of every ratio, `(m + floor) / (b + floor)`: a
+    /// sub-millisecond query enters the geomean with its relative jitter
+    /// damped instead of being left out (review infra#2). Each ratio is
+    /// clamped to `[1 / query.max_ratio, query.max_ratio]`, so one query
+    /// (which the per-query gate judges anyway) can neither sink the geomean
+    /// nor, much faster, hide a broad slowdown of the others.
+    #[serde(default)]
+    pub floor_ms: f64,
     /// Only queries whose baseline median is at least this long enter the
-    /// geomean (all of them when fewer than three qualify): the relative
-    /// jitter of sub-millisecond queries would dominate it, and the
-    /// per-query gate already covers them.
+    /// geomean (all of them when fewer than three qualify). 0, the default
+    /// since review infra#2: every query counts.
     #[serde(default)]
     pub min_base_ms: f64,
+    /// The limit is `max(max_ratio, s)` where `s` is the baseline run's own
+    /// process-to-process spread ([`query_spread`]), but never above
+    /// `max_spread`: the gate stays outside the variance the baseline itself
+    /// shows (review infra#4), and `bless` refuses a run whose spread exceeds
+    /// `max_spread` (a noisy machine). `None` (thresholds files written
+    /// before this field): the limit is `max_ratio`.
+    #[serde(default)]
+    pub max_spread: Option<f64>,
 }
 
 fn default_eps() -> f64 {
     0.001
+}
+
+/// What `bless` (and `ci`, of its baseline) requires of a result besides its
+/// exact self-checks (review infra#10).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BlessGate {
+    /// The 1-minute load average when the run started, per CPU, above which
+    /// the machine counts as busy.
+    #[serde(default = "default_load_per_cpu")]
+    pub max_load_per_cpu: f64,
+}
+
+fn default_load_per_cpu() -> f64 {
+    1.0
+}
+
+impl Default for BlessGate {
+    fn default() -> Self {
+        BlessGate {
+            max_load_per_cpu: default_load_per_cpu(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -97,6 +145,9 @@ pub struct Thresholds {
     pub rss: RssGate,
     pub disk_bytes: SizeGate,
     pub retries: u32,
+    /// What a baseline must satisfy (`bless`, and `ci` of its baseline).
+    #[serde(default)]
+    pub bless: BlessGate,
 }
 
 impl Default for Thresholds {
@@ -406,6 +457,56 @@ fn self_check_section(s: &Section<'_>, out: &mut Vec<GateOutcome>) {
     }
 }
 
+/// One query's geomean term: `(m + floor) / (b + floor)` (zero-guarded),
+/// clamped to `[1 / r, r]` with `r` the per-query gate's limit.
+fn clamped_ratio(t: &Thresholds, base: f64, measured: f64) -> f64 {
+    let f = t.geomean.floor_ms;
+    let eps = t.geomean.epsilon_ms;
+    let r = t.query.max_ratio.max(1.0);
+    ((measured + f).max(eps) / (base + f).max(eps)).clamp(1.0 / r, r)
+}
+
+/// The process-to-process spread of `run`'s warm query medians: per query
+/// the geomean term ([`clamped_ratio`]) of its slowest process median
+/// against its fastest (`proc_medians_ms`), and the geometric mean of those
+/// over the queries. A query measured in one process contributes 1.
+///
+/// The gate compares the minimum over the processes on both sides, so it
+/// sees less than this: the slowest process of the baseline itself against
+/// its fastest. The geomean limit is never below it (review infra#4), and
+/// `bless` refuses a run whose spread is above `geomean.max_spread`.
+pub fn query_spread(run: &BackendRun, t: &Thresholds) -> f64 {
+    if run.queries.is_empty() {
+        return 1.0;
+    }
+    let sum: f64 = run
+        .queries
+        .iter()
+        .map(|q| {
+            let p = &q.proc_medians_ms;
+            match (
+                p.iter().copied().reduce(f64::min),
+                p.iter().copied().reduce(f64::max),
+            ) {
+                (Some(lo), Some(hi)) if p.len() >= 2 => clamped_ratio(t, lo, hi).ln(),
+                _ => 0.0,
+            }
+        })
+        .sum();
+    (sum / run.queries.len() as f64).exp()
+}
+
+/// The geomean limit against baseline run `b`: `max_ratio`, raised to the
+/// baseline's own spread ([`query_spread`]) up to `max_spread`.
+pub fn geomean_limit(t: &Thresholds, b: &BackendRun) -> (f64, f64) {
+    let spread = query_spread(b, t);
+    let limit = match t.geomean.max_spread {
+        Some(cap) => t.geomean.max_ratio.max(spread.min(cap)),
+        None => t.geomean.max_ratio,
+    };
+    (limit, spread)
+}
+
 /// The calibration factor (measured machine time / baseline machine time,
 /// clamped) dividing measured times.
 fn calib_factor(
@@ -630,6 +731,41 @@ impl Ctx<'_> {
         let c = calib_factor(t, self.base, b, self.m, r);
         let norm = |x: f64| x * self.slowdown / c;
 
+        // The configuration the statistics depend on (review infra#10).
+        // Files that did not record it (reps 0) are not compared.
+        let (bc, rc) = (&b.config, &r.config);
+        if bc.reps > 0 && rc.reps > 0 {
+            let mut why = Vec::new();
+            if !bc.builder.is_empty() && !rc.builder.is_empty() && bc.builder != rc.builder {
+                why.push(format!("builder {} vs {}", rc.builder, bc.builder));
+            }
+            if bc.reps != rc.reps {
+                why.push(format!("reps {} vs {}", rc.reps, bc.reps));
+            }
+            if bc.query_procs.max(1) != rc.query_procs.max(1) {
+                why.push(format!(
+                    "query processes {} vs {}",
+                    rc.query_procs.max(1),
+                    bc.query_procs.max(1)
+                ));
+            }
+            out.push(GateOutcome::exact(
+                "exact.config",
+                subj.clone(),
+                why.is_empty(),
+                if why.is_empty() {
+                    format!(
+                        "builder {}, reps {}, query processes {} as the baseline",
+                        rc.builder,
+                        rc.reps,
+                        rc.query_procs.max(1)
+                    )
+                } else {
+                    format!("measured differently than the baseline: {}", why.join(", "))
+                },
+            ));
+        }
+
         // Queries: exact answers, then timing.
         let mut logs = Vec::new();
         for qb in &b.queries {
@@ -662,8 +798,7 @@ impl Ctx<'_> {
                 t.query.max_ratio,
                 retry(Phase::Query),
             ));
-            let eps = t.geomean.epsilon_ms;
-            logs.push((qb.median_ms, (mm.max(eps) / qb.median_ms.max(eps)).ln()));
+            logs.push((qb.median_ms, clamped_ratio(t, qb.median_ms, mm).ln()));
         }
         for qm in &r.queries {
             if b.query(&qm.name).is_none() {
@@ -689,6 +824,7 @@ impl Ctx<'_> {
         };
         if !logs.is_empty() {
             let g = (logs.iter().sum::<f64>() / logs.len() as f64).exp();
+            let (limit, spread) = geomean_limit(t, b);
             out.push(GateOutcome {
                 gate: "time.geomean".into(),
                 subject: subj.clone(),
@@ -696,9 +832,15 @@ impl Ctx<'_> {
                 base: None,
                 measured: None,
                 ratio: Some(g),
-                limit: Some(t.geomean.max_ratio),
-                pass: g <= t.geomean.max_ratio,
-                detail: format!("geomean of {} warm-median ratios", logs.len()),
+                limit: Some(limit),
+                pass: g <= limit,
+                detail: format!(
+                    "geomean of {} warm-median ratios (+{} ms, each clamped to ×{}); \
+                     the baseline's process spread {spread:.2}",
+                    logs.len(),
+                    t.geomean.floor_ms,
+                    t.query.max_ratio
+                ),
                 retry: retry(Phase::Query),
             });
         }
@@ -885,8 +1027,45 @@ mod tests {
     fn default_thresholds_parse() {
         let t = Thresholds::default();
         assert_eq!(t.query.max_ratio, 3.0);
+        assert_eq!(t.query.floor_ms, 0.1);
         assert_eq!(t.geomean.max_ratio, 1.5);
+        assert_eq!(t.geomean.floor_ms, 0.05);
+        assert_eq!(t.geomean.min_base_ms, 0.0);
+        assert_eq!(t.geomean.max_spread, Some(1.6));
         assert_eq!(t.build.max_ratio_disk, Some(2.5));
         assert_eq!(t.retries, 2);
+        assert_eq!(t.bless, BlessGate::default());
+    }
+
+    #[test]
+    fn spread_and_limit() {
+        let t = Thresholds::default();
+        let mut run = BackendRun::new("snapshot");
+        assert_eq!(query_spread(&run, &t), 1.0);
+        let q = |p: Vec<f64>| crate::schema::QueryMeasure {
+            median_ms: p.iter().copied().fold(f64::INFINITY, f64::min),
+            proc_medians_ms: p,
+            ..Default::default()
+        };
+        // (2.05/1.05) and 1 (one process): the geomean of the two.
+        run.queries = vec![q(vec![1.0, 2.0, 1.5]), q(vec![4.0])];
+        let s = query_spread(&run, &t);
+        assert!((s - (2.05f64 / 1.05).sqrt()).abs() < 1e-12, "{s}");
+        assert_eq!(geomean_limit(&t, &run).0, 1.5);
+        // A noisy baseline raises the limit, up to max_spread.
+        run.queries = vec![q(vec![1.0, 1.6])];
+        assert!((geomean_limit(&t, &run).0 - 1.65 / 1.05).abs() < 1e-12);
+        run.queries = vec![q(vec![1.0, 9.0])];
+        let s = query_spread(&run, &t);
+        assert!((s - 3.0).abs() < 1e-12, "clamped to the per-query limit: {s}");
+        assert_eq!(geomean_limit(&t, &run).0, 1.6);
+        let old = Thresholds {
+            geomean: GeomeanGate {
+                max_spread: None,
+                ..t.geomean.clone()
+            },
+            ..t.clone()
+        };
+        assert_eq!(geomean_limit(&old, &run).0, 1.5);
     }
 }
