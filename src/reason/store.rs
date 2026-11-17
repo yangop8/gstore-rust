@@ -793,16 +793,18 @@ mod tests {
         let held = RuleStore::dir(&dst).lock();
         let (tx, rx) = std::sync::mpsc::channel();
         let (m, d) = (mem.clone(), dst.clone());
-        std::thread::spawn(move || {
+        let writer = std::thread::spawn(move || {
             let _ = tx.send(write_memory_rules(&m, &d).map_err(|e| e.to_string()));
         });
         // The timeout is a hang guard only: the write answers at once.
-        let answer = rx
-            .recv_timeout(std::time::Duration::from_secs(30))
-            .expect("the write waited for the rule lock");
+        let answer = rx.recv_timeout(std::time::Duration::from_secs(30));
+        // A writer still waiting goes on now, and is done before the
+        // temporary directory is removed (also when the test fails).
+        drop(held);
+        writer.join().unwrap();
+        let answer = answer.expect("the write waited for the rule lock");
         let e = answer.expect_err("the write went ahead under a held rule lock");
         assert!(e.contains("being changed"), "{e}");
-        drop(held);
         assert_eq!(shown(&dst), rules(&["old"]));
         write_memory_rules(&mem, &dst).unwrap();
         assert_eq!(shown(&dst), rules(&["a"]));
