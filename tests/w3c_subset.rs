@@ -16,7 +16,10 @@
 //! * `query.rq` (SELECT / ASK / CONSTRUCT / DESCRIBE) or `update.ru`,
 //! * `expected.srj` (SPARQL 1.1 Query Results JSON, SELECT and ASK),
 //!   `expected.nt` (the CONSTRUCT / DESCRIBE graph) or `expected.nq` (the
-//!   whole dataset after the update, as N-Quads),
+//!   whole dataset after the update, as N-Quads) — or `expected.error`, a
+//!   negative case: the request must be rejected, as a syntax error
+//!   (`syntax`) or, for an update, by failing without changing the dataset
+//!   (`failure`; see [`run_rejected`]),
 //! * `xfail` (optional): the case exposes a known engine bug; the first line
 //!   names its review id. The run fails if an `xfail` case passes, so the
 //!   package that fixes the bug deletes the marker.
@@ -219,6 +222,19 @@ enum Answer {
     /// CONSTRUCT / DESCRIBE graph or post-update dataset: distinct quads
     /// (the graph term is `None` for the default graph).
     Quads(Vec<Row>),
+    /// `expected.error`: the request must be rejected.
+    Rejected(Rejection),
+}
+
+/// How a request with `expected.error` must be rejected (its first line).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rejection {
+    /// `syntax`: it is not SPARQL — the parser, and so every layout's
+    /// [`Database::query`], refuses it with a parse error.
+    Syntax,
+    /// `failure` (an update only): it parses, but running it fails on every
+    /// layout and executor setting, and the dataset stays as it was.
+    Failure,
 }
 
 impl Answer {
@@ -240,6 +256,10 @@ impl Answer {
                     s.push_str(&show_row(q));
                 }
                 s
+            }
+            Answer::Rejected(Rejection::Syntax) => "a syntax error".to_string(),
+            Answer::Rejected(Rejection::Failure) => {
+                "an update that fails and changes nothing".to_string()
             }
         }
     }
@@ -848,6 +868,7 @@ fn load_case(dir: &Path) -> Result<Case, String> {
         "expected.srj",
         "expected.nt",
         "expected.nq",
+        "expected.error",
         "xfail",
     ];
     for e in fs::read_dir(dir).map_err(|e| e.to_string())? {
@@ -882,11 +903,29 @@ fn load_case(dir: &Path) -> Result<Case, String> {
     {
         return Err("the query/update must cite its spec section in a '# spec: …' line".into());
     }
-    let expected_files: Vec<&str> = ["expected.srj", "expected.nt", "expected.nq"]
-        .into_iter()
-        .filter(|f| has(f))
-        .collect();
+    let expected_files: Vec<&str> = [
+        "expected.srj",
+        "expected.nt",
+        "expected.nq",
+        "expected.error",
+    ]
+    .into_iter()
+    .filter(|f| has(f))
+    .collect();
     let expected = match (&action, expected_files.as_slice()) {
+        (_, ["expected.error"]) => {
+            let kind = read("expected.error")?;
+            match (&action, kind.lines().next().unwrap_or("").trim()) {
+                (_, "syntax") => Answer::Rejected(Rejection::Syntax),
+                (Action::Update(_), "failure") => Answer::Rejected(Rejection::Failure),
+                (_, other) => {
+                    return Err(format!(
+                        "the first line of expected.error must be 'syntax' (or, for an \
+                         update, 'failure'), found {other:?}"
+                    ))
+                }
+            }
+        }
         (Action::Query(q), ["expected.srj"]) => {
             let shape = query_shape(q)?;
             let a = parse_srj(&read("expected.srj")?)?;
@@ -912,7 +951,8 @@ fn load_case(dir: &Path) -> Result<Case, String> {
         _ => {
             return Err(
                 "needs exactly one expected file: expected.srj (SELECT/ASK) or expected.nt \
-                 (CONSTRUCT/DESCRIBE) for query.rq, expected.nq for update.ru"
+                 (CONSTRUCT/DESCRIBE) for query.rq, expected.nq for update.ru, or \
+                 expected.error for a request that must be rejected"
                     .into(),
             )
         }
@@ -1141,6 +1181,94 @@ fn run_update(case: &Case, u: &str, layout: Layout, exec: Exec, data: &Path) -> 
     check(&db, "after reopening: ")
 }
 
+/// Run a case whose request must be rejected (`expected.error`): a syntax
+/// error is refused by the parser and by every layout's
+/// [`Database::query`] with a parse error; a failing update fails on a
+/// fresh database of every layout with each executor setting, without a
+/// parse error, and leaves the dataset as it was — also after the database
+/// is closed and opened again (a snapshot is saved first).
+fn run_rejected(case: &Case, kind: Rejection, data: &Path, scratch: &Path) -> Vec<Miss> {
+    let text = match &case.action {
+        Action::Query(q) => q.as_str(),
+        Action::Update(u) => u.as_str(),
+    };
+    let mut misses = Vec::new();
+    let mut miss = |layout: &'static str, exec: &'static str, why: String| {
+        misses.push(Miss { layout, exec, why });
+    };
+    let parse_error = |e: &gstore::GStoreError| matches!(e, gstore::GStoreError::SparqlParse(_));
+    if kind == Rejection::Syntax {
+        if let Ok(ast) = gstore::parser::sparql::parse(text) {
+            miss("-", "parse", format!("the parser accepted it: {ast:?}"));
+        }
+        for layout in Layout::all() {
+            let mut db = match open_layout(layout, data, scratch) {
+                Ok(db) => db,
+                Err(why) => {
+                    miss(layout.name(), "-", why);
+                    continue;
+                }
+            };
+            match db.query(text) {
+                Err(e) if parse_error(&e) => {}
+                Err(e) => miss(layout.name(), "-", format!("not a parse error: {e}")),
+                Ok(r) => miss(layout.name(), "-", format!("accepted: {r:?}")),
+            }
+        }
+        return misses;
+    }
+    for layout in Layout::all() {
+        for exec in [Exec::Full, Exec::Stream] {
+            if let Err(why) = run_failing_update(case, text, layout, exec, data) {
+                miss(layout.name(), exec.name(), why);
+            }
+        }
+    }
+    misses
+}
+
+/// One run of [`run_rejected`]'s failing update `u`.
+fn run_failing_update(
+    case: &Case,
+    u: &str,
+    layout: Layout,
+    exec: Exec,
+    data: &Path,
+) -> Result<(), String> {
+    let fresh = TempDir::new(&format!("{}_{}", case.name, exec.name()));
+    let mut db = open_layout(layout, data, fresh.path())?;
+    db.set_topk_options(exec.options());
+    let before = dataset_of(&db)?;
+    let unchanged = |db: &Database, when: &str| -> Result<(), String> {
+        let a = dataset_of(db)?;
+        answers_match(&before, &a, None).map_err(|why| {
+            format!(
+                "{when}the failed update changed the dataset: {why}\n    before: {}\n    after:  {}",
+                before.describe(),
+                a.describe()
+            )
+        })
+    };
+    match db.query(u) {
+        Err(gstore::GStoreError::SparqlParse(m)) => {
+            return Err(format!("a parse error, not a failure of the update: {m}"))
+        }
+        Err(_) => {}
+        Ok(r) => return Err(format!("the update succeeded: {r:?}")),
+    }
+    unchanged(&db, "")?;
+    let Some(dir) = layout.dir(fresh.path()) else {
+        return Ok(());
+    };
+    if layout == Layout::Snapshot {
+        db.save(&dir)
+            .map_err(|e| format!("save after the update: {e}"))?;
+    }
+    drop(db);
+    let db = open_layout(layout, data, fresh.path())?;
+    unchanged(&db, "after reopening: ")
+}
+
 /// The engine's answer as an [`Answer`].
 fn answer_of(r: QueryResult) -> Result<Answer, String> {
     match r {
@@ -1189,6 +1317,9 @@ struct Miss {
 fn run_case(case: &Case) -> Vec<Miss> {
     let scratch = TempDir::new(&case.name);
     let data = data_file(case, scratch.path());
+    if let Answer::Rejected(kind) = case.expected {
+        return run_rejected(case, kind, &data, scratch.path());
+    }
     let mut misses = Vec::new();
     for layout in Layout::all() {
         match &case.action {
@@ -1516,6 +1647,81 @@ fn a_failing_xfail_case_is_accepted() {
 }
 
 #[test]
+fn a_negative_syntax_case_passes_only_when_the_request_is_refused() {
+    let (_g, dir) = scratch_case(
+        "syntax_refused",
+        &[
+            (
+                "query.rq",
+                "# spec: SPARQL 1.1 Query §19.8\nSELECT * WHERE { ?s ?p }\n",
+            ),
+            (
+                "expected.error",
+                "syntax\nthe triple pattern has no object\n",
+            ),
+        ],
+    );
+    let case = load_case(&dir).unwrap();
+    assert_eq!(case.expected, Answer::Rejected(Rejection::Syntax));
+    assert!(run_case(&case).is_empty());
+    // A valid query marked as a syntax error misses at the parser and on
+    // every layout.
+    let (_g, dir) = scratch_case(
+        "syntax_accepted",
+        &[
+            ("data.ttl", SELF_DATA),
+            ("query.rq", SELF_QUERY),
+            ("expected.error", "syntax\n"),
+        ],
+    );
+    let case = load_case(&dir).unwrap();
+    let misses = run_case(&case);
+    assert_eq!(misses.len(), Layout::all().len() + 1, "{misses:?}");
+    assert!(verdict(&case).unwrap_err().starts_with("FAIL"));
+}
+
+#[test]
+fn a_failing_update_case_needs_a_failure_that_changes_nothing() {
+    let update =
+        |body: &str| format!("# spec: SPARQL 1.1 Update §3.2.3\nPREFIX : <http://ex/>\n{body}\n");
+    // A COPY from a graph that does not exist fails and changes nothing.
+    let (_g, dir) = scratch_case(
+        "failure_ok",
+        &[
+            ("data.ttl", SELF_DATA),
+            ("update.ru", &update("COPY :none TO :g")),
+            ("expected.error", "failure\n"),
+        ],
+    );
+    let case = load_case(&dir).unwrap();
+    assert_eq!(case.expected, Answer::Rejected(Rejection::Failure));
+    let misses = run_case(&case);
+    assert!(misses.is_empty(), "{misses:?}");
+    // An update that succeeds, one that fails after changing the dataset,
+    // and a syntax error each miss on every layout and setting.
+    for (tag, body) in [
+        ("failure_succeeds", "INSERT DATA { :x :p :y }"),
+        (
+            "failure_changes",
+            "INSERT DATA { :x :p :y } ; COPY :none TO :g",
+        ),
+        ("failure_syntax", "INSERT DATA { :x :p }"),
+    ] {
+        let (_g, dir) = scratch_case(
+            tag,
+            &[
+                ("data.ttl", SELF_DATA),
+                ("update.ru", &update(body)),
+                ("expected.error", "failure\n"),
+            ],
+        );
+        let case = load_case(&dir).unwrap();
+        let misses = run_case(&case);
+        assert_eq!(misses.len(), Layout::all().len() * 2, "{tag}: {misses:?}");
+    }
+}
+
+#[test]
 fn malformed_cases_are_rejected() {
     /// A case name, its files, and a word the rejection must contain.
     type Bad<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str);
@@ -1549,6 +1755,22 @@ fn malformed_cases_are_rejected() {
                 ("xfail", "some bug\n"),
             ],
             "review id",
+        ),
+        (
+            "query_failure",
+            &[
+                ("query.rq", "# spec: SPARQL 1.1 Query §16.3\nASK {}"),
+                ("expected.error", "failure\n"),
+            ],
+            "expected.error",
+        ),
+        (
+            "unknown_rejection",
+            &[
+                ("update.ru", "# spec: SPARQL 1.1 Update §3.1.1\nCLEAR ALL"),
+                ("expected.error", "refused\n"),
+            ],
+            "expected.error",
         ),
         (
             "stray_file",
