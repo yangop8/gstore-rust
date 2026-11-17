@@ -72,6 +72,7 @@ fn build_engine(cfg: &Config, mode: Mode, progress: bool) -> SolveEngine {
         .with_mode(mode)
         .with_cache(cfg.cache_capacity)
         .with_cache_ttl(cfg.cache_ttl_secs)
+        .with_cache_max_bytes(cfg.cache_max_bytes)
         .with_progress(progress)
         .with_linker_builder(LINKER_RETRY, move || {
             Linker::build_from_kb(

@@ -74,4 +74,6 @@ pub use repair::{solve_with_repair, RepairOutcome};
 pub use schema::{entity_has_predicate, EntitySchema, PredicateSchema, SchemaContext};
 pub use secret::Secret;
 pub use session::{rewrite_followup, Session};
-pub use solve::{best_of, score_outcome, Mode, SolveEngine};
+pub use solve::{
+    answer_bytes, best_of, score_outcome, CacheUsage, Mode, SolveEngine, DEFAULT_CACHE_MAX_BYTES,
+};

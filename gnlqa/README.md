@@ -275,7 +275,8 @@ over `http://` to a non-loopback host.
 | `GNLQA_RETRIES`      | `3`                                | retries of a transient LLM / embedding failure (429, 5xx, 529) or gStore overload (429, 502–504), with exponential back-off honouring `Retry-After` (`0` = none) |
 | `GNLQA_MODE`         | `auto`                             | answering mode: `auto`/`structured`/`graphrag`/`open` (see above); applies to CLI, chat, serve, and mcp |
 | `GNLQA_CACHE`        | `256`                              | answer-cache capacity in questions (`0` disables the cache) |
-| `GNLQA_CACHE_TTL_SECS` | `0`                              | cache entry lifetime in seconds (`0` = no expiry; set it when the KB changes under a long-running server) |
+| `GNLQA_CACHE_TTL_SECS` | `3600`                           | cache entry lifetime in seconds (`0` = no expiry); expired entries are dropped |
+| `GNLQA_CACHE_MAX_BYTES` | `67108864`                      | answer-cache byte budget (64 MiB); oldest entries are evicted beyond it, and an answer larger than an eighth of it is not cached |
 | `GNLQA_HTTP_TOKEN`   | — (required by `serve`)            | bearer token HTTP clients must send on `/ask` and `/gSolve` (redacted `Secret`) |
 | `GNLQA_HTTP_ALLOW_UNAUTHENTICATED` | `off`                | `on` = serve loopback clients without a token (refuses non-loopback binds) |
 | `GNLQA_HTTP_RATE_PER_MIN` | `30`                          | `/ask` + `/gSolve` requests per client IP per minute (`0` = unlimited) |

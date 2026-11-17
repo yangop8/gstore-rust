@@ -46,8 +46,12 @@ pub struct Config {
     pub mode: String,
     /// Answer-cache capacity in questions (`GNLQA_CACHE`; 0 disables the cache).
     pub cache_capacity: usize,
-    /// Cache entry time-to-live in seconds (`GNLQA_CACHE_TTL_SECS`; 0 = no expiry).
+    /// Cache entry time-to-live in seconds (`GNLQA_CACHE_TTL_SECS`, default
+    /// 3600; 0 = no expiry).
     pub cache_ttl_secs: u64,
+    /// Answer-cache byte budget (`GNLQA_CACHE_MAX_BYTES`, default 64 MiB); an
+    /// answer above an eighth of it is not cached.
+    pub cache_max_bytes: usize,
     /// Bearer token clients of `gnlqa serve` must present on `/ask` and
     /// `/gSolve` (`GNLQA_HTTP_TOKEN`). Without one (and without
     /// [`http_allow_unauthenticated`](Self::http_allow_unauthenticated)),
@@ -116,7 +120,11 @@ impl Config {
             timeout_secs: parse_or(get("GNLQA_TIMEOUT_SECS"), 60),
             mode: or(get("GNLQA_MODE"), "auto"),
             cache_capacity: parse_or(get("GNLQA_CACHE"), 256),
-            cache_ttl_secs: parse_or(get("GNLQA_CACHE_TTL_SECS"), 0),
+            cache_ttl_secs: parse_or(get("GNLQA_CACHE_TTL_SECS"), DEFAULT_CACHE_TTL_SECS),
+            cache_max_bytes: parse_or(
+                get("GNLQA_CACHE_MAX_BYTES"),
+                crate::solve::DEFAULT_CACHE_MAX_BYTES,
+            ),
             http_token: non_empty(get("GNLQA_HTTP_TOKEN")).map(Secret::new),
             http_allow_unauthenticated: parse_switch(get("GNLQA_HTTP_ALLOW_UNAUTHENTICATED")),
             http_rate_per_min: parse_or(
@@ -252,7 +260,8 @@ impl Default for Config {
             timeout_secs: 60,
             mode: "auto".to_string(),
             cache_capacity: 256,
-            cache_ttl_secs: 0,
+            cache_ttl_secs: DEFAULT_CACHE_TTL_SECS,
+            cache_max_bytes: crate::solve::DEFAULT_CACHE_MAX_BYTES,
             http_token: None,
             http_allow_unauthenticated: false,
             http_rate_per_min: crate::http_server::DEFAULT_REQUESTS_PER_MINUTE,
@@ -297,6 +306,11 @@ fn plain_http_remote_host(url: &str) -> Option<String> {
             .is_ok_and(|ip| ip.is_loopback());
     (!host.is_empty() && !loopback).then_some(host)
 }
+
+/// Default answer-cache entry lifetime (seconds): an hour, so a long-running
+/// server neither serves stale answers nor holds them indefinitely (review
+/// cluster-nlqa#19). `GNLQA_CACHE_TTL_SECS=0` still disables expiry.
+pub const DEFAULT_CACHE_TTL_SECS: u64 = 3600;
 
 /// Treat empty strings as absent.
 fn non_empty(v: Option<String>) -> Option<String> {
@@ -534,7 +548,10 @@ mod tests {
     fn default_has_cache_and_token_floor() {
         let c = Config::default();
         assert_eq!(c.cache_capacity, 256);
-        assert_eq!(c.cache_ttl_secs, 0);
+        // review cluster-nlqa#19: the cache now has an age limit by default
+        // (it was 0 = never expire); 0 still disables expiry explicitly.
+        assert_eq!(c.cache_ttl_secs, 3600);
+        assert_eq!(c.cache_max_bytes, 64 << 20);
         assert_eq!(c.max_tokens, 1024);
     }
 

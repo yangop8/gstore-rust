@@ -72,14 +72,53 @@ pub fn best_of(
     Ok(best.map(|(o, _)| o))
 }
 
+/// Default byte budget of the answer cache (review cluster-nlqa#19).
+pub const DEFAULT_CACHE_MAX_BYTES: usize = 64 << 20;
+
+/// Occupancy of the answer cache (see [`SolveEngine::cache_usage`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheUsage {
+    pub entries: usize,
+    /// Estimated bytes held (see [`answer_bytes`]).
+    pub bytes: usize,
+    pub max_entries: usize,
+    pub max_bytes: usize,
+}
+
+/// A rough estimate of the heap bytes an [`Answer`] keeps alive (strings plus
+/// a per-allocation overhead) — what the cache's byte bound counts.
+pub fn answer_bytes(a: &Answer) -> usize {
+    const PER_STRING: usize = 32;
+    let s = |t: &str| t.len() + PER_STRING;
+    let mut n = 256 + s(&a.text);
+    n += a.sparql.as_deref().map_or(0, s);
+    n += a.explanation.as_deref().map_or(0, s);
+    n += a.values.iter().map(|v| s(v)).sum::<usize>();
+    n += a
+        .citations
+        .iter()
+        .map(|c| s(&c.subject) + s(&c.predicate) + s(&c.object))
+        .sum::<usize>();
+    n
+}
+
 /// A small bounded answer cache (FIFO eviction). gNLQA does not mutate the KB,
 /// but the KB may change externally, so entries can carry a TTL (staleness bound)
 /// and the whole cache can be cleared (e.g. on a chat `:reset`).
+///
+/// Bounded by entry count **and** by bytes (review cluster-nlqa#19): an answer
+/// larger than an eighth of the byte budget is not cached at all, and the
+/// oldest entries are evicted while the total exceeds the budget. Expired
+/// entries are dropped, not just skipped, so they stop holding memory.
 struct Cache {
     cap: usize,
+    max_bytes: usize,
+    bytes: usize,
     /// Optional entry lifetime; `None` = no expiry (bounded only by capacity).
     ttl: Option<Duration>,
-    map: HashMap<String, (Answer, Instant)>,
+    /// key → (answer, inserted at, estimated bytes)
+    map: HashMap<String, (Answer, Instant, usize)>,
+    /// Keys in insertion order (oldest first), so expired entries are at the front.
     order: VecDeque<String>,
 }
 
@@ -87,36 +126,79 @@ impl Cache {
     fn new(cap: usize) -> Cache {
         Cache {
             cap: cap.max(1),
+            max_bytes: DEFAULT_CACHE_MAX_BYTES,
+            bytes: 0,
             ttl: None,
             map: HashMap::new(),
             order: VecDeque::new(),
         }
     }
-    fn get(&self, k: &str) -> Option<Answer> {
-        let (v, at) = self.map.get(k)?;
-        // Expired entries are treated as a miss (and refreshed on the next `put`),
-        // so a long-running server doesn't serve pre-update answers forever.
-        if let Some(ttl) = self.ttl {
-            if at.elapsed() > ttl {
-                return None;
+    fn expired(&self, at: Instant, now: Instant) -> bool {
+        self.ttl
+            .is_some_and(|ttl| now.saturating_duration_since(at) > ttl)
+    }
+    fn remove(&mut self, k: &str) {
+        if let Some((_, _, b)) = self.map.remove(k) {
+            self.bytes -= b;
+            if let Some(i) = self.order.iter().position(|o| o == k) {
+                self.order.remove(i);
             }
+        }
+    }
+    fn get(&mut self, k: &str) -> Option<Answer> {
+        self.get_at(k, Instant::now())
+    }
+    fn get_at(&mut self, k: &str, now: Instant) -> Option<Answer> {
+        let (v, at, _) = self.map.get(k)?;
+        // An expired entry is a miss and is dropped, so a long-running server
+        // neither serves pre-update answers nor keeps holding their memory.
+        if self.expired(*at, now) {
+            self.remove(k);
+            return None;
         }
         Some(v.clone())
     }
     fn put(&mut self, k: String, v: Answer) {
-        if self.map.insert(k.clone(), (v, Instant::now())).is_some() {
-            return; // already present, order unchanged (value/timestamp refreshed)
+        self.put_at(k, v, Instant::now())
+    }
+    fn put_at(&mut self, k: String, v: Answer, now: Instant) {
+        self.remove(&k); // a refresh goes to the back with its new size
+        let size = answer_bytes(&v) + k.len();
+        if size > self.max_bytes / 8 {
+            return; // too big to be worth a slot: never cached
         }
-        self.order.push_back(k);
-        while self.map.len() > self.cap {
-            if let Some(old) = self.order.pop_front() {
-                self.map.remove(&old);
+        // drop expired entries (oldest first)
+        while let Some(front) = self.order.front() {
+            match self.map.get(front) {
+                Some((_, at, _)) if self.expired(*at, now) => {
+                    let f = front.clone();
+                    self.remove(&f);
+                }
+                _ => break,
             }
+        }
+        self.bytes += size;
+        self.map.insert(k.clone(), (v, now, size));
+        self.order.push_back(k);
+        while self.map.len() > self.cap || self.bytes > self.max_bytes {
+            let Some(old) = self.order.front().cloned() else {
+                break;
+            };
+            self.remove(&old);
         }
     }
     fn clear(&mut self) {
         self.map.clear();
         self.order.clear();
+        self.bytes = 0;
+    }
+    fn usage(&self) -> CacheUsage {
+        CacheUsage {
+            entries: self.map.len(),
+            bytes: self.bytes,
+            max_entries: self.cap,
+            max_bytes: self.max_bytes,
+        }
     }
 }
 
@@ -277,6 +359,23 @@ impl SolveEngine {
     pub fn with_cache(mut self, capacity: usize) -> SolveEngine {
         self.cache = (capacity > 0).then(|| Mutex::new(Cache::new(capacity)));
         self
+    }
+
+    /// Bound the answer cache by estimated bytes (default
+    /// [`DEFAULT_CACHE_MAX_BYTES`]); an answer above an eighth of it is not
+    /// cached. Has no effect without [`with_cache`](Self::with_cache).
+    pub fn with_cache_max_bytes(self, max_bytes: usize) -> SolveEngine {
+        if let Some(c) = &self.cache {
+            c.lock().unwrap_or_else(|e| e.into_inner()).max_bytes = max_bytes.max(1);
+        }
+        self
+    }
+
+    /// The answer cache's occupancy (`None` if caching is off).
+    pub fn cache_usage(&self) -> Option<CacheUsage> {
+        self.cache
+            .as_ref()
+            .map(|c| c.lock().unwrap_or_else(|e| e.into_inner()).usage())
     }
 
     /// Give cached answers a time-to-live in seconds (0 = no expiry). Bounds
@@ -1175,5 +1274,71 @@ mod tests {
             "sub-threshold RAG must not override the abstain policy"
         );
         assert!(a.confidence < 0.7);
+    }
+
+    fn sized_answer(bytes: usize) -> Answer {
+        Answer {
+            text: "x".repeat(bytes),
+            values: Vec::new(),
+            sparql: None,
+            rounds: 0,
+            citations: Vec::new(),
+            explanation: None,
+            confidence: 1.0,
+            abstained: false,
+            provenance: Provenance::GStore,
+        }
+    }
+
+    #[test]
+    fn cache_is_bounded_by_bytes() {
+        // review cluster-nlqa#19
+        let mut c = Cache::new(1000);
+        c.max_bytes = 80_000;
+        let t = Instant::now();
+        for i in 0..50 {
+            c.put_at(format!("q{i}"), sized_answer(5_000), t);
+            assert!(c.bytes <= c.max_bytes, "bytes {} over budget", c.bytes);
+        }
+        assert!(c.map.len() < 50, "old entries were evicted");
+        assert!(c.get_at("q49", t).is_some(), "the newest survives");
+        assert!(c.get_at("q0", t).is_none(), "the oldest went first");
+        // an answer above an eighth of the budget is not cached at all
+        c.put_at("big".into(), sized_answer(20_000), t);
+        assert!(c.get_at("big", t).is_none());
+        let u = c.usage();
+        assert_eq!(u.entries, c.order.len());
+    }
+
+    #[test]
+    fn expired_entries_are_dropped_and_free_their_bytes() {
+        let mut c = Cache::new(10);
+        c.ttl = Some(Duration::from_secs(60));
+        let t0 = Instant::now();
+        c.put_at("a".into(), sized_answer(1000), t0);
+        let held = c.bytes;
+        assert!(held > 1000);
+        assert!(c.get_at("a", t0 + Duration::from_secs(59)).is_some());
+        assert!(c.get_at("a", t0 + Duration::from_secs(61)).is_none());
+        assert_eq!(c.bytes, 0, "an expired entry stops holding memory");
+        assert!(c.map.is_empty() && c.order.is_empty());
+        // a put also sweeps expired entries from the front
+        c.put_at("b".into(), sized_answer(10), t0);
+        c.put_at("c".into(), sized_answer(10), t0 + Duration::from_secs(120));
+        assert_eq!(c.map.len(), 1);
+        assert!(c.map.contains_key("c"));
+    }
+
+    #[test]
+    fn re_put_refreshes_age_and_order() {
+        let mut c = Cache::new(2);
+        let t = Instant::now();
+        c.put_at("a".into(), sized_answer(1), t);
+        c.put_at("b".into(), sized_answer(1), t);
+        c.put_at("a".into(), sized_answer(1), t); // a is now the newest
+        c.put_at("c".into(), sized_answer(1), t); // evicts b, not a
+        assert!(c.get_at("a", t).is_some());
+        assert!(c.get_at("b", t).is_none());
+        assert_eq!(c.order.len(), 2);
     }
 }
