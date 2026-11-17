@@ -327,8 +327,11 @@ pub struct Database {
     /// Stream-mode database records only its named-graph changes here: its
     /// default graph's transaction is the on-disk store's overlay.
     txn: Option<Vec<UndoOp>>,
-    /// Stream mode: [`rebuild_index`](Self::rebuild_index) was called inside a
-    /// transaction; the rebuild runs when the transaction ends.
+    /// A [`rebuild_index`](Self::rebuild_index) is owed, run by
+    /// [`run_deferred_rebuild`](Self::run_deferred_rebuild) once no
+    /// transaction is open: Stream mode, it was called inside a transaction;
+    /// any other store, the tree in use went stale (a clear of the default
+    /// graph, reasoning; see [`mark_vstree_stale`](Self::mark_vstree_stale)).
     vstree_rebuild_pending: bool,
     /// Byte-bounded LRU cache of read-query results keyed by the SPARQL
     /// string (gStore `QueryCache`; see the `query_cache` module), cleared on
@@ -1175,12 +1178,34 @@ impl Database {
         Ok(())
     }
 
-    /// Stream mode: run a [`rebuild_index`](Self::rebuild_index) deferred by
-    /// the transaction that just ended.
+    /// Run a [`rebuild_index`](Self::rebuild_index) that is owed
+    /// ([`vstree_rebuild_pending`](Self::vstree_rebuild_pending)) once no
+    /// transaction is open: at the end of the transaction, or of the
+    /// operation that made the tree stale outside one. A rebuild that fails
+    /// is logged and leaves the index unused (it is not retried).
     fn run_deferred_rebuild(&mut self) {
         if self.vstree_rebuild_pending && self.txn.is_none() {
             self.rebuild_index();
+            self.vstree_rebuild_pending = false;
         }
+    }
+
+    /// The VS-tree no longer matches the default graph (a clear, or
+    /// reasoning a disk-backed tree cannot take): stop filtering through it.
+    /// A tree that was in use on a store other than Stream mode's is then
+    /// owed a rebuild, which [`run_deferred_rebuild`](Self::run_deferred_rebuild)
+    /// runs at the end of the operation (or transaction) — so it is not
+    /// lost for the rest of the session (review db#4). Rebuilding right
+    /// after a clear costs what is left, usually nothing; a Stream-mode
+    /// `vstree.kv` is rewritten only by an explicit
+    /// [`rebuild_index`](Self::rebuild_index) or at the next open (its
+    /// rebuild takes commit points, which an operation must not take
+    /// part-way).
+    fn mark_vstree_stale(&mut self) {
+        if self.index_valid && self.store.as_disk().is_none() {
+            self.vstree_rebuild_pending = true;
+        }
+        self.index_valid = false;
     }
 
     /// Whether queries may filter through the VS-tree now: it is consistent
@@ -1648,12 +1673,17 @@ impl Database {
             // While the index is consistent, keep it consistent *incrementally*:
             // the inserted edge only changes the signatures of its subject (and
             // its object, when that is an entity), so re-sign just those entities
-            // and update their VS-tree entries in place — no full rebuild. If the
-            // index is already stale we leave it stale and rebuild lazily.
+            // and update their VS-tree entries in place — no full rebuild. A
+            // stale index stays stale here; the operation that made an
+            // in-memory tree stale rebuilds it (see `run_deferred_rebuild`).
             //
             // An out-of-core (disk-backed) tree can't be updated in place here
-            // (its nodes live in a paged file), so we instead invalidate it; the
-            // next consistent query rebuilds it in memory (or skips filtering).
+            // (its nodes live in a paged file), so we instead stop using it:
+            // queries run without the filter until `rebuild_index` rebuilds
+            // it, or a reopen rebuilds the `vstree.kv` the store's header now
+            // marks stale (Materialize mode always, Stream mode with
+            // `vstree_on_open`) — the non-incremental paged tree, PHASE6_PLAN
+            // §8 D6 (review db#4).
             if self.index_valid {
                 if self.vstree.is_disk_backed() {
                     self.index_valid = false;
@@ -2596,21 +2626,88 @@ impl Database {
 
     /// Materialize the RDFS closure over the current data (gStore `src/Reason`):
     /// subclass/subproperty transitivity, type propagation, and domain/range
-    /// typing. Returns the number of inferred triples added; the VS-tree is
-    /// invalidated (and rebuilt lazily on save / next consistent query).
+    /// typing. Returns the number of inferred triples added. An in-memory
+    /// VS-tree takes them as it takes inserts; a disk-backed one is rebuilt
+    /// in memory at the end of the run (Stream mode: by
+    /// [`rebuild_index`](Self::rebuild_index) or at the next open).
+    ///
+    /// A read error of the store (Stream mode, RocksDB) ends the run early
+    /// and is only logged, so the closure may be incomplete:
+    /// [`try_materialize_rdfs`](Self::try_materialize_rdfs) reports it.
     pub fn materialize_rdfs(&mut self) -> usize {
-        let added =
-            self.infer(|dict, store, insert| crate::reason::materialize_with(dict, store, insert));
-        self.record_inferred(added)
+        let (n, error) = self.materialize_rdfs_scoped();
+        if let Some(e) = error {
+            crate::gs_warn!("materializing the RDFS closure of '{}': {e}", self.name);
+        }
+        n
+    }
+
+    /// [`materialize_rdfs`](Self::materialize_rdfs), reporting a read error
+    /// of the store (contract C2; review design#7): the run reads inside a
+    /// [`ReadScope`], and an error recorded there fails it. The triples
+    /// inferred before the failure stay inserted — each is entailed by the
+    /// data, so the store stays sound, only its closure incomplete — and a
+    /// later run, once the store reads cleanly, completes it.
+    pub fn try_materialize_rdfs(&mut self) -> Result<usize> {
+        match self.materialize_rdfs_scoped() {
+            (n, None) => Ok(n),
+            (_, Some(e)) => Err(e),
+        }
+    }
+
+    /// The RDFS run of [`materialize_rdfs`](Self::materialize_rdfs): the
+    /// number of triples inferred, and the read error that ended it early.
+    fn materialize_rdfs_scoped(&mut self) -> (usize, Option<GStoreError>) {
+        self.infer_scoped("materializing the RDFS closure", |dict, store, insert| {
+            crate::reason::materialize_with(dict, store, insert)
+        })
+    }
+
+    /// Run reasoner `run` ([`infer`](Self::infer)) and record what it
+    /// inferred ([`record_inferred`](Self::record_inferred)) inside a
+    /// [`ReadScope`], then run a VS-tree rebuild that is owed. Returns how
+    /// many triples were inferred, and the read error the scope recorded
+    /// (`what` names the run in it), which ended the run early: a backend
+    /// answers a failed read as "nothing there".
+    fn infer_scoped<R>(&mut self, what: &str, run: R) -> (usize, Option<GStoreError>)
+    where
+        R: FnOnce(
+            &mut Dictionary,
+            &mut Backend,
+            &mut dyn FnMut(&Dictionary, &mut Backend, IdTriple) -> bool,
+        ) -> Vec<IdTriple>,
+    {
+        let scope = ReadScope::enter();
+        let added = self.infer(run);
+        let n = self.record_inferred(added);
+        let error = scope.take_error();
+        drop(scope);
+        if error.is_some() && n > 0 {
+            // A fold into the VS-tree that read nothing would leave a
+            // signature short of its edges: rebuild before filtering again.
+            self.mark_vstree_stale();
+        }
+        self.run_deferred_rebuild();
+        (n, error.map(|e| read_failure(what, e)))
     }
 
     /// Book-keeping after reasoning inserted `added` into the default graph:
-    /// invalidate the index and cache, log them for rollback, and write them
-    /// through (on-disk). Returns how many there were.
+    /// the VS-tree (an in-memory tree takes them as it takes inserts, a
+    /// disk-backed one is owed a rebuild — review db#4), the caches, the
+    /// undo log for rollback, the redo log and the write-through (on-disk).
+    /// Returns how many there were.
     fn record_inferred(&mut self, added: Vec<IdTriple>) -> usize {
         let n = added.len();
         if n > 0 {
-            self.index_valid = false;
+            if self.index_valid && !self.vstree.is_disk_backed() {
+                // Every inferred triple is in the store already: each fold
+                // re-signs from it or ORs the edge in, a sound superset.
+                for &t in &added {
+                    self.vstree_index_insert(t);
+                }
+            } else {
+                self.mark_vstree_stale();
+            }
             self.touched();
             // Record inferred triples so reasoning inside a transaction rolls
             // back (Stream mode: they are in the store's overlay).
@@ -3374,7 +3471,10 @@ impl Database {
                 }
                 gone
             };
-            self.index_valid = false;
+            // Every entry of the tree is a phantom now: rebuilt from what is
+            // left (usually nothing) at the end of this clear, or of the
+            // open transaction (review db#4).
+            self.mark_vstree_stale();
             self.touched();
             if gone.len() == total {
                 self.record_redo_clear(RedoClear::Default);
@@ -3388,6 +3488,7 @@ impl Database {
             for &t in &gone {
                 self.note_removed(None, t);
             }
+            self.run_deferred_rebuild();
         }
         Ok(n)
     }
@@ -3408,8 +3509,10 @@ impl Database {
         };
         let result = dt.remove_many(removed.iter().copied());
         // Whatever happened, the tree may name deleted edges: rebuild before
-        // filtering through it again (as for the other layouts).
-        self.index_valid = false;
+        // filtering through it again (as for the other layouts). The
+        // Stream-mode `vstree.kv` is rewritten by `rebuild_index` or at the
+        // next open only (see `mark_vstree_stale`).
+        self.mark_vstree_stale();
         let n = match result {
             Ok(n) => n as usize,
             Err(e) => {
@@ -4608,11 +4711,36 @@ impl Database {
     /// updating each rule's effect count. Returns the number of triples inferred;
     /// inferred triples are recorded for transaction rollback like
     /// [`materialize_rdfs`](Self::materialize_rdfs).
+    ///
+    /// A read error of the store (Stream mode, RocksDB) ends the run early
+    /// and is only logged: [`try_run_rules`](Self::try_run_rules) reports it.
     pub fn run_rules(&mut self) -> usize {
+        let (n, error) = self.run_rules_scoped();
+        if let Some(e) = error {
+            crate::gs_warn!("running the reasoning rules of '{}': {e}", self.name);
+        }
+        n
+    }
+
+    /// [`run_rules`](Self::run_rules), reporting a read error of the store
+    /// as [`try_materialize_rdfs`](Self::try_materialize_rdfs) does (review
+    /// design#7); the triples inferred before it stay inserted.
+    pub fn try_run_rules(&mut self) -> Result<usize> {
+        match self.run_rules_scoped() {
+            (n, None) => Ok(n),
+            (_, Some(e)) => Err(e),
+        }
+    }
+
+    /// The run of [`run_rules`](Self::run_rules): the number of triples
+    /// inferred, and the read error that ended it early.
+    fn run_rules_scoped(&mut self) -> (usize, Option<GStoreError>) {
         let mut rules = std::mem::take(&mut self.rules);
-        let added = self.infer(|dict, store, insert| rules.apply_with(dict, store, insert));
+        let out = self.infer_scoped("running the reasoning rules", |dict, store, insert| {
+            rules.apply_with(dict, store, insert)
+        });
         self.rules = rules;
-        self.record_inferred(added)
+        out
     }
 
     // ---- upstream reasoning rules (`reasonManage`) --------------------------
@@ -4830,6 +4958,10 @@ impl Database {
         )?;
         let mut seen = HashSet::new();
         let mut derived: Vec<(String, bool, Triple)> = Vec::new();
+        // Whether each derived triple existed is read in a read scope (C2;
+        // review design#7): a store that fails a read must fail the run
+        // before the ledger records a wrong answer.
+        let scope = ReadScope::enter();
         for (g, t) in &ins {
             if g.is_some() {
                 continue;
@@ -4840,6 +4972,10 @@ impl Database {
                 derived.push((line, existed, t.clone()));
             }
         }
+        if let Some(e) = scope.take_error() {
+            return Err(read_failure("checking which derived triples exist", e));
+        }
+        drop(scope);
         let lines: Vec<(String, bool)> = derived.iter().map(|(l, e, _)| (l.clone(), *e)).collect();
         record(&lines).map_err(GStoreError::Database)?;
         let ground = ins
@@ -4857,11 +4993,24 @@ impl Database {
             Ok(_) => Ok(0),
             Err(e) => Err(e.to_string()),
         };
-        let inserted = derived
+        // Which of them the insert added, in a read scope: when a read
+        // fails, every derived triple that did not exist is reported, so
+        // the rule owns (and its disable retracts) all it may have added —
+        // one it did not add is simply absent then.
+        let scope = ReadScope::enter();
+        let mut inserted: Vec<String> = derived
             .iter()
             .filter(|(_, existed, t)| !existed && self.contains_triple(t))
             .map(|(line, _, _)| line.clone())
             .collect();
+        if scope.take_error().is_some() {
+            inserted = derived
+                .iter()
+                .filter(|(_, existed, _)| !existed)
+                .map(|(line, _, _)| line.clone())
+                .collect();
+        }
+        drop(scope);
         Ok(InferReport {
             derived: lines,
             inserted,

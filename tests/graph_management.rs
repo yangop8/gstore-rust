@@ -11,6 +11,12 @@
 //!   enforced (parser#13).
 //! * COPY / MOVE / ADD copy triples by id instead of re-interning their
 //!   terms (db#16).
+//! * The library inference entry points report a store read error through
+//!   `try_materialize_rdfs` / `try_run_rules` instead of inferring less
+//!   (design#7).
+//! * The in-memory VS-tree is rebuilt after a clear of the default graph and
+//!   after reasoning, instead of staying unused for the rest of the session
+//!   (db#4).
 //!
 //! The W3C-style cases of `tests/w3c/update-graph-management/` and
 //! `tests/w3c/grammar/` check the same rules against the specification text.
@@ -471,6 +477,191 @@ fn a_labelled_blank_node_in_a_where_pattern_stays_a_constant() {
         col0(&mut db, "SELECT ?o WHERE { _:b <http://ex/p> ?o }"),
         vec!["\"x\""]
     );
+}
+
+// ---- db#4: the in-memory VS-tree comes back ---------------------------------
+
+/// A dataset whose queries the VS-tree prunes: every `:e<i>` has a `:kind`
+/// and a `:v`; `:t` holds the RDFS schema.
+fn vs_data() -> String {
+    let mut s = String::from(
+        "@prefix : <http://ex/> .\n\
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n\
+         :C rdfs:subClassOf :D .\n\
+         :g1 { :n0 :kind :k0 . :n1 :kind :k1 . }\n",
+    );
+    for i in 0..60 {
+        s.push_str(&format!(":e{i} :kind :k{} ; :v {i} ; a :C .\n", i % 3));
+    }
+    s
+}
+
+const KIND0: &str = "SELECT ?s WHERE { ?s <http://ex/kind> <http://ex/k0> . ?s <http://ex/v> ?v }";
+
+#[test]
+fn the_in_memory_vstree_is_rebuilt_after_clears_copies_moves_and_reasoning() {
+    #[allow(unused_mut)]
+    let mut layouts = vec![Layout::Memory, Layout::Snapshot, Layout::DiskMaterialize];
+    #[cfg(feature = "rocksdb")]
+    layouts.push(Layout::RocksDb);
+    for layout in layouts {
+        let tmp = TmpDir::new("vstree");
+        let data = tmp.write("data.trig", &vs_data());
+        let mut db = open_with(layout, &data, &tmp, true);
+        assert!(db.stats().index_valid, "{layout:?}: built with a tree");
+        let k0 = col0(&mut db, KIND0);
+        assert_eq!(k0.len(), 20, "{layout:?}");
+
+        let step = |db: &mut Database, u: &str, expect: &[String]| {
+            changed(db.query(u)).unwrap_or_else(|e| panic!("{layout:?} {u}: {e}"));
+            assert!(
+                db.stats().index_valid,
+                "{layout:?} after {u}: tree not in use"
+            );
+            assert_eq!(col0(db, KIND0), expect, "{layout:?} after {u}");
+        };
+        // COPY DEFAULT away and back: the clear rebuilds an empty tree, the
+        // copy's inserts are folded into it.
+        step(&mut db, "COPY DEFAULT TO <http://ex/saved>", &k0);
+        step(&mut db, "CLEAR DEFAULT", &[]);
+        step(&mut db, "COPY <http://ex/saved> TO DEFAULT", &k0);
+        step(&mut db, "MOVE DEFAULT TO <http://ex/moved>", &[]);
+        step(&mut db, "MOVE <http://ex/moved> TO DEFAULT", &k0);
+        step(&mut db, "DROP DEFAULT", &[]);
+        step(
+            &mut db,
+            "INSERT DATA { <http://ex/z> <http://ex/kind> <http://ex/k0> ; <http://ex/v> 1 }",
+            &["<http://ex/z>".to_string()],
+        );
+        // Inside a transaction the rebuild waits for its end; a rollback
+        // brings the old graph and a valid tree back.
+        db.begin().unwrap();
+        changed(db.query("CLEAR DEFAULT")).unwrap();
+        db.rollback().unwrap();
+        assert!(db.stats().index_valid, "{layout:?} after a rollback");
+        assert_eq!(col0(&mut db, KIND0), vec!["<http://ex/z>"], "{layout:?}");
+        db.begin().unwrap();
+        changed(db.query("CLEAR DEFAULT")).unwrap();
+        changed(db.query("COPY <http://ex/saved> TO DEFAULT")).unwrap();
+        db.commit().unwrap();
+        assert!(db.stats().index_valid, "{layout:?} after a commit");
+        assert_eq!(col0(&mut db, KIND0), k0, "{layout:?}");
+        assert_eq!(db.vs_shrink_debt(), 0, "{layout:?}: the tree was rebuilt");
+        step(&mut db, "DROP ALL", &[]);
+    }
+}
+
+#[test]
+fn reasoning_keeps_the_in_memory_vstree_in_use() {
+    #[allow(unused_mut)]
+    let mut layouts = vec![Layout::Memory, Layout::Snapshot, Layout::DiskMaterialize];
+    #[cfg(feature = "rocksdb")]
+    layouts.push(Layout::RocksDb);
+    let typed_d = "SELECT ?s WHERE { ?s <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> \
+                   <http://ex/D> . ?s <http://ex/kind> <http://ex/k1> }";
+    let knows = "SELECT ?s WHERE { ?s <http://ex/knows> <http://ex/e0> . ?s <http://ex/v> ?v }";
+    for layout in layouts {
+        let tmp = TmpDir::new("vsinfer");
+        let data = tmp.write("data.trig", &vs_data());
+        let mut db = open_with(layout, &data, &tmp, true);
+        assert!(col0(&mut db, typed_d).is_empty());
+        assert_eq!(db.try_materialize_rdfs().unwrap(), 60, "{layout:?}");
+        assert!(db.stats().index_valid, "{layout:?}: tree unused after RDFS");
+        assert_eq!(col0(&mut db, typed_d).len(), 20, "{layout:?}");
+        db.add_rule(
+            "link",
+            "?x <http://ex/kind> <http://ex/k2> => ?x <http://ex/knows> <http://ex/e0>",
+        )
+        .unwrap();
+        assert_eq!(db.try_run_rules().unwrap(), 20, "{layout:?}");
+        assert!(
+            db.stats().index_valid,
+            "{layout:?}: tree unused after rules"
+        );
+        assert_eq!(col0(&mut db, knows).len(), 20, "{layout:?}");
+    }
+}
+
+// ---- design#7: inference reports store read errors ---------------------------
+
+const RDFS: &str = "<http://ex/a> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://ex/C> .
+<http://ex/C> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://ex/D> .
+<http://ex/a> <http://ex/knows> <http://ex/b> .
+";
+
+const SYMMETRIC: &str = "?x <http://ex/knows> ?y => ?y <http://ex/knows> ?x";
+
+/// Overwrite the root page of the tree in header slot `slot` of `kvstore.kv`
+/// with garbage (as `tests/dt_overlay.rs` does): every read of that tree
+/// fails.
+fn corrupt_root(path: &Path, slot: usize) {
+    let mut bytes = fs::read(path).unwrap();
+    let off = 16 + slot * 8;
+    let page = u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap()) as usize;
+    assert!(page > 0, "the tree has a root page");
+    bytes[page * 4096..(page + 1) * 4096].fill(0xFF);
+    fs::write(path, bytes).unwrap();
+}
+
+#[test]
+fn stream_mode_inference_reports_a_read_error() {
+    const POS: usize = 1; // header slot of the POS tree
+    let tmp = TmpDir::new("infer_stream");
+    let data = tmp.write("rdfs.nt", RDFS);
+    let stream = OpenOptions::new().with_disk_query_mode(DiskQueryMode::Stream);
+    // A healthy store infers.
+    let healthy = tmp.path("healthy");
+    Database::build_disk(&healthy, &[&data]).unwrap();
+    {
+        let mut db = Database::open_with(&healthy, &stream).unwrap();
+        assert_eq!(db.try_materialize_rdfs().unwrap(), 1);
+        db.add_rule("sym", SYMMETRIC).unwrap();
+        assert_eq!(db.try_run_rules().unwrap(), 1);
+    }
+    // A store whose POS tree cannot be read fails the run instead of
+    // inferring nothing.
+    let broken = tmp.path("broken");
+    Database::build_disk(&broken, &[&data]).unwrap();
+    corrupt_root(&broken.join("kvstore.kv"), POS);
+    let mut db = Database::open_with(&broken, &stream).unwrap();
+    let e = db.try_materialize_rdfs().unwrap_err();
+    assert!(
+        e.to_string()
+            .contains("a read from the store failed while materializing the RDFS closure"),
+        "{e}"
+    );
+    assert_eq!(e.kind(), gstore::error::ErrorKind::Storage, "{e}");
+    db.add_rule("sym", SYMMETRIC).unwrap();
+    let e = db.try_run_rules().unwrap_err();
+    assert!(
+        e.to_string()
+            .contains("a read from the store failed while running the reasoning rules"),
+        "{e}"
+    );
+    // The old entry points keep their signatures (the error is logged).
+    let _: usize = db.materialize_rdfs();
+    let _: usize = db.run_rules();
+}
+
+#[cfg(feature = "rocksdb")]
+#[test]
+fn rocksdb_inference_reports_a_read_error() {
+    let tmp = TmpDir::new("infer_rocks");
+    let dir = tmp.path("r.db");
+    drop(Database::build_rocksdb_from_str("r", &dir, RDFS).unwrap());
+    let mut db = Database::open(&dir).unwrap();
+    db.add_rule("sym", SYMMETRIC).unwrap();
+    db.backend().as_rocks().unwrap().debug_fail_reads(true);
+    let e = db.try_materialize_rdfs().unwrap_err();
+    assert!(
+        e.to_string().contains("materializing the RDFS closure"),
+        "{e}"
+    );
+    let e = db.try_run_rules().unwrap_err();
+    assert!(e.to_string().contains("running the reasoning rules"), "{e}");
+    db.backend().as_rocks().unwrap().debug_fail_reads(false);
+    assert_eq!(db.try_materialize_rdfs().unwrap(), 1);
+    assert_eq!(db.try_run_rules().unwrap(), 1);
 }
 
 // ---- db#16: COPY / MOVE / ADD by id -------------------------------------------
