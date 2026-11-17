@@ -1,0 +1,7 @@
+{
+  "head": {"vars": ["a", "b", "c", "d", "e", "f"]},
+  "results": {"bindings": [
+    {"a": {"type": "literal", "value": "true", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"},
+     "d": {"type": "literal", "value": "axc", "xml:lang": "en"}}
+  ]}
+}

@@ -1,0 +1,8 @@
+# spec: SPARQL 1.1 Query §17.4.6 Hash Functions: MD5 / SHA1 / SHA256 take a simple literal or
+# xsd:string and return the lowercase hex digest (MD5("abc") is
+# 900150983cd24fb0d6963f7d28e17f72, RFC 1321 A.5); a language-tagged literal, a number or an
+# IRI is an error (review sparqlconf#17)
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT (MD5("abc") AS ?a) (MD5("abc"^^xsd:string) AS ?b) (SHA1("abc"@en) AS ?c)
+       (SHA256(<http://example.org/a>) AS ?d) (MD5(12) AS ?e)
+WHERE {}

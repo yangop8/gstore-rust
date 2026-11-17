@@ -1,0 +1,10 @@
+{
+  "head": {"vars": ["a", "b", "c", "d", "e", "f", "g", "h"]},
+  "results": {"bindings": [
+    {"a": {"type": "literal", "value": "true", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"},
+     "b": {"type": "literal", "value": "true", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"},
+     "e": {"type": "literal", "value": "true", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"},
+     "g": {"type": "literal", "value": "c", "xml:lang": "en"},
+     "h": {"type": "literal", "value": "true", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"}}
+  ]}
+}

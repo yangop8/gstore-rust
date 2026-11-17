@@ -1,0 +1,5 @@
+# spec: SPARQL 1.1 Query §17.4.3.2 STRLEN (a string literal argument) and §17.2 Filter
+# Evaluation: STRLEN of the integer 30 or of an IRI is an error, so the FILTER drops those
+# rows; only the two-character string passes (review sparqlconf#17: 30 passed too)
+PREFIX : <http://example.org/>
+SELECT ?s WHERE { ?s :v ?v FILTER(STRLEN(?v) = 2) }

@@ -5208,9 +5208,13 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 },
                 lang: None,
             }),
+            // The string functions take string literals (simple,
+            // xsd:string or language-tagged) where §17.4.3 says so — an IRI,
+            // a number or another typed literal is an error (review
+            // sparqlconf#17; see `string_literal`).
             "STRLEN" => {
-                let v = self.eval_value(args.first()?, b, l)?;
-                Some(Value::Int(v.lexical().chars().count() as i64))
+                let (s, _) = string_literal(self.eval_value(args.first()?, b, l)?)?;
+                Some(Value::Int(s.chars().count() as i64))
             }
             "UCASE" => self.str1(args, b, l, |s| s.to_uppercase()),
             "LCASE" => self.str1(args, b, l, |s| s.to_lowercase()),
@@ -5281,7 +5285,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 let mut out = String::new();
                 let mut common: Option<Option<String>> = None;
                 for a in args {
-                    let (s, lang) = str_and_lang(&self.eval_value(a, b, l)?);
+                    let (s, lang) = string_literal(self.eval_value(a, b, l)?)?;
                     out.push_str(&s);
                     common = match common {
                         None => Some(lang),
@@ -5303,11 +5307,13 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             // XPath fn:matches: the s / m / i / x / q flags, any other flag
             // an error; the pattern compiled once per query (review
             // query#11, sparqlconf#8; see `xpath_regex`).
+            // §17.4.3.14: the text a string literal, the pattern and the
+            // flags simple literals (review sparqlconf#17).
             "REGEX" => {
-                let text = self.eval_value(args.first()?, b, l)?.lexical();
-                let pat = self.eval_value(args.get(1)?, b, l)?.lexical();
+                let (text, _) = string_literal(self.eval_value(args.first()?, b, l)?)?;
+                let pat = simple_literal(self.eval_value(args.get(1)?, b, l)?)?;
                 let flags = match args.get(2) {
-                    Some(a) => self.eval_value(a, b, l)?.lexical(),
+                    Some(a) => simple_literal(self.eval_value(a, b, l)?)?,
                     None => String::new(),
                 };
                 let re = self.ctx.regex(&pat, &flags)?;
@@ -5316,8 +5322,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
 
             // ---- strings (SPARQL 1.1) ------------------------------------
             "SUBSTR" => {
-                let src = self.eval_value(args.first()?, b, l)?;
-                let (s, lang) = str_and_lang(&src);
+                let (s, lang) = string_literal(self.eval_value(args.first()?, b, l)?)?;
                 let chars: Vec<char> = s.chars().collect();
                 let total = chars.len() as i64;
                 let start = self.eval_value(args.get(1)?, b, l)?.as_f64()?.round() as i64;
@@ -5344,13 +5349,15 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             // `$N` / `\$` / `\\` syntax (`$1x` is group 1 then "x"), and a
             // pattern matching the empty string is an error (review
             // query#11, sparqlconf#8; see `xpath_regex`).
+            // §17.4.3.15: the input a string literal, the pattern, the
+            // replacement and the flags simple literals (review
+            // sparqlconf#17).
             "REPLACE" => {
-                let src = self.eval_value(args.first()?, b, l)?;
-                let (text, lang) = str_and_lang(&src);
-                let pat = self.eval_value(args.get(1)?, b, l)?.lexical();
-                let rep = self.eval_value(args.get(2)?, b, l)?.lexical();
+                let (text, lang) = string_literal(self.eval_value(args.first()?, b, l)?)?;
+                let pat = simple_literal(self.eval_value(args.get(1)?, b, l)?)?;
+                let rep = simple_literal(self.eval_value(args.get(2)?, b, l)?)?;
                 let flags = match args.get(3) {
-                    Some(a) => self.eval_value(a, b, l)?.lexical(),
+                    Some(a) => simple_literal(self.eval_value(a, b, l)?)?,
                     None => String::new(),
                 };
                 let re = self.ctx.regex(&pat, &flags)?;
@@ -5374,9 +5381,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     lang: None,
                 })
             }
+            // §17.4.2.11: both arguments simple literals — `STRLANG("a"@fr,
+            // "en")` is an error, not a retagging (review sparqlconf#17).
             "STRLANG" => {
-                let s = self.eval_value(args.first()?, b, l)?.lexical();
-                let lang = self.eval_value(args.get(1)?, b, l)?.lexical();
+                let s = simple_literal(self.eval_value(args.first()?, b, l)?)?;
+                let lang = simple_literal(self.eval_value(args.get(1)?, b, l)?)?;
                 // A language tag by the shared LANGTAG rule, else an error:
                 // `STRLANG("x", "en> bad")` or `STRLANG("x", "")` would
                 // store a literal no reader reads back (review sparqlconf#11).
@@ -6170,7 +6179,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         Some(Value::Int(f(&p)))
     }
 
-    /// Hash an argument's lexical form to a lowercase-hex string literal.
+    /// Hash a simple literal (or xsd:string) to a lowercase-hex string
+    /// literal; anything else — a language-tagged literal, a number, an IRI
+    /// — is an error (§17.4.6, review sparqlconf#17).
     fn hash1(
         &self,
         args: &[Expr],
@@ -6178,7 +6189,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         l: &VarLayout,
         f: impl Fn(&str) -> String,
     ) -> Option<Value> {
-        let s = self.eval_value(args.first()?, b, l)?.lexical();
+        let s = simple_literal(self.eval_value(args.first()?, b, l)?)?;
         Some(Value::Str {
             value: f(&s),
             lang: None,
@@ -6186,7 +6197,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     }
 
     /// `UCASE` / `LCASE`: map the lexical form, keeping a language tag
-    /// (§17.4.3.5-6: `UCASE("foo"@en)` is `"FOO"@en`).
+    /// (§17.4.3.5-6: `UCASE("foo"@en)` is `"FOO"@en`); the argument must
+    /// be a string literal (review sparqlconf#17).
     fn str1(
         &self,
         args: &[Expr],
@@ -6194,17 +6206,21 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         l: &VarLayout,
         f: impl Fn(&str) -> String,
     ) -> Option<Value> {
-        let (s, lang) = str_and_lang(&self.eval_value(args.first()?, b, l)?);
+        let (s, lang) = string_literal(self.eval_value(args.first()?, b, l)?)?;
         Some(Value::Str { value: f(&s), lang })
     }
 
     /// `STRBEFORE` / `STRAFTER` (§17.4.3.7-8): the part of the first
     /// argument before / after the first occurrence of the second, with the
     /// first argument's language tag; no occurrence gives the empty simple
-    /// literal.
+    /// literal. Both must be string literals, argument-compatible
+    /// (§17.4.3.1.2, review sparqlconf#17).
     fn str_split(&self, args: &[Expr], b: &Binding, l: &VarLayout, before: bool) -> Option<Value> {
-        let (a, lang) = str_and_lang(&self.eval_value(args.first()?, b, l)?);
-        let c = self.eval_value(args.get(1)?, b, l)?.lexical();
+        let (a, lang) = string_literal(self.eval_value(args.first()?, b, l)?)?;
+        let (c, c_lang) = string_literal(self.eval_value(args.get(1)?, b, l)?)?;
+        if !argument_compatible(lang.as_deref(), c_lang.as_deref()) {
+            return None;
+        }
         Some(match a.split_once(&c) {
             Some((head, tail)) => Value::Str {
                 value: if before { head } else { tail }.to_string(),
@@ -6217,6 +6233,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         })
     }
 
+    /// `CONTAINS` / `STRSTARTS` / `STRENDS` (§17.4.3.9-11): two
+    /// argument-compatible string literals (§17.4.3.1.2), else an error
+    /// (review sparqlconf#17).
     fn str2_bool(
         &self,
         args: &[Expr],
@@ -6224,8 +6243,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         l: &VarLayout,
         f: impl Fn(String, String) -> bool,
     ) -> Option<Value> {
-        let a = self.eval_value(args.first()?, b, l)?.lexical();
-        let c = self.eval_value(args.get(1)?, b, l)?.lexical();
+        let (a, a_lang) = string_literal(self.eval_value(args.first()?, b, l)?)?;
+        let (c, c_lang) = string_literal(self.eval_value(args.get(1)?, b, l)?)?;
+        if !argument_compatible(a_lang.as_deref(), c_lang.as_deref()) {
+            return None;
+        }
         Some(Value::Bool(f(a, c)))
     }
 
@@ -6521,12 +6543,50 @@ fn split_date_tz(s: &str) -> (&str, &str) {
     (s, "")
 }
 
-/// A value's lexical form plus its language tag (preserved by `SUBSTR`/`REPLACE`
-/// when the input is a language-tagged string literal).
-fn str_and_lang(v: &Value) -> (String, Option<String>) {
+/// A string-literal argument of a string function — SPARQL 1.1 §17.4.3.1.1:
+/// a simple literal, an `xsd:string` (the same term under RDF 1.1) or a
+/// language-tagged literal — as its lexical form and language tag. Any
+/// other term (an IRI, a blank node, a number, another typed literal) is
+/// `None`: an error, which leaves a SELECT expression unbound and fails a
+/// FILTER (review sparqlconf#17: `STRLEN(1)`, `CONCAT("a", 1)` and
+/// `REGEX(<iri>, "x")` used to read the term's lexical form).
+///
+/// The one check `STRLEN`, `SUBSTR`, `UCASE`, `LCASE`, `STRSTARTS`,
+/// `STRENDS`, `CONTAINS`, `STRBEFORE`, `STRAFTER`, `CONCAT`, `REGEX` and
+/// `REPLACE` apply to their string arguments ([`simple_literal`] for the
+/// ones the spec types as simple literals). Still lenient, documented:
+/// `ENCODE_FOR_URI`, `LANGMATCHES`, `STRDT` and the gStore extensions
+/// (`CONTAINALL`, `CONTAINANY`, `SIMILARITY`) read any term's lexical
+/// form, and `SUBSTR`'s positions take any numeric, not only `xsd:integer`.
+fn string_literal(v: Value) -> Option<(String, Option<String>)> {
     match v {
-        Value::Str { value, lang } => (value.clone(), lang.clone()),
-        other => (other.lexical(), None),
+        Value::Str { value, lang } => Some((value, lang)),
+        _ => None,
+    }
+}
+
+/// A simple-literal argument (or `xsd:string`, the same term): the regular
+/// expression, flags and replacement of `REGEX` / `REPLACE`, both arguments
+/// of `STRLANG` and the input of the hash functions (SPARQL 1.1 §17.4.2.11,
+/// §17.4.3.14-15, §17.4.6). A language-tagged literal or any other term is
+/// `None`, an error (review sparqlconf#17).
+fn simple_literal(v: Value) -> Option<String> {
+    match v {
+        Value::Str { value, lang: None } => Some(value),
+        _ => None,
+    }
+}
+
+/// SPARQL 1.1 §17.4.3.1.2 Argument Compatibility Rules, on the language
+/// tags of two string literals: both untagged, both tagged with the same
+/// tag (compared case-insensitively, as RDF 1.1 does), or the first tagged
+/// and the second untagged — `CONTAINS("abc"@en, "b"@cy)` and
+/// `STRBEFORE("abc", "b"@en)` are errors.
+fn argument_compatible(first: Option<&str>, second: Option<&str>) -> bool {
+    match (first, second) {
+        (_, None) => true,
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        (None, Some(_)) => false,
     }
 }
 

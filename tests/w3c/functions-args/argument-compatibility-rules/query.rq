@@ -1,0 +1,11 @@
+# spec: SPARQL 1.1 Query §17.4.3.1.2 Argument Compatibility Rules: two arguments are
+# compatible when both are simple literals / xsd:string, both carry the same language tag, or
+# the first is tagged and the second is not; CONTAINS, STRSTARTS, STRBEFORE and STRAFTER on
+# incompatible arguments are errors (unbound). §17.4.3.8: STRAFTER keeps the first
+# argument's tag (review sparqlconf#17)
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+SELECT (CONTAINS("abc"@en, "b") AS ?a) (CONTAINS("abc"@en, "b"@en) AS ?b)
+       (CONTAINS("abc"@en, "b"@cy) AS ?c) (CONTAINS("abc", "b"@en) AS ?d)
+       (STRSTARTS("abc"^^xsd:string, "a") AS ?e) (STRBEFORE("abc"@en, "b"@cy) AS ?f)
+       (STRAFTER("abc"@en, "b") AS ?g) (STRENDS("abc"@en, "c"@EN) AS ?h)
+WHERE {}

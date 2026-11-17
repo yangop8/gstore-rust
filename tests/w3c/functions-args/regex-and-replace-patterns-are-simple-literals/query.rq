@@ -1,0 +1,8 @@
+# spec: SPARQL 1.1 Query §17.4.3.14 REGEX (string literal text, simple literal pattern and
+# flags) and §17.4.3.15 REPLACE (string literal input, simple literal pattern, replacement and
+# flags; the result keeps the input's language tag): a tagged pattern, replacement or flag is
+# an error (review sparqlconf#17)
+SELECT (REGEX("Abc"@en, "^a", "i") AS ?a) (REGEX("abc", "b"@en) AS ?b)
+       (REGEX("abc", "B", "i"@en) AS ?c) (REPLACE("abc"@en, "b", "x") AS ?d)
+       (REPLACE("abc", "b"@en, "x") AS ?e) (REPLACE("abc", "b", "x"@en) AS ?f)
+WHERE {}

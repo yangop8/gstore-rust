@@ -1,0 +1,7 @@
+{
+  "head": {"vars": ["a", "b", "c", "d", "e"]},
+  "results": {"bindings": [
+    {"a": {"type": "literal", "value": "chat", "xml:lang": "en"},
+     "b": {"type": "literal", "value": "chat", "xml:lang": "fr"}}
+  ]}
+}
