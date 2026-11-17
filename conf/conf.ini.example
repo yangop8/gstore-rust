@@ -12,12 +12,13 @@
 # own (whitespace before and after it, or the end of the line) starts a
 # comment:  thread_num=30  # workers  reads 30 (gstore-rust only, reported
 # as a warning: upstream reads it as part of the value). A marker glued to
-# more text stays in the value (Tr0ub4dor #3 reads "Tr0ub4dor #3"), nothing
-# inside double quotes is a comment, and root_password is never cut. An empty
-# value (key=) means "use the built-in default". If a key appears twice, the
-# first one wins. Unknown keys are reported as warnings and ignored, and so
-# are settings that cannot take effect (resource_check=on, or a build_threads
-# that build_multi_thread=off overrides).
+# more text stays in the value (Tr0ub4dor #3 reads "Tr0ub4dor #3"; earlier
+# gstore-rust versions read "#3" as a comment, so that is a warning too),
+# nothing inside double quotes is a comment, and root_password is never cut.
+# An empty value (key=) means "use the built-in default". If a key appears
+# twice, the first one wins. Unknown keys are reported as warnings and
+# ignored, and so are settings that cannot take effect (resource_check=on, or
+# a build_threads that build_multi_thread=off overrides).
 #
 # Precedence: command-line flag (e.g. -p/--port, --password, --no-checkpoint,
 # --addr, or a database directory argument) > this file > built-in default.

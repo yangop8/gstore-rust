@@ -682,6 +682,56 @@ impl IpFilter {
             .with_upstream_lockout(upstream)
     }
 
+    /// Warnings about the list files `conf.ini` configures but that cannot be
+    /// read (missing, a directory, unreadable). Such a list is empty, as
+    /// upstream reads it — a deny list then keeps nobody out and an allow
+    /// list lets nobody in — which a server must not decide silently (round-4
+    /// review of bulkcli#9's fix: `ip_deny_path=./conf/ipDeny.config
+    /// #blocked`, which earlier gstore-rust versions cut at the note, names
+    /// no file now). `gserver` prints them at startup with the `conf.ini`
+    /// warnings. A deny list missing at its built-in place
+    /// (`./conf/ipDeny.config`, which the shipped example names too) is the
+    /// out-of-the-box state — no address is denied — and not reported.
+    pub fn list_file_warnings(config: &GStoreConfig) -> Vec<String> {
+        let default_deny = GStoreConfig::default().ip_deny_path;
+        let at_default = |p: &Path| {
+            let p = p.strip_prefix(".").unwrap_or(p);
+            default_deny.as_deref() == Some(p)
+        };
+        let lists = [
+            (
+                "ip_allow_path",
+                &config.ip_allow_path,
+                "the allow list is empty: no address is let in to /api",
+            ),
+            (
+                "ip_deny_path",
+                &config.ip_deny_path,
+                "the deny list is empty: no address is kept out of /api",
+            ),
+        ];
+        let mut out = Vec::new();
+        for (key, path, effect) in lists {
+            let Some(path) = path else { continue };
+            let problem = match std::fs::metadata(path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if key == "ip_deny_path" && at_default(path) {
+                        continue;
+                    }
+                    "does not exist".to_string()
+                }
+                Err(e) => format!("cannot be read ({e})"),
+                Ok(m) if m.is_dir() => "is a directory".to_string(),
+                Ok(_) => match std::fs::File::open(path) {
+                    Ok(_) => continue,
+                    Err(e) => format!("cannot be read ({e})"),
+                },
+            };
+            out.push(format!("{key} '{}' {problem}; {effect}", path.display()));
+        }
+        out
+    }
+
     /// Use upstream's per-address lockout (`on`; the
     /// `upstream_login_lockout` switch, see the module docs) instead of the
     /// default per-account one.

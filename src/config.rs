@@ -24,8 +24,17 @@
 //!   inline comment that cuts a value is reported as a
 //!   [warning](GStoreConfig::warnings) (upstream gStore reads it as part of
 //!   the value), so a value copied from an upstream file is never shortened
-//!   silently; so is a `root_password` that holds such a marker (earlier
-//!   gstore-rust versions cut it there; the warning does not quote it).
+//!   silently.
+//!
+//!   Earlier gstore-rust versions cut an unquoted value at *any* whitespace
+//!   followed by `#` or `;` (after some of the value), glued marker or not:
+//!   `db_home=/srv/gstore #primary` read `/srv/gstore`. Wherever that rule
+//!   would cut and this one keeps more of the value, a warning says so
+//!   (review of bulkcli#9's fix: `db_home`, `backup_path` or `ip_deny_path`
+//!   changed on upgrade without a word) — for `root_password` too, without
+//!   quoting it. Quote the whole value to keep the text in it without the
+//!   warning, or put whitespace after the marker (or the comment on a line
+//!   of its own) to keep it a comment.
 //! * [`GStoreConfig`] — every key of upstream's `conf/conf.ini` as a typed field,
 //!   with upstream's built-in defaults (the `Util::configure()` defaults, i.e.
 //!   what an empty `conf.ini` gives). An empty value means "unset" (upstream:
@@ -152,9 +161,15 @@ pub struct Ini {
     /// Inline comments cut from values: (1-based line number, key, the
     /// comment as written).
     inline_comments: Vec<(usize, String, String)>,
-    /// Values of [`VERBATIM_KEYS`] kept whole although they hold what would
-    /// start an inline comment elsewhere: (1-based line number, key).
+    /// Values of [`VERBATIM_KEYS`] kept whole although they hold what
+    /// earlier gstore-rust versions read as the start of an inline comment
+    /// ([`legacy_comment_start`]): (1-based line number, key).
     verbatim_markers: Vec<(usize, String)>,
+    /// Text earlier gstore-rust versions cut from a value as a comment
+    /// ([`legacy_comment_start`]) that is part of the value now — a marker
+    /// glued to the next word: (1-based line number, key, the text as
+    /// written). [`VERBATIM_KEYS`] are in `verbatim_markers` instead.
+    legacy_cuts: Vec<(usize, String, String)>,
 }
 
 /// Keys whose value is taken whole, an inline-comment marker included (see
@@ -196,11 +211,20 @@ impl Ini {
                 continue;
             }
             let (value, comment) = if VERBATIM_KEYS.contains(&key) {
-                if comment_start(v).is_some() {
+                if legacy_comment_start(v).is_some() {
                     ini.verbatim_markers.push((line_no, key.to_string()));
                 }
                 (clean_value(v), None)
             } else {
+                // Where the old rule cut, the new rule cuts there too or
+                // later (a word-like marker is also a marker after
+                // whitespace); text between the two cuts is now kept.
+                let cut = comment_start(v);
+                if let Some(old) = legacy_comment_start(v).filter(|&old| cut != Some(old)) {
+                    let kept = v[old..cut.unwrap_or(v.len())].trim_end();
+                    ini.legacy_cuts
+                        .push((line_no, key.to_string(), kept.to_string()));
+                }
                 split_comment(v)
             };
             if let Some(c) = comment {
@@ -284,6 +308,26 @@ fn comment_start(raw: &str) -> Option<usize> {
             {
                 return Some(i);
             }
+            _ => {}
+        }
+        prev_ws = c.is_whitespace();
+        seen_content |= !prev_ws;
+    }
+    None
+}
+
+/// Where earlier gstore-rust versions cut `raw` as an inline comment: at the
+/// first `#` or `;` outside double quotes that follows whitespace and comes
+/// after some of the value, whatever follows it. Only used to warn about
+/// values that rule cut and [`comment_start`] keeps (see the module docs).
+fn legacy_comment_start(raw: &str) -> Option<usize> {
+    let mut in_quotes = false;
+    let mut prev_ws = false;
+    let mut seen_content = false;
+    for (i, c) in raw.char_indices() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            '#' | ';' if !in_quotes && prev_ws && seen_content => return Some(i),
             _ => {}
         }
         prev_ws = c.is_whitespace();
@@ -988,15 +1032,28 @@ impl GStoreConfig {
                  (upstream gStore reads it as part of the value; quote the value to keep it)"
             ));
         }
+        // Text earlier gstore-rust versions cut as a comment (any whitespace
+        // + `#`/`;`) that is part of the value now (a marker glued to the
+        // next word): `db_home=/srv/gstore #primary` read `/srv/gstore` and
+        // now reads all of it, as upstream does (round-4 review of
+        // bulkcli#9's fix: such a path changed on upgrade without a word).
+        for (line, key, kept) in &ini.legacy_cuts {
+            self.warnings.push(format!(
+                "line {line}: '{kept}' after the value of '{key}' is part of the value, as \
+                 upstream gStore reads it (earlier gstore-rust versions read it as a comment; \
+                 put whitespace after the '#' or ';', or the comment on a line of its own, to \
+                 keep it a comment, or quote the whole value to keep it in the value)"
+            ));
+        }
         // A password kept whole where earlier gstore-rust versions cut it at
         // the marker (a quoted `root_password="pw"  # note` read `pw`, and
-        // now reads all of it, as upstream does): said, without quoting it.
+        // `root_password=pw #x` read `pw`; both now read all of it, as
+        // upstream does): said, without quoting it.
         for (line, key) in &ini.verbatim_markers {
             self.warnings.push(format!(
-                "line {line}: the value of '{key}' holds a '#' or ';' standing as a word of its \
-                 own; all of it is the value ({key} is never cut at an inline comment, as \
-                 upstream gStore reads it; earlier gstore-rust versions read the rest as a \
-                 comment)"
+                "line {line}: the value of '{key}' holds a '#' or ';' after whitespace; all of \
+                 it is the value ({key} is never cut at an inline comment, as upstream gStore \
+                 reads it; earlier gstore-rust versions read the rest as a comment)"
             ));
         }
         // Keys in their own section first, so a correctly placed key always
@@ -2013,6 +2070,61 @@ upload_allow_compress_packages = "zip"
         assert_eq!(ini.get("c", "k1"), None);
         assert_eq!(ini.sections(), vec!["", "a", "b"]);
         assert_eq!(ini.malformed(), &[(11, "garbage line".to_string())]);
+    }
+
+    /// Round-4 review of bulkcli#9's fix: earlier gstore-rust versions cut an
+    /// unquoted value at any whitespace + `#`/`;`; the narrower rule keeps a
+    /// glued marker in the value, as upstream does. A path that changes
+    /// meaning on upgrade (`db_home`, `backup_path`, `ip_deny_path` — a
+    /// deny list that silently names no file lets every address in) must
+    /// not change silently.
+    #[test]
+    fn a_value_earlier_versions_cut_at_a_glued_marker_is_kept_and_reported() {
+        let c = GStoreConfig::from_ini_str(
+            "[system]\ndb_home=/x #y\n\
+             [backup]\nbackup_path=./backups ;nightly\n\
+             [server]\nip_deny_path=\"./conf/ipDeny.config\" #blocked hosts\n",
+        );
+        assert_eq!(c.db_home, PathBuf::from("/x #y"));
+        assert_eq!(c.backup_path, PathBuf::from("./backups ;nightly"));
+        assert_eq!(
+            c.ip_deny_path,
+            Some(PathBuf::from("./conf/ipDeny.config #blocked hosts"))
+        );
+        let w = c.warnings();
+        assert_eq!(w.len(), 3, "{w:?}");
+        assert!(
+            w[0].starts_with("line 2: '#y' after the value of 'db_home' is part of the value"),
+            "{w:?}"
+        );
+        assert!(w[1].starts_with("line 4: ';nightly' after the value of 'backup_path'"));
+        assert!(w[2].starts_with("line 6: '#blocked hosts' after the value of 'ip_deny_path'"));
+        assert!(w.iter().all(|w| w.contains("earlier gstore-rust versions")));
+
+        // Text between the old cut and a later word-like comment is kept and
+        // reported once; the comment itself is reported as cut.
+        let c = GStoreConfig::from_ini_str("[system]\ndb_home=/x #y # note\n");
+        assert_eq!(c.db_home, PathBuf::from("/x #y"));
+        assert_eq!(c.warnings().len(), 2, "{:?}", c.warnings());
+        assert!(
+            c.warnings()[0].contains("'# note' after the value of 'db_home' is read as a comment")
+        );
+        assert!(c.warnings()[1].contains("'#y' after the value of 'db_home' is part of the value"));
+
+        // A glued marker in root_password: reported without quoting it.
+        let c = GStoreConfig::from_ini_str("[system]\nroot_password=pw #x\n");
+        assert_eq!(c.root_password, "pw #x");
+        assert_eq!(c.warnings().len(), 1, "{:?}", c.warnings());
+        assert!(c.warnings()[0].starts_with("line 2: the value of 'root_password' holds"));
+        assert!(!c.warnings()[0].contains("pw") && !c.warnings()[0].contains("#x"));
+
+        // Where both rules agree, nothing is said: a quoted value, a marker
+        // at the start, a marker without whitespace before it.
+        let c = GStoreConfig::from_ini_str(
+            "[system]\ndb_home=\"/x #y\"\nlicensetype=#x\n[backup]\nbackup_path=/a#b\n",
+        );
+        assert_eq!(c.db_home, PathBuf::from("/x #y"));
+        assert!(c.warnings().is_empty(), "{:?}", c.warnings());
     }
 
     #[test]

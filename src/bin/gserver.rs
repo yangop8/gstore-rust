@@ -536,6 +536,10 @@ fn report_config(cfg: &GStoreConfig) {
     for w in cfg.warnings() {
         gs_warn!("conf.ini warning: {w}");
     }
+    // A configured IP list file that cannot be read is an empty list.
+    for w in gstore::gapi::ipfilter::IpFilter::list_file_warnings(cfg) {
+        gs_warn!("conf.ini warning: {w}");
+    }
     // The upstream-compat switches that are on (each restores an upstream
     // behaviour a secure default turned off). A starting server reports the
     // configuration after its diagnostic log is set up, so these reach the

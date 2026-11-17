@@ -492,7 +492,38 @@ fn conf_ini_inline_comments_follow_the_documented_rule() {
     assert_eq!(c.root_password, "Tr0ub4dor #3");
     assert_eq!(c.db_home, PathBuf::from("/srv/a ;b"));
     assert_eq!(c.licensetype, "#x");
-    assert!(c.warnings().is_empty(), "{:?}", c.warnings());
+    // review bulkcli#9 (round-4 review): this asserted no warning, but
+    // earlier gstore-rust versions cut both values at the glued marker
+    // (`Tr0ub4dor`, `/srv/a`), so keeping the rest changed a password and a
+    // path on upgrade without a word. Both are reported now — the password
+    // without being quoted; `#x` at the start was never cut.
+    let w = c.warnings();
+    assert_eq!(w.len(), 2, "{w:?}");
+    assert!(
+        w.iter().any(|w| w.starts_with(
+            "line 3: ';b' after the value of 'db_home' is part of \
+                  the value"
+        )),
+        "{w:?}"
+    );
+    assert!(
+        w.iter()
+            .any(|w| w.starts_with("line 2: the value of 'root_password' holds")),
+        "{w:?}"
+    );
+    assert!(w.iter().all(|w| !w.contains("Tr0ub4dor")), "{w:?}");
+    // The same glued note after a path in its home section (the round-4
+    // review's probe): the path keeps the note, and says so.
+    let c = GStoreConfig::from_ini_str("[system]\ndb_home=/srv/gstore #primary store\n");
+    assert_eq!(c.db_home, PathBuf::from("/srv/gstore #primary store"));
+    assert_eq!(c.warnings().len(), 1, "{:?}", c.warnings());
+    assert!(
+        c.warnings()[0].starts_with(
+            "line 2: '#primary store' after the value of 'db_home' is part of the value"
+        ),
+        "{:?}",
+        c.warnings()
+    );
 
     // A password is taken whole, a word-like marker included. Earlier
     // gstore-rust versions cut it there — a quoted password followed by a
