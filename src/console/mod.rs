@@ -281,6 +281,8 @@ fn login(console: &mut Console, opts: &Options) -> Result<(), i32> {
                     .get("StatusMsg")
                     .and_then(crate::json::Json::as_str)
                     .unwrap_or_default();
+                // The server's text must not drive the terminal (ext#10).
+                let msg = table::printable(msg, true);
                 term::show(&format!("login failed: {msg}\n"));
             }
             Err(CallError::Interrupted) => return Err(1),

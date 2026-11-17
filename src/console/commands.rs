@@ -361,7 +361,7 @@ impl Resp {
     fn no_answer(e: &CallError) -> Resp {
         Resp {
             code: -1,
-            msg: e.to_string(),
+            msg: table::printable(&e.to_string(), true).into_owned(),
             json: Json::obj(),
         }
     }
@@ -370,16 +370,19 @@ impl Resp {
         self.code == 0
     }
 
-    /// Field `key` as text (`""` when absent).
+    /// Field `key` as text to print (`""` when absent): its control
+    /// characters escaped ([`table::printable`]), as every server string
+    /// the console prints — a path, a count — must not drive the terminal
+    /// (review ext#10).
     pub fn text(&self, key: &str) -> String {
-        self.json.get(key).map(text_of).unwrap_or_default()
+        let text = self.json.get(key).map(text_of).unwrap_or_default();
+        table::printable(&text, false).into_owned()
     }
 
-    /// Field `key` as text, `"0"` when absent (upstream's numeric defaults).
+    /// [`text`](Self::text), `"0"` when absent (upstream's numeric
+    /// defaults).
     pub fn num(&self, key: &str) -> String {
-        self.json
-            .get(key)
-            .map(text_of)
+        Some(self.text(key))
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "0".to_string())
     }

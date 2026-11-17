@@ -198,9 +198,12 @@ fn exchange(
     match json::parse(&text) {
         Ok(j @ Json::Obj(_)) => Ok(j),
         _ => {
+            // Quoted for the operator: escaped, so it cannot drive the
+            // terminal (review ext#10).
             let snippet: String = text.chars().take(200).collect();
             Err(CallError::Transport(format!(
-                "unexpected answer (HTTP {status}): {snippet}"
+                "unexpected answer (HTTP {status}): {}",
+                super::table::printable(&snippet, false)
             )))
         }
     }

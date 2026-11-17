@@ -1818,6 +1818,111 @@ fn requests_carry_upstreams_operations_and_parameters() {
     assert_eq!(r.code, 0, "{r:?}");
 }
 
+/// Whether `text` holds a character a terminal acts on rather than shows
+/// (C0 controls but line breaks and tabs, DEL, C1 controls).
+fn drives_the_terminal(text: &str) -> bool {
+    text.chars().any(|c| {
+        let u = c as u32;
+        (u < 0x20 && c != '\n' && c != '\t') || (0x7f..0xa0).contains(&u)
+    })
+}
+
+/// review ext#10: what a server answers is printed with its control
+/// characters escaped — the paths `backup` and `export` print, the counts
+/// and times of a query, an update and an import, the failure message of a
+/// login and the text of an answer that is not an `/api` envelope — so a
+/// spoofed or compromised server cannot drive the operator's terminal
+/// (retitle it, clear it, write the clipboard).
+#[test]
+fn server_fields_cannot_drive_the_terminal() {
+    const ESC: &str = "\u{1b}]0;PWNED\u{7}\u{1b}[2J";
+    let respond: Arc<Responder> = Arc::new(|req: &Json| {
+        Some(match field(req, "operation").as_str() {
+            "backup" => success().with("backupfilepath", format!("{ESC}./backups/x").as_str()),
+            "export" => success().with("filepath", "\u{1b}]52;c;SGVsbG8=\u{7}f.nt"),
+            "query" => success()
+                .with("AnsNum", "\u{1b}[2J5")
+                .with("QueryTime", "\u{1b}]0;T\u{7}1"),
+            "batchInsert" => success()
+                .with("success_num", format!("{ESC}3").as_str())
+                .with("failed_num", format!("{ESC}1").as_str()),
+            "build" => success().with("failed_num", format!("{ESC}2").as_str()),
+            _ => success(),
+        })
+    });
+    let fake = Fake::start(respond);
+    let cwd = scratch("gc_control_chars");
+    let _cwd = DirGuard(cwd.clone());
+    let nt = cwd.join("x.nt");
+    fs::write(&nt, "<a> <b> <c> .\n").unwrap();
+    let mut cmd = gconsole(&fake.addr, &cwd);
+    cmd.args(["-u", "root", "-p", PASSWORD]);
+    let r = run(
+        cmd,
+        &format!(
+            "create db1 {nt};\nuse db1;\nbackup;\nexport;\ninsert data {{ <a> <b> <c> }};\n\
+             batchinsert {nt};\n",
+            nt = path_str(&nt)
+        ),
+    );
+    assert!(!drives_the_terminal(&r.out), "{r:?}");
+    for shown in [
+        "Backup path: \\u001B]0;PWNED\\u0007\\u001B[2J./backups/x",
+        "Export file: \\u001B]52;c;SGVsbG8=\\u0007f.nt",
+        "Update ans num \\u001B[2J5, use \\u001B]0;T\\u00071 ms.",
+        "RDF parse error num \\u001B]0;PWNED",
+        "After inserted triples num \\u001B]0;PWNED",
+    ] {
+        assert!(r.out.contains(shown), "{shown:?}: {r:?}");
+    }
+    assert_eq!(r.code, 0, "{r:?}");
+
+    // A login refused with such a message, and an answer that is not an
+    // `/api` envelope.
+    let respond: Arc<Responder> = Arc::new(|req: &Json| {
+        Some(match field(req, "operation").as_str() {
+            "login" => Json::obj()
+                .with("StatusCode", 1001)
+                .with("StatusMsg", format!("{ESC}no").as_str()),
+            _ => success(),
+        })
+    });
+    let fake = Fake::start(respond);
+    let mut cmd = gconsole(&fake.addr, &cwd);
+    cmd.args(["-u", "root", "-p", PASSWORD]);
+    let r = run(cmd, "showdbs;\n");
+    assert_eq!(r.code, 1, "{r:?}");
+    assert!(r.out.contains("login failed: \\u001B]0;PWNED"), "{r:?}");
+    assert!(!drives_the_terminal(&r.out), "{r:?}");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let not_json = thread::spawn(move || {
+        // The login, then one more request: each answered with text.
+        for _ in 0..2 {
+            let Ok((mut s, _)) = listener.accept() else {
+                return;
+            };
+            let _ = read_request(&mut s);
+            let body = format!("{ESC}<html>");
+            let _ = write!(
+                s,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    let mut cmd = gconsole(&addr, &cwd);
+    cmd.args(["-u", "root", "-p", PASSWORD]);
+    let r = run(cmd, "showdbs;\n");
+    // Unblock the fake's last accept, if the console made fewer requests.
+    let _ = TcpStream::connect(addr);
+    not_json.join().unwrap();
+    assert_eq!(r.code, 1, "{r:?}");
+    assert!(!drives_the_terminal(&r.out), "{r:?}");
+    assert!(!drives_the_terminal(&r.err), "{r:?}");
+    assert!(r.err.contains("\\u001B]0;PWNED"), "{r:?}");
+}
+
 fn sigint(child: &Child) {
     let ok = Command::new("kill")
         .args(["-INT", &child.id().to_string()])
