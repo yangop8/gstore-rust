@@ -529,9 +529,26 @@ pub fn remove_rule_dir(db_dir: &Path) -> crate::Result<()> {
 /// part-way never leaves some rule files without their ledgers, which
 /// [`super::manage`] would take for upstream rules (review durability#11,
 /// carried over to the paths that replace a database).
+///
+/// What stands at the rule directory's place and is not a directory is
+/// handled as a recursive delete would: a symbolic link that leads to no
+/// directory is removed (the link, not its target), anything else is an
+/// error — it cannot be removed as the rule directory.
 pub fn remove_rule_dir_locked(db_dir: &Path, held: &StoreLock) -> crate::Result<()> {
     debug_assert!(held.state.is_some(), "a directory store's lock");
-    fsutil::discard_dir(&db_dir.join(RULE_DIR))
+    let rules = db_dir.join(RULE_DIR);
+    match fs::symlink_metadata(&rules) {
+        Ok(m) if m.file_type().is_symlink() && !rules.is_dir() => {
+            fs::remove_file(&rules)?;
+            fsutil::sync_dir(db_dir)
+        }
+        Ok(m) if !m.is_dir() && !m.file_type().is_symlink() => Err(std::io::Error::new(
+            ErrorKind::NotADirectory,
+            format!("'{}' is not a directory", rules.display()),
+        )
+        .into()),
+        _ => fsutil::discard_dir(&rules),
+    }
 }
 
 /// Copy the regular files of `src` (and of its sub-directories) into `dst`:
@@ -814,6 +831,14 @@ mod tests {
         assert!(!rules_dir.exists(), "renamed aside before the delete");
         assert_eq!(shown(&dst), rules(&[]));
         assert!(!fsutil::STORE_SWAP.in_progress(&rules_dir), "cleaned up");
+
+        // A file where the directory belongs cannot be removed as one: an
+        // error, and the file stays (as with a recursive delete).
+        let odd = root.0.join("odd.db");
+        fs::create_dir_all(&odd).unwrap();
+        fs::write(odd.join(RULE_DIR), "not a directory").unwrap();
+        assert!(remove_rule_dir(&odd).is_err());
+        assert!(odd.join(RULE_DIR).is_file());
     }
 
     /// A swap a crash interrupted after the old directory was moved aside
