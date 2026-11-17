@@ -312,3 +312,105 @@ pub fn unpack_packages(
     }
     Ok(unpacked)
 }
+
+/// An output file written under a temporary name beside its destination —
+/// `<dest>.part-<pid>-<n>`, created exclusively — and renamed over the
+/// destination only once it is complete and synced
+/// ([`commit`](Self::commit)). Until then the destination is untouched (a
+/// previous file of that name stays as it was), and a temporary file that
+/// is not committed is removed when this is dropped — on an error, a panic,
+/// a failed open of the database (review bulkcli#10, #11: `gquery -f`
+/// truncated its result file before the database was even opened, and
+/// `gexport` wrote in place, leaving a partial file behind on a write
+/// error).
+pub struct OutputFile {
+    dest: PathBuf,
+    tmp: PathBuf,
+    file: Option<std::io::BufWriter<std::fs::File>>,
+    committed: bool,
+}
+
+impl OutputFile {
+    /// Create the temporary file for `dest` (whose directory must exist).
+    pub fn create(dest: &Path) -> std::io::Result<OutputFile> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let mut attempt = 0;
+        loop {
+            let mut tmp = dest.as_os_str().to_owned();
+            tmp.push(format!(
+                ".part-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            let tmp = PathBuf::from(tmp);
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+            {
+                Ok(f) => {
+                    return Ok(OutputFile {
+                        dest: dest.to_path_buf(),
+                        tmp,
+                        file: Some(std::io::BufWriter::new(f)),
+                        committed: false,
+                    })
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 100 => {
+                    attempt += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Where the content is written until [`commit`](Self::commit).
+    pub fn tmp_path(&self) -> &Path {
+        &self.tmp
+    }
+
+    /// The writer of the temporary file (an error once it was
+    /// [`finish`](Self::finish)ed).
+    pub fn writer(&mut self) -> std::io::Result<&mut std::io::BufWriter<std::fs::File>> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("the output file is closed"))
+    }
+
+    /// Flush the temporary file, sync it to disk and close it (it stays
+    /// under its temporary name, removed on drop unless committed).
+    pub fn finish(&mut self) -> std::io::Result<()> {
+        if let Some(w) = self.file.take() {
+            let f = w.into_inner().map_err(|e| e.into_error())?;
+            f.sync_all()?;
+        }
+        Ok(())
+    }
+
+    /// Finish the file and rename it over the destination (then sync the
+    /// directory, best effort).
+    pub fn commit(mut self) -> std::io::Result<()> {
+        self.finish()?;
+        std::fs::rename(&self.tmp, &self.dest)?;
+        self.committed = true;
+        let parent = self
+            .dest
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        if let Ok(d) = std::fs::File::open(parent) {
+            let _ = d.sync_all();
+        }
+        Ok(())
+    }
+}
+
+impl Drop for OutputFile {
+    fn drop(&mut self) {
+        if !self.committed {
+            drop(self.file.take());
+            let _ = std::fs::remove_file(&self.tmp);
+        }
+    }
+}

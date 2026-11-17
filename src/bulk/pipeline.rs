@@ -40,8 +40,8 @@ use super::budget::Budget;
 use super::encode::{Dict, Encoder, Space};
 use super::extsort::{ExtSorter, Sorted};
 use super::kvimage::{
-    fixed_tree_pages, header_page, ivarray_pages, write_header, write_ivarray, FixedTreeWriter,
-    PageAlloc, PageOut, VarTreePlan,
+    check_range, fixed_tree_pages, header_page, ivarray_pages, write_header, write_ivarray,
+    FixedTreeWriter, PageAlloc, PageOut, VarTreePlan,
 };
 use super::scratch::Scratch;
 use super::sigs::{IdSig, JoinSigs, OutSigs};
@@ -186,8 +186,9 @@ pub(crate) fn build_image(
     // 3. POS / OSP + VS-tree / dictionary, each in its own page range.
     let t = Instant::now();
     let n = stats.triples;
-    let pos_base = alloc.reserve(fixed_tree_pages(n, 12, fill))?;
-    let osp_base = alloc.reserve(fixed_tree_pages(n, 12, fill))?;
+    let tree_pages = fixed_tree_pages(n, 12, fill);
+    let pos_base = alloc.reserve(tree_pages)?;
+    let osp_base = alloc.reserve(tree_pages)?;
     let pred_records = stats.pred_records();
     let ps_pages = ivarray_pages(pred_records.iter().map(|(p, r)| (*p, r.len())));
     let ps_base = alloc.reserve(ps_pages)?;
@@ -201,7 +202,8 @@ pub(crate) fn build_image(
         move || -> Result<(PageId, Stats, f64)> {
             let t = Instant::now();
             let sorted = pos.finish()?;
-            let (root, st) = write_pos(file_ref, pos_base, sorted, npreds, fill)?;
+            let (root, st, used) = write_pos(file_ref, pos_base, sorted, npreds, fill)?;
+            check_range("POS index", used, tree_pages)?;
             Ok((root, st, t.elapsed().as_secs_f64() * 1e3))
         },
         move || -> Result<(PageId, u32, (u64, u64), f64)> {
@@ -210,6 +212,7 @@ pub(crate) fn build_image(
             let r = write_osp(
                 file_ref, osp_base, sorted, outsig, vs_path, budget, scratch, fill,
             )?;
+            check_range("OSP index", r.3, tree_pages)?;
             Ok((r.0, r.1, r.2, t.elapsed().as_secs_f64() * 1e3))
         },
         move || -> Result<(DictRoots, f64)> {
@@ -249,7 +252,7 @@ pub(crate) fn build_image(
             ps_base,
             records.iter().map(|(p, r)| (*p, r.as_slice())),
         )?;
-        debug_assert_eq!(used, ps_pages);
+        check_range("statistics array", used, ps_pages)?;
         roots[PRED_STATS] = u64::from(root);
         out.flush()?;
     }
@@ -282,15 +285,15 @@ pub(crate) fn build_image(
     Ok(img)
 }
 
-/// Write the POS tree; returns its root and the per-predicate distinct
-/// objects.
+/// Write the POS tree; returns its root, the per-predicate distinct
+/// objects and the pages it took (checked against its range).
 fn write_pos(
     file: &File,
     base: PageId,
     mut sorted: Sorted<'_, [u32; 3]>,
     npreds: usize,
     fill: u8,
-) -> Result<(PageId, Stats)> {
+) -> Result<(PageId, Stats, u64)> {
     let mut out = PageOut::new(file);
     let mut st = Stats::new(npreds);
     let mut w = FixedTreeWriter::new(base, 12, fill);
@@ -298,13 +301,14 @@ fn write_pos(
         w.push(&mut out, &key3(p, o, s))?;
         st.on_pos(p, o, s);
     }
-    let (root, _) = w.finish(&mut out)?;
+    let (root, pages) = w.finish(&mut out)?;
     out.flush()?;
-    Ok((root, st))
+    Ok((root, st, pages))
 }
 
 /// Write the OSP tree and, from the joined signatures, `vstree.kv`; returns
-/// the OSP root, the distinct-object count and the VS-tree file's numbers.
+/// the OSP root, the distinct-object count, the VS-tree file's numbers and
+/// the pages the OSP tree took (checked against its range).
 #[allow(clippy::too_many_arguments)]
 fn write_osp<'a>(
     file: &File,
@@ -315,7 +319,7 @@ fn write_osp<'a>(
     budget: &'a Budget,
     scratch: &'a Scratch,
     fill: u8,
-) -> Result<(PageId, u32, (u64, u64))> {
+) -> Result<(PageId, u32, (u64, u64), u64)> {
     let mut out = PageOut::new(file);
     let mut st = Stats::new(0);
     let mut join = JoinSigs::new(outsig, budget, scratch, budget.share(2))?;
@@ -326,7 +330,7 @@ fn write_osp<'a>(
         join.add(o, s, p)?;
     }
     drop(sorted);
-    let (root, _) = w.finish(&mut out)?;
+    let (root, pages) = w.finish(&mut out)?;
     out.flush()?;
     let (sigs, _) = join.finish()?;
     let mut sigs = sigs.finish()?;
@@ -336,7 +340,7 @@ fn write_osp<'a>(
         Err(e) => Some(Err(e)),
     });
     let vs = VsTree::write_disk_sorted(vs_path, entries)?;
-    Ok((root, st.distinct_obj, vs))
+    Ok((root, st.distinct_obj, vs, pages))
 }
 
 /// The roots and size of the dictionary region.

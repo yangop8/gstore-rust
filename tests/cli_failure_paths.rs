@@ -603,3 +603,197 @@ fn gbuild_reports_conf_ini_warnings() {
         text(&out)
     );
 }
+
+// ---- gquery / gexport outputs (bulkcli#10, #11) -------------------------------
+
+/// `n` triples of N-Triples.
+fn many_triples(n: usize) -> String {
+    (0..n)
+        .map(|i| format!("<http://ex.org/s{i}> <http://ex.org/p1> \"value {i} of the export\" .\n"))
+        .collect()
+}
+
+/// Entries of `dir` whose name contains `part`.
+fn leftovers(dir: &Path, part: &str) -> Vec<String> {
+    fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(part))
+        .collect()
+}
+
+/// Review bulkcli#10: `gquery -f FILE` created (truncated) FILE before it
+/// opened the database or parsed the query, so a mistyped database name or
+/// query destroyed the previous result. FILE is now replaced only by a
+/// complete result.
+#[test]
+fn gquery_replaces_its_result_file_only_with_a_complete_result() {
+    let base = TmpDir::new("gquery_f");
+    fs::write(base.0.join("new.nt"), NEW).unwrap();
+    let out = run("gbuild", &["t1", "new.nt"], &base.0);
+    assert!(out.status.success(), "{}", text(&out));
+    let res = base.0.join("res.txt");
+    let previous = "the previous result\n";
+    for args in [
+        // A database that does not exist.
+        &[
+            "nosuchdb",
+            "-f",
+            "res.txt",
+            "-e",
+            "SELECT ?s WHERE { ?s ?p ?o }",
+        ][..],
+        // A query that does not parse.
+        &["t1", "-f", "res.txt", "-e", "SELEC ?s WHERE { ?s ?p ?o"],
+    ] {
+        fs::write(&res, previous).unwrap();
+        let out = run("gquery", args, &base.0);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", text(&out));
+        assert_eq!(fs::read_to_string(&res).unwrap(), previous, "{args:?}");
+    }
+    let out = run(
+        "gquery",
+        &["t1", "-f", "res.txt", "-e", "SELECT ?o WHERE { ?s ?p ?o }"],
+        &base.0,
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let got = fs::read_to_string(&res).unwrap();
+    assert!(got.contains("new1") && got.contains("new2"), "{got}");
+    assert!(leftovers(&base.0, ".part-").is_empty());
+}
+
+/// Run `tool args` in `cwd` with a file-size limit of about `kib` KiB
+/// (RLIMIT_FSIZE through the shell's `ulimit -f`, SIGXFSZ ignored): a write
+/// past it fails with EFBIG, as on a full disk.
+#[cfg(unix)]
+fn run_with_file_limit(name: &str, args: &[&str], cwd: &Path, kib: u64) -> Output {
+    // `ulimit -f` counts 512-byte blocks in POSIX shells (1 KiB in bash):
+    // either way the limit is far below the export written here.
+    Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "trap '' XFSZ; ulimit -f {kib} && exec \"$0\" \"$@\""
+        ))
+        .arg(tool(name))
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap()
+}
+
+/// Review bulkcli#11: gexport wrote in place — a write error (a full disk;
+/// here the file-size limit) left a partial `out.nt` cut mid-statement, and
+/// an existing file of that name was destroyed. The export is now written
+/// beside it and renamed into place once complete: a failed export leaves
+/// no partial file, and the previous one as it was.
+#[cfg(unix)]
+#[test]
+fn a_failed_gexport_leaves_no_partial_output() {
+    let base = TmpDir::new("gexport_partial");
+    fs::write(base.0.join("big.nt"), many_triples(5000)).unwrap();
+    let out = run("gbuild", &["big", "big.nt"], &base.0);
+    assert!(out.status.success(), "{}", text(&out));
+
+    // No file before: none after.
+    let out = run_with_file_limit("gexport", &["big", "out.nt"], &base.0, 64);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(
+        !base.0.join("out.nt").exists(),
+        "a partial export was left behind: {}",
+        text(&out)
+    );
+    // A previous export stays as it was.
+    let previous = "<http://ex.org/a> <http://ex.org/b> <http://ex.org/c> .\n";
+    fs::write(base.0.join("out.nt"), previous).unwrap();
+    let out = run_with_file_limit("gexport", &["big", "out.nt"], &base.0, 64);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert_eq!(fs::read_to_string(base.0.join("out.nt")).unwrap(), previous);
+    assert!(leftovers(&base.0, ".part-").is_empty());
+
+    // Without the limit the export is complete.
+    let out = run("gexport", &["big", "out.nt"], &base.0);
+    assert!(out.status.success(), "{}", text(&out));
+    let exported = fs::read_to_string(base.0.join("out.nt")).unwrap();
+    assert_eq!(exported.lines().count(), 5000);
+    assert!(exported.ends_with(" .\n"));
+    assert!(leftovers(&base.0, ".part-").is_empty());
+}
+
+/// The zip form of bulkcli#11: a failed export left `<archive>.export-tmp`
+/// behind.
+#[cfg(all(unix, feature = "zip"))]
+#[test]
+fn a_failed_zipped_gexport_leaves_no_temporary_file() {
+    let base = TmpDir::new("gexport_zip_partial");
+    fs::write(base.0.join("big.nt"), many_triples(5000)).unwrap();
+    let out = run("gbuild", &["big", "big.nt"], &base.0);
+    assert!(out.status.success(), "{}", text(&out));
+    let out = run_with_file_limit("gexport", &["-z", "1", "big", "out.nt"], &base.0, 64);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    let names: Vec<String> = leftovers(&base.0, "out.");
+    assert!(names.is_empty(), "left behind: {names:?}\n{}", text(&out));
+    let out = run("gexport", &["-z", "1", "big", "out.nt"], &base.0);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(leftovers(&base.0, "out."), vec!["out.zip".to_string()]);
+}
+
+// ---- gserver's exit status (bulkcli#18) ---------------------------------------
+
+/// Review bulkcli#18: gserver answered invalid arguments with exit status 1
+/// — a failed start — while every other tool uses 2.
+#[test]
+fn gserver_answers_invalid_arguments_with_status_2() {
+    let base = TmpDir::new("gserver_usage");
+    for args in [&["--no-such-option"][..], &["-p"], &["--port", "notaport"]] {
+        let out = run("gserver", args, &base.0);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {}", text(&out));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("Invalid arguments"),
+            "{args:?}: {}",
+            text(&out)
+        );
+    }
+    // The other tools agree.
+    let out = run("gbuild", &["--no-such-option", "x"], &base.0);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+}
+
+// ---- the crash-test failpoint (tests-a#19) ------------------------------------
+
+/// Review tests-a#19: `GSTORE_BULK_CRASH`, a crash-test failpoint, is live
+/// in every build; an environment that kept it made bulk builds abort with
+/// only a terse line. Whenever it is set, a bulk build now says so — what
+/// it will do, or that the value names no install step and is ignored.
+#[test]
+fn the_bulk_crash_failpoint_is_reported_whenever_it_is_set() {
+    let base = TmpDir::new("failpoint");
+    fs::write(base.0.join("new.nt"), NEW).unwrap();
+    let out = Command::new(tool("gbuild"))
+        .args(["--disk", "f", "new.nt"])
+        .current_dir(&base.0)
+        .env(bulk::CRASH_ENV, "no-such-step")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("GSTORE_BULK_CRASH=no-such-step is set but names no install step"),
+        "{err}"
+    );
+    let out = Command::new(tool("gbuild"))
+        .args(["--disk", "--force", "f", "new.nt"])
+        .current_dir(&base.0)
+        .env(bulk::CRASH_ENV, "staged")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{}", text(&out));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("GSTORE_BULK_CRASH=staged is set: this bulk build aborts"),
+        "{err}"
+    );
+    // Aborted after staging: the old database is intact.
+    assert_eq!(Database::open(base.0.join("f.db")).unwrap().triple_num(), 2);
+}

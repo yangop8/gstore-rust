@@ -118,7 +118,7 @@ impl Failpoints {
             .find(|(d, _)| *d == canonical)
             .map(|(_, p)| p.clone());
         Failpoints {
-            abort_at: std::env::var(CRASH_ENV).ok().filter(|s| !s.is_empty()),
+            abort_at: super::commit::crash_env(&ROCKS_CRASH_POINTS),
             fail_at,
             crashed: false,
         }

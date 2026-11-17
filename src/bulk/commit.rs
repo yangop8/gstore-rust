@@ -14,7 +14,7 @@
 //! | # | step | a crash after it leaves |
 //! |---|------|-------------------------|
 //! | 1 `staged` | `kvstore.kv` + `vstree.kv` complete and synced in `.bulk-tmp/` | the old database |
-//! | 2 `marked` | `.bulk-tmp/COMMIT` written and synced | the old database |
+//! | 2 `marked` | `.bulk-tmp/COMMIT` written and synced (advisory, see below) | the old database |
 //! | 3 `cleared` | a stale `kvstore.kv.wal` replayed into the old file (what any open does) and removed — a replay that fails stops the install with the log in place; the old `vstree.kv` and its WAL removed; synced | the old database (a missing `vstree.kv` is rebuilt at open) |
 //! | 4 `kv-renamed` | `.bulk-tmp/kvstore.kv` renamed over `kvstore.kv` | the new database (no `vstree.kv` yet: rebuilt at open), or — under an existing `rocksdb/`, which detection prefers — still the old one |
 //! | 5 `kv-synced` | directory synced | as 4, durably |
@@ -35,10 +35,21 @@
 //! the new store is durable; a crash in that short window leaves them
 //! beside the new database.
 //!
-//! Crash tests: the `GSTORE_BULK_CRASH=<step>` environment variable aborts
-//! the process right after that step (read once per install, never on the
-//! hot path), and [`debug_crash_at`] makes an in-process build of one
-//! directory stop there with an error, leaving its files as a crash would.
+//! **The `COMMIT` marker is advisory** (review durability#12, bulkcli#15):
+//! it records that the staged files were complete and synced when the
+//! install began — a forensic aid for whoever finds a `.bulk-tmp/` a crash
+//! left behind — and nothing reads it. No recovery rolls an interrupted
+//! install forward: before step 4 the old database is the database (the
+//! next build, or `gbuild --force`, deletes the staging area, marked or
+//! not), and from step 4 on the new store is in place without it. The
+//! format is unchanged (D7); the step costs one fsync.
+//!
+//! Crash tests: the `GSTORE_BULK_CRASH=<step>` environment variable — a
+//! test failpoint live in every build, reported on standard error whenever
+//! it is set ([`CRASH_ENV`]) — aborts the process right after that step
+//! (read once per install, never on the hot path), and [`debug_crash_at`]
+//! makes an in-process build of one directory stop there with an error,
+//! leaving its files as a crash would.
 
 use std::fs::{self, File};
 use std::io::Write;
@@ -66,7 +77,8 @@ pub const STAGING_DIR: &str = ".bulk-tmp";
 /// [`BulkReport::opens_as_built`]): the staging area not removed — no
 /// layout detection reads it, and the next build removes it.
 pub(crate) const STAGING_CLEANUP: &str = "removing the staging area";
-/// The commit marker inside the staging directory.
+/// The commit marker inside the staging directory: advisory, read by no
+/// recovery (see the module docs).
 const COMMIT_MARKER: &str = "COMMIT";
 /// The disk layout's files (`db::KV_FILE`, `db::VSTREE_KV_FILE`).
 const KV_FILE: &str = "kvstore.kv";
@@ -93,9 +105,34 @@ pub const CRASH_POINTS: [&str; 8] = [
 ];
 
 /// The environment variable naming the step after which an install aborts
-/// the process (crash tests).
+/// the process — a **test failpoint** of the crash tests, live in every
+/// build (review tests-a#19). Set, it makes every bulk install of the
+/// process (`gbuild --disk` / `--rocksdb`, a server's bulk build) say so on
+/// standard error and abort right after that step, leaving the old or the
+/// new database; unset it outside crash tests. A value that names no
+/// install step of the build is reported and ignored.
 #[doc(hidden)]
 pub const CRASH_ENV: &str = "GSTORE_BULK_CRASH";
+
+/// The install step [`CRASH_ENV`] names among `points`, reported on standard
+/// error whenever the variable is set (an operator who left it in an
+/// environment sees why the build aborts, or that it is ignored).
+pub(crate) fn crash_env(points: &[&str]) -> Option<String> {
+    let v = std::env::var(CRASH_ENV).ok().filter(|s| !s.is_empty())?;
+    if points.contains(&v.as_str()) {
+        eprintln!(
+            "{CRASH_ENV}={v} is set: this bulk build aborts right after its install step '{v}' \
+             (a crash-test failpoint; unset it outside crash tests)"
+        );
+        Some(v)
+    } else {
+        eprintln!(
+            "{CRASH_ENV}={v} is set but names no install step of this bulk build ({}); ignored",
+            points.join(", ")
+        );
+        None
+    }
+}
 
 /// Per-directory simulated crash points (see [`debug_crash_at`]).
 fn hooks() -> &'static Mutex<Vec<(PathBuf, String)>> {
@@ -134,7 +171,7 @@ impl Failpoints {
                 .map(|(_, p)| p.clone())
         };
         Failpoints {
-            abort_at: std::env::var(CRASH_ENV).ok().filter(|s| !s.is_empty()),
+            abort_at: crash_env(&CRASH_POINTS),
             fail_at,
             crashed: false,
         }
