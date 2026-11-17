@@ -616,14 +616,35 @@ pub fn read_rule_dir(db_dir: &Path) -> crate::Result<MemoryRules> {
 /// (another database is changing the rules of that directory), the write
 /// is refused and nothing is changed.
 pub fn write_memory_rules(m: &MemoryRules, dst_db_dir: &Path) -> crate::Result<()> {
-    let dir = dst_db_dir.join(RULE_DIR);
-    let Some(_lock) = try_lock_dir(dst_db_dir) else {
-        return Err(crate::GStoreError::Database(format!(
+    let lock = try_lock_rules(dst_db_dir)?;
+    write_memory_rules_locked(m, dst_db_dir, &lock)
+}
+
+/// The rule lock [`write_memory_rules`] takes, taken without waiting (see
+/// there): an error, and nothing changed, while another operation of this
+/// process holds it. A caller that writes more than the rules into
+/// `dst_db_dir` takes it before it writes anything, so a refusal leaves the
+/// destination as it was (round-4 review: a detached database's save
+/// installed its snapshot first and then had its rules refused, pairing the
+/// new data with the directory's old rules and ledgers).
+pub(crate) fn try_lock_rules(dst_db_dir: &Path) -> crate::Result<StoreLock> {
+    try_lock_dir(dst_db_dir).ok_or_else(|| {
+        crate::GStoreError::Database(format!(
             "the reasoning rules in '{}' are being changed by another operation; they were \
              not written (try again)",
             dst_db_dir.display()
-        )));
-    };
+        ))
+    })
+}
+
+/// [`write_memory_rules`] with `dst_db_dir`'s rule lock already held (from
+/// [`try_lock_rules`]).
+pub(crate) fn write_memory_rules_locked(
+    m: &MemoryRules,
+    dst_db_dir: &Path,
+    _held: &StoreLock,
+) -> crate::Result<()> {
+    let dir = dst_db_dir.join(RULE_DIR);
     if m.is_empty() {
         return fsutil::discard_dir(&dir);
     }

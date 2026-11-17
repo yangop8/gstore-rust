@@ -831,11 +831,21 @@ impl Database {
             fsutil::install_staged_dir(&staged, &target)?;
             return remove_other_layouts(dir, StorageKind::RocksDb);
         }
-        self.save_snapshot(dir)?;
         // Reasoning rules held in memory (see `reason_db_dir`) go with the
-        // snapshot; with none, the directory's own are left alone.
-        if self.reason_db_dir().is_none() && !self.reason_home.mem.is_empty() {
-            crate::reason::store::write_memory_rules(&self.reason_home.mem, dir)?;
+        // snapshot; with none, the directory's own are left alone. Whether
+        // they can be written is decided before anything is (round-4
+        // review): the destination's rule lock, taken without waiting —
+        // so contract C8's order is kept — refuses the whole save while
+        // another operation changes those rules, instead of installing the
+        // snapshot and then leaving the directory's old rules beside it.
+        let rules = if self.reason_db_dir().is_none() && !self.reason_home.mem.is_empty() {
+            Some(crate::reason::store::try_lock_rules(dir)?)
+        } else {
+            None
+        };
+        self.save_snapshot(dir)?;
+        if let Some(held) = &rules {
+            crate::reason::store::write_memory_rules_locked(&self.reason_home.mem, dir, held)?;
         }
         Ok(())
     }
