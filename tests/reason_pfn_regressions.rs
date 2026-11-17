@@ -16,7 +16,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use gstore::reason::store::RuleStore;
 use gstore::{Database, QueryResult};
@@ -196,8 +196,37 @@ fn chain(n: usize) -> String {
         .collect()
 }
 
-/// The fastest of `tries` timed runs of a two-hop rule over a chain of `n`
-/// edges.
+/// The CPU time the calling thread has used (Linux
+/// `CLOCK_THREAD_CPUTIME_ID`): unlike the wall clock, it does not grow while
+/// the thread waits for a CPU, so a ratio of two measurements does not
+/// depend on what else the machine runs (parallel tests, other builds).
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+fn thread_cpu_time() -> Duration {
+    #[repr(C)]
+    struct Timespec {
+        sec: i64,
+        nsec: i64,
+    }
+    extern "C" {
+        fn clock_gettime(clock: i32, tp: *mut Timespec) -> i32;
+    }
+    const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
+    let mut t = Timespec { sec: 0, nsec: 0 };
+    // SAFETY: a plain syscall wrapper writing a properly sized struct
+    // (64-bit Linux `timespec`).
+    assert_eq!(unsafe { clock_gettime(CLOCK_THREAD_CPUTIME_ID, &mut t) }, 0);
+    Duration::new(t.sec as u64, t.nsec as u32)
+}
+
+/// Elsewhere: the wall clock since the first call.
+#[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
+fn thread_cpu_time() -> Duration {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed()
+}
+
+/// The least thread CPU time of `tries` runs of a two-hop rule over a chain
+/// of `n` edges.
 fn two_hop(n: usize, tries: usize) -> Duration {
     (0..tries)
         .map(|_| {
@@ -207,9 +236,9 @@ fn two_hop(n: usize, tries: usize) -> Duration {
                 "?x <http://ex/p> ?y . ?y <http://ex/p> ?z => ?x <http://ex/q> ?z",
             )
             .unwrap();
-            let t = Instant::now();
+            let t = thread_cpu_time();
             assert_eq!(db.run_rules(), n - 1);
-            t.elapsed()
+            thread_cpu_time().saturating_sub(t)
         })
         .min()
         .unwrap()
@@ -219,9 +248,11 @@ fn two_hop(n: usize, tries: usize) -> Duration {
 /// every binding with every stored pair (10.8 / 41.3 / 149.7 ms for 500 /
 /// 1000 / 2000 edges). Eight times the data takes about eight to ten times
 /// as long now (measured 2.1 ms -> 20 ms), not sixty-four (the nested loop:
-/// 53 ms -> 2.6 s). The bound sits between the two; the work counter's
-/// version of this check is the unit test
-/// `reason::tests::rule_joins_scale_linearly`.
+/// 53 ms -> 2.6 s). The bound sits between the two. The runs are timed by
+/// the thread's CPU time (the wall clock made the ratio depend on the
+/// machine's load: a small run done in one scheduler slice against large
+/// runs preempted throughout). The work counter's version of this check is
+/// the unit test `reason::tests::rule_joins_scale_linearly`.
 #[test]
 fn textual_rule_joins_scale_linearly() {
     let small = two_hop(1000, 5);
