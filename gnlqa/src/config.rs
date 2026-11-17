@@ -77,8 +77,8 @@ pub struct Config {
     /// with exponential back-off (`GNLQA_RETRIES`; 0 = no retry).
     pub retries: u32,
     /// Most entity labels the linker indexes (`GNLQA_LINKER_MAX_LABELS`,
-    /// default 10000); a larger KB is indexed up to this many, in label
-    /// order, with a warning.
+    /// default 10000); a larger KB is indexed up to this many, in
+    /// entity-IRI order, with a warning.
     pub linker_max_labels: usize,
     /// Where the linker's label index is cached between runs
     /// (`GNLQA_LINKER_CACHE_DIR`, default `$XDG_CACHE_HOME/gnlqa` or

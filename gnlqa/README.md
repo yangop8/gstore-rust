@@ -286,7 +286,7 @@ over `http://` to a non-loopback host.
 | `GSTORE_PASSWORD`    | —                                  | optional HTTP Basic password (redacted `Secret`) |
 | `GNLQA_MAX_TOKENS`   | `1024`                             | minimum completion-token budget floored onto every LLM request (raise it for reasoning models that spend tokens on hidden reasoning) |
 | `GNLQA_TIMEOUT_SECS` | `60`                               | per-request HTTP timeout |
-| `GNLQA_LINKER_MAX_LABELS` | `10000`                       | entity labels the linker indexes; a larger KB is indexed up to this many, in label order, with a warning |
+| `GNLQA_LINKER_MAX_LABELS` | `10000`                       | entity labels the linker indexes; a larger KB is indexed up to this many, in entity-IRI order, with a warning |
 | `GNLQA_LINKER_CACHE` | `on`                               | cache the linker's label index on disk per KB fingerprint (`off` = rebuild from the KB on every start) |
 | `GNLQA_LINKER_CACHE_DIR` | `$XDG_CACHE_HOME/gnlqa` or `~/.cache/gnlqa` | where that cache lives (files are mode 0600: labels are KB data) |
 | `GNLQA_RETRIES`      | `3`                                | retries of a transient LLM / embedding failure (429, 5xx, 529) or gStore overload (429, 502–504), with exponential back-off honouring `Retry-After` (`0` = none) |

@@ -46,7 +46,7 @@ GSTORE_ENDPOINT=http://127.0.0.1:9000/sparql
 # GNLQA_CACHE_MAX_BYTES=67108864
 # Minimum completion-token budget per request (raise for reasoning models)
 # GNLQA_MAX_TOKENS=1024
-# Entity labels the linker indexes (in label order)
+# Entity labels the linker indexes (the first ones in entity-IRI order)
 # GNLQA_LINKER_MAX_LABELS=10000
 # Cache the linker's label index per KB fingerprint (off = rebuild every start)
 # GNLQA_LINKER_CACHE=on

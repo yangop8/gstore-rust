@@ -341,7 +341,7 @@ impl LinkerLabels {
         if self.entities_truncated {
             eprintln!(
                 "gnlqa: warning: the KB has more than {} entity labels; only the first {} \
-                 (in label order) are indexed and the rest cannot be linked — raise \
+                 (in entity-IRI order) are indexed and the rest cannot be linked — raise \
                  GNLQA_LINKER_MAX_LABELS",
                 entity_limit.unwrap_or(0),
                 self.entities.len()
