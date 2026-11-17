@@ -48,7 +48,11 @@
 //! let it go — by replaying the changes made since (O(changes)), instead of
 //! copying the whole store (O(triples), the fallback when a reader still
 //! holds that older snapshot). A one-triple update therefore costs about
-//! two triple inserts, not a store copy. Memory: the database's indexes,
+//! two triple inserts, not a store copy — as long as it interns no new
+//! term: the dictionary's interners are copy-on-write without a spare, so
+//! the first brand-new term after a publish copies that term space's
+//! interner (O(terms of the space), about 0.4 ms at 20,000 entities in an
+//! unoptimized build; `crate::dict`). Memory: the database's indexes,
 //! the spare and the construction-time base snapshot's (see
 //! [`VersionView`]) — three copies at most, as when every publish cloned
 //! the store. A database with no in-RAM store — a Stream-mode on-disk one
