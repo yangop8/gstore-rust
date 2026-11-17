@@ -903,19 +903,57 @@ impl Shard {
 /// module's distributed stores construct one.
 pub struct Scatter<'a> {
     shards: Vec<&'a dyn ShardRead>,
+    /// Whether one triple may sit on more than one shard right now (a
+    /// [`ShardCluster`] bucket whose migration is unfinished). Lists are
+    /// de-duplicated anyway; counts then cannot simply be summed.
+    overlapping: bool,
 }
 
 impl std::fmt::Debug for Scatter<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Scatter")
             .field("shards", &self.shards.len())
+            .field("overlapping", &self.overlapping)
             .finish()
     }
 }
 
 impl<'a> Scatter<'a> {
     fn new(shards: Vec<&'a dyn ShardRead>) -> Scatter<'a> {
-        Scatter { shards }
+        Scatter {
+            shards,
+            overlapping: false,
+        }
+    }
+
+    /// Mark the shards as possibly holding copies of the same triples.
+    fn overlapping(mut self, overlapping: bool) -> Scatter<'a> {
+        self.overlapping = overlapping;
+        self
+    }
+
+    /// The number of distinct triples with predicate `pred`: the per-shard
+    /// counts summed, or — while shards may overlap — the size of the merged,
+    /// de-duplicated `(sub, obj)` list.
+    fn pred_card(&self, pred: PredId) -> io::Result<u64> {
+        if self.overlapping {
+            return Ok(self.gather(|s| s.read_so_by_p(pred))?.len() as u64);
+        }
+        self.sum(|s| s.read_pred_card(pred))
+    }
+
+    /// The number of distinct triples: the per-shard counts summed, or — while
+    /// shards may overlap, when a sum would count a copied triple twice
+    /// (review cluster-nlqa#1) — the distinct triples counted per predicate.
+    fn triple_count(&self) -> io::Result<u64> {
+        if !self.overlapping {
+            return self.sum(|s| s.read_triple_count());
+        }
+        let mut total = 0;
+        for pred in self.gather(|s| s.read_predicates())? {
+            total += self.pred_card(pred)?;
+        }
+        Ok(total)
     }
 
     /// `true` as soon as any shard holds the triple (a found triple is found no
@@ -1030,9 +1068,10 @@ pub trait TryTripleSource {
         self.scatter()?.gather(|s| s.read_object_keys())
     }
     /// Fallible [`TripleSource::triple_count`]. Each triple lives on exactly one
-    /// shard, so the per-shard sum is the global count.
+    /// shard, so the per-shard sum is the global count — except while a
+    /// [`ShardCluster`] migration is unfinished, when the count de-duplicates.
     fn try_triple_count(&self) -> io::Result<u64> {
-        self.scatter()?.sum(|s| s.read_triple_count())
+        self.scatter()?.triple_count()
     }
     /// Fallible [`TripleSource::distinct_subjects`] (global-distinct, not a sum).
     fn try_distinct_subjects(&self) -> io::Result<usize> {
@@ -1047,9 +1086,10 @@ pub trait TryTripleSource {
     fn try_num_predicates(&self) -> io::Result<usize> {
         Ok(self.scatter()?.gather(|s| s.read_predicates())?.len())
     }
-    /// Fallible [`TripleSource::pred_card`] (triple counts partition cleanly).
+    /// Fallible [`TripleSource::pred_card`] (triple counts partition cleanly,
+    /// except while a [`ShardCluster`] migration is unfinished).
     fn try_pred_card(&self, pred: PredId) -> io::Result<usize> {
-        Ok(self.scatter()?.sum(|s| s.read_pred_card(pred))? as usize)
+        Ok(self.scatter()?.pred_card(pred)? as usize)
     }
     /// Fallible [`TripleSource::pred_distinct_subj`].
     fn try_pred_distinct_subj(&self, pred: PredId) -> io::Result<usize> {
@@ -1482,10 +1522,45 @@ impl ClusterConfig {
 /// is [`ClusterNode`]'s Raft-replicated [`ClusterConfig`]. A deployment feeds each
 /// committed config-change into [`ShardCluster::add_node`]/`remove_node` to enact
 /// the migration; the two share the [`ClusterConfig`] type.
+///
+/// ## Interrupted migrations
+///
+/// A migration copies a bucket triple by triple over RPC, so it can fail part
+/// way (a node dies, a link resets). The routing change is recorded first and
+/// every re-homed bucket stays a *pending move* until both its copy and the
+/// purge of the source succeed; a failure leaves the bucket **stranded** — its
+/// triples may sit on both nodes, which reads de-duplicate, counts included —
+/// and returns the error. Moves are idempotent, so they simply run again
+/// (review cluster-nlqa#1; before, a retry was a silent no-op and a later
+/// leave dropped the stranded triples while every call returned `Ok`):
+///
+/// * repeating the failed [`ShardCluster::add_node`] / `remove_node`, or
+///   [`ShardCluster::resume_migrations`], finishes the stranded buckets
+///   ([`ShardCluster::stranded_buckets`] lists them);
+/// * any *other* membership change first resumes them, and is refused —
+///   changing nothing — while a bucket stays stranded, so a node is never
+///   dropped while it may hold the only copy of some triples;
+/// * a leaving node is drained of *every* bucket (not only those it owned, so
+///   stray copies are not left behind), and its endpoint is dropped only once
+///   all of them moved.
+///
+/// Re-adding an existing member never replaces its endpoint — that silently
+/// dropped a `Local` member's data (review cluster-nlqa#10): the same address
+/// is a retry, a different one is refused.
 #[derive(Debug)]
 pub struct ShardCluster {
     config: ClusterConfig,
     endpoints: HashMap<NodeId, Shard>,
+    /// Buckets whose re-homing `config` already records but the data plane has
+    /// not finished, bucket → move (at most one per bucket).
+    pending: BTreeMap<usize, BucketMove>,
+}
+
+/// One unfinished bucket migration of a [`ShardCluster`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BucketMove {
+    from: NodeId,
+    to: NodeId,
 }
 
 impl ShardCluster {
@@ -1494,6 +1569,7 @@ impl ShardCluster {
         ShardCluster {
             config: ClusterConfig::new(num_shards),
             endpoints: HashMap::new(),
+            pending: BTreeMap::new(),
         }
     }
 
@@ -1513,63 +1589,161 @@ impl ShardCluster {
     pub fn owner_of_subject(&self, sub: EntityLiteralId) -> Option<NodeId> {
         self.config.owner_of_subject(sub)
     }
-    /// Borrow a member's shard endpoint (for inspection / tests).
+    /// Borrow a node's shard endpoint (for inspection / tests): a member's, or
+    /// a departed node's that is still being drained.
     pub fn endpoint(&self, id: NodeId) -> Option<&Shard> {
         self.endpoints.get(&id)
+    }
+
+    /// The buckets whose migration is unfinished, as `(bucket, from, to)`,
+    /// ascending by bucket — empty unless a membership change failed part way.
+    /// While any remain their triples may sit on two nodes (reads stay complete
+    /// and exact), and other membership changes are refused until
+    /// [`ShardCluster::resume_migrations`] (or a retry of the failed change)
+    /// finishes them.
+    pub fn stranded_buckets(&self) -> Vec<(usize, NodeId, NodeId)> {
+        self.pending
+            .iter()
+            .map(|(&bucket, m)| (bucket, m.from, m.to))
+            .collect()
+    }
+
+    /// Finish every stranded bucket migration (see
+    /// [`ShardCluster::stranded_buckets`]), then drop the endpoints of departed
+    /// nodes that hold nothing more. Stops at the first failure and returns it;
+    /// the buckets not yet moved stay stranded for a later call. `Ok` at once
+    /// when nothing is stranded.
+    pub fn resume_migrations(&mut self) -> io::Result<()> {
+        let moves: Vec<(usize, BucketMove)> = self.pending.iter().map(|(&b, &m)| (b, m)).collect();
+        for (bucket, mv) in moves {
+            if let Err(e) = self.migrate_shard(bucket, mv.from, mv.to) {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!(
+                        "migrating bucket {bucket} from node {} to node {} failed; {} bucket(s) \
+                         stay stranded until the membership change is retried or \
+                         resume_migrations succeeds: {e}",
+                        mv.from,
+                        mv.to,
+                        self.pending.len()
+                    ),
+                ));
+            }
+            self.pending.remove(&bucket);
+        }
+        self.retire_departed();
+        Ok(())
+    }
+
+    /// Drop the endpoint of every node that is no longer a member and that no
+    /// pending move still involves.
+    fn retire_departed(&mut self) {
+        let (config, pending) = (&self.config, &self.pending);
+        self.endpoints.retain(|&id, _| {
+            config.contains(id) || pending.values().any(|m| m.from == id || m.to == id)
+        });
     }
 
     /// Admit node `id` (at `addr`) with a freshly bound, empty (or pre-seeded)
     /// shard `endpoint`, then migrate the buckets that rendezvous now assigns to
     /// it from their previous owners — so the new node *receives its shards*. The
     /// first node admitted simply owns every bucket (nothing to migrate yet).
+    ///
+    /// If a migration fails the error is returned and the unfinished buckets
+    /// stay stranded (see the type docs); calling `add_node` again with the same
+    /// `id` and `addr` resumes them. For an existing member that retry is all
+    /// it does: the registered endpoint is kept and the `endpoint` passed is
+    /// dropped (refused if it is a `Local` shard holding triples, which would
+    /// be lost); an existing member at a different `addr` is refused with
+    /// [`io::ErrorKind::InvalidInput`]. A new member is refused while buckets
+    /// of an earlier change stay stranded.
     pub fn add_node(&mut self, id: NodeId, addr: SocketAddr, endpoint: Shard) -> io::Result<()> {
+        if self.config.contains(id) {
+            let known = self.config.addr(id);
+            if known != Some(addr) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "node {id} is already a member at {}; remove it before adding it at {addr}",
+                        known.map_or_else(|| "an unknown address".to_string(), |a| a.to_string())
+                    ),
+                ));
+            }
+            if let Shard::Local(store) = &endpoint {
+                if store.triple_count() > 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "node {id} is already a member; re-adding it with a pre-seeded \
+                             local shard would discard that shard's triples"
+                        ),
+                    ));
+                }
+            }
+            drop(endpoint); // a retry: the member keeps its registered endpoint
+            return self.resume_migrations();
+        }
+        // A different change: finish an earlier one first, or change nothing.
+        self.resume_migrations()?;
         let old = self.config.clone();
         self.endpoints.insert(id, endpoint);
-        if !self.config.add_node(id, addr) {
-            return Ok(()); // already a member: no rebalance
+        self.config.add_node(id, addr);
+        for bucket in 0..self.config.num_shards() {
+            if let (Some(from), Some(to)) = (old.owner(bucket), self.config.owner(bucket)) {
+                if from != to {
+                    self.pending.insert(bucket, BucketMove { from, to });
+                }
+            }
         }
-        self.rebalance(&old)
+        self.resume_migrations()
     }
 
-    /// Evict node `id`: migrate every bucket it owned to that bucket's new
+    /// Evict node `id`: migrate every bucket it may hold to that bucket's new
     /// (survivor) owner — no data loss — then drop its endpoint. A no-op if `id`
-    /// is not a member.
+    /// is neither a member nor a departed node still being drained.
+    ///
+    /// Refused, changing nothing, while buckets of an earlier change stay
+    /// stranded, or when `id` is the last member and still holds triples
+    /// (they would have nowhere to go). If a migration fails the error is
+    /// returned: `id` has left the membership (writes no longer route to it)
+    /// but keeps its endpoint — reads still see its triples — until a retry
+    /// of `remove_node(id)` or [`ShardCluster::resume_migrations`] has moved
+    /// every bucket.
     pub fn remove_node(&mut self, id: NodeId) -> io::Result<()> {
-        let old = self.config.clone();
-        if !self.config.remove_node(id) {
+        if self.config.contains(id) {
+            self.resume_migrations()?;
+            if self.config.members() == [id] {
+                let held = match self.endpoints.get(&id) {
+                    Some(ep) => ep.reader().read_triple_count()?,
+                    None => 0,
+                };
+                if held > 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "node {id} is the last member and holds {held} triple(s), which \
+                             would have nowhere to go; add another node first"
+                        ),
+                    ));
+                }
+            }
+            self.config.remove_node(id);
+            for bucket in 0..self.config.num_shards() {
+                if let Some(to) = self.config.owner(bucket) {
+                    self.pending.insert(bucket, BucketMove { from: id, to });
+                }
+            }
+        } else if !self.endpoints.contains_key(&id) {
             return Ok(());
         }
-        for shard in 0..self.config.num_shards() {
-            if old.owner(shard) == Some(id) {
-                if let Some(new_owner) = self.config.owner(shard) {
-                    self.migrate_shard(shard, id, new_owner)?;
-                }
-            }
-        }
-        self.endpoints.remove(&id);
-        Ok(())
+        self.resume_migrations()
     }
 
-    /// Migrate every bucket whose owner changed between `old` and the current
-    /// config (used after admitting a node).
-    fn rebalance(&mut self, old: &ClusterConfig) -> io::Result<()> {
-        for shard in 0..self.config.num_shards() {
-            let new_owner = match self.config.owner(shard) {
-                Some(o) => o,
-                None => continue,
-            };
-            if let Some(old_owner) = old.owner(shard) {
-                if old_owner != new_owner {
-                    self.migrate_shard(shard, old_owner, new_owner)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Stream bucket `shard` from `from`'s endpoint to `to`'s, then purge it from
-    /// `from` (cut-over). If the source endpoint is gone (e.g. a failed node) the
-    /// migration is skipped rather than erroring.
+    /// Copy bucket `shard` from `from`'s endpoint to `to`'s, then purge it from
+    /// `from` (cut-over). Idempotent: run again after a failure at any step it
+    /// copies what is left (a triple already on `to` is a no-op insert) and
+    /// purges again — which is how a stranded bucket is finished. Nothing is
+    /// purged before every scanned triple reached `to`.
     fn migrate_shard(&mut self, shard: usize, from: NodeId, to: NodeId) -> io::Result<()> {
         if from == to {
             return Ok(());
@@ -1577,12 +1751,16 @@ impl ShardCluster {
         let n = self.config.num_shards() as u32;
         let triples = match self.endpoints.get(&from) {
             Some(ep) => ep.scan_shard(shard as u32, n)?,
-            None => return Ok(()),
+            None => return Ok(()), // the source holds nothing any more
         };
-        if let Some(dst) = self.endpoints.get_mut(&to) {
-            for t in &triples {
-                dst.insert(*t)?;
-            }
+        let dst = self.endpoints.get_mut(&to).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("migration target node {to} has no registered endpoint"),
+            )
+        })?;
+        for t in &triples {
+            dst.insert(*t)?;
         }
         if let Some(src) = self.endpoints.get_mut(&from) {
             src.purge_shard(shard as u32, n)?;
@@ -1628,10 +1806,14 @@ impl ShardCluster {
 }
 
 impl TryTripleSource for ShardCluster {
+    /// Every registered endpoint — the members', plus a departed node's that is
+    /// still being drained — marked as overlapping while a bucket is stranded
+    /// (its triples may then sit on two nodes).
     fn scatter(&self) -> io::Result<Scatter<'_>> {
-        Ok(Scatter::new(
-            self.endpoints.values().map(Shard::reader).collect(),
-        ))
+        Ok(
+            Scatter::new(self.endpoints.values().map(Shard::reader).collect())
+                .overlapping(!self.pending.is_empty()),
+        )
     }
 }
 
@@ -4094,6 +4276,7 @@ mod tests {
 #[cfg(test)]
 mod test_support {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     /// A TCP front for a shard node that can be **cut** and **restored** —
     /// modelling a shard host that goes down and comes back while coordinators
@@ -4105,6 +4288,9 @@ mod test_support {
     pub(super) struct Link {
         addr: SocketAddr,
         up: Arc<AtomicBool>,
+        /// Requests the link still forwards before it cuts itself
+        /// ([`Link::fail_after`]); `usize::MAX` means unlimited.
+        budget: Arc<AtomicUsize>,
     }
 
     impl Link {
@@ -4113,7 +4299,9 @@ mod test_support {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind link");
             let addr = listener.local_addr().expect("link addr");
             let up = Arc::new(AtomicBool::new(true));
+            let budget = Arc::new(AtomicUsize::new(usize::MAX));
             let flag = Arc::clone(&up);
+            let left = Arc::clone(&budget);
             thread::spawn(move || {
                 for client in listener.incoming().flatten() {
                     if !flag.load(Ordering::SeqCst) {
@@ -4121,10 +4309,18 @@ mod test_support {
                         continue;
                     }
                     let flag = Arc::clone(&flag);
-                    thread::spawn(move || relay(client, backend, &flag));
+                    let left = Arc::clone(&left);
+                    thread::spawn(move || relay(client, backend, &flag, &left));
                 }
             });
-            Link { addr, up }
+            Link { addr, up, budget }
+        }
+
+        /// Forward `n` more requests, then cut the link at the next one (which
+        /// is not forwarded) — a deterministic mid-operation failure: the host
+        /// dies after exactly `n` RPCs, whatever the timing.
+        pub(super) fn fail_after(&self, n: usize) {
+            self.budget.store(n, Ordering::SeqCst);
         }
 
         /// The address coordinators should use for this shard.
@@ -4137,15 +4333,33 @@ mod test_support {
             self.up.store(false, Ordering::SeqCst);
         }
 
-        /// Bring the shard back.
+        /// Bring the shard back (and lift any [`Link::fail_after`] budget).
         pub(super) fn restore(&self) {
+            self.budget.store(usize::MAX, Ordering::SeqCst);
             self.up.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Spend one request of a [`Link::fail_after`] budget; `false` once it is
+    /// exhausted (`usize::MAX` is unlimited).
+    fn take_one(budget: &AtomicUsize) -> bool {
+        let mut cur = budget.load(Ordering::SeqCst);
+        loop {
+            let next = match cur {
+                usize::MAX => return true,
+                0 => return false,
+                n => n - 1,
+            };
+            match budget.compare_exchange(cur, next, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return true,
+                Err(seen) => cur = seen,
+            }
         }
     }
 
     /// Relay framed request/response pairs between `client` and the node at
     /// `backend` until either side closes or the link is cut.
-    fn relay(mut client: TcpStream, backend: SocketAddr, up: &AtomicBool) {
+    fn relay(mut client: TcpStream, backend: SocketAddr, up: &AtomicBool, budget: &AtomicUsize) {
         let Ok(mut server) = TcpStream::connect(backend) else {
             return;
         };
@@ -4154,6 +4368,10 @@ mod test_support {
         while let Ok(req) = rpc::read_message(&mut client) {
             if !up.load(Ordering::SeqCst) {
                 return; // cut mid-session: sever both sockets
+            }
+            if !take_one(budget) {
+                up.store(false, Ordering::SeqCst); // budget exhausted: the host dies now
+                return;
             }
             if rpc::write_message(&mut server, &req).is_err() {
                 return;
@@ -6559,6 +6777,211 @@ mod review_fix_tests {
             .reader()
             .read_exists(tr.sub, tr.pred, tr.obj)
             .expect("endpoint answers")
+    }
+
+    // ----- review cluster-nlqa#1: retry-safe migrations -----------------------
+
+    /// The reviewer's experiment: node 0 holds 400 triples, node 1 joins over
+    /// a link that dies after 30 RPCs. The retry of the join must finish the
+    /// stranded buckets, and a later leave of node 0 must lose nothing (before
+    /// the fix the retry was a silent no-op, the count read 430 and the leave
+    /// dropped ~65 triples, every call returning `Ok`).
+    #[test]
+    fn a_failed_join_is_resumed_by_its_retry_and_a_later_leave_loses_nothing() {
+        let triples: Vec<IdTriple> = (1..=400).map(|s| t(s, 7, s + 1000)).collect();
+        let mut cluster = ShardCluster::new(16);
+        cluster
+            .add_node(0, local_addr(1), local_shard(&triples))
+            .unwrap();
+
+        let link = Link::to(start_shard(&[]));
+        link.fail_after(30);
+        let joined = cluster.add_node(1, link.addr(), remote(link.addr()));
+        assert!(joined.is_err(), "the link dies mid-migration: {joined:?}");
+
+        link.restore();
+        cluster
+            .add_node(1, link.addr(), remote(link.addr()))
+            .expect("the retry resumes the stranded buckets");
+        assert_eq!(
+            cluster.try_triple_count().unwrap(),
+            400,
+            "no triple lost or counted twice after the retried join"
+        );
+        for &tr in &triples {
+            let owner = cluster.owner_of_subject(tr.sub).unwrap();
+            for id in cluster.members() {
+                assert_eq!(
+                    holds(&cluster, id, tr),
+                    id == owner,
+                    "{tr:?} must live on its owner {owner} only (checked node {id})"
+                );
+            }
+        }
+
+        cluster.remove_node(0).expect("node 0 leaves");
+        assert_eq!(cluster.members(), vec![1]);
+        assert_eq!(cluster.try_triple_count().unwrap(), 400);
+        for &tr in &triples {
+            assert!(
+                cluster.try_exists(tr.sub, tr.pred, tr.obj).unwrap(),
+                "{tr:?} lost by the leave"
+            );
+        }
+    }
+
+    /// While a failed join leaves buckets stranded, reads stay exact (the
+    /// copied triples sit on both nodes but are counted once), and every other
+    /// membership change is refused without changing anything — before the
+    /// fix `remove_node(0)` went ahead and dropped the stranded triples.
+    #[test]
+    fn stranded_buckets_block_other_membership_changes_until_resumed() {
+        let triples: Vec<IdTriple> = (1..=400).map(|s| t(s, 7, s + 1000)).collect();
+        let mut cluster = ShardCluster::new(16);
+        cluster
+            .add_node(0, local_addr(1), local_shard(&triples))
+            .unwrap();
+        let link = Link::to(start_shard(&[]));
+        link.fail_after(30);
+        assert!(cluster
+            .add_node(1, link.addr(), remote(link.addr()))
+            .is_err());
+        let stranded = cluster.stranded_buckets();
+        assert!(!stranded.is_empty());
+        assert!(stranded.iter().all(|&(_, from, to)| (from, to) == (0, 1)));
+
+        // The link is still down: nothing else may change.
+        assert!(
+            cluster.remove_node(0).is_err(),
+            "node 0 may hold the only copy"
+        );
+        assert!(cluster
+            .add_node(2, local_addr(2), Shard::Local(TripleStore::new()))
+            .is_err());
+        assert_eq!(cluster.members(), vec![0, 1]);
+        assert_eq!(cluster.stranded_buckets(), stranded);
+
+        link.restore();
+        assert_eq!(
+            cluster.try_triple_count().unwrap(),
+            400,
+            "copies counted once"
+        );
+        assert_eq!(cluster.try_pred_card(7).unwrap(), 400);
+        assert_eq!(cluster.try_iter_all().unwrap().len(), 400);
+
+        cluster.resume_migrations().expect("the link is back");
+        assert!(cluster.stranded_buckets().is_empty());
+        assert_eq!(cluster.try_triple_count().unwrap(), 400);
+        cluster.remove_node(0).expect("nothing stranded any more");
+        assert_eq!(cluster.try_triple_count().unwrap(), 400);
+    }
+
+    /// A leave interrupted mid-migration keeps the leaving node's endpoint —
+    /// reads still see everything — until a retry has drained it.
+    #[test]
+    fn an_interrupted_leave_keeps_the_leaving_endpoint_until_it_is_drained() {
+        let triples: Vec<IdTriple> = (1..=200).map(|s| t(s, 3, s)).collect();
+        let link = Link::to(start_shard(&[]));
+        let mut cluster = ShardCluster::new(8);
+        cluster
+            .add_node(0, link.addr(), remote(link.addr()))
+            .unwrap();
+        cluster
+            .add_node(1, local_addr(1), Shard::Local(TripleStore::new()))
+            .unwrap();
+        cluster.insert_all(triples.iter().copied()).unwrap();
+        let held_by_0 = triples.iter().filter(|tr| holds(&cluster, 0, **tr)).count();
+        assert!(
+            held_by_0 > 10,
+            "node 0 owns some buckets ({held_by_0} triples)"
+        );
+
+        link.fail_after(5);
+        assert!(cluster.remove_node(0).is_err());
+        assert_eq!(
+            cluster.members(),
+            vec![1],
+            "writes no longer route to node 0"
+        );
+        assert!(cluster.endpoint(0).is_some(), "but its endpoint is kept");
+        assert!(!cluster.stranded_buckets().is_empty());
+
+        link.restore();
+        assert_eq!(cluster.try_triple_count().unwrap(), 200);
+        cluster.remove_node(0).expect("the retry drains node 0");
+        assert!(cluster.endpoint(0).is_none(), "drained, then dropped");
+        assert!(cluster.stranded_buckets().is_empty());
+        assert_eq!(cluster.try_triple_count().unwrap(), 200);
+        for &tr in &triples {
+            assert!(holds(&cluster, 1, tr), "{tr:?} reached the survivor");
+        }
+    }
+
+    /// The last member cannot leave while it holds triples: they would have
+    /// nowhere to go (before, its endpoint was dropped with them).
+    #[test]
+    fn the_last_member_holding_data_cannot_leave() {
+        let mut cluster = ShardCluster::new(4);
+        cluster
+            .add_node(0, local_addr(1), local_shard(&[t(1, 2, 3)]))
+            .unwrap();
+        let err = cluster.remove_node(0).expect_err("it holds a triple");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert_eq!(cluster.members(), vec![0]);
+        assert_eq!(cluster.try_triple_count().unwrap(), 1);
+
+        let mut empty = ShardCluster::new(4);
+        empty
+            .add_node(0, local_addr(1), Shard::Local(TripleStore::new()))
+            .unwrap();
+        empty
+            .remove_node(0)
+            .expect("an empty last member may leave");
+        assert!(empty.members().is_empty());
+    }
+
+    // ----- review cluster-nlqa#10: re-adding a member -------------------------
+
+    /// Re-adding an existing member must not replace (and drop) its endpoint:
+    /// before the fix a second `add_node(1, .., Local(empty))` silently dropped
+    /// the member's 10 triples. A re-add naming a different address is not a
+    /// retry and is refused instead of leaving config and endpoint disagreeing.
+    #[test]
+    fn re_adding_a_member_keeps_its_endpoint_and_its_data() {
+        let mut cluster = ShardCluster::new(4);
+        cluster
+            .add_node(1, local_addr(1), Shard::Local(TripleStore::new()))
+            .unwrap();
+        for i in 0..10 {
+            assert!(cluster.insert(t(i, 100, i + 1)).unwrap());
+        }
+        cluster
+            .add_node(1, local_addr(1), Shard::Local(TripleStore::new()))
+            .expect("re-adding with the same address is an idempotent retry");
+        assert_eq!(cluster.try_triple_count().unwrap(), 10, "member data kept");
+
+        let err = cluster
+            .add_node(1, local_addr(2), Shard::Local(TripleStore::new()))
+            .expect_err("a different address is not a retry");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert_eq!(cluster.config().addr(1), Some(local_addr(1)));
+        assert_eq!(cluster.try_triple_count().unwrap(), 10);
+    }
+
+    /// A re-add whose `Local` endpoint holds triples is refused rather than
+    /// silently discarding them.
+    #[test]
+    fn re_adding_a_member_with_a_seeded_local_shard_is_refused() {
+        let mut cluster = ShardCluster::new(4);
+        cluster
+            .add_node(1, local_addr(1), Shard::Local(TripleStore::new()))
+            .unwrap();
+        let err = cluster
+            .add_node(1, local_addr(1), local_shard(&[t(5, 6, 7)]))
+            .expect_err("the seeded triples would be discarded");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert_eq!(cluster.try_triple_count().unwrap(), 0);
     }
 
     // ----- review cluster-nlqa#9 (+ sec#19, conc#11, robust#15) ---------------
