@@ -89,7 +89,13 @@ Behaviour changes first:
     replaced as a whole, so the directory still holds a complete backup
     (the earlier one, or the new one where its store was replaced before
     the failure), and a retry into it — the default `<db>.backup` is reused
-    by every REST backup of the database — is allowed;
+    by every REST backup of the database — is allowed (round-3 review
+    correction: a crash or panic skipped that cleanup and left a directory
+    with no record, which blocked every later default-path backup, and the
+    rules are copied before the store, so a replaced backup could pair new
+    rules with the old store; a backup now marks its directory in progress
+    first, `BACKUP_OF.partial` — see r3-integration's round-3 review
+    fixes);
   - REST `/restore` registers a database it creates at the backup's time
     (a `<db>.db_<YYYYmmddHHMMSS>` backup), as `/api` `restore` does —
     before, at the time of the restore;

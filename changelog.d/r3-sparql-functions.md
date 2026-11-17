@@ -16,6 +16,10 @@ Behaviour changes first:
   solution (also `BIND(BNODE("x") AS ?a) BIND(BNODE("x") AS ?b)`, and across
   a `GRAPH` block) and a different one in every other solution and query
   (SPARQL 1.1 §17.4.2.9). Only the labels change; nothing on disk.
+  (Round-3 review correction: as merged, a solution was told apart by its
+  bindings only, so equal solutions of a multiset — a repeated `VALUES`
+  row, a path reached by two routes — shared one node; each solution now
+  has an identity of its own — see r3-integration's round-3 review fixes.)
 - **Behaviour change (query#5, found by the round-2 w3c harness): a labelled
   blank node in a CONSTRUCT / INSERT template (`_:v`) is a fresh node per
   solution**, the same across the template triples of one solution (Query

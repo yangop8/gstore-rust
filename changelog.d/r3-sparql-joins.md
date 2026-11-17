@@ -67,7 +67,12 @@ Behaviour changes first:
   after an `OPTIONAL`: 14.7 s). All of them now probe a hash index of the
   right side that also handles unbound shared variables (see the new
   `src/query/probe.rs`), so they cost about the size of their output; the
-  answers and their order are unchanged. The `OPTIONAL` loop also polls
+  answers and their order are unchanged. (Round-3 review correction: one
+  index of the whole right side was built and kept per distinct subset of
+  the shared variables a left solution binds, so 1,000 VALUES rows binding
+  different subsets cost 1.6 GB on 10,000 triples for a one-row answer; the
+  partial indexes are now bounded to 4x the right side's rows, past which
+  a group is scanned — see r3-integration's round-3 review fixes.) The `OPTIONAL` loop also polls
   cancellation between left solutions.
 
 New files and tests:

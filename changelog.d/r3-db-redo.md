@@ -98,10 +98,15 @@
 - **db#13: `restore_incremental` never writes the base backup.** A snapshot
   base is read in place without taking its lock (it used to create or
   rewrite `LOCK`); a disk or RocksDB base is copied (`Database::backup_dir`)
-  into a scratch directory under the system temporary directory, opened and
-  detached there, and the copy removed (it used to be opened in place, which
-  rewrote `kvstore.kv`'s header and wrote `vstree.kv` when the tree was
-  stale). A base on read-only media can be restored now.
+  into a scratch directory, opened and detached there, and the copy removed
+  (it used to be opened in place, which rewrote `kvstore.kv`'s header and
+  wrote `vstree.kv` when the tree was stale). A base on read-only media can
+  be restored now. (Round-3 review correction: the scratch directory was
+  `gstore-restore-<pid>-<n>` in the system temporary directory, often a
+  small tmpfs, and reused whatever another user had put there; it is now
+  created exclusively, mode 0700, beside the base — the temporary directory
+  only when the base's parent cannot be written — see r3-integration's
+  round-3 review fixes.)
 - **Behaviour change (db#14): `Database::backup` inside an open transaction
   is refused** ("backup: commit or roll back the open transaction first").
   It used to capture the transaction's uncommitted writes, which no later
@@ -119,7 +124,11 @@
   query the cache does take (a user function makes a query uncacheable).
 - New tests: `tests/redo_log_durability.rs` (torn tails, all-or-nothing
   commits at every cut, a `SIGXFSZ` crash mid-append and an `EFBIG` append
-  in `RLIMIT_FSIZE` child processes, a failed commit point logged nowhere,
+  in `RLIMIT_FSIZE` child processes, a failed commit point logged nowhere
+  (round-3 review correction: wrong when the failed flush had already
+  given its write-ahead log a durable name, which the next open replays;
+  the test now reopens the database and checks that the logs agree with
+  it — see r3-integration's round-3 review fixes),
   owed records across rollback / disable, committed-only update log,
   inferred triples, crafted lengths, unknown ops, a line-for-line emulation
   of the pre-clear-record reader, old-format logs, a base backup that stays
@@ -164,8 +173,10 @@ none
   torn-tail and corruption behaviour of replay, the reported append failure
   and the `backup_incremental` refusal, `backup()` refused inside a
   transaction, and `restore_incremental` reading the base read-only (a
-  scratch copy of a disk / RocksDB base in the system temporary directory:
-  it needs that much free space there).
+  scratch copy of a disk / RocksDB base beside it, or in the system
+  temporary directory when the base's parent cannot be written: it needs
+  about the base's size of free space there, besides the memory the
+  restored database takes; round-3 review).
 - docs/DESIGN.md §11 (contract C8, owned by r4-ext-docs): add the two log
   appenders (`redo_writer`, `update_writer`) as leaf mutexes under
   `persist_lock` (held for one append or tail scan; nothing is taken under
@@ -191,12 +202,19 @@ none
     session (afterwards the appender knows the boundary) and
     `backup_incremental` reads only `[checkpoint, end)`.
   - (durability#6) Torn-versus-corrupt is decided by what follows the
-    defect: a record that runs past the end of the file is torn unless a
-    whole record follows it, any other defect is corruption when a record
-    header follows it. Two contrived cases remain: a torn update-log
-    statement whose own text holds a complete, well-framed record (a line
-    `REC <n> <n> <len>` with exactly `<len>` bytes and a newline after it,
-    or a valid checksum) is reported as corruption instead of skipped; and
+    defect: a defective record (running past the end of the file, or with
+    a wrong checksum or terminator) is torn unless a whole record (complete,
+    checksum right) follows it. (Round-3 review correction: as merged, a
+    checksum or terminator defect was corruption when any record *header*
+    followed it, so a zero-filled or changed last update-log record whose
+    statement held a line starting with `REC ` was reported as corruption,
+    and the appender cut the file at that line, inside the record, making
+    the log unreplayable for good; both now use the whole-record rule and
+    the appender cuts at the record's start.) Two contrived cases remain: a
+    torn update-log statement whose own text holds a complete record with a
+    valid checksum (a line `REC <n> <n> <len> c=<crc>` with exactly `<len>`
+    bytes matching the CRC after it) is reported as corruption instead of
+    skipped; and
     a record whose length field was damaged to run past the end, followed
     only by a torn record, is skipped with the torn tail instead of
     reported. A per-append marker (or a log-level sequence number) would

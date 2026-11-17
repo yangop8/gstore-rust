@@ -27,7 +27,12 @@ Behaviour changes first (query results; no wire-format or on-disk change):
   (each node once, with the number of routes to it), so `/` and `|` cost
   the distinct nodes of each step rather than the routes, which grow as
   degree^length: `(:p/:p/:p/:p)+` over a dense graph is as cheap as the
-  set-valued walk was, and only the solutions handed out are expanded.
+  set-valued walk was. (Round-3 review correction: as merged, the pairs were
+  then expanded into one copy per route before anything consumed them, in
+  both executors, so `ASK`, `EXISTS` and `LIMIT 1` over a 24-step
+  `(:p|:p)/…` chain on one triple took 1.2 GB; the copies are now handed
+  out lazily under a per-query budget — see r3-integration's round-3
+  review fixes.)
 - **Zero-length paths match constants that are not in the data** (review
   M14: sparqlconf#13). `<unknown> :p* ?x` and `<unknown> :p? ?x` bind `?x`
   to `<unknown>`, `?x :p* <unknown>` binds `?x` likewise, `ASK { <u> :p*
@@ -115,13 +120,14 @@ none
 - README.md / docs/BENCHMARKS.md (EvalStats): mention `path_steps` next
   to the other work counters if they are listed.
 - docs/REFACTOR_BACKLOG.md (sparqlconf#9, D3): the bind join covers a path
-  conjunct of a group (`Join`). A path inside an OPTIONAL / MINUS / EXISTS
-  operand whose end point the other side binds is still evaluated with
-  both ends free (`eval_left_join` / `eval_minus` / `eval_exists` are
-  r3-sparql-joins' this round; the same `PathJoin`/`bound_path_pairs`
-  machinery can serve them), and a lone path pattern under `LIMIT` is
-  still evaluated in full before the first row streams (the Path arm of
-  `stream_pattern`). The parts of a bind-joined group that are evaluated on
+  conjunct of a group (`Join`) and, since the round-3 review fixes, the
+  right side of an OPTIONAL. A path inside a MINUS / EXISTS operand whose
+  end point the other side binds is still evaluated with both ends free
+  (the same `PathJoin`/`bound_path_pairs` machinery can serve them), and a
+  lone path pattern under `LIMIT` still has its `(start, end)` pairs walked
+  in full (as counts) before the first row streams (the Path arm of
+  `stream_pattern`; since the round-3 review fixes its copies are handed
+  out one at a time). The parts of a bind-joined group that are evaluated on
   their own (e.g. `?x :label ?l` beyond the path) are still materialized in
   full, as every conjunct of a group was before (linear, not quadratic).
 - docs/REFACTOR_BACKLOG.md (D3, query#17 / design#10 context): eval_join
@@ -199,5 +205,6 @@ campaign VM (other worktrees building at the same time, load average 4.6 to
   order used to be random) can now be removed, so path queries are
   compared in order between the Stream and Materialize databases.
 - Not yet: see the REFACTOR_BACKLOG notes above (paths inside
-  OPTIONAL/MINUS/EXISTS operands and a lone path under LIMIT are not
-  bind-joined / streamed). Every id of this package is fixed.
+  MINUS/EXISTS operands are not bind-joined, a lone path's pairs are walked
+  in full under LIMIT; OPTIONAL is covered since the round-3 review fixes).
+  Every id of this package is fixed.
