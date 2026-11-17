@@ -2972,7 +2972,11 @@ impl RaftJournal {
     const HEADER_LEN: usize = 16;
 
     /// Open (creating it if needed) the journal of node `id` in `dir` and
-    /// replay it. Refuses a journal written by another node id.
+    /// replay it. Refuses a journal written by another node id, and one that
+    /// another open journal (another process, or another node in this one)
+    /// holds: two copies of one replica writing one journal could again vote
+    /// twice in a term. The exclusive advisory lock lasts as long as the
+    /// journal is open; a file system without advisory locks opens unlocked.
     fn open(dir: &std::path::Path, id: NodeId) -> io::Result<(RaftJournal, RecoveredState)> {
         use std::io::{Read as _, Write as _};
         std::fs::create_dir_all(dir)?;
@@ -2982,6 +2986,20 @@ impl RaftJournal {
             .append(true)
             .create(true)
             .open(&path)?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "{} is in use: another running node holds this state directory",
+                        path.display()
+                    ),
+                ))
+            }
+            Err(std::fs::TryLockError::Error(e)) if e.kind() == io::ErrorKind::Unsupported => {}
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        }
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
         if bytes.len() < Self::HEADER_LEN {
@@ -8036,9 +8054,10 @@ mod review_fix_tests {
     }
 
     /// A torn record at the journal's tail (a crash mid-append) is cut off,
-    /// and a state directory of another node id is refused.
+    /// a state directory of another node id is refused, and so is a second
+    /// copy of the same node while the first holds the journal.
     #[test]
-    fn the_raft_journal_drops_a_torn_tail_and_refuses_a_foreign_node() {
+    fn the_raft_journal_drops_a_torn_tail_and_refuses_a_foreign_or_second_node() {
         use std::io::Write;
         let dir = TempDir::new("journal");
         let cfg = RaftConfig::default();
@@ -8073,8 +8092,19 @@ mod review_fix_tests {
         ));
         drop(node);
 
-        let err = ClusterNode::bind_persistent(9, vec![4], &dir.0, "127.0.0.1:0", cfg)
+        let err = ClusterNode::bind_persistent(9, vec![4], &dir.0, "127.0.0.1:0", cfg.clone())
             .expect_err("node 3's state directory");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+
+        // One replica, one journal: a second copy of node 3 on the same
+        // directory is refused while the first one runs.
+        let first =
+            ClusterNode::bind_persistent(3, vec![4], &dir.0, "127.0.0.1:0", cfg.clone()).unwrap();
+        let err = ClusterNode::bind_persistent(3, vec![4], &dir.0, "127.0.0.1:0", cfg.clone())
+            .expect_err("the journal is held");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock, "{err}");
+        drop(first);
+        ClusterNode::bind_persistent(3, vec![4], &dir.0, "127.0.0.1:0", cfg)
+            .expect("released when the first node is gone");
     }
 }
