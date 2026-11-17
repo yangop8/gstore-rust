@@ -26,7 +26,7 @@
 //! see [`crate::budget`]). See [`HttpLimits`] for the defaults.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, ErrorKind, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -118,6 +118,10 @@ pub struct HttpServer {
     max_conn: usize,
     auth: HttpAuth,
     limits: HttpLimits,
+    read_deadline: Duration,
+    /// Test failpoint: fail this many thread spawns (review conc#10).
+    #[cfg(test)]
+    fail_spawns: AtomicUsize,
 }
 
 impl HttpServer {
@@ -134,7 +138,18 @@ impl HttpServer {
             max_conn: 64,
             auth: HttpAuth::Unconfigured,
             limits: HttpLimits::default(),
+            read_deadline: REQUEST_DEADLINE,
+            #[cfg(test)]
+            fail_spawns: AtomicUsize::new(0),
         })
+    }
+
+    /// Cap the wall-clock time for reading one request (headers and body;
+    /// default 30 s). A client still sending after it gets a 400 and the
+    /// connection is closed, so a slow drip cannot pin a slot.
+    pub fn with_read_deadline(mut self, d: Duration) -> HttpServer {
+        self.read_deadline = d;
+        self
     }
 
     /// Cap the number of concurrently-handled connections (excess → 503).
@@ -195,6 +210,7 @@ impl HttpServer {
             auth: self.auth.clone(),
             limits: self.limits,
             limiter: RateLimiter::new(self.limits.requests_per_minute),
+            read_deadline: self.read_deadline,
         });
         let active = Arc::new(AtomicUsize::new(0));
         for stream in self.listener.incoming() {
@@ -210,14 +226,88 @@ impl HttpServer {
                 );
                 continue;
             }
-            active.fetch_add(1, Ordering::AcqRel);
+            // The slot is released by a drop guard (review conc#10 /
+            // cluster-nlqa#20): a handler that panics no longer leaks it, so
+            // max_conn panics can't turn into a permanent "server busy".
+            let slot = Slot::take(&active);
+            // A second handle on the socket, so a failed thread spawn can
+            // still answer 503 instead of taking the accept loop down.
+            let fallback = stream.try_clone().ok();
             let ctx = Arc::clone(&ctx);
-            let active2 = Arc::clone(&active);
-            thread::spawn(move || {
-                let _ = handle_connection(stream, &ctx);
-                active2.fetch_sub(1, Ordering::AcqRel);
+            let spawned = self.spawn_handler(move || {
+                let mut stream = stream;
+                {
+                    let _slot = slot; // released at the end of this block, also on unwind
+                    serve_connection(&mut stream, &ctx);
+                }
+                // The connection closes only after the slot is free, so a
+                // client that has read the response to EOF can rely on its
+                // slot being available again.
+                drop(stream);
             });
+            if let Err(e) = spawned {
+                // The closure (and with it the slot) was dropped by the failed
+                // spawn; answer on the second handle and keep accepting.
+                eprintln!("gnlqa: cannot start a connection handler thread: {e}");
+                if let Some(mut s) = fallback {
+                    let _ = write_json(
+                        &mut s,
+                        503,
+                        &json!({"status":"error","message":"server busy"}),
+                    );
+                }
+            }
         }
+    }
+
+    /// Start a handler thread (`Builder::spawn`, so an OS refusal is an
+    /// error, not a panic of the accept loop).
+    fn spawn_handler(&self, f: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
+        #[cfg(test)]
+        {
+            let n = self.fail_spawns.load(Ordering::Acquire);
+            if n > 0 {
+                self.fail_spawns.store(n - 1, Ordering::Release);
+                return Err(std::io::Error::other("injected thread-spawn failure"));
+            }
+        }
+        thread::Builder::new()
+            .name("gnlqa-http".into())
+            .spawn(f)
+            .map(|_| ())
+    }
+}
+
+/// One taken connection slot; dropping it gives the slot back.
+struct Slot(Arc<AtomicUsize>);
+
+impl Slot {
+    fn take(active: &Arc<AtomicUsize>) -> Slot {
+        active.fetch_add(1, Ordering::AcqRel);
+        Slot(Arc::clone(active))
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Serve one connection; a panic in the handler is caught, logged and
+/// answered with a 500 (the response had not been written yet: replies are
+/// written only after routing returns).
+fn serve_connection(stream: &mut TcpStream, ctx: &Ctx) {
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        handle_connection(stream, ctx)
+    }));
+    if r.is_err() {
+        eprintln!("gnlqa: a request handler panicked; answered 500");
+        let _ = write_json(
+            stream,
+            500,
+            &json!({"status":"error","message":"internal error"}),
+        );
     }
 }
 
@@ -227,6 +317,8 @@ struct Ctx {
     auth: HttpAuth,
     limits: HttpLimits,
     limiter: RateLimiter,
+    /// Wall-clock cap on reading one request (anti-slowloris).
+    read_deadline: Duration,
 }
 
 /// A per-client-IP token bucket: `per_minute` requests of burst, refilled at
@@ -311,19 +403,19 @@ impl Reply {
 }
 
 /// Parse one request, route it, and write the response.
-fn handle_connection(mut stream: TcpStream, ctx: &Ctx) -> std::io::Result<()> {
-    let deadline = Instant::now() + REQUEST_DEADLINE;
+fn handle_connection(stream: &mut TcpStream, ctx: &Ctx) -> std::io::Result<()> {
+    let deadline = Instant::now() + ctx.read_deadline;
     let peer = stream.peer_addr().ok().map(|a| a.ip());
-    let Some(req) = read_request(&mut stream, deadline)? else {
+    let Some(req) = read_request(stream, deadline)? else {
         return write_json(
-            &mut stream,
+            stream,
             400,
             &json!({"status":"error","message":"bad request"}),
         );
     };
 
     let reply = route(ctx, peer, &req);
-    write_reply(&mut stream, &reply)
+    write_reply(stream, &reply)
 }
 
 /// Constant-time byte comparison (the length is not secret).
@@ -555,10 +647,37 @@ fn read_request(stream: &mut TcpStream, deadline: Instant) -> std::io::Result<Op
     }))
 }
 
+/// Before a read that will hit the socket, bound the socket's read timeout
+/// by the time left until `deadline` (and [`IO_TIMEOUT`]), so a client that
+/// goes silent is cut off at the request deadline rather than only after a
+/// full per-read timeout. Returns `false` once the deadline has passed.
+fn arm(reader: &BufReader<TcpStream>, deadline: Instant) -> std::io::Result<bool> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Ok(false);
+    }
+    if reader.buffer().is_empty() {
+        reader
+            .get_ref()
+            .set_read_timeout(Some(left.min(IO_TIMEOUT)))?;
+    }
+    Ok(true)
+}
+
+/// Read into `buf`, mapping a read timeout to `None` (the request deadline or
+/// the per-read timeout expired: answer 400 and close).
+fn read_some(reader: &mut BufReader<TcpStream>, buf: &mut [u8]) -> std::io::Result<Option<usize>> {
+    match reader.read(buf) {
+        Ok(n) => Ok(Some(n)),
+        Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// Read exactly `len` body bytes, giving up once the request `deadline` passes so
 /// a slow-drip body can't hold the connection open forever.
-fn read_body<R: BufRead>(
-    reader: &mut R,
+fn read_body(
+    reader: &mut BufReader<TcpStream>,
     len: usize,
     deadline: Instant,
 ) -> std::io::Result<Option<Vec<u8>>> {
@@ -566,11 +685,13 @@ fn read_body<R: BufRead>(
     let mut chunk = [0u8; 4096];
     let mut got = 0usize;
     while got < len {
-        if Instant::now() >= deadline {
+        if !arm(reader, deadline)? {
             return Ok(None);
         }
         let want = (len - got).min(chunk.len());
-        let n = reader.read(&mut chunk[..want])?;
+        let Some(n) = read_some(reader, &mut chunk[..want])? else {
+            return Ok(None);
+        };
         if n == 0 {
             break; // EOF before Content-Length; return what we have
         }
@@ -582,20 +703,24 @@ fn read_body<R: BufRead>(
 
 /// Read one `\n`-terminated line (trailing `\r` stripped), capped at `max`
 /// bytes. Returns `None` on EOF-with-nothing, if the line exceeds `max`, or once
-/// the request `deadline` has passed (checked between bytes so a byte-per-timeout
-/// trickle can't extend the read indefinitely).
-fn read_line_capped<R: BufRead>(
-    reader: &mut R,
+/// the request `deadline` has passed (checked between bytes, and the socket's
+/// read timeout is bounded by it, so neither a trickle nor silence can extend
+/// the read past the deadline).
+fn read_line_capped(
+    reader: &mut BufReader<TcpStream>,
     max: usize,
     deadline: Instant,
 ) -> std::io::Result<Option<String>> {
     let mut buf = Vec::new();
     let mut byte = [0u8; 1];
     loop {
-        if Instant::now() >= deadline {
+        if !arm(reader, deadline)? {
             return Ok(None);
         }
-        if reader.read(&mut byte)? == 0 {
+        let Some(n) = read_some(reader, &mut byte)? else {
+            return Ok(None);
+        };
+        if n == 0 {
             if buf.is_empty() {
                 return Ok(None);
             }
@@ -808,6 +933,7 @@ mod tests {
             auth,
             limits: HttpLimits::default(),
             limiter: RateLimiter::new(0),
+            read_deadline: REQUEST_DEADLINE,
         }
     }
 
@@ -856,5 +982,38 @@ mod tests {
                 .status,
             401
         );
+    }
+
+    #[test]
+    fn failed_thread_spawn_answers_503_and_keeps_serving() {
+        // review conc#10: thread::spawn used to panic the accept loop when the
+        // OS refused a thread; now the client gets a 503, the slot is
+        // returned and the next connection is served.
+        let engine = Arc::new(SolveEngine::new(
+            Box::new(MockLlm::fixed("x")),
+            Box::new(MockKb::new(vec![])),
+        ));
+        let server = HttpServer::bind(engine, "127.0.0.1:0")
+            .unwrap()
+            .with_max_conn(1);
+        server.fail_spawns.store(1, Ordering::SeqCst);
+        let addr = server.local_addr().unwrap();
+        thread::spawn(move || server.serve_forever());
+        // The refusal is written without reading the request, so this client
+        // sends nothing (unread request bytes would make the close a reset).
+        let first = raw_status(addr, "");
+        assert!(first.starts_with("HTTP/1.1 503"), "{first}");
+        let second = raw_status(addr, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(second.starts_with("HTTP/1.1 200"), "{second}");
+    }
+
+    fn raw_status(addr: std::net::SocketAddr, req: &str) -> String {
+        let mut s = TcpStream::connect(addr).unwrap();
+        if !req.is_empty() {
+            s.write_all(req.as_bytes()).unwrap();
+        }
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).unwrap();
+        resp
     }
 }
