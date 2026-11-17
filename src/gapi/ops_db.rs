@@ -2143,7 +2143,8 @@ fn zip_backup_owner(zip: &Path) -> Option<String> {
 /// ([`crate::http_api::backup_owner`]), or one without that record that
 /// holds a database (made by upstream or by hand) — never one recorded as
 /// another database's, nor a directory holding no database, whatever its
-/// name says.
+/// name says, nor one marked as a backup in progress
+/// ([`crate::http_api::BACKUP_PARTIAL_FILE`]: it did not complete).
 fn backups_of(dir: &Path, db: &str) -> Vec<String> {
     let Ok(rd) = fs::read_dir(dir) else {
         return Vec::new();
@@ -2154,6 +2155,10 @@ fn backups_of(dir: &Path, db: &str) -> Vec<String> {
         .filter(|n| crate::http_api::backup_name_db(n) == Some(db))
         .filter(|n| {
             let p = dir.join(n);
+            // A backup that did not complete is nobody's (round-3 review).
+            if p.is_dir() && crate::http_api::backup_in_progress(&p).is_some() {
+                return false;
+            }
             let owner = if p.is_file() {
                 zip_backup_owner(&p)
             } else {
@@ -2332,8 +2337,13 @@ fn backup(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
             let _ = fs::remove_dir_all(&dest);
             // `Database::backup` carries the reasoning rules of the directory
             // it is served from (`DbSlot::handle`), as upstream's
-            // whole-directory copy does.
-            slot.db.backup(&dest).map_err(|e| e.to_string())
+            // whole-directory copy does. Marked as a backup in progress
+            // first: one a crash stops is never restored (round-3 review).
+            fs::create_dir_all(&dest)
+                .map_err(crate::GStoreError::from)
+                .and_then(|()| crate::http_api::mark_backup_started(&dest, &db))
+                .and_then(|()| slot.db.backup(&dest))
+                .map_err(|e| e.to_string())
         }
         None => {
             let _busy = match claim(ctx, &db) {
@@ -2343,14 +2353,18 @@ fn backup(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
             match DirLock::acquire(&dir) {
                 Ok(_lock) => {
                     let _ = fs::remove_dir_all(&dest);
-                    Database::backup_dir(&dir, &dest).map_err(|e| e.to_string())
+                    fs::create_dir_all(&dest)
+                        .map_err(crate::GStoreError::from)
+                        .and_then(|()| crate::http_api::mark_backup_started(&dest, &db))
+                        .and_then(|()| Database::backup_dir(&dir, &dest))
+                        .map_err(|e| e.to_string())
                 }
                 Err(e) => Err(e.to_string()),
             }
         }
     };
-    // Recorded as a backup of `db` once complete (an interrupted backup holds
-    // no record, so `restore` never picks it for anyone but root).
+    // Recorded as a backup of `db` once complete (an interrupted backup
+    // holds only its in-progress marker, so `restore` never picks it).
     let written =
         written.and_then(|()| crate::http_api::mark_backup(&dest, &db).map_err(|e| e.to_string()));
     if let Err(e) = written {
@@ -2456,6 +2470,17 @@ fn restore(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
             }
         }
     };
+    // A backup that did not complete is restored for nobody (round-3
+    // review).
+    if source.is_dir() && crate::http_api::backup_in_progress(&source).is_some() {
+        return GResp::error(
+            Status::OperationConditionsAreNotSatisfied,
+            format!(
+                "The backup '{}' is incomplete (a backup into it did not finish).",
+                p.str("backup_path").unwrap_or_default()
+            ),
+        );
+    }
     // The restore privilege on `db` restores `db`'s own backups: another
     // database's backup would hand the caller that database's data.
     if !may_restore(ctx, &source) {

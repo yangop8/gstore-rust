@@ -6785,16 +6785,28 @@ impl ApiInner {
                 Err(r) => return r,
             };
             // Recorded as a backup of this database once complete, as the
-            // `/api` `backup` does (review design#4): a directory this backup
-            // makes holds no record while it is written, and goes again if
-            // the backup fails, so `/restore` never takes it for a backup of
-            // the database. `backup_target` allows only a new directory, an
-            // empty one or an earlier backup of this database here.
+            // `/api` `backup` does (review design#4): while it is written the
+            // directory is marked as a backup of it in progress, so
+            // `/restore` never takes it for a complete backup — also when a
+            // crash or a panic skips the cleanup below — and a later backup
+            // of the database may write there again (round-3 review: it
+            // was refused for good). `backup_target` allows only a new
+            // directory, an empty one or one of this database's (complete
+            // or not) here.
             let created = !path.exists();
-            let earlier = !created && backup_owner(&path).as_deref() == Some(name.as_str());
+            let earlier = !created
+                && fs::read_to_string(path.join(BACKUP_OWNER_FILE))
+                    .ok()
+                    .as_deref()
+                    == Some(name.as_str());
             let backed_up = fs::create_dir_all(&path)
                 .map_err(GStoreError::from)
-                .and_then(|()| slot.db.backup(&path))
+                .and_then(|()| mark_backup_started(&path, &name))
+                .and_then(|()| {
+                    #[cfg(test)]
+                    backup_test_hook::reached(&path);
+                    slot.db.backup(&path)
+                })
                 .and_then(|()| mark_backup(&path, &name));
             drop(slot);
             match backed_up {
@@ -6810,17 +6822,17 @@ impl ApiInner {
                     // backup's), and an empty one it wrote into is emptied
                     // again: neither is left holding data a later backup
                     // there would refuse as "not a backup" (409). An earlier
-                    // backup it was replacing keeps its record: each store
-                    // is replaced as a whole, so the directory still holds a
-                    // complete backup of the database (the earlier one, or —
-                    // past the store's replacement — this one), and a retry
-                    // into it is allowed.
+                    // backup it was replacing stays marked as a backup in
+                    // progress: its rules may already be this backup's
+                    // while its store is still the earlier one's, so
+                    // `/restore` refuses it until a backup into it succeeds
+                    // (a retry is allowed).
                     let note = if created {
                         let _ = fs::remove_dir_all(&path);
                         ""
                     } else if earlier {
-                        "; the directory still holds the earlier backup, or this one where its \
-                         store was replaced before the failure"
+                        "; the earlier backup in that directory may be partly replaced, so it \
+                         is marked incomplete until a backup into it succeeds"
                     } else {
                         empty_dir(&path);
                         ""
@@ -6897,6 +6909,17 @@ impl ApiInner {
                     &format!(
                         "restore path refused: it is not a backup of database '{name}' (only \
                          root and admin users may restore a database from another one's backup)"
+                    ),
+                );
+            }
+            if backup_in_progress(&path).is_some() {
+                return Resp::fail(
+                    409,
+                    &format!(
+                        "restore refused: the backup in '{}' is incomplete (a backup into it \
+                         did not finish); back the database up there again, or restore \
+                         another backup",
+                        path.display()
                     ),
                 );
             }
@@ -7509,17 +7532,55 @@ impl ApiInner {
 /// knows whose data it holds ([`may_restore_from`]).
 pub(crate) const BACKUP_OWNER_FILE: &str = "BACKUP_OF";
 
+/// Marker a backup this server is writing carries in its directory until
+/// it is complete (the name of the database backed up there): written
+/// before anything is copied and replaced by [`BACKUP_OWNER_FILE`] once the
+/// backup succeeded (round-3 review). A directory a crashed or panicked
+/// backup left keeps it, so a later backup of the same database may write
+/// there again (it used to be refused for good, `409` "already holds data
+/// that is not a backup of …"), while a restore refuses it as incomplete —
+/// also when it was replacing an earlier, complete backup.
+pub(crate) const BACKUP_PARTIAL_FILE: &str = "BACKUP_OF.partial";
+
 /// The database the backup at `dir` was recorded as a backup of (its
-/// [`BACKUP_OWNER_FILE`]), if any.
+/// [`BACKUP_OWNER_FILE`]), if any — none while the directory is marked as a
+/// backup in progress ([`BACKUP_PARTIAL_FILE`]): it is not complete.
 pub(crate) fn backup_owner(dir: &Path) -> Option<String> {
+    if backup_in_progress(dir).is_some() {
+        return None;
+    }
     fs::read_to_string(dir.join(BACKUP_OWNER_FILE))
         .ok()
         .map(|s| s.trim().to_string())
 }
 
-/// Record the backup at `dir` as one of database `db`.
+/// The database a backup into `dir` was started for and has not completed
+/// ([`BACKUP_PARTIAL_FILE`]), if any.
+pub(crate) fn backup_in_progress(dir: &Path) -> Option<String> {
+    let path = dir.join(BACKUP_PARTIAL_FILE);
+    match fs::read_to_string(&path) {
+        Ok(s) => Some(s.trim().to_string()),
+        // Present but unreadable: still not a complete backup.
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Some(String::new()),
+        Err(_) => None,
+    }
+}
+
+/// Mark `dir` as a backup of database `db` in progress, before anything is
+/// copied into it ([`BACKUP_PARTIAL_FILE`]).
+pub(crate) fn mark_backup_started(dir: &Path, db: &str) -> crate::Result<()> {
+    crate::db::fsutil::atomic_write(&dir.join(BACKUP_PARTIAL_FILE), db.as_bytes())
+}
+
+/// Record the backup at `dir` as one of database `db`, complete: its owner
+/// record is written, then its in-progress marker removed (durably).
 pub(crate) fn mark_backup(dir: &Path, db: &str) -> crate::Result<()> {
-    crate::db::fsutil::atomic_write(&dir.join(BACKUP_OWNER_FILE), db.as_bytes())
+    crate::db::fsutil::atomic_write(&dir.join(BACKUP_OWNER_FILE), db.as_bytes())?;
+    match fs::remove_file(dir.join(BACKUP_PARTIAL_FILE)) {
+        Ok(()) => crate::db::fsutil::sync_dir(dir),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Best effort: remove everything in directory `dir`, keeping `dir` itself —
@@ -7797,7 +7858,10 @@ fn backup_target(
     }
     let mut ancestor = target.parent();
     while let Some(dir) = ancestor.filter(|d| d.starts_with(&base) && *d != base) {
-        if Database::storage_kind(dir).is_some() || dir.join(BACKUP_OWNER_FILE).exists() {
+        if Database::storage_kind(dir).is_some()
+            || dir.join(BACKUP_OWNER_FILE).exists()
+            || dir.join(BACKUP_PARTIAL_FILE).exists()
+        {
             return Err(conflict("lies inside another backup"));
         }
         ancestor = dir.parent();
@@ -7806,10 +7870,16 @@ fn backup_target(
         Err(_) => Ok((target, claim)),
         Ok(m) if m.is_dir() => {
             let owner = fs::read_to_string(target.join(BACKUP_OWNER_FILE)).ok();
+            // A backup of `name` that did not complete (a crash or a panic
+            // skipped its cleanup) may be written again.
+            let partial = backup_in_progress(&target);
             let empty = fs::read_dir(&target)
                 .map(|mut d| d.next().is_none())
                 .unwrap_or(false);
-            if empty || owner.as_deref() == Some(name) {
+            let ours = |record: &Option<String>| record.as_deref().map(str::trim) == Some(name);
+            let foreign = |record: &Option<String>| record.is_some() && !ours(record);
+            if empty || ((ours(&owner) || ours(&partial)) && !foreign(&owner) && !foreign(&partial))
+            {
                 Ok((target, claim))
             } else {
                 Err(conflict(&format!(
@@ -8481,6 +8551,48 @@ fn new_system_password() -> String {
     let mut b = [0u8; 8];
     crate::http_users::random_bytes(&mut b);
     u64::from_le_bytes(b).to_string()
+}
+
+/// Test hook: lets a test act on a REST `/backup` once it marked its
+/// directory as a backup in progress and before it copies anything — e.g.
+/// panic there, as a crash would stop it.
+#[cfg(test)]
+pub(crate) mod backup_test_hook {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    type Hook = Arc<dyn Fn() + Send + Sync>;
+
+    static HOOKS: Mutex<Vec<(PathBuf, Hook)>> = Mutex::new(Vec::new());
+
+    /// Call `hook` when a backup into `dir` reaches the point.
+    pub(crate) fn set(dir: &Path, hook: Hook) {
+        HOOKS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((dir.to_path_buf(), hook));
+    }
+
+    /// Remove the hooks of `dir`.
+    pub(crate) fn clear(dir: &Path) {
+        HOOKS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(d, _)| d != dir);
+    }
+
+    pub(super) fn reached(dir: &Path) {
+        let hooks: Vec<Hook> = HOOKS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(d, _)| d == dir)
+            .map(|(_, h)| Arc::clone(h))
+            .collect();
+        for hook in hooks {
+            hook();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -10966,6 +11078,83 @@ mod tests {
             assert_eq!(Database::read_copy(&copy).unwrap().triple_num(), 20000);
         }
         assert!(failures.is_empty(), "{failures:#?}");
+        server.shutdown();
+    }
+
+    /// Round-3 review: a REST `/backup` stopped part-way without its
+    /// cleanup — a crash, or a panic, which the request answers with a
+    /// `500` — left its directory holding data but no owner record, and
+    /// every later default-path backup of the database was refused (`409
+    /// "already holds data that is not a backup of …"`) until someone
+    /// removed it by hand; one stopped while replacing an earlier backup
+    /// left that one's owner record beside new rules, and `/restore` took
+    /// it. The directory is now marked as a backup in progress first: a
+    /// later backup of the database writes there again, and a restore
+    /// refuses it until one completes.
+    #[test]
+    fn a_rest_backup_stopped_part_way_can_be_retried_and_is_never_restored() {
+        let (server, addr) = start("rest_backup_stopped");
+        let auth = basic("root", "root");
+        let post =
+            |target: &str| split_status_body(&raw_request(&addr, "POST", target, Some(&auth), ""));
+        let data = "<http://ex/a> <http://ex/p> <http://ex/b> .\n";
+        let (s, b) = split_status_body(&raw_request(
+            &addr,
+            "POST",
+            "/build?db_name=pbk",
+            Some(&auth),
+            data,
+        ));
+        assert_eq!(s, 200, "build: {b}");
+        let dir = server.inner.backup_dir().join("pbk.backup");
+        // A backup into a new directory, stopped after it started writing
+        // (a stray file stands in for what it copied).
+        let stray = dir.join("LOCK");
+        backup_test_hook::set(&dir, {
+            let stray = stray.clone();
+            Arc::new(move || {
+                fs::write(&stray, b"").unwrap();
+                panic!("stopped part-way (test)");
+            })
+        });
+        let (s, _) = post("/backup?db_name=pbk");
+        assert_eq!(s, 500, "the stopped backup is answered as failed");
+        backup_test_hook::clear(&dir);
+        assert!(stray.exists(), "the stopped backup left its files behind");
+        // Not restorable, also for root.
+        let (s, b) = post("/restore?db_name=pbk&path=pbk.backup");
+        assert_eq!(s, 409, "an incomplete backup was restored: {b}");
+        // The next backup of the database writes there again.
+        let (s, b) = post("/backup?db_name=pbk");
+        assert_eq!(
+            s, 200,
+            "the stopped backup's directory blocks the next one: {b}"
+        );
+        assert_eq!(backup_owner(&dir).as_deref(), Some("pbk"));
+        assert!(!dir.join("BACKUP_OF.partial").exists());
+        // Stopped again while replacing that complete backup: refused by
+        // `/restore` until a backup into it completes.
+        backup_test_hook::set(&dir, Arc::new(|| panic!("stopped part-way (test)")));
+        let (s, _) = post("/backup?db_name=pbk");
+        assert_eq!(s, 500);
+        backup_test_hook::clear(&dir);
+        let (s, b) = post("/restore?db_name=pbk&path=pbk.backup");
+        assert_eq!(s, 409, "a partly replaced backup was restored: {b}");
+        let (s, b) = post("/backup?db_name=pbk");
+        assert_eq!(s, 200, "{b}");
+        let (s, b) = post("/restore?db_name=pbk&path=pbk.backup");
+        assert_eq!(s, 200, "{b}");
+        // Another database's backup into the same directory stays refused.
+        let (s, b) = split_status_body(&raw_request(
+            &addr,
+            "POST",
+            "/build?db_name=other",
+            Some(&auth),
+            data,
+        ));
+        assert_eq!(s, 200, "build: {b}");
+        let (s, _) = post("/backup?db_name=other&path=pbk.backup");
+        assert_eq!(s, 409);
         server.shutdown();
     }
 
