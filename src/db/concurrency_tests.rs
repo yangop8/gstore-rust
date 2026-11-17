@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Barrier, RwLock};
+use std::sync::{Arc, Barrier, Condvar, Mutex, PoisonError, RwLock};
 
 use super::*;
 
@@ -196,49 +196,124 @@ fn concurrent_saves_and_backups_stay_valid_and_contiguous() {
 
 /// Readers under a shared lock and a writer under the exclusive lock, with
 /// the query cache on: every answer matches the generation the reader saw.
+///
+/// The writer hands over to the readers after every insert: it takes the
+/// next write lock only once a reader has checked the generation it just
+/// made, so every generation, 0 to 60, is checked — whatever the scheduler
+/// does. (It made its 60 inserts back to back before, and the test only
+/// required `checked > 0`: on a loaded machine the writer could take all
+/// 60 write locks before any reader took a read lock, and the test failed
+/// without a stale answer; a reader starved of every generation but the
+/// last checked almost nothing.)
 #[test]
 fn generation_oracle_under_a_rwlock() {
+    const INSERTS: u64 = 60;
+    /// A wait that only guards against a hang (never the assertion).
+    const HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(120);
+
+    /// The newest generation a reader checked (`None`: none yet) and
+    /// whether a reader failed — then the writer stops waiting for one.
+    struct Progress {
+        newest: Option<u64>,
+        reader_failed: bool,
+    }
+    /// Held by a reader: marks it failed if it panics, so the writer is
+    /// not left waiting for its check.
+    struct ReaderGuard<'a>(&'a Mutex<Progress>, &'a Condvar);
+    impl Drop for ReaderGuard<'_> {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                self.0
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .reader_failed = true;
+                self.1.notify_all();
+            }
+        }
+    }
+    /// Held by the writer: stops the readers when it returns or panics.
+    struct StopReaders<'a>(&'a AtomicBool);
+    impl Drop for StopReaders<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
     let mut db =
         Database::build_from_str("oracle", "<http://ex/s> <http://ex/k> \"0\" .\n").unwrap();
     db.set_query_cache_size(DEFAULT_QUERY_CACHE_BYTES);
     let lock = RwLock::new(db);
     let done = AtomicBool::new(false);
     let checked = AtomicU64::new(0);
+    let progress = Mutex::new(Progress {
+        newest: None,
+        reader_failed: false,
+    });
+    let changed = Condvar::new();
     let count_q = "SELECT ?o WHERE { <http://ex/s> <http://ex/v> ?o }";
     std::thread::scope(|s| {
         for _ in 0..4 {
             s.spawn(|| {
+                let _guard = ReaderGuard(&progress, &changed);
                 while !done.load(Ordering::Acquire) {
-                    let db = lock.read().unwrap();
-                    // One insert per generation (the base data is generation 0).
-                    let generation = db.mutation_count();
-                    let QueryResult::Select(rs) = db.query_read(count_q, None, None).unwrap()
-                    else {
-                        panic!("SELECT expected");
+                    let generation = {
+                        let db = lock.read().unwrap();
+                        // One insert per generation (the base data is generation 0).
+                        let generation = db.mutation_count();
+                        let QueryResult::Select(rs) = db.query_read(count_q, None, None).unwrap()
+                        else {
+                            panic!("SELECT expected");
+                        };
+                        assert_eq!(rs.row_count() as u64, generation, "stale answer");
+                        // Twice: the second is usually a cache hit.
+                        let again = db.query_read(count_q, None, None).unwrap();
+                        assert_eq!(again, QueryResult::Select(rs));
+                        generation
                     };
-                    assert_eq!(rs.row_count() as u64, generation, "stale answer");
-                    // Twice: the second is usually a cache hit.
-                    let again = db.query_read(count_q, None, None).unwrap();
-                    assert_eq!(again, QueryResult::Select(rs));
                     checked.fetch_add(1, Ordering::Relaxed);
+                    let mut p = progress.lock().unwrap_or_else(PoisonError::into_inner);
+                    p.newest = Some(p.newest.map_or(generation, |g| g.max(generation)));
+                    drop(p);
+                    changed.notify_all();
                 }
             });
         }
         s.spawn(|| {
-            for i in 0..60 {
+            let _stop = StopReaders(&done);
+            // Whether a reader checked `generation` (false: a reader failed,
+            // and its panic fails the test).
+            let checked_by_a_reader = |generation: u64| {
+                let mut p = progress.lock().unwrap_or_else(PoisonError::into_inner);
+                while !p.reader_failed && p.newest.is_none_or(|g| g < generation) {
+                    let (next, waited) = changed
+                        .wait_timeout(p, HANG_GUARD)
+                        .unwrap_or_else(PoisonError::into_inner);
+                    p = next;
+                    assert!(
+                        !waited.timed_out(),
+                        "no reader checked generation {generation} (hang guard)"
+                    );
+                }
+                !p.reader_failed
+            };
+            for i in 0..INSERTS {
+                if !checked_by_a_reader(i) {
+                    return;
+                }
                 let mut db = lock.write().unwrap();
                 db.query(&format!(
                     "INSERT DATA {{ <http://ex/s> <http://ex/v> \"{i}\" }}"
                 ))
                 .unwrap();
-                drop(db);
-                std::thread::yield_now();
             }
-            done.store(true, Ordering::Release);
+            checked_by_a_reader(INSERTS);
         });
     });
-    assert!(checked.load(Ordering::Relaxed) > 0);
-    assert_eq!(lock.read().unwrap().mutation_count(), 60);
+    assert!(
+        checked.load(Ordering::Relaxed) > INSERTS,
+        "every generation checked"
+    );
+    assert_eq!(lock.read().unwrap().mutation_count(), INSERTS);
 }
 
 /// A user function that reports a read error fails only the query it runs
