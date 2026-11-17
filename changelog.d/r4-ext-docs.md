@@ -237,6 +237,20 @@ agents' builds:
     no longer names the removed `strip_graph_keyword` (parser#17).
 - tests/dt_phase4_review_fixes.rs: only `a_cancelled_execute_leaves_the_rule_as_it_was`
   changed (tests-b#5, sole editor this round); comments `review tests-b#5`.
+- Found in this package's review, outside its files (durability#11
+  follow-up for whoever owns them next): three paths delete a replaced
+  database's `reason_rule_files/` with a plain recursive delete —
+  `gbuild --force`'s `drop_old_rules` (src/bin/gbuild.rs), the bulk
+  install's `remove_rule_dir` (src/bulk/commit.rs) and the REST rebuild in
+  src/http_api.rs. A crash part-way through such a delete can leave rule
+  files without their ledgers (which `reasonManage` takes for upstream
+  rules); `fsutil::discard_dir` (rename aside durably, then delete) avoids
+  that. `drop_old_rules` also takes no rule lock, so a
+  `reason_rule_files.new` an interrupted swap left there is not finished
+  or removed first and comes back as the rebuilt database's rules at the
+  next rule operation (the other two lock, which finishes the swap before
+  they delete). Needs a crash inside the swap's last rename followed by a
+  forced rebuild; not reproduced.
 - ext#14 asks for local-console tests too (`gconsole --local` snapshot
   updates lost on quit, statements split at `;`): those belong with ext#5 /
   ext#9, which are not in this package; this package's tests cover the

@@ -103,7 +103,7 @@ RDF项(对应`src/Util/Triple.h`):
 **两套执行器**(都在`Evaluator`上):
 
 - **物化执行器**(`engine.rs`的`eval_*`):自底向上求出每个图模式的全部解,再做`ORDER BY`、`DISTINCT`、`OFFSET`/`LIMIT`与投影。BGP的流程:常量解析成id(缺一个常量则整个BGP为空)→ 每个变量的精确候选集(`query::candidates`,常量边的索引列表求交,上游`FilterPlan`/`CacheConstantCandidates`的移植)与VS-tree候选(`signature`,按`query::VsPolicy`决定是否查树)→ 代价优化器定计划 → 按计划用索引查找 + unification扩展部分解。
-- **流式执行器**(`topk.rs`的`stream_*`):`LIMIT`且无`ORDER BY`的SELECT/CONSTRUCT、`ASK`、`EXISTS`逐个拉取解,够数即停;`ORDER BY` + `LIMIT`经大小为OFFSET+LIMIT的有界堆(Top-K);线性`ORDER BY`键 + 树形BGP用上游DP-B Top-K的移植。它产出与物化执行器**完全相同**的行与行序(`TopKOptions`可关掉,`tests/dt_topk.rs`在随机数据与查询上核对)。两套执行器各自实现代数算子(合并它们记在`docs/REFACTOR_BACKLOG.md`,review query#17/design#10);OPTIONAL、MINUS与含可能未绑定共享变量的连接,两者都用`query::probe`的`RowIndex`哈希索引。
+- **流式执行器**(`topk.rs`的`stream_*`):`LIMIT`且无`ORDER BY`的SELECT/CONSTRUCT、`ASK`、`EXISTS`逐个拉取解,够数即停;`ORDER BY` + `LIMIT`经大小为OFFSET+LIMIT的有界堆(Top-K);线性`ORDER BY`键 + 树形BGP用上游DP-B Top-K的移植。它产出与物化执行器**完全相同**的行与行序(`TopKOptions`可关掉,`tests/dt_topk.rs`在随机数据与查询上核对)。两套执行器各自实现代数算子(合并它们记在`docs/REFACTOR_BACKLOG.md`,review query#17/design#10);OPTIONAL、MINUS与含可能未绑定共享变量的连接,两者都用`src/query/probe.rs`(`engine`的私有子模块)的`RowIndex`哈希索引。
 
 **计划**:
 
