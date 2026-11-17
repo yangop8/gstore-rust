@@ -736,7 +736,25 @@ pub struct Evaluator<'a, S: TripleSource = TripleStore> {
     /// `UUID()` randomness and compiled `REGEX` patterns (see [`QueryCtx`]).
     /// Shared with `GRAPH` sub-evaluators: one query, one state.
     ctx: Rc<QueryCtx>,
+    /// The most repeated property-path solutions one query may hand out
+    /// ([`with_path_max_duplicates`](Self::with_path_max_duplicates)).
+    path_max_duplicates: u64,
+    /// The repeated property-path solutions this query handed out so far
+    /// (shared with `GRAPH` sub-evaluators): every copy of a `(start, end)`
+    /// pair past its first, which a `/` or `|` path reaching the pair by
+    /// several routes produces (round-3 review).
+    path_duplicates: Rc<std::cell::Cell<u64>>,
+    /// Whether only existence or distinctness of the solutions being
+    /// computed matters (`ASK`, `EXISTS`, a qualifying `SELECT DISTINCT`):
+    /// then a property path hands each `(start, end)` pair out once,
+    /// whatever its number of routes. Shared with `GRAPH` sub-evaluators;
+    /// a sub-`SELECT` decides for itself (see [`PathSetMode`]).
+    path_sets: Rc<std::cell::Cell<bool>>,
 }
+
+/// The default of [`Evaluator::with_path_max_duplicates`]: 4,194,304
+/// repeated property-path solutions per query.
+pub const PATH_MAX_DUPLICATES: u64 = 1 << 22;
 
 /// A source of the per-predicate CSR the advanced graph functions run on
 /// (see [`Evaluator::with_csr_provider`]).
@@ -798,6 +816,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             gfun_spent: Rc::default(),
             pfn: None,
             ctx: Rc::default(),
+            path_max_duplicates: PATH_MAX_DUPLICATES,
+            path_duplicates: Rc::default(),
+            path_sets: Rc::default(),
         }
     }
 
@@ -831,6 +852,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             gfun_spent: Rc::default(),
             pfn: None,
             ctx: Rc::default(),
+            path_max_duplicates: PATH_MAX_DUPLICATES,
+            path_duplicates: Rc::default(),
+            path_sets: Rc::default(),
         }
     }
 
@@ -952,6 +976,24 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// fails.
     pub fn with_gfun_max_output_bytes(mut self, bytes: usize) -> Evaluator<'a, S> {
         self.gfun_max_output = bytes;
+        self
+    }
+
+    /// Bound the repeated solutions the property paths of one query may hand
+    /// out (default [`PATH_MAX_DUPLICATES`]). A `/` or `|` path is a
+    /// multiset (SPARQL 1.1 §18.4): a pair of nodes reached by `k` routes is
+    /// `k` solutions, and `k` grows as the product of the steps' fan-outs —
+    /// `<a> (:p|:p)/…/(:p|:p) ?x` with 30 steps over one triple is 2³⁰
+    /// solutions. The walk keeps `k` as a count; the copies past the first
+    /// of each pair are charged here as they are handed out, so `ASK`,
+    /// `EXISTS` and `LIMIT` stop after the copies they take, and a query
+    /// that would hand out more fails with a query error instead of
+    /// exhausting the memory. Where only existence or distinctness matters
+    /// (`ASK`, `EXISTS`, `SELECT DISTINCT` without aggregates or
+    /// per-solution functions such as `BNODE`/`RAND`), each pair is handed
+    /// out once and nothing is charged.
+    pub fn with_path_max_duplicates(mut self, max: u64) -> Evaluator<'a, S> {
+        self.path_max_duplicates = max;
         self
     }
 
@@ -1476,6 +1518,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             || (gfns.is_empty()
                 && (!q.having.is_empty()
                     || q.order_by.iter().any(|o| expr_has_aggregate(&o.expr))));
+        // Whether its property paths may hand each pair out once (a
+        // sub-SELECT decides for itself, whatever the enclosing pattern
+        // does; the guard restores the enclosing mode).
+        let _path_sets =
+            self.path_set_mode(self.select_wants_path_sets(q, has_agg, !gfns.is_empty()));
         // A trailing `VALUES` block joins the solutions before the SELECT
         // expressions, ORDER BY and projection (§18.2.4.3): without grouping
         // that is a join with the WHERE pattern; after grouping it joins the
@@ -2524,34 +2571,49 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     // each solution once. A walk keeps the multiset as counts ([`Reached`]:
     // each node once, with the number of routes to it), so `/` and `|` cost
     // the distinct nodes of each step, not the routes — which grow as
-    // degree^length, inside a closure too — and only the solutions handed
-    // out are expanded. Reached nodes come out in a fixed order — the
-    // stores' sorted lists, followed breadth first — never in a hash set's
-    // iteration order, so `LIMIT` / `OFFSET` pages and `ORDER BY` ties are
-    // the same on every run (review gap-accel-soundness#1).
+    // degree^length, inside a closure too. The `(start, end)` pairs keep
+    // their counts too ([`CountedPairs`]) until a consumer takes their
+    // copies one at a time: the streaming executor hands each copy to its
+    // sink, so `ASK`, `EXISTS` and `LIMIT` stop after the copies they take;
+    // the materializing one pushes them. Every copy past a pair's first is
+    // charged to the query's budget ([`with_path_max_duplicates`](Self::with_path_max_duplicates)),
+    // and where only existence or distinctness matters each pair is handed
+    // out once (round-3 review: the pairs were expanded eagerly, so a short
+    // `ASK` over one triple used exponential memory). Reached nodes come out
+    // in a fixed order — the stores' sorted lists, followed breadth first —
+    // never in a hash set's iteration order, so `LIMIT` / `OFFSET` pages
+    // and `ORDER BY` ties are the same on every run (review
+    // gap-accel-soundness#1).
 
-    /// Evaluate a single property-path pattern into bindings over the layout.
+    /// Evaluate a single property-path pattern into bindings over the layout
+    /// (each pair's copies, see [`path_copies`](Self::path_copies)).
     fn eval_path_pattern(&self, p: &PathPattern, layout: &VarLayout) -> Vec<Binding> {
-        self.path_pattern_pairs(p)
-            .into_iter()
-            .filter_map(|(s, o)| {
-                let mut b = vec![None; layout.len()];
-                if !bind_node(&mut b, &p.subject, s, layout)
-                    || !bind_node(&mut b, &p.object, o, layout)
-                {
-                    return None;
-                }
-                Some(b)
-            })
-            .collect()
+        let mut out = Vec::new();
+        for ((s, o), k) in self.path_pattern_pairs(p) {
+            let mut b = vec![None; layout.len()];
+            if !bind_node(&mut b, &p.subject, s, layout) || !bind_node(&mut b, &p.object, o, layout)
+            {
+                continue;
+            }
+            let n = self.path_copies(k);
+            if !self.charge_path_duplicates(n - 1) {
+                return Vec::new();
+            }
+            for _ in 1..n {
+                out.push(b.clone());
+            }
+            out.push(b);
+        }
+        out
     }
 
-    /// The `(start, end)` pairs of a path pattern, with its constant end
-    /// points fixed. A constant that is not in the dictionary still matches
-    /// itself at length zero (`<unknown> :p* ?x` binds `?x` to `<unknown>`,
-    /// §18.4 ZeroLengthPath / ALP): it gets a synthetic id, which has no
-    /// edges, so only the zero-length matches reach it (review sparqlconf#13).
-    fn path_pattern_pairs(&self, p: &PathPattern) -> Vec<(u32, u32)> {
+    /// The `(start, end)` pairs of a path pattern, with their numbers of
+    /// routes and its constant end points fixed. A constant that is not in
+    /// the dictionary still matches itself at length zero (`<unknown> :p*
+    /// ?x` binds `?x` to `<unknown>`, §18.4 ZeroLengthPath / ALP): it gets a
+    /// synthetic id, which has no edges, so only the zero-length matches
+    /// reach it (review sparqlconf#13).
+    fn path_pattern_pairs(&self, p: &PathPattern) -> CountedPairs {
         let end = |t: &PatternTerm| match t {
             PatternTerm::Term(t) => Some(self.term_to_id(t)),
             PatternTerm::Var(_) => None,
@@ -2560,25 +2622,22 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     }
 
     /// All `(start, end)` pairs matching `path`, constrained by known
-    /// endpoints — a multiset, in a deterministic order.
-    fn path_pairs(&self, path: &PathExpr, subj: Option<u32>, obj: Option<u32>) -> Vec<(u32, u32)> {
+    /// endpoints — a multiset kept as counts (each pair once, with its
+    /// number of routes), in a deterministic order.
+    fn path_pairs(&self, path: &PathExpr, subj: Option<u32>, obj: Option<u32>) -> CountedPairs {
         let mut out = Vec::new();
         match (subj, obj) {
             (Some(s), _) => {
-                let ends = self.path_reach_counted(path, s, false);
-                for (e, k) in ends.nodes {
-                    if obj.is_none_or(|o| o == e) && !self.push_pairs(&mut out, (s, e), k) {
-                        break;
+                for (e, k) in self.path_reach_counted(path, s, false).nodes {
+                    if obj.is_none_or(|o| o == e) {
+                        out.push(((s, e), k));
                     }
                 }
             }
             (None, Some(o)) => {
                 // Walk the path backwards from the object.
-                let starts = self.path_reach_counted(path, o, true);
-                for (s, k) in starts.nodes {
-                    if !self.push_pairs(&mut out, (s, o), k) {
-                        break;
-                    }
+                for (s, k) in self.path_reach_counted(path, o, true).nodes {
+                    out.push(((s, o), k));
                 }
             }
             (None, None) => {
@@ -2588,11 +2647,12 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 nodes.extend(self.store.object_keys());
                 nodes.sort_unstable();
                 nodes.dedup();
-                'starts: for s in nodes {
+                for s in nodes {
+                    if self.cancelled() {
+                        break;
+                    }
                     for (e, k) in self.path_reach_counted(path, s, false).nodes {
-                        if !self.push_pairs(&mut out, (s, e), k) {
-                            break 'starts;
-                        }
+                        out.push(((s, e), k));
                     }
                 }
             }
@@ -2600,17 +2660,147 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         out
     }
 
-    /// Append `pair` `k` times (a pair reached by `k` routes is `k`
-    /// solutions); `false` once the evaluation is cancelled, which the
-    /// multiplicity of a long `/` or `|` chain makes worth polling for.
-    fn push_pairs(&self, out: &mut Vec<(u32, u32)>, pair: (u32, u32), k: u64) -> bool {
-        for i in 0..k {
-            if i % 4096 == 4095 && self.cancelled() {
-                return false;
-            }
-            out.push(pair);
+    /// How many copies of a path solution reached by `k` routes are handed
+    /// out: `k` — a multiset (§18.4) — or one where only existence or
+    /// distinctness matters ([`path_sets`](Self::path_sets)).
+    fn path_copies(&self, k: u64) -> u64 {
+        if self.path_sets.get() {
+            1
+        } else {
+            k.max(1)
         }
-        true
+    }
+
+    /// Charge `extra` repeated path solutions to the query's budget
+    /// ([`with_path_max_duplicates`](Self::with_path_max_duplicates)):
+    /// `false` — and the query fails with a query error — once it is spent.
+    fn charge_path_duplicates(&self, extra: u64) -> bool {
+        if extra == 0 {
+            return true;
+        }
+        let spent = self.path_duplicates.get().saturating_add(extra);
+        self.path_duplicates.set(spent);
+        if spent <= self.path_max_duplicates {
+            return true;
+        }
+        let mut failed = self.failed.borrow_mut();
+        if failed.is_none() {
+            *failed = Some(GStoreError::Query(format!(
+                "a property path of this query has more than {} repeated solutions: a `/` or \
+                 `|` path reaches the same pair of nodes by that many routes, each a solution \
+                 of its own (SPARQL 1.1 §18.4); ask for distinct solutions (DISTINCT, ASK, \
+                 EXISTS), a LIMIT, or a closure (`*`, `+`) instead",
+                self.path_max_duplicates
+            )));
+        }
+        false
+    }
+
+    /// Make the solutions computed while the returned guard lives handed
+    /// out by path pair (`sets`) or by route (see [`PathSetMode`]).
+    fn path_set_mode(&self, sets: bool) -> PathSetMode {
+        PathSetMode {
+            prev: self.path_sets.replace(sets),
+            cell: Rc::clone(&self.path_sets),
+        }
+    }
+
+    /// Whether the solutions of SELECT `q` only matter as distinct rows, so
+    /// its property paths may hand each pair out once: `DISTINCT` without
+    /// aggregation or projected graph function, and no function anywhere in
+    /// the query that gives each solution a value of its own (`BNODE`,
+    /// `RAND`, `UUID`, `STRUUID`, a user or PFN function) — every other
+    /// operator keeps the set of distinct solutions whatever their
+    /// multiplicities. Sub-`SELECT`s decide for themselves.
+    fn select_wants_path_sets(&self, q: &SelectQuery, has_agg: bool, gfns: bool) -> bool {
+        if !q.distinct || has_agg || gfns {
+            return false;
+        }
+        let items = match &q.projection {
+            Projection::All => Vec::new(),
+            Projection::Items(items) => items
+                .iter()
+                .filter_map(|it| match it {
+                    SelectItem::Expr(e, _) => Some(e),
+                    SelectItem::Var(_) => None,
+                })
+                .collect(),
+        };
+        !(items.into_iter().any(|e| self.expr_is_volatile(e))
+            || q.having
+                .iter()
+                .chain(q.order_by.iter().map(|o| &o.expr))
+                .any(|e| self.expr_is_volatile(e))
+            || self.pattern_is_volatile(&q.pattern))
+    }
+
+    /// Whether `gp` evaluates an expression that gives each solution a
+    /// value of its own (see [`select_wants_path_sets`](Self::select_wants_path_sets)).
+    fn pattern_is_volatile(&self, gp: &GraphPattern) -> bool {
+        match gp {
+            GraphPattern::Empty
+            | GraphPattern::Bgp(_)
+            | GraphPattern::Path(_)
+            | GraphPattern::Values(_, _) => false,
+            GraphPattern::Join(a, b) | GraphPattern::Union(a, b) | GraphPattern::Minus(a, b) => {
+                self.pattern_is_volatile(a) || self.pattern_is_volatile(b)
+            }
+            GraphPattern::LeftJoin(a, b, fs) => {
+                self.pattern_is_volatile(a)
+                    || self.pattern_is_volatile(b)
+                    || fs.iter().any(|e| self.expr_is_volatile(e))
+            }
+            GraphPattern::Filter(fs, inner) => {
+                fs.iter().any(|e| self.expr_is_volatile(e)) || self.pattern_is_volatile(inner)
+            }
+            GraphPattern::Extend(inner, _, e) => {
+                self.pattern_is_volatile(inner) || self.expr_is_volatile(e)
+            }
+            GraphPattern::SubSelect(sq) => {
+                let items = match &sq.projection {
+                    Projection::All => false,
+                    Projection::Items(items) => items.iter().any(|it| match it {
+                        SelectItem::Expr(e, _) => self.expr_is_volatile(e),
+                        SelectItem::Var(_) => false,
+                    }),
+                };
+                items
+                    || sq
+                        .group_by
+                        .iter()
+                        .chain(&sq.having)
+                        .chain(sq.order_by.iter().map(|o| &o.expr))
+                        .any(|e| self.expr_is_volatile(e))
+                    || self.pattern_is_volatile(&sq.pattern)
+            }
+            GraphPattern::Graph(_, inner) => self.pattern_is_volatile(inner),
+            GraphPattern::Service { pattern, .. } => self.pattern_is_volatile(pattern),
+        }
+    }
+
+    /// Whether expression `e` gives each solution a value of its own.
+    fn expr_is_volatile(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Var(_) | Expr::Const(_) => false,
+            Expr::Or(a, b) | Expr::And(a, b) | Expr::Arith(_, a, b) | Expr::Compare(_, a, b) => {
+                self.expr_is_volatile(a) || self.expr_is_volatile(b)
+            }
+            Expr::Not(a) | Expr::Unary(_, a) => self.expr_is_volatile(a),
+            Expr::In { expr, list, .. } => {
+                self.expr_is_volatile(expr) || list.iter().any(|x| self.expr_is_volatile(x))
+            }
+            Expr::Builtin(name, args) => {
+                matches!(
+                    name.to_ascii_uppercase().as_str(),
+                    "BNODE" | "RAND" | "UUID" | "STRUUID"
+                ) || self.functions.get(name).is_some()
+                    || args.iter().any(|x| self.expr_is_volatile(x))
+            }
+            Expr::Exists(_, gp) => self.pattern_is_volatile(gp),
+            Expr::Aggregate { arg, .. } => arg.as_deref().is_some_and(|a| self.expr_is_volatile(a)),
+            // User, PFN and graph functions: whatever they compute.
+            Expr::IriCall { .. } | Expr::Pfn { .. } | Expr::GraphFn { .. } => true,
+        }
     }
 
     /// The nodes reached from `start` by following `path` (or, if `reverse`,
@@ -2836,6 +3026,18 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             }
             GraphPattern::LeftJoin(a, b, filters) => {
                 let left = self.eval_pattern(a, layout);
+                // A property path of the right side whose end point the
+                // left side binds is walked from each left solution's value
+                // (round-3 review of sparqlconf#9): evaluated on its own it
+                // ran from every node of the graph.
+                let avars = pattern_vars(a, layout);
+                if let Some(group) = self.bound_right(b, &avars, layout) {
+                    if left.is_empty() {
+                        return left;
+                    }
+                    let probes = self.path_join_probes(&group, &avars, layout);
+                    return self.eval_left_join_bound(left, &probes, filters, layout);
+                }
                 let right = self.eval_pattern(b, layout);
                 self.eval_left_join(left, b, right, filters, layout)
             }
@@ -3034,6 +3236,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             pfn: self.pfn.clone(),
             // Same NOW(), BNODE(str) nodes and pattern cache as the outer query.
             ctx: Rc::clone(&self.ctx),
+            path_max_duplicates: self.path_max_duplicates,
+            path_duplicates: Rc::clone(&self.path_duplicates),
+            path_sets: Rc::clone(&self.path_sets),
         }
     }
 
@@ -3141,6 +3346,63 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             });
             if !matched {
                 out.push(l.clone());
+            }
+        }
+        out
+    }
+
+    /// The right side `b` of an OPTIONAL as a [`PathJoin`] seeded by the
+    /// left side's variables `seed`, when one of its property paths has an
+    /// end point among them; `None` otherwise (it is then evaluated on its
+    /// own, as before).
+    fn bound_right<'g>(
+        &self,
+        b: &'g GraphPattern,
+        seed: &[usize],
+        layout: &VarLayout,
+    ) -> Option<PathJoin<'g>> {
+        let mut conjuncts = Vec::new();
+        flatten_join(b, &mut conjuncts);
+        PathJoin::new_seeded(&conjuncts, layout, seed)
+    }
+
+    /// [`eval_left_join`](Self::eval_left_join) with a right side whose
+    /// path is walked from each left solution ([`bound_right`](Self::bound_right),
+    /// `probes` from [`path_join_probes`](Self::path_join_probes)): each
+    /// left solution is joined with the right side's parts depth first —
+    /// the solutions of `{ l } ⋈ right`, left-major, as the streaming
+    /// executor produces them — and kept as it is when none passes the
+    /// filters.
+    fn eval_left_join_bound(
+        &self,
+        left: Vec<Binding>,
+        probes: &[topk::JoinProbe<'_>],
+        filters: &[Expr],
+        layout: &VarLayout,
+    ) -> Vec<Binding> {
+        let mut out = Vec::new();
+        for l in left {
+            if self.cancelled() {
+                // Reported by the caller's `check_cancel`.
+                return Vec::new();
+            }
+            let mut matched = false;
+            let flow = self.path_join_dfs(probes, layout, l.clone(), &mut |m| {
+                if filters
+                    .iter()
+                    .all(|f| self.eval_ebv(f, &m, layout) == Some(true))
+                {
+                    out.push(m);
+                    matched = true;
+                }
+                ControlFlow::Continue(())
+            });
+            if flow.is_break() {
+                // Cancelled, or the path budget is spent (reported).
+                return Vec::new();
+            }
+            if !matched {
+                out.push(l);
             }
         }
         out
@@ -3258,7 +3520,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
 
     /// [`eval_join`](Self::eval_join) for a group with a property path
     /// whose end point another conjunct binds (see [`PathJoin`]): the parts
-    /// are joined in [`PathJoin::order`]; a [`PathJoinStep::Bound`] path
+    /// are joined in [`PathJoin::order_from`]; a [`PathJoinStep::Bound`] path
     /// extends each solution so far from the value it gives the end point.
     fn eval_path_join(&self, group: &PathJoin<'_>, layout: &VarLayout) -> Vec<Binding> {
         let (mut rows, steps) = self.path_join_plan(group, layout);
@@ -3290,8 +3552,15 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                         if n % 64 == 63 && self.cancelled() {
                             return Vec::new();
                         }
-                        for &pair in self.bound_path_pairs(p, l, layout, &mut cache).iter() {
+                        for &(pair, k) in self.bound_path_pairs(p, l, layout, &mut cache).iter() {
                             if let Some(m) = extend_by_path(l, p, pair, layout) {
+                                let copies = self.path_copies(k);
+                                if !self.charge_path_duplicates(copies - 1) {
+                                    return Vec::new();
+                                }
+                                for _ in 1..copies {
+                                    next.push(m.clone());
+                                }
                                 next.push(m);
                             }
                         }
@@ -3320,6 +3589,17 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         group: &PathJoin<'_>,
         layout: &VarLayout,
     ) -> (Vec<Option<Vec<Binding>>>, Vec<PathJoinStep>) {
+        self.path_join_plan_from(group, &[], layout)
+    }
+
+    /// [`path_join_plan`](Self::path_join_plan) for joining solutions that
+    /// already bind `seed` ([`PathJoin::order_from`]).
+    fn path_join_plan_from(
+        &self,
+        group: &PathJoin<'_>,
+        seed: &[usize],
+        layout: &VarLayout,
+    ) -> (Vec<Option<Vec<Binding>>>, Vec<PathJoinStep>) {
         let rows: Vec<Option<Vec<Binding>>> = group
             .parts
             .iter()
@@ -3327,7 +3607,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             .map(|(part, ends)| ends.is_empty().then(|| self.eval_pattern(part, layout)))
             .collect();
         let sizes: Vec<Option<usize>> = rows.iter().map(|r| r.as_ref().map(Vec::len)).collect();
-        let steps = group.order(&sizes);
+        let steps = group.order_from(&sizes, seed);
         (rows, steps)
     }
 
@@ -6975,7 +7255,7 @@ fn flatten_join<'a>(gp: &'a GraphPattern, out: &mut Vec<&'a GraphPattern>) {
 /// solutions is extended by the path walked from the value it binds
 /// ([`Evaluator::bound_path_pairs`], once per distinct value) — the same
 /// solutions as the join of the path's own ones (§18.5), at the cost of the
-/// bound side. Both executors run the parts in [`order`](Self::order): the
+/// bound side. Both executors run the parts in [`order_from`](Self::order_from): the
 /// materializing one level by level ([`Evaluator::eval_path_join`]), the
 /// streaming one depth first (`topk`), so they agree on the solution order.
 struct PathJoin<'g> {
@@ -7013,11 +7293,25 @@ impl<'g> PathJoin<'g> {
     /// The group's parts, or `None` when no path qualifies (then the group
     /// joins as before, by [`greedy_join_order`]).
     fn new(conjuncts: &[&'g GraphPattern], layout: &VarLayout) -> Option<PathJoin<'g>> {
+        PathJoin::new_seeded(conjuncts, layout, &[])
+    }
+
+    /// [`new`](Self::new) for conjuncts joined to solutions that already
+    /// bind (some of) `seed` — the right side of an OPTIONAL, `seed` the
+    /// left side's variables: `None` unless a path's end point is among
+    /// them.
+    fn new_seeded(
+        conjuncts: &[&'g GraphPattern],
+        layout: &VarLayout,
+        seed: &[usize],
+    ) -> Option<PathJoin<'g>> {
         let vars: Vec<Vec<usize>> = conjuncts.iter().map(|c| pattern_vars(c, layout)).collect();
         let bound_elsewhere = |i: usize, v: usize| {
-            vars.iter()
-                .enumerate()
-                .any(|(j, vs)| j != i && vs.contains(&v))
+            seed.contains(&v)
+                || vars
+                    .iter()
+                    .enumerate()
+                    .any(|(j, vs)| j != i && vs.contains(&v))
         };
         let ends: Vec<Vec<usize>> = conjuncts
             .iter()
@@ -7043,7 +7337,9 @@ impl<'g> PathJoin<'g> {
                 _ => Vec::new(),
             })
             .collect();
-        if ends.iter().all(Vec::is_empty) {
+        if ends.iter().all(Vec::is_empty)
+            || (!seed.is_empty() && !ends.iter().flatten().any(|v| seed.contains(v)))
+        {
             return None;
         }
         let mut group = PathJoin {
@@ -7084,9 +7380,13 @@ impl<'g> PathJoin<'g> {
     /// first in the group), else the smallest unconnected part, else the
     /// first remaining path, evaluated with both ends free. Ties go to the
     /// earlier part.
-    fn order(&self, sizes: &[Option<usize>]) -> Vec<PathJoinStep> {
+    ///
+    /// For joining solutions that already bind `seed` (an OPTIONAL's left
+    /// side), those variables count as joined before the first part, so the
+    /// first step is already a connected part or a bind-joined path.
+    fn order_from(&self, sizes: &[Option<usize>], seed: &[usize]) -> Vec<PathJoinStep> {
         let mut left: Vec<usize> = (0..self.parts.len()).collect();
-        let mut acc_vars: Vec<usize> = Vec::new();
+        let mut acc_vars: Vec<usize> = seed.to_vec();
         let mut steps = Vec::with_capacity(left.len());
         while !left.is_empty() {
             let connected = |i: usize| self.vars[i].iter().any(|v| acc_vars.contains(v));
@@ -7096,7 +7396,7 @@ impl<'g> PathJoin<'g> {
                     .filter(|&i| sizes[i].is_some() && (!want_connected || connected(i)))
                     .min_by_key(|&i| sizes[i])
             };
-            let step = if steps.is_empty() {
+            let step = if steps.is_empty() && seed.is_empty() {
                 smallest(false).map(PathJoinStep::Rows)
             } else {
                 smallest(true).map(PathJoinStep::Rows).or_else(|| {
@@ -7124,8 +7424,26 @@ impl<'g> PathJoin<'g> {
     }
 }
 
-/// The `(start, end)` pairs of a path pattern, shared by a memo's users.
-type PathPairs = Rc<Vec<(u32, u32)>>;
+/// The `(start, end)` pairs of a path pattern, each once with its number
+/// of routes (see the property path section of [`Evaluator`]).
+type CountedPairs = Vec<((u32, u32), u64)>;
+
+/// [`CountedPairs`] shared by a memo's users.
+type PathPairs = Rc<CountedPairs>;
+
+/// While it lives, the solutions an evaluator computes hand each property
+/// path pair out once ([`Evaluator::path_set_mode`]); dropping it restores
+/// the previous mode (a sub-`SELECT` inside an `EXISTS`, say).
+struct PathSetMode {
+    cell: Rc<std::cell::Cell<bool>>,
+    prev: bool,
+}
+
+impl Drop for PathSetMode {
+    fn drop(&mut self) {
+        self.cell.set(self.prev);
+    }
+}
 
 /// The memo of one bind-joined path ([`Evaluator::bound_path_pairs`]): its
 /// `(start, end)` pairs per bound value and side (walked backwards from the

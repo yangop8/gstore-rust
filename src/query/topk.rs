@@ -28,7 +28,11 @@
 //! * **FILTER, BIND, UNION, `GRAPH`** — fully (`UNION` streams its left
 //!   branch, then its right one; `GRAPH ?g` each named graph in turn).
 //! * **OPTIONAL, MINUS** — the left side streams; the right side is
-//!   evaluated in full once, on the first left solution.
+//!   evaluated in full once, on the first left solution — except an
+//!   OPTIONAL property path whose end point the left side binds: it is
+//!   walked from each left solution's value, once per distinct value (the
+//!   materializing executor does the same, so the rows come in the same
+//!   order; round-3 review of sparqlconf#9).
 //! * **A group of several conjuncts** (`{ … } { … }`, a BGP next to
 //!   `VALUES`, a sub-SELECT, a path, …) — each conjunct is evaluated in full,
 //!   because their sizes decide the join order; the join itself then streams
@@ -37,8 +41,14 @@
 //!   it is walked from the value each streamed solution binds, once per
 //!   distinct value, in the order the full evaluation uses (`PathJoin`,
 //!   review sparqlconf#9).
-//! * **VALUES, sub-SELECT, property path, SERVICE** — evaluated in full
-//!   (a sub-SELECT applies these optimizations to itself).
+//! * **Property path** — its `(start, end)` pairs are walked in full, as
+//!   counts of routes, but the copies a pair reached by several routes
+//!   stands for are handed out one at a time, each past the first charged
+//!   to the query's path budget (`Evaluator::with_path_max_duplicates`),
+//!   so `ASK`, `EXISTS` and `LIMIT` stop after the copies they take
+//!   (round-3 review).
+//! * **VALUES, sub-SELECT, SERVICE** — evaluated in full (a sub-SELECT
+//!   applies these optimizations to itself).
 //!
 //! # Top-K with a bounded heap
 //!
@@ -273,6 +283,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// Whether `gp` has a solution — for `ASK` and `EXISTS`: stops at the
     /// first one when early termination is on.
     pub(super) fn pattern_has_solution(&self, gp: &GraphPattern, layout: &VarLayout) -> bool {
+        // Only existence matters: a property path hands each pair out once.
+        let _sets = self.path_set_mode(true);
         if !self.topk.early_termination {
             return !self.eval_pattern(gp, layout).is_empty();
         }
@@ -295,6 +307,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         layout: &VarLayout,
         accept: &dyn Fn(&Binding) -> bool,
     ) -> bool {
+        let _sets = self.path_set_mode(true);
         if !self.topk.early_termination {
             return self.eval_pattern(gp, layout).iter().any(accept);
         }
@@ -383,6 +396,33 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             }
             GraphPattern::LeftJoin(a, b, filters) => {
                 let avars = pattern_vars(a, layout);
+                // A property path of the right side whose end point the
+                // left side binds: walked from each left solution's value
+                // (as the materializing executor does, in the same order).
+                if let Some(group) = self.bound_right(b, &avars, layout) {
+                    let mut probes: Option<Vec<JoinProbe<'_>>> = None;
+                    return self.stream_pattern(a, layout, &mut |l| {
+                        let probes = probes
+                            .get_or_insert_with(|| self.path_join_probes(&group, &avars, layout));
+                        let mut matched = false;
+                        self.path_join_dfs(probes, layout, l.clone(), &mut |m| {
+                            if filters
+                                .iter()
+                                .all(|f| self.eval_ebv(f, &m, layout) == Some(true))
+                            {
+                                matched = true;
+                                sink(m)
+                            } else {
+                                GO
+                            }
+                        })?;
+                        if matched {
+                            GO
+                        } else {
+                            sink(l)
+                        }
+                    });
+                }
                 let hint: Vec<usize> = pattern_vars(b, layout)
                     .into_iter()
                     .filter(|v| avars.contains(v))
@@ -449,9 +489,22 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 })
             }
             GraphPattern::Graph(g, inner) => self.stream_graph(g, inner, layout, sink),
+            // A path's pairs are walked in full (their counts), but their
+            // copies are handed out one at a time.
+            GraphPattern::Path(p) => {
+                for ((s, o), k) in self.path_pattern_pairs(p) {
+                    let mut b = vec![None; layout.len()];
+                    if !bind_node(&mut b, &p.subject, s, layout)
+                        || !bind_node(&mut b, &p.object, o, layout)
+                    {
+                        continue;
+                    }
+                    self.emit_path_copies(b, self.path_copies(k), &mut |m| sink(m))?;
+                }
+                GO
+            }
             GraphPattern::Values(..)
             | GraphPattern::SubSelect(_)
-            | GraphPattern::Path(_)
             | GraphPattern::Service { .. } => {
                 for b in self.eval_pattern(gp, layout) {
                     sink(b)?;
@@ -559,7 +612,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
 
     /// [`eval_path_join`](Self::eval_path_join), depth first: the first
     /// part's solutions stream through the other parts in the same
-    /// [`PathJoin::order`] — a part evaluated on its own as a hash-indexed
+    /// [`PathJoin::order_from`] — a part evaluated on its own as a hash-indexed
     /// [`Probe`], a bind-joined path walked from the end point each solution
     /// binds — so the solutions come in the materializing executor's order.
     fn stream_path_join(
@@ -611,8 +664,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     }
 
     /// Join `b` with each step of a [`PathJoin`] in turn, depth first (as
-    /// [`join_dfs`] does for plain probes).
-    fn path_join_dfs(
+    /// [`join_dfs`] does for plain probes); a path pair reached by several
+    /// routes continues once per copy ([`path_copies`](Self::path_copies)).
+    pub(super) fn path_join_dfs(
         &self,
         probes: &[JoinProbe<'_>],
         layout: &VarLayout,
@@ -629,14 +683,76 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     return STOP;
                 }
                 let pairs = self.bound_path_pairs(p, &b, layout, &mut cache.borrow_mut());
-                for &pair in pairs.iter() {
+                for &(pair, k) in pairs.iter() {
                     if let Some(m) = extend_by_path(&b, p, pair, layout) {
-                        self.path_join_dfs(rest, layout, m, sink)?;
+                        self.emit_path_copies(m, self.path_copies(k), &mut |m| {
+                            self.path_join_dfs(rest, layout, m, sink)
+                        })?;
                     }
                 }
                 GO
             }
         }
+    }
+
+    /// Hand `n` copies of path solution `b` to `next`, one at a time: each
+    /// past the first is charged to the query's budget
+    /// ([`charge_path_duplicates`](Self::charge_path_duplicates)) just
+    /// before it is handed out, so a consumer that stops early pays for
+    /// what it took. `STOP` once the budget is spent or the query is
+    /// cancelled.
+    fn emit_path_copies(&self, b: Binding, n: u64, next: &mut dyn FnMut(Binding) -> Flow) -> Flow {
+        for i in 1..n {
+            next(b.clone())?;
+            if (i % 4096 == 0 && self.cancelled()) || !self.charge_path_duplicates(1) {
+                return STOP;
+            }
+        }
+        next(b)
+    }
+
+    /// The probes of `group`, the right side of an OPTIONAL
+    /// ([`bound_right`](Self::bound_right)), for joining solutions that bind
+    /// (some of) `seed`: the parts evaluated on their own as hash-indexed
+    /// [`Probe`]s, the paths walked from the end point each solution binds,
+    /// in [`PathJoin::order_from`] — the same for both executors.
+    pub(super) fn path_join_probes<'g>(
+        &self,
+        group: &'g PathJoin<'_>,
+        seed: &[usize],
+        layout: &VarLayout,
+    ) -> Vec<JoinProbe<'g>> {
+        let (mut rows, steps) = self.path_join_plan_from(group, seed, layout);
+        let mut acc_vars = seed.to_vec();
+        let mut probes = Vec::with_capacity(steps.len());
+        for step in steps {
+            let i = step.part();
+            probes.push(match step {
+                PathJoinStep::Rows(_) => {
+                    let shared: Vec<usize> = acc_vars
+                        .iter()
+                        .copied()
+                        .filter(|v| group.vars[i].contains(v))
+                        .collect();
+                    let part = rows[i]
+                        .take()
+                        .unwrap_or_else(|| self.eval_pattern(&group.parts[i], layout));
+                    JoinProbe::Rows(Probe::new(part, &shared))
+                }
+                PathJoinStep::Bound(_) => {
+                    let GraphPattern::Path(p) = group.parts[i].as_ref() else {
+                        unreachable!("only a path is joined from its bound end point");
+                    };
+                    JoinProbe::Path(p, std::cell::RefCell::default())
+                }
+            });
+            for &v in &group.vars[i] {
+                if !acc_vars.contains(&v) {
+                    acc_vars.push(v);
+                }
+            }
+        }
+        probes
     }
 
     /// Stream a BGP with the plan [`eval_bgp_constrained`](Self::eval_bgp_constrained)
@@ -1694,7 +1810,7 @@ fn tree_leaves(tree: &JoinTree, out: &mut Vec<usize>) {
 /// shared [`RowIndex`]: hashed on the shared variables each row binds, so a
 /// left solution or right rows that leave a shared variable unbound cost no
 /// scan of the operand (review query#10).
-struct Probe {
+pub(super) struct Probe {
     rows: Vec<Binding>,
     index: RowIndex,
 }
@@ -1727,7 +1843,7 @@ fn join_dfs(probes: &[Probe], b: Binding, sink: &mut Sink<'_>) -> Flow {
 }
 
 /// One step of a streamed [`PathJoin`] after its first part.
-enum JoinProbe<'g> {
+pub(super) enum JoinProbe<'g> {
     /// A part evaluated on its own.
     Rows(Probe),
     /// A path walked from the end point each solution binds, with its memo.
