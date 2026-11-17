@@ -37,7 +37,10 @@ for data, databases and results) are relative paths.
 | `calibrate [--quick]` | print this machine's calibration | 0 |
 
 Every command exits **2** on a usage error, a crashed or timed-out phase, or
-an unreadable file — never 0.
+an unreadable file — never 0. Only `compare`, `merge`, `report` and its
+`--update` / `--check` take positional arguments; any other command refuses
+one (review infra#5: `check --from X other.json` used to gate X against the
+default baseline).
 
 Run options: `--profile micro|smoke|reference`, `--workload lubm|watdiv|tiny`
 (alone: drops the profile's extra workloads), `--scale`, `--seed`,
@@ -60,7 +63,13 @@ name), `--drop-caches` (drop the page cache before the first open; needs
 root), `--no-calibrate`, `--verify-data` (re-hash a cached data file and
 re-run the ASK walk of cached WatDiv bindings), `--quiet`. The concurrency
 and mixed-workload query choices apply to the main workload; extra
-workloads use their own defaults.
+workloads use their own defaults. `--conc-secs` and `--mixed-secs` must be
+finite, positive and at most 3600, `--conc-clients` at least 1, and a mixed
+point may not need more than 100 000 writes (`--mixed-secs` × 1000 ÷
+`--mixed-write-ms`): checked before anything is generated (review
+infra#16: a negative or NaN value used to panic the phase child after the
+build and query phases, and the writer built all its statements up front —
+it now makes them as it sends them).
 
 ## Profiles
 

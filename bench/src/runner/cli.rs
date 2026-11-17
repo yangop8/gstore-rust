@@ -132,6 +132,24 @@ impl Args {
         }
         Ok(self.items)
     }
+
+    /// [`finish`](Self::finish) for a command that takes no positional
+    /// arguments: a leftover one is a usage error rather than silently
+    /// dropped (review infra#5: `check --from X other.json` gated X against
+    /// the default baseline, `run --profile reference 38` ran univ 8).
+    fn done(self) -> Result<(), String> {
+        match self.finish()?.first() {
+            Some(p) => Err(format!(
+                "unexpected argument '{p}' (this command takes options only)"
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// Consume every item of `a`, leaving it empty.
+    fn take(a: &mut Args) -> Args {
+        std::mem::replace(a, Args { items: Vec::new() })
+    }
 }
 
 fn usage_error(msg: &str) -> ExitCode {
@@ -321,6 +339,15 @@ fn run_options(a: &mut Args, default_profile: &str) -> Result<RunOptions, String
         }
         p.mixed = Some(m);
     }
+    // Before anything is generated or built (review infra#16: a negative or
+    // NaN --conc-secs panicked the conc child after the build and query
+    // phases, --mixed-secs 1e9 aborted the mixed child out of memory).
+    if let Some(c) = &p.conc {
+        c.validate()?;
+    }
+    if let Some(m) = &p.mixed {
+        m.validate()?;
+    }
     if let Some(t) = a.parsed::<u64>("--timeout-s")? {
         p.timeout_s = t;
         p.timeout_build_s = t;
@@ -498,7 +525,7 @@ fn cmd_gen(a: &mut Args) -> CmdResult {
     usage(workload_options(a, &mut spec, &no_default))?;
     let chunk = a.flag("--chunk");
     let out = usage(a.value("--out"))?.unwrap_or_else(|| "-".into());
-    usage(std::mem::replace(a, Args { items: Vec::new() }).finish())?;
+    usage(Args::take(a).done())?;
     let w = usage(spec.instantiate())?;
     let t = Instant::now();
     let stats = if out == "-" {
@@ -548,7 +575,7 @@ fn cmd_queries(a: &mut Args) -> CmdResult {
     }
     o.verify_data = a.flag("--verify-data");
     o.quiet = a.flag("--quiet");
-    usage(std::mem::replace(a, Args { items: Vec::new() }).finish())?;
+    usage(Args::take(a).done())?;
     let runner = failed(Runner::prepare(o))?;
     let s = runner.main();
     let mut out = String::new();
@@ -588,7 +615,7 @@ fn cmd_run(a: &mut Args) -> CmdResult {
         .map(PathBuf::from)
         .unwrap_or_else(|| default_out(&o));
     let note = usage(a.value("--note"))?;
-    usage(std::mem::replace(a, Args { items: Vec::new() }).finish())?;
+    usage(Args::take(a).done())?;
     let mut runner = failed(Runner::prepare(o))?;
     let r = runner.run_all(false);
     runner.finish(r.is_ok());
@@ -685,7 +712,7 @@ fn cmd_check(a: &mut Args, ci: bool) -> CmdResult {
 
     let (result, outcomes) = if let Some(f) = from {
         usage(a.value("--backends"))?;
-        usage(std::mem::replace(a, Args { items: Vec::new() }).finish())?;
+        usage(Args::take(a).done())?;
         let r = failed(BenchResult::load(Path::new(&f)))?;
         let o = evaluate(&baseline, &r, &t, slowdown);
         (r, o)
@@ -737,7 +764,7 @@ fn cmd_check(a: &mut Args, ci: bool) -> CmdResult {
                 o.builder = c.builder.clone();
             }
         }
-        usage(std::mem::replace(a, Args { items: Vec::new() }).finish())?;
+        usage(Args::take(a).done())?;
         let mut runner = failed(Runner::prepare(o))?;
         let mut result = match runner.run_all(true) {
             Ok(r) => r,
@@ -794,7 +821,7 @@ fn cmd_compare(a: &mut Args) -> CmdResult {
     let _ = a.flag("--markdown");
     let summary = usage(a.value("--summary"))?.map(PathBuf::from);
     let only = usage(a.list("--backends"))?;
-    let pos = usage(std::mem::replace(a, Args { items: Vec::new() }).finish())?;
+    let pos = usage(Args::take(a).finish())?;
     let [base, res] = pos.as_slice() else {
         return Err(Error::Usage("compare needs BASELINE and RESULT".into()));
     };
@@ -825,7 +852,7 @@ fn cmd_report(a: &mut Args) -> CmdResult {
         if update_flag && check_flag {
             return Err(Error::Usage("give --update or --check, not both".into()));
         }
-        let docs = usage(std::mem::replace(a, Args { items: Vec::new() }).finish())?;
+        let docs = usage(Args::take(a).finish())?;
         if docs.is_empty() {
             return Err(Error::Usage(
                 "report --update / --check needs at least one document".into(),
@@ -893,11 +920,11 @@ fn cmd_bless(a: &mut Args) -> CmdResult {
     let provisional = a.flag("--provisional");
     let note = usage(a.value("--note"))?;
     let mut result = if let Some(f) = from {
-        usage(std::mem::replace(a, Args { items: Vec::new() }).finish())?;
+        usage(Args::take(a).done())?;
         failed(BenchResult::load(Path::new(&f)))?
     } else {
         let o = usage(run_options(a, "smoke"))?;
-        usage(std::mem::replace(a, Args { items: Vec::new() }).finish())?;
+        usage(Args::take(a).done())?;
         let mut runner = failed(Runner::prepare(o))?;
         let r = runner.run_all(false);
         runner.finish(r.is_ok());
@@ -977,7 +1004,7 @@ fn merge_runs(
 fn cmd_merge(a: &mut Args) -> CmdResult {
     let out =
         usage(a.value("--out"))?.ok_or_else(|| Error::Usage("merge needs --out FILE".into()))?;
-    let pos = usage(std::mem::replace(a, Args { items: Vec::new() }).finish())?;
+    let pos = usage(Args::take(a).finish())?;
     if pos.len() < 2 {
         return Err(Error::Usage("merge needs at least two results".into()));
     }
@@ -1050,7 +1077,7 @@ fn cmd_merge(a: &mut Args) -> CmdResult {
 
 fn cmd_calibrate(a: &mut Args) -> CmdResult {
     let quick = a.flag("--quick");
-    usage(std::mem::replace(a, Args { items: Vec::new() }).finish())?;
+    usage(Args::take(a).done())?;
     let dir = std::env::temp_dir();
     let req = ChildRequest {
         phase: "calibrate".into(),
@@ -1156,6 +1183,15 @@ mod tests {
             items: vec!["--bogus".into()],
         };
         assert!(a.finish().is_err());
+        // A command without positionals refuses one (review infra#5).
+        let a = Args {
+            items: vec!["other.json".into()],
+        };
+        assert_eq!(
+            a.done().unwrap_err(),
+            "unexpected argument 'other.json' (this command takes options only)"
+        );
+        assert!(Args { items: Vec::new() }.done().is_ok());
     }
 
     #[test]
@@ -1235,5 +1271,26 @@ mod tests {
             items: vec!["--mixed-checkpoint".into(), "maybe".into()],
         };
         assert!(run_options(&mut bad, "smoke").is_err());
+    }
+
+    /// Point durations are finite, positive and bounded (review infra#16).
+    #[test]
+    fn point_durations_are_validated() {
+        let err = |line: &str| {
+            let mut a = Args {
+                items: line.split(' ').map(String::from).collect(),
+            };
+            run_options(&mut a, "smoke").unwrap_err()
+        };
+        for v in ["-1", "0", "NaN", "inf", "1e9"] {
+            assert!(err(&format!("--conc-secs {v}")).contains("--conc-secs"), "{v}");
+            assert!(err(&format!("--mixed-secs {v}")).contains("--mixed-secs"), "{v}");
+        }
+        assert!(err("--mixed-secs 3600 --mixed-write-ms 1").contains("writes per point"));
+        assert!(err("--conc-clients 0").contains("--conc-clients"));
+        // --no-conc drops both phases, so their settings are not checked.
+        let o = parse("--conc-secs 2.5 --mixed-secs 3600");
+        assert_eq!(o.profile.conc.unwrap().secs, 2.5);
+        assert_eq!(o.profile.mixed.unwrap().secs, 3600.0);
     }
 }
