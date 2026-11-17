@@ -29,7 +29,7 @@ use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use gstore::query::Evaluator;
-use gstore::{Database, QueryResult, ResultSet, Value};
+use gstore::{Database, GStoreError, QueryResult, ResultSet, Value};
 
 // ---- helpers ---------------------------------------------------------------
 
@@ -285,10 +285,15 @@ fn template_blank_nodes_are_fresh_per_solution_and_request() {
 
 /// The fresh-per-solution rule is for the templates that create nodes
 /// (CONSTRUCT, INSERT). SPARQL 1.1 Update forbids blank nodes in DELETE
-/// templates; this engine reads a labelled `_:b` there as it does in the
-/// WHERE pattern and in `DELETE DATA`: the stored node of that label (the
-/// label a query returned). Made fresh, it deleted nothing — `DELETE WHERE
-/// { <a> <p> _:b }` matched the triple and then left it in place.
+/// templates; made fresh there, a labelled `_:b` deleted nothing — `DELETE
+/// WHERE { <a> <p> _:b }` matched the triple and then left it in place.
+///
+/// review sparqlconf#16 / parser#13: this test pinned the reading that
+/// replaced that (the stored node of the label); the parser now refuses a
+/// blank node in DELETE DATA, DELETE WHERE and DELETE templates, as SPARQL
+/// requires. What it checks is kept: such a request deletes nothing
+/// silently — it fails, leaving the triple, and a variable deletes it — and
+/// the INSERT template's label is still a fresh node.
 #[test]
 fn delete_templates_keep_labelled_blank_nodes() {
     let mut db = db("<http://ex/a> <http://ex/p> _:x .\n\
@@ -303,28 +308,42 @@ fn delete_templates_keep_labelled_blank_nodes() {
         b
     };
     let count = |db: &mut Database, q: &str| select(db, q).row_count();
-    // DELETE WHERE with the label a query returned.
+    let refused = |db: &mut Database, u: &str| match db.query(u) {
+        Err(GStoreError::SparqlParse(m)) => {
+            assert!(m.contains("blank nodes are not allowed"), "{u}: {m}")
+        }
+        other => panic!("{u}: expected a parse error, got {other:?}"),
+    };
+    // DELETE WHERE with the label a query returned: refused, nothing
+    // matched-and-kept; a variable deletes the triple.
     let a = node(&mut db, "http://ex/a");
-    update(
+    refused(
         &mut db,
         &format!("DELETE WHERE {{ <http://ex/a> <http://ex/p> {a} }}"),
     );
+    let left = "SELECT ?b WHERE { <http://ex/a> <http://ex/p> ?b }";
+    assert_eq!(count(&mut db, left), 1, "a refused DELETE WHERE deleted");
+    update(&mut db, "DELETE WHERE { <http://ex/a> <http://ex/p> ?b }");
     assert_eq!(
-        count(
-            &mut db,
-            "SELECT ?b WHERE { <http://ex/a> <http://ex/p> ?b }"
-        ),
+        count(&mut db, left),
         0,
-        "DELETE WHERE matched {a} but did not delete it"
+        "DELETE WHERE matched but did not delete"
     );
-    // DELETE … INSERT … WHERE: the DELETE template's label is the stored
-    // node, the INSERT template's a fresh one.
+    // DELETE … INSERT … WHERE: a label in the DELETE template is refused;
+    // with a variable there, the INSERT template's label is a fresh node.
     let c = node(&mut db, "http://ex/c");
-    update(
+    refused(
         &mut db,
         &format!(
             "DELETE {{ ?s <http://ex/p> {c} }} INSERT {{ ?s <http://ex/r> {c} }} \
              WHERE {{ ?s <http://ex/q> \"2\" }}"
+        ),
+    );
+    update(
+        &mut db,
+        &format!(
+            "DELETE {{ ?s <http://ex/p> ?b }} INSERT {{ ?s <http://ex/r> {c} }} \
+             WHERE {{ ?s <http://ex/q> \"2\" . ?s <http://ex/p> ?b }}"
         ),
     );
     assert_eq!(
@@ -333,7 +352,7 @@ fn delete_templates_keep_labelled_blank_nodes() {
             "SELECT ?b WHERE { <http://ex/c> <http://ex/p> ?b }"
         ),
         0,
-        "the DELETE template's {c} is the stored node"
+        "the DELETE template removed the stored node's triple"
     );
     let rs = select(
         &mut db,
