@@ -452,8 +452,11 @@ a check that reports a new workload and passes). The end-to-end tests
 run the `gbuild` next to the test binary (`cargo test --workspace` builds
 it; alone, build it first with `cargo build --profile test -p gstore --bin
 gbuild`, adding `--features rocksdb` for a RocksDB test run): a missing
-`gbuild`, one older than a gstore source file, or one without RocksDB for
-`--features rocksdb` fails them with that instruction (review infra#18:
+`gbuild`, one older than a source file it is compiled from (the files
+rustc's dep-info in its target directory lists for `gbuild` and the gstore
+library, so editing a `#[cfg(test)]` module or another binary does not
+count), or one without RocksDB for `--features rocksdb` fails them with
+that instruction (review infra#18:
 they used to fall back to the library build, or measure a stale binary,
 saying so only on captured stderr). `GSTORE_BENCH_TEST_BUILDER=lib`
 chooses the library build explicitly. The tests of the update phase

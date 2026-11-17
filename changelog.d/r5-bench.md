@@ -62,8 +62,11 @@ workflows; no gstore library, server or on-disk change):
   hook `--inject lose-writes:update`.
 - **Bench end-to-end tests fail on a missing, stale or RocksDB-less
   `gbuild`** (infra#18) instead of silently using the library builder or a
-  binary older than the sources; `GSTORE_BENCH_TEST_BUILDER=lib` chooses the
-  library builder explicitly. `cargo test -p gstore-bench` alone now needs
+  binary older than the sources it is compiled from (the files rustc's
+  dep-info in the target directory lists for `gbuild` and the gstore
+  library; a `#[cfg(test)]` module, another binary or any other file under
+  `src/` does not count, since cargo does not relink `gbuild` for it);
+  `GSTORE_BENCH_TEST_BUILDER=lib` chooses the library builder explicitly. `cargo test -p gstore-bench` alone now needs
   `cargo build --profile test -p gstore --bin gbuild [--features rocksdb]`
   first (`cargo test --workspace` and both CI jobs already build it).
 - **Reports match sections by workload** (infra#8): a section is compared
@@ -90,7 +93,9 @@ workflows; no gstore library, server or on-disk change):
   `bench/tests/baseline_validity.rs`, `bench/tests/cli_arguments.rs`,
   `bench/tests/update_phase_reopen.rs`, `bench/tests/reference_compare.rs`;
   unit tests in `gates.rs`, `runner/cli.rs`, `runner/conc.rs`;
-  `a_missing_or_stale_gbuild_is_refused` in `bench/tests/cli.rs`.
+  `a_missing_or_stale_gbuild_is_refused` and
+  `only_the_sources_gbuild_is_compiled_from_make_it_stale` in
+  `bench/tests/cli.rs`.
 - Corrected tests (D6): `bench/tests/gates.rs`'s
   `one_slow_query_of_20ms_or_more_fails` asserted that a sub-millisecond
   query slowed 4× and four of them slowed 5× pass — the blindness of
