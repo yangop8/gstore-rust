@@ -75,7 +75,8 @@ mod tests {
     #[test]
     fn non_ascii_graph_label_does_not_panic() {
         // The graph-label region `:café` is >= 5 bytes but byte 5 falls inside
-        // the `é`; `strip_graph_keyword` must not slice on a non-char boundary.
+        // the `é`; reading the graph label must not slice on a non-char
+        // boundary (the byte-slicing keyword stripper this guarded is gone).
         let doc = "@prefix : <http://e/> .\n:café { :s :p :o }";
         let qs = parse_str(doc).unwrap();
         assert_eq!(qs.len(), 1);

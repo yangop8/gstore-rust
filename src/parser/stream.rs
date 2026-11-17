@@ -18,7 +18,13 @@
 //!   ones are `genid-<n>`; in *scoped* mode (every bulk load) both are
 //!   prefixed with a scope unique to that one document, so blank nodes of two
 //!   files, or of two `gadd` / `batchInsert` calls, can never merge. Every
-//!   label it produces uses only `[A-Za-z0-9_-]`, so it round-trips through
+//!   label it produces is a valid blank-node label
+//!   ([`is_valid_blank_label`](crate::model::term::is_valid_blank_label):
+//!   letters, digits, `_`, `-` and inner `.`) — an explicit label outside
+//!   that set is made one by
+//!   [`safe_blank_label`](crate::model::term::safe_blank_label), the N-Triples
+//!   / N-Quads readers pass on only labels they validated, and minted labels
+//!   and scopes use only `[A-Za-z0-9_-]` — so it round-trips through
 //!   [`ntriples::parse_term`](crate::parser::ntriples::parse_term) and every
 //!   exporter.
 
@@ -30,8 +36,11 @@ use crate::error::{GStoreError, Result};
 use crate::model::Term;
 use crate::parser::nquads::Quad;
 
-/// Characters of lookahead a reader may ask for ([`CharSource::peek_at`]).
-/// The Turtle/TriG reader needs at most 6 (`PREFIX` / `GRAPH` keywords).
+/// Characters of lookahead a reader may ask for ([`CharSource::peek_at`]
+/// offsets `0..MAX_LOOKAHEAD`). The Turtle/TriG reader peeks past a keyword
+/// (`PREFIX`, `GRAPH`: 6 characters) and past a run of dots inside a
+/// blank-node label or prefix name, up to `MAX_LOOKAHEAD - 1` dots and the
+/// character after them (a longer run of dots ends the name).
 pub const MAX_LOOKAHEAD: usize = 8;
 
 /// The read window the bulk loaders use: the capacity of the `BufReader`
