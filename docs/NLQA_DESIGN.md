@@ -265,7 +265,7 @@ gAnswer 的核心是**数据驱动消歧**:为实体/谓语保留多个候选计
 | 模式 | 允许的路径 | 语义 |
 |------|-----------|------|
 | `auto`(默认) | 结构化 → 不行再 GraphRAG;**绝不**纯 LLM | 安全默认 |
-| `structured` | 仅结构化 SPARQL / 图分析,**数据绝不出域**,否则拒答 | 强隐私 |
+| `structured` | 仅结构化 SPARQL / 图分析,**结果数据(答案行/支撑三元组)不出域**,否则拒答;为生成查询,LLM 仍会看到问题、链接到的 URI 及其 label、少量 schema 采样、修复循环中的 gStore 错误文本与"无结果"信号(review cluster-nlqa#21) | 强隐私 |
 | `graphrag` | 取私域子图 → 交 LLM 作答 | 中间档 |
 | `open` | 纯 LLM 世界知识,不碰 KB(`answer_direct`) | 无私域数据 |
 
@@ -274,7 +274,7 @@ gAnswer 的核心是**数据驱动消歧**:为实体/谓语保留多个候选计
 ### 12.2 Provenance(答案来源)——数据出域边界,而不只是署名
 每个答案带一个 `Provenance` 标签,三档正好对齐"隐私 + 可信度":
 
-- **`gStore`**:结构化 SPARQL / 图分析,本地计算,**答案数据(结果行/三元组)从未离开本机**。精确地说:为了*生成* SPARQL,发给 LLM 的是问题 + 链接到的实体/谓语 URI 及其 label + 少量 schema 采样,但**不含答案行**。(`with_explain` 开启时会把答案的支撑三元组也发给 LLM 来措辞解释,默认关闭。)
+- **`gStore`**:结构化 SPARQL / 图分析,本地计算,**答案数据(结果行/三元组)从未离开本机**。精确地说:为了*生成* SPARQL,发给 LLM 的是问题 + 链接到的实体/谓语 URI 及其 label + 少量 schema 采样,但**不含答案行**。(`with_explain` 开启时会把答案的支撑三元组也发给 LLM 来措辞解释,默认关闭;`structured` 模式下即使开启也跳过,review cluster-nlqa#21。)
 - **`gStore+LLM (GraphRAG)`**:答案由 LLM 从 gStore 取回的**私域三元组**综合而来(这些三元组发给了 LLM)。
 - **`LLM`**:LLM 用自身世界知识作答,**不涉及任何 KB 数据**。
 

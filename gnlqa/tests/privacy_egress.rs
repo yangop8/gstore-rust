@@ -125,3 +125,96 @@ fn open_mode_answers_stay_available_to_later_rewrites() {
     sess.ask_with_mode("who directed it?", Mode::Open).unwrap();
     assert!(llm.any_prompt_contains("A: Alien is a 1979 film."));
 }
+
+// ---- review cluster-nlqa#21 / #24: structured mode end to end ----
+
+/// Answers the generated query with the secret row, and citation lookups
+/// (`SELECT ?p ?o WHERE { <answer> ?p ?o }`) with a supporting triple whose
+/// object is another private value.
+struct CitationKb;
+impl gnlqa::KbClient for CitationKb {
+    fn query(&self, sparql: &str) -> gnlqa::Result<SparqlAnswer> {
+        if sparql.starts_with("SELECT ?p ?o") {
+            let t = |v: &str| {
+                Some(RdfTerm {
+                    kind: TermKind::Uri,
+                    value: v.into(),
+                    datatype: None,
+                    lang: None,
+                })
+            };
+            return Ok(SparqlAnswer::Select {
+                vars: vec!["p".into(), "o".into()],
+                rows: vec![vec![t("http://ex/paidTo"), t("http://ex/PRIVATEPERSON")]],
+            });
+        }
+        gnlqa::KbClient::query(&secret_kb(), sparql)
+    }
+}
+
+fn citation_kb() -> CitationKb {
+    CitationKb
+}
+
+#[test]
+fn structured_mode_skips_the_explanation_even_when_enabled() {
+    let llm = RecordingLlm::new(&[INTENT, GEN, "An explanation."]);
+    let engine =
+        SolveEngine::new(Box::new(Arc::clone(&llm)), Box::new(citation_kb())).with_explain(true);
+    let a = engine
+        .ask_with_mode("list the salaries", Mode::Structured)
+        .unwrap();
+    assert!(a.text.contains("SECRETSALARY"), "answered locally");
+    assert!(a.explanation.is_none());
+    assert_eq!(llm.calls(), 2, "intent + generation only");
+    assert!(
+        !a.citations.is_empty(),
+        "citations are still gathered locally"
+    );
+    assert!(
+        !llm.any_prompt_contains("PRIVATEPERSON") && !llm.any_prompt_contains("SECRETSALARY"),
+        "structured mode sent supporting KB triples to the LLM"
+    );
+}
+
+#[test]
+fn auto_mode_explanation_stays_opt_in_egress() {
+    // Contrast: in auto mode the documented with_explain egress happens.
+    let llm = RecordingLlm::new(&[INTENT, GEN, "An explanation."]);
+    let engine =
+        SolveEngine::new(Box::new(Arc::clone(&llm)), Box::new(citation_kb())).with_explain(true);
+    let a = engine
+        .ask_with_mode("list the salaries", Mode::Auto)
+        .unwrap();
+    assert_eq!(a.explanation.as_deref(), Some("An explanation."));
+}
+
+#[test]
+fn structured_mode_never_falls_back_to_graphrag() {
+    // Guard (cluster-nlqa#24): the structured query finds nothing and the
+    // question links to an entity, yet no subgraph goes to the LLM.
+    let linker = gnlqa::Linker::from_labels(
+        Box::new(gnlqa::HashEmbedder::new(64)),
+        &[("http://ex/Alien".to_string(), "Alien".to_string())],
+        &[],
+        &[],
+        0.0,
+    )
+    .unwrap();
+    let llm = RecordingLlm::new(&[
+        r#"{"qtype":"open","mentions":[{"text":"Alien","kind":"entity"}]}"#,
+        r#"["SELECT ?x WHERE { ?x <http://ex/p> <http://ex/Alien> }"]"#,
+        "SHOULD NOT BE CALLED",
+    ]);
+    let kb = MockKb::new(vec![SparqlAnswer::Select {
+        vars: vec!["x".into()],
+        rows: vec![],
+    }]);
+    let a = SolveEngine::new(Box::new(Arc::clone(&llm)), Box::new(kb))
+        .with_linker(linker)
+        .with_max_rounds(0)
+        .ask_with_mode("tell me about Alien", Mode::Structured)
+        .unwrap();
+    assert_eq!(a.provenance, Provenance::GStore);
+    assert_eq!(llm.calls(), 2, "no GraphRAG call in structured mode");
+}

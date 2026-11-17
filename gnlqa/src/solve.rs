@@ -209,8 +209,15 @@ pub enum Mode {
     /// Structured SPARQL, then a GraphRAG fallback; never pure LLM. (default)
     #[default]
     Auto,
-    /// Structured SPARQL / graph-analytics only — the data never leaves the
-    /// machine; abstain if it can't be answered that way.
+    /// Structured SPARQL / graph-analytics only — the **result data** (answer
+    /// rows, supporting triples) stays on the machine; abstain if it can't be
+    /// answered that way. To *build* the query the LLM still receives the
+    /// question, the linked entity/type/predicate URIs and their labels,
+    /// small schema samples (predicates and types around the linked terms)
+    /// and, in the repair loop, gStore's error text for a failing query and
+    /// whether a query returned no rows (review cluster-nlqa#21). The
+    /// follow-up rewrite and [`SolveEngine::with_explain`] send no KB answer
+    /// in this mode.
     Structured,
     /// Retrieve a private subgraph from gStore and let the LLM answer from it.
     GraphRag,
@@ -429,9 +436,10 @@ impl SolveEngine {
     /// Have the LLM phrase a grounded natural-language answer (default off).
     ///
     /// Data-egress note: enabling this sends the answer's supporting **KB triples**
-    /// to the LLM (to phrase the explanation), even on the structured path whose
-    /// provenance is [`Provenance::GStore`](crate::pipeline::Provenance::GStore).
-    /// Leave it off if the structured "result data stays local" guarantee matters.
+    /// to the LLM (to phrase the explanation) on the `auto` structured path,
+    /// whose provenance is [`Provenance::GStore`](crate::pipeline::Provenance::GStore).
+    /// [`Mode::Structured`] never does: its "result data stays local"
+    /// guarantee wins and the explanation is skipped (review cluster-nlqa#21).
     pub fn with_explain(mut self, on: bool) -> SolveEngine {
         self.explain = on;
         self
@@ -823,7 +831,10 @@ impl SolveEngine {
                 };
                 // Grounded prose is exposed via `explanation` (only when it could
                 // be grounded on citations); `text` stays the rendered answer.
-                let explanation = if self.explain {
+                // The explanation sends the supporting KB triples to the LLM,
+                // which structured mode promises not to do (review
+                // cluster-nlqa#21): it is skipped there even when enabled.
+                let explanation = if self.explain && mode != Mode::Structured {
                     explain(self.llm.as_ref(), question, &citations, model, &lang)
                 } else {
                     None

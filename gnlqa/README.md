@@ -132,10 +132,12 @@ signal, not just attribution:
 
 - **`gStore`** — structured SPARQL / graph-analytics computed locally; the query
   **result data stays on the machine**. To *generate* the SPARQL, the LLM does
-  receive the question, the linked entity/predicate URIs and their labels, and
-  small schema samples — but never the answer rows/triples. (Enabling
+  receive the question, the linked entity/predicate URIs and their labels, small
+  schema samples (the predicates and types around the linked terms), and — in the
+  self-repair loop — gStore's error text for a failing query and the fact that a
+  query returned no rows; but never the answer rows/triples. (Enabling
   `with_explain` additionally sends the answer's supporting triples to the LLM to
-  phrase an explanation; it's off by default.)
+  phrase an explanation — off by default, and never done in `structured` mode.)
 - **`gStore+LLM (GraphRAG)`** — the LLM composed the answer from private triples
   **retrieved from gStore and sent to the LLM**.
 - **`LLM`** — the LLM answered from its **general knowledge**; no KB data involved.
@@ -145,7 +147,7 @@ You choose which path(s) are allowed with `GNLQA_MODE` (or `/mode` in chat):
 | Mode         | Behaviour | Provenance |
 |--------------|-----------|------------|
 | `auto` (default) | structured SPARQL, then GraphRAG fallback; **never** pure LLM | gStore / GraphRAG |
-| `structured` | SPARQL / analytics **only** — result data stays local; abstains otherwise | gStore |
+| `structured` | SPARQL / analytics **only** — result data stays local (no explanation, no answers replayed); abstains otherwise | gStore |
 | `graphrag`   | retrieve a private subgraph → LLM answers from it | GraphRAG |
 | `open`       | answer from the LLM's general knowledge; ignore the KB | LLM |
 
@@ -160,7 +162,7 @@ keeps its result data local too.
 
 ```sh
 gnlqa chat
-[auto]> /mode structured      # data never leaves the machine
+[auto]> /mode structured      # result rows stay local (the LLM sees URIs, labels, schema)
 [structured]> who directed Alien?
 [open]> what is SPARQL?        # /mode open → answered from the LLM
 ```

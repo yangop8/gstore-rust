@@ -8,7 +8,8 @@
 //! * `gnlqa` (no args)           — print configuration/readiness.
 //!
 //! Answering mode (`GNLQA_MODE` / `/mode` in chat): `auto` (structured then
-//! GraphRAG), `structured` (SPARQL only — data never leaves), `graphrag`
+//! GraphRAG), `structured` (SPARQL only — result rows stay local; the LLM
+//! still sees the question, linked URIs/labels and schema samples), `graphrag`
 //! (private subgraph → LLM), `open` (LLM general knowledge, no KB).
 
 use std::io::{self, Write};
