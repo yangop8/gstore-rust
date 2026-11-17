@@ -1,0 +1,4 @@
+# spec: SPARQL 1.1 Query §17.4.2.9 BNODE: BNODE(str) gives blank nodes distinct from those
+# created for other query solutions; a VALUES block with a repeated row has two solutions
+# (§10.2.2 and §18.2.1: a solution sequence is a multiset), so they get two nodes
+SELECT ?v (BNODE("x") AS ?b) WHERE { VALUES ?v { 1 1 } }

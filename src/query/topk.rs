@@ -481,10 +481,14 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             GraphPattern::Extend(inner, var, expr) => {
                 let vi = layout.index[var];
                 self.stream_pattern(inner, layout, &mut |mut b| {
+                    // Each solution is one of its own for `BNODE(str)` (as
+                    // the materializing executor's `BIND`).
+                    let solution = self.ctx.solution_scope();
                     // BIND error/unbound leaves the variable unbound (no row drop).
                     if let Some(id) = self.eval_id(expr, &b, layout) {
                         b[vi] = Some(id);
                     }
+                    drop(solution);
                     sink(b)
                 })
             }
@@ -1032,6 +1036,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// Extend a WHERE solution with the SELECT-expression columns the full
     /// path adds before sorting (see [`OrderCtx`]).
     fn order_extend(&self, ctx: &OrderCtx<'_>, b: &mut Binding) {
+        // One solution, one identity for `BNODE(str)` (as the full path
+        // gives each solution in its SELECT-expression passes).
+        let _solution = self.ctx.solution_scope();
         for (e, lay) in &ctx.aliases {
             // The full path evaluates the expression before its column
             // exists; an unbound column reads the same (and a reference to

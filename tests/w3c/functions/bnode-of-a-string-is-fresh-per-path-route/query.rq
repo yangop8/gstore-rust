@@ -1,0 +1,6 @@
+# spec: SPARQL 1.1 Query §17.4.2.9 BNODE: BNODE(str) gives blank nodes distinct from those
+# created for other query solutions; the sequence path :p/:q reaches :z from :a by two routes,
+# which are two solutions (§18.4 property path semantics: a sequence is a join, a multiset),
+# so they get two nodes
+PREFIX : <http://example.com/>
+SELECT ?x ?y (BNODE("r") AS ?route) WHERE { ?x :p/:q ?y }

@@ -1,0 +1,7 @@
+{
+  "head": {"vars": ["x", "y", "route"]},
+  "results": {"bindings": [
+    {"x": {"type": "uri", "value": "http://example.com/a"}, "y": {"type": "uri", "value": "http://example.com/z"}, "route": {"type": "bnode", "value": "r1"}},
+    {"x": {"type": "uri", "value": "http://example.com/a"}, "y": {"type": "uri", "value": "http://example.com/z"}, "route": {"type": "bnode", "value": "r2"}}
+  ]}
+}

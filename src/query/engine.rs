@@ -443,8 +443,16 @@ impl Extras {
 }
 
 /// What identifies one `BNODE(str)` node: the solution mapping (see
-/// [`QueryCtx::solution_key`]) and the string.
-type BnodeKey = (Box<[Option<u32>]>, String);
+/// [`QueryCtx::solution_key`]: its bindings and its identity) and the
+/// string.
+type BnodeKey = (SolutionKey, String);
+
+/// A solution mapping as `BNODE(str)` tells it from the others
+/// ([`QueryCtx::solution_key`]): its bindings (without the blank nodes
+/// `BNODE` minted, without trailing unbound slots) and the identity of the
+/// solution among equal ones (a [`QueryCtx::solution_scope`]; `0` outside
+/// any).
+type SolutionKey = (Rc<[Option<u32>]>, u64);
 
 /// Per-query state of the built-ins whose answer belongs to the query
 /// execution rather than to their arguments — `NOW`, `BNODE`, `RAND`,
@@ -467,11 +475,21 @@ struct QueryCtx {
     /// mapping, keyed by the solution (see [`QueryCtx::solution_key`]) and
     /// the string (§17.4.2.9; review query#5).
     bnode_by_str: std::cell::RefCell<HashMap<BnodeKey, String>>,
-    /// The (synthetic) ids of the blank nodes `BNODE` minted in this query.
-    /// They are left out of a solution's key, so `BIND(BNODE("x") AS ?a)
+    /// The (synthetic) ids of the blank nodes `BNODE` minted in this query,
+    /// with the identity of the solution each was minted for. They are left
+    /// out of a solution's bindings in its key, so `BIND(BNODE("x") AS ?a)
     /// BIND(BNODE("x") AS ?b)` — where the second call sees `?a` bound —
-    /// still gives one node per solution.
-    minted: std::cell::RefCell<HashSet<u32>>,
+    /// still gives one node per solution; the identity they carry tells
+    /// that solution from an equal one (see [`solution_key`](Self::solution_key)).
+    minted: std::cell::RefCell<HashMap<u32, u64>>,
+    /// The bindings (as in a [`SolutionKey`]) of the solution each identity
+    /// minted a node for.
+    minted_for: std::cell::RefCell<HashMap<u64, Rc<[Option<u32>]>>>,
+    /// The identity of the solution whose expressions are being evaluated
+    /// ([`solution_scope`](Self::solution_scope)); `0` outside any.
+    scope: std::cell::Cell<u64>,
+    /// The last identity handed out.
+    scopes: std::cell::Cell<u64>,
     /// `RAND()`: xoshiro256** state, seeded from OS randomness at the first
     /// call. Per query, so concurrent queries never share (and race on) a
     /// generator (review conc#1).
@@ -496,6 +514,27 @@ impl QueryCtx {
         self.now.set(None);
         self.bnode_by_str.borrow_mut().clear();
         self.minted.borrow_mut().clear();
+        self.minted_for.borrow_mut().clear();
+        self.scope.set(0);
+    }
+
+    /// Give the solution whose expressions are evaluated while the returned
+    /// guard lives an identity of its own, so `BNODE(str)` tells it from an
+    /// equal solution — a solution sequence is a multiset (§18.1.7: a
+    /// `VALUES` block with a repeated row, a path reached by two routes),
+    /// and `BNODE(str)` gives each solution its own node (§17.4.2.9;
+    /// round-3 review of query#5: equal solutions shared one). Taken per
+    /// solution by every pass that binds an expression's value — `BIND`,
+    /// the SELECT expressions — in both executors; dropping the guard
+    /// restores the enclosing identity (an `EXISTS` evaluated inside an
+    /// expression runs passes of its own).
+    fn solution_scope(&self) -> SolutionScope<'_> {
+        let id = self.scopes.get() + 1;
+        self.scopes.set(id);
+        SolutionScope {
+            ctx: self,
+            prev: self.scope.replace(id),
+        }
     }
 
     /// `NOW()`'s instant for this query.
@@ -557,25 +596,73 @@ impl QueryCtx {
 
     /// The key identifying the solution mapping `b` for `BNODE(str)`: its
     /// bindings, without the blank nodes `BNODE` itself minted (see
-    /// [`minted`](Self::minted)) and without trailing unbound slots. A
-    /// solution's columns only grow at the end while it is evaluated — the
-    /// SELECT expressions extend it left to right, each alias appended
-    /// unbound before its expression runs (§18.2.4.4) — and an unbound
-    /// column is no part of the mapping, so `(BNODE(?v) AS ?a) (BNODE(?v) AS
-    /// ?b)` sees one solution in both calls.
-    fn solution_key(&self, b: &Binding) -> Box<[Option<u32>]> {
+    /// [`minted`](Self::minted)) and without trailing unbound slots, and its
+    /// identity. A solution's columns only grow at the end while it is
+    /// evaluated — the SELECT expressions extend it left to right, each
+    /// alias appended unbound before its expression runs (§18.2.4.4) — and
+    /// an unbound column is no part of the mapping, so `(BNODE(?v) AS ?a)
+    /// (BNODE(?v) AS ?b)` sees one solution in both calls.
+    ///
+    /// The identity: the solution's own ([`solution_scope`](Self::solution_scope))
+    /// — unless it holds nodes `BNODE` minted for one solution whose
+    /// bindings were these (and for no other such solution): then it is
+    /// that solution, extended since only by `BNODE`'s nodes (a later
+    /// `BIND` or SELECT expression of it, a join with a solution holding
+    /// nothing else), and keeps its identity. A solution whose bindings
+    /// changed since — joined with another, say, which may repeat it — is a
+    /// new one.
+    fn solution_key(&self, b: &Binding) -> SolutionKey {
         let minted = self.minted.borrow();
-        let mut key: Vec<Option<u32>> = if minted.is_empty() {
-            b.to_vec()
-        } else {
-            b.iter()
-                .map(|slot| slot.filter(|id| !minted.contains(id)))
-                .collect()
-        };
+        let mut scopes: Vec<u64> = Vec::new();
+        let mut key: Vec<Option<u32>> = b
+            .iter()
+            .map(|slot| match slot.and_then(|id| minted.get(&id)) {
+                Some(&scope) => {
+                    if scope != 0 && !scopes.contains(&scope) {
+                        scopes.push(scope);
+                    }
+                    None
+                }
+                None => *slot,
+            })
+            .collect();
         while key.last() == Some(&None) {
             key.pop();
         }
-        key.into_boxed_slice()
+        let key: Rc<[Option<u32>]> = key.into();
+        let minted_for = self.minted_for.borrow();
+        let mut same = scopes
+            .into_iter()
+            .filter(|s| minted_for.get(s).is_some_and(|k| *k == key));
+        let identity = match (same.next(), same.next()) {
+            (Some(scope), None) => scope,
+            _ => self.scope.get(),
+        };
+        (key, identity)
+    }
+
+    /// Record `id` as a node `BNODE` minted for the solution `key`.
+    fn note_minted(&self, id: u32, key: &SolutionKey) {
+        self.minted.borrow_mut().insert(id, key.1);
+        if key.1 != 0 {
+            self.minted_for
+                .borrow_mut()
+                .entry(key.1)
+                .or_insert_with(|| Rc::clone(&key.0));
+        }
+    }
+}
+
+/// The identity of the solution being evaluated, while it lives (see
+/// [`QueryCtx::solution_scope`]).
+struct SolutionScope<'c> {
+    ctx: &'c QueryCtx,
+    prev: u64,
+}
+
+impl Drop for SolutionScope<'_> {
+    fn drop(&mut self) {
+        self.ctx.scope.set(self.prev);
     }
 }
 
@@ -1684,6 +1771,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                                     // instead of indexing past the end — as
                                     // the Top-K path (`order_extend`) does.
                                     b.push(None);
+                                    let _solution = self.ctx.solution_scope();
                                     b[idx] = self.eval_id(e, b, &layout);
                                 }
                             }
@@ -2281,6 +2369,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     .collect(),
             };
             for (mut gb, vrow) in joined {
+                // One grouped solution, one identity for `BNODE(str)`.
+                let _solution = self.ctx.solution_scope();
                 for ((lifted, gfn), col) in lifted_items.iter().zip(&gfn_values).zip(&alias_cols) {
                     let Some(col) = *col else { continue };
                     gb[col] = match (gfn, lifted) {
@@ -3052,6 +3142,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 let mut sols = self.eval_pattern(inner, layout);
                 let vi = layout.index[var];
                 for b in &mut sols {
+                    // Each solution is one of its own for `BNODE(str)`, also
+                    // when another one is equal to it.
+                    let _solution = self.ctx.solution_scope();
                     // BIND error/unbound leaves the variable unbound (no row drop).
                     if let Some(id) = self.eval_id(expr, b, layout) {
                         b[vi] = Some(id);
@@ -5298,23 +5391,24 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             // same for every call there and a different one in the next
             // solution (review query#5).
             "BNODE" => {
+                let solution = self.ctx.solution_key(b);
                 let label = match args.first() {
                     None => fresh_bnode_label(),
                     Some(a) => {
                         let s = self.eval_value(a, b, l)?.lexical();
-                        let key = (self.ctx.solution_key(b), s);
                         self.ctx
                             .bnode_by_str
                             .borrow_mut()
-                            .entry(key)
+                            .entry((solution.clone(), s))
                             .or_insert_with(fresh_bnode_label)
                             .clone()
                     }
                 };
                 // Interned now, so a later call of this query can tell the
-                // node is BNODE's own (see `QueryCtx::minted`).
+                // node is BNODE's own, minted for this solution (see
+                // `QueryCtx::minted`).
                 let id = self.term_to_id(&Term::Blank(label.clone()));
-                self.ctx.minted.borrow_mut().insert(id);
+                self.ctx.note_minted(id, &solution);
                 Some(Value::Blank(label))
             }
             // Version-4 UUIDs from OS randomness: unique across threads,
