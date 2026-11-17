@@ -192,29 +192,14 @@ impl Replacement {
                     if digits.is_empty() {
                         return None;
                     }
-                    // §5.6.3: while N names no group and is above 9, its
-                    // last digit is a literal character after the reference.
-                    let mut tail = String::new();
-                    let group = loop {
-                        // More digits than fit a u64 are certainly above 9
-                        // and above the group count.
-                        let n = digits.parse::<u64>().unwrap_or(u64::MAX);
-                        if n <= groups as u64 {
-                            break Some(n as usize);
-                        }
-                        if n <= 9 {
-                            break None; // an absent group 1..=9: empty text
-                        }
-                        let last = digits.pop().expect("more than one digit");
-                        tail.insert(0, last);
-                    };
+                    let (group, used) = group_reference(&digits, groups);
                     if let Some(g) = group {
                         if !text.is_empty() {
                             pieces.push(Piece::Text(std::mem::take(&mut text)));
                         }
                         pieces.push(Piece::Group(g));
                     }
-                    text.push_str(&tail);
+                    text.push_str(&digits[used..]);
                 }
                 _ => text.push(c),
             }
@@ -248,6 +233,33 @@ impl Replacement {
         out.push_str(&text[last..]);
         out
     }
+}
+
+/// The group a `$` reference with the digit run `digits` names, and how
+/// many of the digits the reference takes; the rest are literal text after
+/// it. §5.6.3: while N names no group and is above 9, its last digit is a
+/// literal character after the reference — so the reference is the longest
+/// prefix whose value is at most the group count, or at most 9 (an absent
+/// group 1..=9, `None`: empty text). Prefix values only grow with their
+/// length, so one forward pass finds it, however long the run (round-3
+/// review: giving the digits back one at a time from the end was quadratic
+/// in the run's length, and nothing in it polled for cancellation).
+fn group_reference(digits: &str, groups: usize) -> (Option<usize>, usize) {
+    let bound = (groups as u64).max(9);
+    let (mut value, mut used) = (0u64, 0usize);
+    for (i, d) in digits.bytes().enumerate() {
+        match value
+            .checked_mul(10)
+            .and_then(|v| v.checked_add(u64::from(d - b'0')))
+        {
+            Some(v) if v <= bound => (value, used) = (v, i + 1),
+            _ => break,
+        }
+    }
+    // The first digit is at most 9, so the reference takes at least one.
+    debug_assert!(used >= 1);
+    let group = (value <= groups as u64).then_some(value as usize);
+    (group, used)
 }
 
 /// Compiled patterns of one query, keyed by (flags, pattern); a pattern or
@@ -397,6 +409,49 @@ mod tests {
         assert_eq!(replace("abc", "", "-", ""), None);
         assert_eq!(replace("abc", "x*", "-", ""), None);
         assert_eq!(replace("aaa", "a", "b", "").as_deref(), Some("bbb"));
+    }
+
+    /// The group reference as the previous parser chose it: the digits
+    /// given back one at a time from the end (quadratic in the run's
+    /// length) — the reference [`group_reference`] must agree with.
+    fn group_reference_by_giving_back(digits: &str, groups: usize) -> (Option<usize>, usize) {
+        let mut digits = digits.to_string();
+        loop {
+            let n = digits.parse::<u64>().unwrap_or(u64::MAX);
+            if n <= groups as u64 {
+                return (Some(n as usize), digits.len());
+            }
+            if n <= 9 {
+                return (None, digits.len());
+            }
+            digits.pop();
+        }
+    }
+
+    /// Round-3 review: one forward pass chooses the group the reference
+    /// names exactly as giving the digits back from the end did — every
+    /// digit run of up to five digits (leading zeros included) against 0 to
+    /// 120 groups, and long runs.
+    #[test]
+    fn a_group_reference_takes_the_digits_giving_back_took() {
+        let mut runs: Vec<String> = Vec::new();
+        for len in 1..=5u32 {
+            for n in 0..10u64.pow(len) {
+                runs.push(format!("{n:0width$}", width = len as usize));
+            }
+        }
+        runs.push("1".repeat(40));
+        runs.push(format!("{}7", "0".repeat(40)));
+        runs.push("18446744073709551615999".to_string());
+        for groups in (0..=12).chain([19, 99, 100, 120]) {
+            for run in &runs {
+                assert_eq!(
+                    group_reference(run, groups),
+                    group_reference_by_giving_back(run, groups),
+                    "${run} with {groups} groups"
+                );
+            }
+        }
     }
 
     #[test]
