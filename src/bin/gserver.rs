@@ -616,7 +616,10 @@ impl Target {
             (Some(d), true) => Kind::Api(d.clone()),
             // The legacy `--api` without a directory served `.`.
             (None, true) if !cfg.is_set("db_home") => Kind::Api(PathBuf::from(".")),
-            (None, _) => Kind::Api(cfg.db_home.clone()),
+            // The databases' directory, as `GStoreConfig::db_path` places
+            // them (review design#11: one definition for the servers and
+            // the library).
+            (None, _) => Kind::Api(cfg.db_root().to_path_buf()),
         };
         let pid_file = cli.pid_file.clone().unwrap_or_else(|| match &kind {
             Kind::Api(root) => root.join("gserver.pid"),

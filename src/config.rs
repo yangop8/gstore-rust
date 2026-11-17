@@ -8,11 +8,23 @@
 //!   whitespace-trimmed, `"` characters removed from values (upstream's
 //!   `setGlobalConfig` does `replace_all(value, "\"", "")`), and the **first**
 //!   occurrence of a key in a section wins (upstream inserts into a
-//!   `std::map`). Lines starting with `#` or `;` are comments, as is the rest of
-//!   an unquoted value after whitespace + `#`/`;`. Upstream has no comment
-//!   syntax as such — a commented-out `# db_home=…` simply becomes a key named
-//!   `#db_home` that nothing looks up — so treating those lines as comments is
-//!   equivalent for every real file.
+//!   `std::map`). Lines starting with `#` or `;` are comments. Upstream has
+//!   no comment syntax as such — a commented-out `# db_home=…` simply becomes
+//!   a key named `#db_home` that nothing looks up — so treating those lines
+//!   as comments is equivalent for every real file.
+//!
+//!   **Inline comments** (a gstore-rust extension; review bulkcli#9): the
+//!   rest of an unquoted value is a comment from a `#` or `;` that follows
+//!   whitespace, comes after some of the value, and is followed by
+//!   whitespace or the end of the line — `port = 9000  # the HTTP port`
+//!   reads `9000`. A marker that is not a word of its own stays part of the
+//!   value, as upstream reads it: `Tr0ub4dor #3`, `/srv/a ;b`, `#x`. Inside
+//!   double quotes nothing is a comment (`"a # b"` reads `a # b`). The value
+//!   of `root_password` is never cut: a password may contain ` # `. Every
+//!   inline comment that cuts a value is reported as a
+//!   [warning](GStoreConfig::warnings) (upstream gStore reads it as part of
+//!   the value), so a value copied from an upstream file is never shortened
+//!   silently.
 //! * [`GStoreConfig`] — every key of upstream's `conf/conf.ini` as a typed field,
 //!   with upstream's built-in defaults (the `Util::configure()` defaults, i.e.
 //!   what an empty `conf.ini` gives). An empty value means "unset" (upstream:
@@ -24,6 +36,27 @@
 //! built-in default. Callers override a loaded config with
 //! [`GStoreConfig::set`] (same parsing as the file) or by assigning the public
 //! fields.
+//!
+//! **The environment overrides `conf.ini`** for the storage defaults a
+//! process installs ([`GStoreConfig::install_storage_defaults`],
+//! [`set_default_open_options`](crate::db::set_default_open_options)):
+//! `GSTORE_DISK_QUERY_MODE` and `GSTORE_DISK_CACHE_MB` over `[storage]
+//! disk_query_mode` / `disk_cache_mb`, `GSTORE_VSTREE_ON_OPEN` over
+//! `vstree_on_open`, `GSTORE_ID_RECLAIM` over `[system] id_reclaim`,
+//! `GSTORE_ROCKS_BLOCK_CACHE_MB` over `rocksdb_block_cache_mb` — applied
+//! whenever a database is opened, so a variable left in a service's
+//! environment wins over the file (review design#11: documented, not
+//! changed; the tools without a `conf.ini` — `gadd`, `gsub`, `gquery`, … —
+//! follow the variables only). `gserver` logs the effective values at
+//! startup. `GSTORE_VS_POLICY` has no `conf.ini` key.
+//!
+//! **Accepted but not acted on**: `tcp_port` (upstream's socket API, not
+//! built in gStore 1.4), `min_memory`, `min_million_disk`,
+//! `min_million_memory` and `resource_check` (gstore-rust performs no
+//! resource check: `resource_check=on` is a [warning](GStoreConfig::warnings)),
+//! `db_suffix` (databases always end with `.db`; `gserver` warns about
+//! another value) and `root_username` (the root user is `root`; `gserver`
+//! warns).
 //!
 //! Relative paths (`db_home`, `backup_path`, log paths, …) are relative to the
 //! process's working directory, exactly as upstream (which is run from its
@@ -114,7 +147,14 @@ pub struct Ini {
     /// Lines that were neither blank, a comment, a section header nor a
     /// `key=value` pair (1-based line number, text).
     malformed: Vec<(usize, String)>,
+    /// Inline comments cut from values: (1-based line number, key, the
+    /// comment as written).
+    inline_comments: Vec<(usize, String, String)>,
 }
+
+/// Keys whose value is taken whole, an inline-comment marker included (see
+/// the module docs): a password may contain ` # `.
+const VERBATIM_KEYS: &[&str] = &["root_password"];
 
 impl Ini {
     /// Parse INI text. Never fails: lines that make no sense are recorded in
@@ -150,10 +190,19 @@ impl Ini {
                 ini.malformed.push((line_no, raw.to_string()));
                 continue;
             }
+            let (value, comment) = if VERBATIM_KEYS.contains(&key) {
+                (clean_value(v), None)
+            } else {
+                split_comment(v)
+            };
+            if let Some(c) = comment {
+                ini.inline_comments
+                    .push((line_no, key.to_string(), c.to_string()));
+            }
             ini.entries.push(IniEntry {
                 section: section.clone(),
                 key: key.to_string(),
-                value: clean_value(v),
+                value,
                 line: line_no,
             });
         }
@@ -168,6 +217,12 @@ impl Ini {
     /// Lines that could not be understood, as `(line number, text)`.
     pub fn malformed(&self) -> &[(usize, String)] {
         &self.malformed
+    }
+
+    /// The inline comments cut from values (see the module docs), as `(line
+    /// number, key, comment)`.
+    pub fn inline_comments(&self) -> &[(usize, String, String)] {
+        &self.inline_comments
     }
 
     /// The value of `key` in `section`: the first occurrence wins, as in
@@ -191,29 +246,46 @@ impl Ini {
     }
 }
 
-/// Normalize a raw value: drop a trailing comment (whitespace followed by `#`
-/// or `;`, outside quotes), trim, and remove every `"` (upstream behaviour).
-/// A value wrapped in single quotes loses that pair too.
-fn clean_value(raw: &str) -> String {
+/// Split a raw value into the value and its inline comment, if any (see the
+/// module docs for the rule), and normalize the value ([`clean_value`]).
+fn split_comment(raw: &str) -> (String, Option<&str>) {
+    match comment_start(raw) {
+        Some(at) => (clean_value(&raw[..at]), Some(raw[at..].trim_end())),
+        None => (clean_value(raw), None),
+    }
+}
+
+/// Where the inline comment of `raw` starts: a `#` or `;` outside double
+/// quotes that follows whitespace, comes after some of the value, and is
+/// followed by whitespace or the end — a word of its own. Upstream has no
+/// inline comments, so a marker glued to more text (`Tr0ub4dor #3`) stays
+/// part of the value, as does one at the start (`key = #x`).
+fn comment_start(raw: &str) -> Option<usize> {
     let mut in_quotes = false;
     let mut prev_ws = false;
-    // A comment needs some value before it: `key = #x` keeps `#x` (upstream has
-    // no inline comments, so a value may legitimately start with `#`).
     let mut seen_content = false;
-    let mut cut = raw.len();
-    for (i, c) in raw.char_indices() {
+    let mut chars = raw.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
         match c {
             '"' => in_quotes = !in_quotes,
             '#' | ';' if !in_quotes && prev_ws && seen_content => {
-                cut = i;
-                break;
+                if chars.peek().is_none_or(|(_, n)| n.is_whitespace()) {
+                    return Some(i);
+                }
             }
             _ => {}
         }
         prev_ws = c.is_whitespace();
         seen_content |= !prev_ws;
     }
-    let v = raw[..cut].trim().replace('"', "");
+    None
+}
+
+/// Normalize a value (its inline comment already removed): trim, and remove
+/// every `"` (upstream behaviour). A value wrapped in single quotes loses
+/// that pair too.
+fn clean_value(raw: &str) -> String {
+    let v = raw.trim().replace('"', "");
     let v = v.trim();
     match v.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
         Some(inner) if v.len() >= 2 => inner.to_string(),
@@ -460,17 +532,23 @@ pub struct GStoreConfig {
     pub allow_default_root_password: bool,
 
     // ---- [system] -------------------------------------------------------
-    /// Minimum free memory in MB for the resource check (default `512`).
+    /// Minimum free memory in MB for upstream's resource check (default
+    /// `512`). Parsed for compatibility; no check uses it (see
+    /// [`resource_check`](Self::resource_check)).
     pub min_memory: u64,
-    /// Disk needed per million triples, MB (default `50`).
+    /// Disk needed per million triples, MB (default `50`). Parsed only.
     pub min_million_disk: u64,
-    /// Memory needed per million triples, MB (default `20`).
+    /// Memory needed per million triples, MB (default `20`). Parsed only.
     pub min_million_memory: u64,
-    /// Check resources before building/loading (default off).
+    /// Upstream: check resources before building/loading (default off).
+    /// gstore-rust performs no such check: `on` is accepted with a
+    /// [warning](Self::warnings) (review design#11).
     pub resource_check: bool,
     /// Directory holding the databases (default `./dbhome/`).
     pub db_home: PathBuf,
-    /// Database directory suffix (default `.db`).
+    /// Database directory suffix (default `.db`). Accepted for upstream
+    /// compatibility; the databases always use `.db` (`gserver` warns about
+    /// another value, and [`db_path`](Self::db_path) follows the servers).
     pub db_suffix: String,
     /// The root user's name (default `root`).
     pub root_username: String,
@@ -497,8 +575,11 @@ pub struct GStoreConfig {
     /// behaviour). A transaction whose owner was deleted is rolled back
     /// too.
     pub txn_idle_timeout: u64,
-    /// Build with multiple threads (default on). `off` makes `gbuild`'s
-    /// bulk build use one thread.
+    /// Build with multiple threads (default on). `off` makes the bulk
+    /// builds use one thread, whatever `build_threads` says (a conflicting
+    /// `build_threads` is reported as a [warning](Self::warnings); upstream's
+    /// shipped `conf.ini` has `off`, the example shipped here leaves it at
+    /// the default, review bulkcli#8).
     pub build_multi_thread: bool,
     /// *(Rust extension)* Memory budget of `gbuild --disk`'s bulk build in
     /// MiB: its sort buffers stay within it (spilling sorted runs to disk);
@@ -881,6 +962,14 @@ impl GStoreConfig {
                 text.trim()
             ));
         }
+        // Review bulkcli#9: a value cut at an inline comment is never
+        // shortened silently — upstream reads the comment as part of it.
+        for (line, key, comment) in ini.inline_comments() {
+            self.warnings.push(format!(
+                "line {line}: '{comment}' after the value of '{key}' is read as a comment \
+                 (upstream gStore reads it as part of the value; quote the value to keep it)"
+            ));
+        }
         // Keys in their own section first, so a correctly placed key always
         // beats a misplaced copy; within a section the first occurrence wins.
         let in_home = |e: &&IniEntry| section_of(canonical_key(&e.key)) == Some(e.section.as_str());
@@ -928,6 +1017,28 @@ impl GStoreConfig {
                 self.warnings
                     .push(format!("line {}: {err}; keeping the default", e.line));
             }
+        }
+        self.warn_inert_settings();
+    }
+
+    /// Warn about settings this configuration accepts but cannot honour as
+    /// written (review design#11, bulkcli#8): a key whose upstream meaning
+    /// is not implemented, or one another key overrides.
+    fn warn_inert_settings(&mut self) {
+        if self.resource_check {
+            self.warnings.push(
+                "resource_check=on has no effect: gstore-rust does not check free memory or disk \
+                 space before a build or load (min_memory, min_million_disk and \
+                 min_million_memory are not used either)"
+                    .to_string(),
+            );
+        }
+        if !self.build_multi_thread && self.is_set("build_threads") && self.build_threads != 1 {
+            self.warnings.push(format!(
+                "build_threads={} has no effect: build_multi_thread=off makes bulk builds use one \
+                 thread (set build_multi_thread=on, or remove build_threads)",
+                self.build_threads
+            ));
         }
     }
 
@@ -1387,10 +1498,21 @@ impl GStoreConfig {
         self.warnings.push(msg.into());
     }
 
-    /// The directory of database `name`: `db_home/<name><db_suffix>`
-    /// (upstream `GlobalTypedef::db_path`).
+    /// The directory the databases live in: `db_home` — what `gserver`
+    /// serves (its API root when no directory is named) and what
+    /// [`db_path`](Self::db_path) puts a database's directory in.
+    pub fn db_root(&self) -> &Path {
+        &self.db_home
+    }
+
+    /// The directory of database `name` (upstream `GlobalTypedef::db_path`):
+    /// `db_home/<name>.db`, where the servers look for it (review design#11:
+    /// this used `db_suffix`, which the servers do not honour — they always
+    /// use [`DB_SUFFIX`](crate::DB_SUFFIX) and `gserver` warns about another
+    /// suffix — so it named a directory no server would open). A name that
+    /// already ends with `.db` is taken as is, as the servers take it.
     pub fn db_path(&self, name: &str) -> PathBuf {
-        self.db_home.join(format!("{name}{}", self.db_suffix))
+        self.db_root().join(crate::db_dir_for(name))
     }
 
     /// The HTTP connection settings implied by this configuration: the worker
@@ -2001,11 +2123,22 @@ upload_allow_compress_packages = "zip"
         let upstream = GStoreConfig::from_ini_str(UPSTREAM_CONF);
         for (_, key) in KNOWN_KEYS {
             // review infra#1: the shipped upload cap is lowered (see below).
-            if *key == "upload_allow_extensions" || *key == "upload_max_body_size" {
+            // review bulkcli#8: the shipped example no longer forces
+            // single-threaded bulk builds (see below).
+            if *key == "upload_allow_extensions"
+                || *key == "upload_max_body_size"
+                || *key == "build_multi_thread"
+            {
                 continue;
             }
             assert_eq!(c.value(key), upstream.value(key), "{key}");
         }
+        // review bulkcli#8: upstream ships build_multi_thread=off, which made
+        // every bulk build of an installed example single-threaded; the
+        // example leaves it at the default, on.
+        assert!(!upstream.build_multi_thread);
+        assert!(c.build_multi_thread && !c.is_set("build_multi_thread"));
+        assert_eq!(c.bulk_options().threads, 0, "every core");
         // review infra#1: the shipped example lowers upstream's 1 GiB upload
         // cap to the built-in default, 256 MiB.
         assert_eq!(upstream.upload_max_body_size, 1 << 30);
@@ -2108,7 +2241,13 @@ upload_allow_compress_packages = "zip"
                     vstree_on_open=on\ndefault_layout=disk\nrocksdb_block_cache_mb=64\n\
                     rocksdb_bloom=off\nrocksdb_max_open_files=512\n";
         let c = GStoreConfig::from_ini_str(text);
-        assert!(c.warnings().is_empty(), "{:?}", c.warnings());
+        // review design#11, bulkcli#8: every key is read without a parse
+        // warning; two of these values are accepted but cannot be honoured
+        // (resource_check=on, build_threads=3 under build_multi_thread=off),
+        // which is now said instead of ignored silently.
+        assert_eq!(c.warnings().len(), 2, "{:?}", c.warnings());
+        assert!(c.warnings()[0].starts_with("resource_check=on has no effect"));
+        assert!(c.warnings()[1].starts_with("build_threads=3 has no effect"));
         assert!(
             KNOWN_KEYS.iter().all(|(_, k)| c.is_set(k)),
             "every key counted as set"
@@ -2162,7 +2301,10 @@ upload_allow_compress_packages = "zip"
         assert_eq!(bulk.temp_dir, Some(PathBuf::from("/scratch")));
         assert_eq!(c.db_home, PathBuf::from("/data/gs"));
         assert_eq!(c.db_suffix, ".gdb");
-        assert_eq!(c.db_path("lubm"), PathBuf::from("/data/gs/lubm.gdb"));
+        // review design#11: db_path names the directory the servers use; a
+        // db_suffix other than ".db" is not honoured (gserver warns), and
+        // this assertion used to pin the suffix the servers ignore.
+        assert_eq!(c.db_path("lubm"), PathBuf::from("/data/gs/lubm.db"));
         assert_eq!(c.root_username, "admin");
         assert_eq!(c.root_password, "s3cret");
         assert_eq!(c.system_username, "sys");

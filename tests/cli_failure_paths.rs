@@ -475,3 +475,131 @@ fn gbuild_unpacks_into_a_fresh_scratch_directory_after_taking_the_lock() {
     );
     assert_eq!(unzip_scratch(&base.0), vec!["z.db.unzip-tmp-0".to_string()]);
 }
+
+// ---- conf.ini hygiene (bulkcli#7, #8, #9, design#11) --------------------------
+
+/// Review bulkcli#9: an unquoted value was cut at any whitespace + `#` or
+/// `;` — `root_password = Tr0ub4dor #3` set the password `Tr0ub4dor`,
+/// without a word. The documented rule: an inline comment is a marker that
+/// stands as a word of its own (whitespace before and after it, or the
+/// end); `root_password` is never cut; every value an inline comment cuts
+/// is reported.
+#[test]
+fn conf_ini_inline_comments_follow_the_documented_rule() {
+    use gstore::config::GStoreConfig;
+    let c = GStoreConfig::from_ini_str(
+        "[system]\nroot_password = Tr0ub4dor #3\ndb_home = /srv/a ;b\nlicensetype = #x\n",
+    );
+    assert_eq!(c.root_password, "Tr0ub4dor #3");
+    assert_eq!(c.db_home, PathBuf::from("/srv/a ;b"));
+    assert_eq!(c.licensetype, "#x");
+    assert!(c.warnings().is_empty(), "{:?}", c.warnings());
+
+    // A password is taken whole, a word-like marker included.
+    let c = GStoreConfig::from_ini_str("[system]\nroot_password = correct horse # battery\n");
+    assert_eq!(c.root_password, "correct horse # battery");
+    assert!(c.warnings().is_empty(), "{:?}", c.warnings());
+
+    // A comment of its own word cuts the value — and says so.
+    let c = GStoreConfig::from_ini_str(
+        "[server]\nport = 9001  # the HTTP port\nthread_num = 4 ;\n\
+         [system]\nlicensetype = \"a # b\"  ; quoted\n",
+    );
+    assert_eq!(c.port, 9001);
+    assert_eq!(c.thread_num, 4);
+    assert_eq!(c.licensetype, "a # b", "nothing inside quotes is a comment");
+    assert_eq!(c.warnings().len(), 3, "{:?}", c.warnings());
+    assert!(c.warnings()[0].contains("line 2: '# the HTTP port' after the value of 'port'"));
+    assert!(c.warnings().iter().all(|w| w.contains("read as a comment")));
+
+    // Upstream's own file still parses as before, without a warning.
+    let shipped = GStoreConfig::from_ini_str(include_str!("../conf/conf.ini.example"));
+    assert!(shipped.warnings().is_empty(), "{:?}", shipped.warnings());
+}
+
+/// Review design#11 / bulkcli#8: settings that are accepted but cannot take
+/// effect were silent — `resource_check=on` (no resource check exists) and
+/// a `build_threads` that `build_multi_thread=off` overrides — and the
+/// shipped example forced single-threaded bulk builds. Both are reported
+/// now, and the example leaves `build_multi_thread` at its default.
+#[test]
+fn settings_that_cannot_take_effect_are_reported() {
+    use gstore::config::GStoreConfig;
+    let c = GStoreConfig::from_ini_str("[system]\nresource_check=on\nmin_memory=4096\n");
+    assert_eq!(c.warnings().len(), 1, "{:?}", c.warnings());
+    assert!(c.warnings()[0].contains("resource_check=on has no effect"));
+
+    let c = GStoreConfig::from_ini_str("[system]\nbuild_multi_thread=off\nbuild_threads=8\n");
+    assert_eq!(c.bulk_options().threads, 1);
+    assert_eq!(c.warnings().len(), 1, "{:?}", c.warnings());
+    assert!(c.warnings()[0].contains("build_threads=8 has no effect"));
+    // Consistent settings say nothing.
+    for ok in [
+        "[system]\nbuild_multi_thread=off\nbuild_threads=1\n",
+        "[system]\nbuild_multi_thread=off\n",
+        "[system]\nbuild_threads=8\n",
+        "[system]\nresource_check=off\nmin_memory=4096\n",
+    ] {
+        let c = GStoreConfig::from_ini_str(ok);
+        assert!(c.warnings().is_empty(), "{ok}: {:?}", c.warnings());
+    }
+
+    let shipped = GStoreConfig::from_ini_str(include_str!("../conf/conf.ini.example"));
+    assert!(shipped.build_multi_thread);
+    assert_eq!(shipped.bulk_options().threads, 0, "every core");
+}
+
+/// Review design#11: `GStoreConfig::db_path` named `<db_home>/<name><db_suffix>`,
+/// a directory no server opens (they always use `.db`); it now names the
+/// servers' directory.
+#[test]
+fn db_path_names_the_directory_the_servers_use() {
+    use gstore::config::GStoreConfig;
+    let c = GStoreConfig::from_ini_str("[system]\ndb_home=/data/gs\ndb_suffix=.gdb\n");
+    assert_eq!(c.db_path("lubm"), PathBuf::from("/data/gs/lubm.db"));
+    assert_eq!(c.db_path("lubm.db"), PathBuf::from("/data/gs/lubm.db"));
+    assert_eq!(
+        c.db_path("lubm"),
+        c.db_home.join(gstore::db_dir_for("lubm")),
+        "what the servers open"
+    );
+}
+
+/// Review bulkcli#7: gbuild read `./conf/conf.ini` but dropped its
+/// warnings — a mistyped value silently fell back to the default (here a
+/// version-2 disk file instead of the version-1 file asked for). It now
+/// prints them, as gserver logs them; the shipped example prints none.
+#[test]
+fn gbuild_reports_conf_ini_warnings() {
+    let base = TmpDir::new("gbuild_conf");
+    fs::write(base.0.join("new.nt"), NEW).unwrap();
+    fs::create_dir_all(base.0.join("conf")).unwrap();
+    fs::write(
+        base.0.join("conf/conf.ini"),
+        "[system]\nbuild_memory_mb=2G\nid_reclaim=maybe\nbuild_multi_thread=off\nbuild_threads=8\n",
+    )
+    .unwrap();
+    let out = run("gbuild", &["--disk", "w", "new.nt"], &base.0);
+    assert!(out.status.success(), "{}", text(&out));
+    let err = String::from_utf8_lossy(&out.stderr);
+    for what in [
+        "invalid value '2G' for 'build_memory_mb'",
+        "invalid value 'maybe' for 'id_reclaim'",
+        "build_threads=8 has no effect",
+    ] {
+        assert!(err.contains(what), "missing '{what}':\n{}", text(&out));
+    }
+    // The shipped example: nothing to report.
+    fs::write(
+        base.0.join("conf/conf.ini"),
+        include_str!("../conf/conf.ini.example"),
+    )
+    .unwrap();
+    let out = run("gbuild", &["--disk", "x", "new.nt"], &base.0);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("conf.ini"),
+        "{}",
+        text(&out)
+    );
+}

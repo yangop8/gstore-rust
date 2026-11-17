@@ -57,7 +57,9 @@
 //! database it prints the counts and a phase / memory / spill summary.
 //! `--incremental` selects the previous path (one B+ tree insert per index
 //! and term), for comparisons. The `[system]` keys are read from
-//! `./conf/conf.ini` when it exists — `id_reclaim` among them: with
+//! `./conf/conf.ini` when it exists (its warnings — unknown keys, values
+//! that do not parse, settings that cannot take effect — are printed on
+//! standard error, as `gserver` logs them) — `id_reclaim` among them: with
 //! `id_reclaim=off` a new disk database is created version 1 (no free-id
 //! list), which binaries older than Phase 6 can open; `GSTORE_ID_RECLAIM`
 //! overrides it, as for the server.
@@ -185,6 +187,7 @@ const LAYOUT: cli::Opt = cli::Opt {
 /// The layout `gbuild` builds in: `--layout`, else `--disk` / `--rocksdb`,
 /// else `conf.ini`'s `[storage] default_layout`, else the snapshot layout.
 fn resolve_layout(
+    cfg: &GStoreConfig,
     layout: Option<&str>,
     disk: bool,
     rocksdb: bool,
@@ -201,9 +204,7 @@ fn resolve_layout(
         None
     };
     let Some(v) = layout else {
-        return Ok(flag
-            .or(load_config().default_layout)
-            .unwrap_or(StorageKind::Snapshot));
+        return Ok(flag.or(cfg.default_layout).unwrap_or(StorageKind::Snapshot));
     };
     let chosen = match v.to_ascii_lowercase().as_str() {
         "snapshot" | "memory" => StorageKind::Snapshot,
@@ -221,21 +222,38 @@ fn resolve_layout(
     }
 }
 
-/// The `[system]` configuration: `./conf/conf.ini` when it exists.
+/// The configuration: `./conf/conf.ini` when it exists, else the built-in
+/// defaults. Its warnings — unknown keys, values that do not parse (the
+/// default is kept), settings that cannot take effect — go to standard
+/// error, as `gserver` logs them; a file that cannot be read is reported and
+/// the defaults are used, as `gserver` does (review bulkcli#7: both were
+/// dropped silently).
 fn load_config() -> GStoreConfig {
     let path = Path::new("conf/conf.ini");
-    if path.is_file() {
-        if let Ok(c) = GStoreConfig::load(path) {
-            return c;
+    if !path.is_file() {
+        return GStoreConfig::default();
+    }
+    match GStoreConfig::load(path) {
+        Ok(c) => {
+            for w in c.warnings() {
+                eprintln!("gbuild: conf.ini warning: {w}");
+            }
+            c
+        }
+        Err(e) => {
+            eprintln!(
+                "gbuild: conf.ini warning: cannot read '{}': {e}; using the built-in defaults",
+                path.display()
+            );
+            GStoreConfig::default()
         }
     }
-    GStoreConfig::default()
 }
 
 /// The bulk options: `conf.ini`'s `build_*` keys, then the command line
 /// (options 4–7 of `args`).
-fn bulk_options(args: &cli::Args) -> Result<BulkOptions, String> {
-    let mut bulk = load_config().bulk_options();
+fn bulk_options(cfg: &GStoreConfig, args: &cli::Args) -> Result<BulkOptions, String> {
+    let mut bulk = cfg.bulk_options();
     if let Some(v) = args.value(4) {
         let mb: u64 = v
             .parse()
@@ -285,16 +303,17 @@ fn main() -> ExitCode {
         Ok(cli::Parsed::Args(a)) => a,
         Err(e) => return TOOL.usage_error(&e),
     };
+    let cfg = load_config();
     // `[system] id_reclaim` (which file version a new disk database gets)
     // and the RocksDB tuning keys, as the server installs them.
-    load_config().install_storage_defaults();
+    cfg.install_storage_defaults();
     // Optional flags select an alternative storage backend / strict parsing.
     let disk = args.take_flag(&["--disk"]);
     let rocksdb = args.take_flag(&["--rocksdb"]);
     let strict = args.take_flag(&["--strict"]);
     let force = args.take_flag(&["--force"]);
     let incremental = args.take_flag(&["--incremental"]);
-    let layout = match resolve_layout(args.value(8), disk, rocksdb) {
+    let layout = match resolve_layout(&cfg, args.value(8), disk, rocksdb) {
         Ok(l) => l,
         Err(e) => return TOOL.usage_error(&e),
     };
@@ -309,7 +328,7 @@ fn main() -> ExitCode {
     if args.value(7).is_some() && !disk {
         return TOOL.usage_error("--fill applies to --disk builds");
     }
-    let bulk = match bulk_options(&args) {
+    let bulk = match bulk_options(&cfg, &args) {
         Ok(b) => b,
         Err(e) => return TOOL.usage_error(&e),
     };
