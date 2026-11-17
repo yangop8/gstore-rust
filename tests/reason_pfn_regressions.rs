@@ -395,7 +395,7 @@ fn a_rule_directory_write_that_fails_part_way_changes_nothing() {
 mod pfn {
     use std::sync::Arc;
 
-    use gstore::pfn::{url_encode, PfnCaller, PfnInfo, PfnLimits, PfnRegistry};
+    use gstore::pfn::{generate_source, url_encode, PfnCaller, PfnInfo, PfnLimits, PfnRegistry};
     use gstore::{ConcurrentDb, Database, QueryResult};
 
     use super::TmpDir;
@@ -632,5 +632,36 @@ mod pfn {
             ..PfnLimits::default()
         });
         db.query(all).unwrap();
+    }
+
+    /// Review ext#8: compile built the source *file*, which `update` writes
+    /// before `data.json`; a crash between the two left `funquery` showing a
+    /// function emitting 7 while it emitted 8. Compile builds what the
+    /// record generates (and rewrites the file from it).
+    #[test]
+    fn compile_builds_what_data_json_records() {
+        let (mut db, reg, base) = embedded("pfn_record", 1);
+        let emit = |n: i64| format!("(call $emit_i64 (i64.const {n})) (i32.const 1)");
+        define(&reg, "ver", "", &emit(7));
+        // What a crash between update's two writes leaves: the new source
+        // file, the old record.
+        let newer = PfnInfo {
+            name: "ver".into(),
+            body: url_encode(&emit(8)),
+            ..PfnInfo::default()
+        };
+        std::fs::write(reg.source_file("root", "ver"), generate_source(&newer)).unwrap();
+        // The server restarts.
+        let reg = Arc::new(PfnRegistry::new(&base.0));
+        db.set_pfn_caller(Some(PfnCaller::new(Arc::clone(&reg), "root")));
+        let compiled = reg.compile("root", "ver").unwrap().unwrap();
+        assert_eq!(compiled.body, url_encode(&emit(7)));
+        assert_eq!(value(db.query("SELECT (PFN.ver({}) AS ?v) WHERE {}")), "7");
+        let stored = reg.get("root", "ver").unwrap().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(reg.source_file("root", "ver")).unwrap(),
+            generate_source(&stored),
+            "the source file shows what was compiled"
+        );
     }
 }
