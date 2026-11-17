@@ -24,7 +24,8 @@
   Option<&AtomicU64>` (`None`: the call is a query of its own). Every query
   path installs its caller through `with_limits` or `for_query`
   (`ConcurrentDb` snapshots and version views included), so repeated
-  queries never share a budget.
+  queries never share a budget; in an update every `DELETE` / `INSERT …
+  WHERE` operation has its own.
 - **PFN functions of any size run (review ext#2).** The wasmi runtime
   translates modules eagerly, when they are compiled and loaded. With
   wasmi's default lazy translation a function's translation (7 fuel units
@@ -75,7 +76,13 @@
   fsyncing, so a crash or a full disk lost the old rules and left rule
   files without ledgers (which `reasonManage` takes for upstream rules and
   retracts by label). An interrupted swap is finished by the next operation
-  that takes the database's rule lock.
+  that takes the database's rule lock. `write_memory_rules` takes the
+  destination's rule lock without waiting (a save calls it under the
+  database's `persist_lock` and the directory's writing exclusion, which
+  contract C8 orders after the rule lock, and `reasonManage`'s disable
+  saves while it holds the rule lock): while another operation of the
+  process holds it, the write is refused with an error and nothing is
+  changed.
 - **Documentation (review ext#15, design#16, parser#17).** Every reasoner
   (RDFS, textual rules, `reasonManage`) reads and writes the default graph
   only — now said in `src/reason` and `docs/DESIGN.md`. `docs/DESIGN.md`
@@ -96,7 +103,11 @@
   `RLIMIT_FSIZE`); unit tests in `src/reason/mod.rs` (non-IRI
   subPropertyOf, non-ASCII rule text, join work counter, join shapes) and
   `src/reason/store.rs` (a crash at every point of both rule-directory
-  writes, an interrupted swap finished). `tests/dt_phase4_review_fixes.rs`
+  writes, an interrupted swap finished) and `src/pfn/wasm.rs` (the
+  instantiation charge counts the initial memory and the data section).
+  The join-scaling test times its runs by the thread's CPU time, not the
+  wall clock, so the machine's load (parallel tests, other builds) cannot
+  move its ratio. `tests/dt_phase4_review_fixes.rs`
   `a_cancelled_execute_leaves_the_rule_as_it_was` now requires a
   cancellation: a flag raised before the call must cancel the execute, and
   an error in the timed sweep must be the cancellation (with execute
@@ -141,6 +152,14 @@ none
     and persisting them is the refactor the review suggests.
   - review query#17 / design#10 (recorded in DESIGN.md §6, owned by
     r4-sparql-guard): the two executors.
+  - review durability#11 (found in this package's review): `Database::save`
+    writes a detached database's in-memory rules
+    (`reason::store::write_memory_rules`) with its `persist_lock` and the
+    directory's writing exclusion held, after the rule lock in contract
+    C8's order, so the write takes the rule lock without waiting and is
+    refused while another operation holds it. Taking the destination's
+    rule lock in `save` before `persist_lock` (src/db/persist.rs, which no
+    package owned in round 4) would let it wait instead.
 - docs/STORAGE_BACKEND.md: no format change. The rule-directory swap uses
   the `STORE_SWAP` sibling names inside the database directory
   (`reason_rule_files.tmp` / `.new` / `.old`); an older binary ignores
