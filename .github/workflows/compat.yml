@@ -1,0 +1,49 @@
+name: Format compatibility
+
+# Cross-version format compatibility against the binaries of the pre-Phase-6
+# commit eaf5320 (review gap-doc-claims#8): scripts/compat-fixtures.sh builds
+# that commit in a scratch worktree, has its gbuild/gquery write fixtures
+# that the current code must open and answer (tests/format_compat.rs, also
+# run on the checked-in testdata/compat/eaf5320), checks that its gquery
+# reads the snapshot and version-1 disk databases the current gbuild writes
+# and refuses a version-2 one, and that its restore_incremental fails on the
+# CLEAR redo records the current code writes. Weekly and on demand, not on
+# every push: it builds two revisions of the crate.
+on:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: compat-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Same pin as ci.yml.
+  RUST_TOOLCHAIN: "1.99.1"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+
+jobs:
+  eaf5320:
+    name: eaf5320 binaries vs the current code
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The script checks out eaf5320 from this history.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: compat
+      - name: scripts/compat-fixtures.sh
+        run: scripts/compat-fixtures.sh --work "$RUNNER_TEMP/compat"
