@@ -20,12 +20,24 @@
 //! left solution on every shared variable both bind, in the right operand's
 //! order, so the operators keep their output order (left-major,
 //! right-minor) and the work is the size of the output, not the product.
+//!
+//! The partial indexes are bounded (round-3 review): together they hold at
+//! most [`PARTIAL_INDEX_FACTOR`] times the operand's rows. Left solutions
+//! binding many different parts of a group's key (each a VALUES row
+//! binding another subset, say) used to build and keep one full index of
+//! the group per part — memory growing as |right| × parts, 1.6 GB for
+//! 1,000 parts over 10,000 rows; once the bound is reached, a part without
+//! an index is answered by a scan of its group, as the nested loop did.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ops::ControlFlow;
 
 use super::{Binding, FxBuildHasher};
+
+/// The partial indexes of a [`RowIndex`] hold at most this many times its
+/// rows together; a part without an index past that is scanned.
+pub(super) const PARTIAL_INDEX_FACTOR: usize = 4;
 
 /// Row indices of the right operand, ascending.
 type Rows = Vec<usize>;
@@ -49,11 +61,35 @@ struct Group {
 impl Group {
     /// The group's rows that hold `values` in the variables `part`, which
     /// is a strict, non-empty part of the key (a copy: the index may be
-    /// built here, and the caller's sink may probe again).
-    fn partial_lookup(&self, all: &[Binding], part: &[usize], values: &[u32]) -> Rows {
+    /// built here, and the caller's sink may probe again). An index on
+    /// `part` is built only while `held` (the entries every partial index
+    /// of the [`RowIndex`] holds) stays within `cap`; past it the group is
+    /// scanned.
+    fn partial_lookup(
+        &self,
+        all: &[Binding],
+        part: &[usize],
+        values: &[u32],
+        held: &Cell<usize>,
+        cap: usize,
+    ) -> Rows {
         if let Some(found) = self.partial.borrow().get(part) {
             return found.get(values).cloned().unwrap_or_default();
         }
+        let entries = held.get().saturating_add(self.rows.len());
+        if entries > cap {
+            return self
+                .rows
+                .iter()
+                .copied()
+                .filter(|&ri| {
+                    part.iter()
+                        .zip(values)
+                        .all(|(&v, &x)| all[ri][v].unwrap_or(u32::MAX) == x)
+                })
+                .collect();
+        }
+        held.set(entries);
         let mut index = KeyIndex::default();
         for &ri in &self.rows {
             let k = part
@@ -76,6 +112,10 @@ pub(super) struct RowIndex {
     /// The rows grouped by the shared variables they bind, in the order of
     /// each group's first row.
     groups: Vec<Group>,
+    /// The entries (row references) every group's partial indexes hold
+    /// together, and the most they may ([`PARTIAL_INDEX_FACTOR`] × rows).
+    partial_held: Cell<usize>,
+    partial_cap: usize,
 }
 
 impl RowIndex {
@@ -116,7 +156,17 @@ impl RowIndex {
                 g.full.entry(k).or_default().push(ri);
             }
         }
-        RowIndex { groups }
+        RowIndex {
+            groups,
+            partial_held: Cell::new(0),
+            partial_cap: PARTIAL_INDEX_FACTOR.saturating_mul(rows.len()),
+        }
+    }
+
+    /// The entries the partial indexes hold (a work counter for tests).
+    #[cfg(test)]
+    pub(super) fn partial_entries(&self) -> usize {
+        self.partial_held.get()
     }
 
     /// Feed `f` the index of every row of `rows` (the slice the index was
@@ -173,7 +223,7 @@ impl RowIndex {
         } else {
             let part: Vec<usize> = g.key.iter().copied().filter(|&v| l[v].is_some()).collect();
             let values: Vec<u32> = part.iter().map(|&v| l[v].unwrap_or(u32::MAX)).collect();
-            for ri in g.partial_lookup(rows, &part, &values) {
+            for ri in g.partial_lookup(rows, &part, &values, &self.partial_held, self.partial_cap) {
                 f(ri)?;
             }
         }
@@ -301,6 +351,44 @@ mod tests {
             assert!(flow.is_break());
             assert_eq!(seen, 2);
         }
+    }
+
+    /// Round-3 review: left solutions binding many different parts of the
+    /// key build partial indexes only up to the bound (they used to keep
+    /// one index of the whole group per part: |right| × parts entries);
+    /// past it the group is scanned, with the same candidates.
+    #[test]
+    fn partial_indexes_hold_at_most_a_few_times_the_rows() {
+        let width = 12;
+        let key: Vec<usize> = (0..width).collect();
+        // Right rows binding every key variable.
+        let right: Vec<Binding> = (0..500u32)
+            .map(|i| (0..width).map(|v| Some((i + v as u32) % 7)).collect())
+            .collect();
+        let index = RowIndex::new(&right, &key);
+        let mut rng = Rng(5);
+        for _ in 0..300 {
+            // A left solution binding a random strict part of the key.
+            let mut l: Binding = vec![None; width];
+            for v in 0..width {
+                if rng.below(2) == 0 {
+                    l[v] = Some(rng.below(7) as u32);
+                }
+            }
+            l[rng.below(width)] = None;
+            let mut got = Vec::new();
+            let _ = index.for_each_candidate(&right, &l, |ri| {
+                got.push(ri);
+                ControlFlow::<()>::Continue(())
+            });
+            assert_eq!(got, agreeing(&right, &key, &l), "{l:?}");
+        }
+        assert!(
+            index.partial_entries() <= PARTIAL_INDEX_FACTOR * right.len(),
+            "{} entries for {} rows",
+            index.partial_entries(),
+            right.len()
+        );
     }
 
     /// The work of a probe is what it returns: a left solution that leaves
