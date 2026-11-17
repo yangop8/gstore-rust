@@ -294,3 +294,78 @@ fn mcp_run_sparql_flags_a_truncated_result() {
         "a capped count is not a total"
     );
 }
+
+#[test]
+fn anthropic_client_sends_its_headers_and_parses_the_reply() {
+    let stub = Stub::start(vec![Scripted::json(200, ANTHROPIC_OK)]);
+    let client = AnthropicClient::new(KEY, stub.url(""), "the-model");
+    let out = client
+        .complete(&LlmRequest::prompt("hi").system("be terse"))
+        .unwrap();
+    assert_eq!(out, "ok");
+    let rec = &stub.recorded()[0];
+    assert_eq!(rec.path, "/v1/messages");
+    assert_eq!(rec.header("x-api-key"), Some(KEY));
+    assert_eq!(rec.header("anthropic-version"), Some("2023-06-01"));
+    let body: serde_json::Value = serde_json::from_str(&rec.body).unwrap();
+    assert_eq!(body["system"], "be terse");
+    assert_eq!(body["model"], "the-model");
+}
+
+#[test]
+fn gstore_classifies_query_errors_and_transport_failures() {
+    // An HTTP status is a query/server error: repairable, Error::GStore.
+    let stub = Stub::start(vec![Scripted::new(
+        400,
+        "text/plain",
+        b"bad query".to_vec(),
+    )]);
+    let err = GStoreClient::new(stub.url("/sparql"))
+        .query("SELECT ?s WHERE { ?s ?p ?o }")
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::GStore(ref m) if m.contains("bad query")),
+        "{err:?}"
+    );
+    // A refused connection is an outage: Error::Http, which ends the request.
+    let dead = GStoreClient::new(format!("http://127.0.0.1:{}/sparql", common::closed_port()));
+    let err = dead.query("SELECT ?s WHERE { ?s ?p ?o }").unwrap_err();
+    assert!(matches!(err, Error::Http(_)), "{err:?}");
+    assert!(err.is_fatal());
+    // the request itself
+    let rec = &stub.recorded()[0];
+    assert_eq!(rec.header("Content-Type"), Some("application/sparql-query"));
+    assert_eq!(rec.body, "SELECT ?s WHERE { ?s ?p ?o }");
+}
+
+#[test]
+fn gstore_graph_replies_are_returned_as_graphs() {
+    let nt = "<http://ex/a> <http://ex/p> <http://ex/b> .\n";
+    let stub = Stub::start(vec![Scripted::new(
+        200,
+        "application/n-triples",
+        nt.as_bytes().to_vec(),
+    )]);
+    let ans = GStoreClient::new(stub.url("/sparql"))
+        .query("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }")
+        .unwrap();
+    assert_eq!(ans, gnlqa::SparqlAnswer::Graph(nt.to_string()));
+}
+
+#[test]
+fn gstore_reply_size_is_capped() {
+    // 32 MiB + 1 byte: refused instead of read whole or silently cut.
+    let body = vec![b' '; (32 << 20) + 1];
+    let stub = Stub::start(vec![Scripted::new(
+        200,
+        "application/sparql-results+json",
+        body,
+    )]);
+    let err = GStoreClient::new(stub.url("/sparql"))
+        .query("SELECT ?s WHERE { ?s ?p ?o }")
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::GStore(ref m) if m.contains("limit")),
+        "{err:?}"
+    );
+}
