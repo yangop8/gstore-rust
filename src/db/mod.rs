@@ -33,7 +33,7 @@ use crate::parser::sparql;
 use crate::parser::sparql::ast::{
     GraphPattern, GraphTarget, GroundTriple, QuadPattern, Query, UpdateOp, RDF_TYPE,
 };
-use crate::query::engine::dictionary_string_index_cancellable;
+use crate::query::engine::{dictionary_string_index_cancellable, EvalProviders};
 use crate::query::{Evaluator, FunctionRegistry, IntegerDivision, QueryResult, TopKOptions};
 use crate::signature::{EdgeDir, Signature, VsTree};
 use crate::store::read_scope::ReadScope;
@@ -2712,6 +2712,28 @@ impl Database {
         self.read_as(&stmt, cancel, pfn)
     }
 
+    /// This database's evaluation settings, as every evaluator it builds
+    /// applies them ([`Evaluator::with_settings`]): the `SERVICE` policy of
+    /// its [`LoadPolicy`], the integer-division mode, the Top-K options, the
+    /// graph-function output bound, the PFN caller and limits and the
+    /// user-defined functions. A read snapshot (an HTTP transaction's, a
+    /// [`ConcurrentDb`](crate::ConcurrentDb) version) stores this value and
+    /// applies it to its own reads, so they follow the same settings
+    /// (review design#9).
+    pub fn eval_settings(&self) -> crate::query::engine::EvalSettings {
+        crate::query::engine::EvalSettings {
+            service_policy: self.load_policy.service_policy(),
+            integer_division: self.integer_division,
+            topk: self.topk,
+            gfun_max_output_bytes: self.gfun_max_output_bytes,
+            path_max_duplicates: crate::query::engine::PATH_MAX_DUPLICATES,
+            pfn_limits: self.pfn_limits,
+            pfn: self.pfn.clone(),
+            functions: self.functions.clone(),
+            vs_policy: None,
+        }
+    }
+
     /// Run the parsed read request `stmt` on a shared `&Database` (see
     /// [`query_read`](Self::query_read)); an UPDATE is refused with no side
     /// effect. The evaluation runs inside a [`ReadScope`]: a read error a
@@ -2760,27 +2782,22 @@ impl Database {
         if !self.named.is_empty() {
             eval = eval.with_named(&self.named);
         }
-        // Make user-defined functions (PFN) visible to this query.
-        if !self.functions.is_empty() {
-            eval = eval.with_functions(self.functions.clone());
-        }
-        // gStore's PFN functions: the caller's, under this database's
-        // limits (never cached, see `query_cache::is_cacheable`).
-        if let Some(caller) = pfn.or(self.pfn.as_ref()) {
-            eval = eval.with_pfn(caller.clone().with_limits(self.pfn_limits));
-        }
+        // This database's settings — `SERVICE` only where its load policy
+        // allows remote sources, user-defined functions, gStore's PFN
+        // functions as the request's caller (else the installed one)
+        // under this database's limits (never cached, see
+        // `query_cache::is_cacheable`), … — in one call (review design#9).
+        eval = eval.with_settings(
+            self.eval_settings(),
+            EvalProviders {
+                csr: Some(&csr),
+                string_index: Some(&string_index),
+            },
+            pfn,
+        );
         if let Some(c) = cancel {
             eval = eval.with_cancel(c);
         }
-        // `SERVICE` makes outbound requests: only where remote sources
-        // are allowed (not on a server's restricted policy).
-        eval = eval
-            .with_service_policy(self.load_policy.service_policy())
-            .with_csr_provider(&csr)
-            .with_string_index_provider(&string_index)
-            .with_integer_division(self.integer_division)
-            .with_topk_options(self.topk)
-            .with_gfun_max_output_bytes(self.gfun_max_output_bytes);
         // A read error a backend reports fails the query (C2).
         let scope = ReadScope::enter();
         let evaluated = eval.evaluate(q);
@@ -3466,37 +3483,31 @@ impl Database {
         fn prepare<'e, S: TripleSource>(
             db: &Database,
             eval: Evaluator<'e, S>,
+            providers: EvalProviders<'e>,
             cancel: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
             pfn: Option<&crate::pfn::PfnCaller>,
         ) -> Evaluator<'e, S> {
-            // IRI function calls in the WHERE clause reach the user-defined
-            // functions, as in read queries; `SERVICE` follows the load
-            // policy (refused on a server's restricted policy), as in reads;
+            // The WHERE clause runs with this database's settings, as reads
+            // do (review design#9): IRI function calls reach the
+            // user-defined functions; `SERVICE` follows the load policy
+            // (refused on a server's restricted policy); PFN calls reach
+            // the request's caller (a server passes the authenticated
+            // user), else the installed one, under this database's limits;
             // and the request's cancel flag stops it (a graph function in a
-            // sub-SELECT included), as in reads.
-            let mut eval = eval
-                .with_service_policy(db.load_policy.service_policy())
-                .with_integer_division(db.integer_division)
-                .with_topk_options(db.topk)
-                .with_gfun_max_output_bytes(db.gfun_max_output_bytes);
-            if let Some(c) = cancel {
-                eval = eval.with_cancel(std::sync::Arc::clone(c));
-            }
-            // PFN calls: the request's caller (a server passes the
-            // authenticated user), else the installed one — under this
-            // database's limits, as in reads.
-            let caller = pfn
-                .map(|c| c.clone().with_limits(db.pfn_limits))
-                .or_else(|| db.pfn_caller());
-            if let Some(caller) = caller {
-                eval = eval.with_pfn(caller);
-            }
-            if db.functions.is_empty() {
-                eval
-            } else {
-                eval.with_functions(db.functions.clone())
+            // sub-SELECT included).
+            let eval = eval.with_settings(db.eval_settings(), providers, pfn);
+            match cancel {
+                Some(c) => eval.with_cancel(std::sync::Arc::clone(c)),
+                None => eval,
             }
         }
+        // The substring index covers the dictionary, which every graph
+        // shares; the CSR covers the default graph only.
+        let string_index = || self.string_index_cancellable(cancel.map(|c| &**c));
+        let dictionary_only = EvalProviders {
+            csr: None,
+            string_index: Some(&string_index),
+        };
         if !using.is_empty() || !using_named.is_empty() {
             let mut merged = TripleStore::new();
             for iri in using {
@@ -3510,23 +3521,41 @@ impl Database {
                 .iter()
                 .filter_map(|iri| graph(iri).map(|(gid, s)| (gid, s.clone())))
                 .collect();
-            let eval =
-                prepare(self, Evaluator::new(&self.dict, &merged), cancel, pfn).with_named(&named);
+            let eval = prepare(
+                self,
+                Evaluator::new(&self.dict, &merged),
+                dictionary_only,
+                cancel,
+                pfn,
+            )
+            .with_named(&named);
             return eval.eval_update_modify(delete, insert, pattern);
         }
         if let Some(w) = with {
             let empty = TripleStore::new();
             let store = graph(w).map_or(&empty, |(_, s)| s);
-            let eval = prepare(self, Evaluator::new(&self.dict, store), cancel, pfn)
-                .with_named(&self.named);
+            let eval = prepare(
+                self,
+                Evaluator::new(&self.dict, store),
+                dictionary_only,
+                cancel,
+                pfn,
+            )
+            .with_named(&self.named);
             return eval.eval_update_modify(delete, insert, pattern);
         }
         let csr = || self.csr_cancellable(cancel.map(|c| &**c));
-        let string_index = || self.string_index_cancellable(cancel.map(|c| &**c));
-        let eval = prepare(self, Evaluator::new(&self.dict, &self.store), cancel, pfn)
-            .with_named(&self.named)
-            .with_csr_provider(&csr)
-            .with_string_index_provider(&string_index);
+        let eval = prepare(
+            self,
+            Evaluator::new(&self.dict, &self.store),
+            EvalProviders {
+                csr: Some(&csr),
+                ..dictionary_only
+            },
+            cancel,
+            pfn,
+        )
+        .with_named(&self.named);
         eval.eval_update_modify(delete, insert, pattern)
     }
 

@@ -852,6 +852,264 @@ pub type CsrProvider<'a> = dyn Fn() -> Result<Arc<CsrGraph>> + 'a;
 /// (an out-of-core dictionary, or one too small to index).
 pub type StringIndexProvider<'a> = dyn Fn() -> Option<Arc<StringIndex>> + 'a;
 
+/// The evaluation settings of a database — or of a read snapshot taken
+/// from it — that every [`Evaluator`] it builds must carry: captured once
+/// ([`Database::eval_settings`](crate::Database::eval_settings)), stored
+/// by every snapshot (transaction reads, [`ConcurrentDb`](crate::ConcurrentDb)
+/// snapshots), and applied by one call,
+/// [`Evaluator::with_settings`], at every construction site. A new
+/// per-database setting is one field here — it cannot be forgotten at one
+/// of the sites (review design#9: the chain of `with_*` calls was copied at
+/// six places, and a transaction read once missed the `SERVICE` policy).
+///
+/// The data (dictionary, store, named graphs) and the per-request inputs
+/// (cancel flag, the requesting user's PFN caller) are not settings; the
+/// CSR and substring-index caches are borrowed per evaluation
+/// ([`EvalProviders`]). [`Default`] is what [`Evaluator::new`] starts with.
+#[derive(Clone)]
+pub struct EvalSettings {
+    /// What `SERVICE` may contact
+    /// ([`with_service_policy`](Evaluator::with_service_policy); a
+    /// database's [`LoadPolicy::service_policy`](crate::db::LoadPolicy::service_policy)).
+    pub service_policy: crate::db::ServicePolicy,
+    /// How `/` divides two integers
+    /// ([`with_integer_division`](Evaluator::with_integer_division)).
+    pub integer_division: IntegerDivision,
+    /// The `LIMIT` / `ORDER BY` / `ASK` optimizations
+    /// ([`with_topk_options`](Evaluator::with_topk_options)).
+    pub topk: TopKOptions,
+    /// The graph-function / PFN output budget of one query
+    /// ([`with_gfun_max_output_bytes`](Evaluator::with_gfun_max_output_bytes)).
+    pub gfun_max_output_bytes: usize,
+    /// The repeated property-path solutions one query may hand out
+    /// ([`with_path_max_duplicates`](Evaluator::with_path_max_duplicates)).
+    pub path_max_duplicates: u64,
+    /// The sandbox limits every PFN call runs under, whoever the caller.
+    pub pfn_limits: crate::pfn::PfnLimits,
+    /// The database's own PFN caller ([`Database::set_pfn_caller`](crate::Database::set_pfn_caller)):
+    /// used when a request brings none.
+    pub pfn: Option<crate::pfn::PfnCaller>,
+    /// User-defined scalar functions ([`with_functions`](Evaluator::with_functions)).
+    pub functions: FunctionRegistry,
+    /// How a VS-tree is used ([`with_vs_policy`](Evaluator::with_vs_policy));
+    /// `None` = the thread's / process's policy.
+    pub vs_policy: Option<VsPolicy>,
+}
+
+impl Default for EvalSettings {
+    fn default() -> EvalSettings {
+        EvalSettings {
+            service_policy: crate::db::ServicePolicy::AnyHost,
+            integer_division: IntegerDivision::default(),
+            topk: TopKOptions::default(),
+            gfun_max_output_bytes: crate::analytics::gfun::paths::MAX_OUTPUT_BYTES,
+            path_max_duplicates: PATH_MAX_DUPLICATES,
+            pfn_limits: crate::pfn::PfnLimits::default(),
+            pfn: None,
+            functions: FunctionRegistry::new(),
+            vs_policy: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for EvalSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EvalSettings")
+            .field("service_policy", &self.service_policy)
+            .field("integer_division", &self.integer_division)
+            .field("topk", &self.topk)
+            .field("gfun_max_output_bytes", &self.gfun_max_output_bytes)
+            .field("path_max_duplicates", &self.path_max_duplicates)
+            .field("pfn_limits", &self.pfn_limits)
+            .field("pfn", &self.pfn)
+            .field("functions", &self.functions.len())
+            .field("vs_policy", &self.vs_policy)
+            .finish()
+    }
+}
+
+/// The caches an evaluation borrows from whoever builds it
+/// ([`Evaluator::with_settings`]): the per-predicate CSR of the graph
+/// functions and the dictionary substring index. Both fields must be
+/// given, so every construction site decides about both: `None` makes the
+/// evaluator build its own on first use (the right choice when the store
+/// is not the one a cache covers — a `WITH` graph, a `USING` merge).
+#[derive(Clone, Copy)]
+pub struct EvalProviders<'a> {
+    /// See [`Evaluator::with_csr_provider`].
+    pub csr: Option<&'a CsrProvider<'a>>,
+    /// See [`Evaluator::with_string_index_provider`].
+    pub string_index: Option<&'a StringIndexProvider<'a>>,
+}
+
+impl EvalProviders<'_> {
+    /// No cache: the evaluator builds what it needs per query.
+    pub const NONE: EvalProviders<'static> = EvalProviders {
+        csr: None,
+        string_index: None,
+    };
+}
+
+/// The dictionary substring index of a read snapshot, kept across its
+/// queries: seeded with the database's cached index when the snapshot is
+/// taken ([`seeded`](Self::seeded)), else built on first use and kept —
+/// unless the build was cancelled. It serves only the dictionary state it
+/// was made for (equal [`Dictionary::generation`]); a query over another
+/// state (a [`ConcurrentDb`](crate::ConcurrentDb) version that interned
+/// new terms) gets an index built for it and not kept (review design#9:
+/// transaction and `ConcurrentDb` reads rebuilt the index on every
+/// substring query). As the database's own cache does, a query that finds
+/// the first build still running goes on without the prefilter (exact all
+/// the same) instead of waiting for it.
+#[derive(Default)]
+pub struct StringIndexCell {
+    slot: std::sync::Mutex<IndexSlot>,
+}
+
+/// The state of a [`StringIndexCell`].
+#[derive(Default)]
+struct IndexSlot {
+    /// The generation it serves and its index (`None` inside: no index
+    /// helps, a small or out-of-core dictionary).
+    entry: Option<(u64, Option<Arc<StringIndex>>)>,
+    /// A first build is running.
+    building: bool,
+}
+
+impl StringIndexCell {
+    /// An empty cell (built on first use).
+    pub fn new() -> StringIndexCell {
+        StringIndexCell::default()
+    }
+
+    /// A cell holding `index`, built for a dictionary at `generation`.
+    pub fn seeded(generation: u64, index: Arc<StringIndex>) -> StringIndexCell {
+        StringIndexCell {
+            slot: std::sync::Mutex::new(IndexSlot {
+                entry: Some((generation, Some(index))),
+                building: false,
+            }),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, IndexSlot> {
+        self.slot.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The index for `dict` as it is now (see the type docs); a raised
+    /// `cancel` stops a build, which gives `None` and keeps nothing.
+    pub fn get(&self, dict: &Dictionary, cancel: Option<&AtomicBool>) -> Option<Arc<StringIndex>> {
+        let generation = dict.generation();
+        {
+            let mut slot = self.lock();
+            match &slot.entry {
+                Some((g, index)) if *g == generation => return index.clone(),
+                // Another state: an index of its own, not kept.
+                Some(_) => {}
+                None if slot.building => return None,
+                None => {
+                    slot.building = true;
+                    drop(slot);
+                    /// Ends the first build — also when it panics.
+                    struct Building<'c>(&'c StringIndexCell);
+                    impl Drop for Building<'_> {
+                        fn drop(&mut self) {
+                            self.0.lock().building = false;
+                        }
+                    }
+                    let _building = Building(self);
+                    let built = dictionary_string_index_cancellable(dict, cancel).ok()?;
+                    self.lock().entry = Some((generation, built.clone()));
+                    return built;
+                }
+            }
+        }
+        dictionary_string_index_cancellable(dict, cancel)
+            .ok()
+            .flatten()
+    }
+}
+
+/// What an evaluator was configured with, as [`watch_evaluator_settings`]
+/// reports it for every evaluation (a test hook, review design#9: every
+/// read and UPDATE construction site must apply the database's
+/// [`EvalSettings`]).
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeenSettings {
+    pub service_policy: crate::db::ServicePolicy,
+    pub integer_division: IntegerDivision,
+    pub topk: TopKOptions,
+    pub gfun_max_output_bytes: usize,
+    pub path_max_duplicates: u64,
+    /// The limits of the PFN caller (`None`: no caller).
+    pub pfn_limits: Option<crate::pfn::PfnLimits>,
+    /// How many user-defined functions it sees.
+    pub functions: usize,
+    pub vs_policy: Option<VsPolicy>,
+    pub csr_provider: bool,
+    pub string_index_provider: bool,
+}
+
+impl SeenSettings {
+    /// What an evaluator configured with `settings` (and a PFN caller iff
+    /// `settings.pfn` is set) and providers `csr` / `string_index` reports.
+    pub fn of(settings: &EvalSettings, csr: bool, string_index: bool) -> SeenSettings {
+        SeenSettings {
+            service_policy: settings.service_policy,
+            integer_division: settings.integer_division,
+            topk: settings.topk,
+            gfun_max_output_bytes: settings.gfun_max_output_bytes,
+            path_max_duplicates: settings.path_max_duplicates,
+            pfn_limits: settings.pfn.as_ref().map(|_| settings.pfn_limits),
+            functions: settings.functions.len(),
+            vs_policy: settings.vs_policy,
+            csr_provider: csr,
+            string_index_provider: string_index,
+        }
+    }
+}
+
+static WATCHING: AtomicBool = AtomicBool::new(false);
+static WATCHED: std::sync::Mutex<Vec<SeenSettings>> = std::sync::Mutex::new(Vec::new());
+/// One watch at a time (a second waits for the first to end).
+static WATCH_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// While the returned guard lives, every evaluation of the process — each
+/// [`Evaluator::evaluate`] and [`Evaluator::eval_update_modify`] call, on
+/// any thread — records the settings its evaluator was configured with
+/// ([`EvalWatch::take`]). A test hook (review design#9); off, it costs one
+/// relaxed atomic load per evaluation. Watches do not overlap: a second
+/// waits until the first guard is dropped.
+#[doc(hidden)]
+pub fn watch_evaluator_settings() -> EvalWatch {
+    let turn = WATCH_TURN.lock().unwrap_or_else(|e| e.into_inner());
+    WATCHED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    WATCHING.store(true, AtomicOrdering::SeqCst);
+    EvalWatch { _turn: turn }
+}
+
+/// A running [`watch_evaluator_settings`].
+#[doc(hidden)]
+pub struct EvalWatch {
+    _turn: std::sync::MutexGuard<'static, ()>,
+}
+
+impl EvalWatch {
+    /// The settings recorded since the watch began (or since the last
+    /// `take`), in evaluation order.
+    pub fn take(&self) -> Vec<SeenSettings> {
+        std::mem::take(&mut *WATCHED.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
+impl Drop for EvalWatch {
+    fn drop(&mut self) {
+        WATCHING.store(false, AtomicOrdering::SeqCst);
+        WATCHED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+}
+
 /// Per-query memoization of whole-graph analytics results (see
 /// [`Evaluator::algo_cache`]). All maps are keyed by dense node id
 /// ([`EntityLiteralId`](crate::model::id::EntityLiteralId) = `u32`).
@@ -912,37 +1170,75 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// Build an evaluator that uses `vstree` to prune entity-variable bindings.
     pub fn with_vstree(dict: &'a Dictionary, store: &'a S, vstree: &'a VsTree) -> Evaluator<'a, S> {
         Evaluator {
-            dict,
-            store,
             vstree: Some(vstree),
-            vs_policy: None,
-            named: None,
-            extras: Rc::new(std::cell::RefCell::new(Extras::default())),
-            plan_cache: std::cell::RefCell::new(HashMap::new()),
-            graph_cache: std::cell::RefCell::new(None),
-            functions: Rc::new(FunctionRegistry::new()),
-            cancel: None,
-            algo_cache: std::cell::RefCell::new(AlgoCache::default()),
-            string_index: std::cell::RefCell::new(None),
-            string_index_tried: std::cell::Cell::new(false),
-            string_index_provider: None,
-            memo: Rc::default(),
-            service_policy: crate::db::ServicePolicy::AnyHost,
-            service_denied: Rc::new(std::cell::Cell::new(false)),
-            failed: Rc::default(),
-            csr_provider: None,
-            gfun_csr: std::cell::RefCell::new(None),
-            integer_division: IntegerDivision::default(),
-            topk: TopKOptions::default(),
-            stats: Rc::default(),
-            gfun_max_output: crate::analytics::gfun::paths::MAX_OUTPUT_BYTES,
-            gfun_spent: Rc::default(),
-            pfn: None,
-            ctx: Rc::default(),
-            path_max_duplicates: PATH_MAX_DUPLICATES,
-            path_duplicates: Rc::default(),
-            path_sets: Rc::default(),
+            ..Evaluator::new(dict, store)
         }
+    }
+
+    /// Apply a database's (or snapshot's) evaluation settings in one call
+    /// (see [`EvalSettings`]): the `SERVICE` policy, integer division,
+    /// Top-K options, graph-function budget, path budget, user-defined
+    /// functions, VS-tree policy and the PFN caller — `request_pfn` (the
+    /// requesting user's) if given, else the settings' own, under the
+    /// settings' PFN limits either way — plus the CSR and substring-index
+    /// caches of `providers`. Every database read and UPDATE path and
+    /// every read snapshot builds its evaluator with this (review
+    /// design#9); the per-request cancel flag and named graphs are set
+    /// apart ([`with_cancel`](Self::with_cancel), [`with_named`](Self::with_named)).
+    pub fn with_settings(
+        mut self,
+        settings: EvalSettings,
+        providers: EvalProviders<'a>,
+        request_pfn: Option<&crate::pfn::PfnCaller>,
+    ) -> Evaluator<'a, S> {
+        let EvalSettings {
+            service_policy,
+            integer_division,
+            topk,
+            gfun_max_output_bytes,
+            path_max_duplicates,
+            pfn_limits,
+            pfn,
+            functions,
+            vs_policy,
+        } = settings;
+        self.service_policy = service_policy;
+        self.integer_division = integer_division;
+        self.topk = topk;
+        self.gfun_max_output = gfun_max_output_bytes;
+        self.path_max_duplicates = path_max_duplicates;
+        self.pfn = request_pfn
+            .cloned()
+            .or(pfn)
+            .map(|caller| caller.with_limits(pfn_limits));
+        self.functions = Rc::new(functions);
+        if vs_policy.is_some() {
+            self.vs_policy = vs_policy;
+        }
+        self.csr_provider = providers.csr;
+        self.string_index_provider = providers.string_index;
+        self
+    }
+
+    /// Record this evaluator's settings for a running
+    /// [`watch_evaluator_settings`] (a test hook).
+    fn note_settings(&self) {
+        if !WATCHING.load(AtomicOrdering::Relaxed) {
+            return;
+        }
+        let seen = SeenSettings {
+            service_policy: self.service_policy,
+            integer_division: self.integer_division,
+            topk: self.topk,
+            gfun_max_output_bytes: self.gfun_max_output,
+            path_max_duplicates: self.path_max_duplicates,
+            pfn_limits: self.pfn.as_ref().map(crate::pfn::PfnCaller::limits),
+            functions: self.functions.len(),
+            vs_policy: self.vs_policy,
+            csr_provider: self.csr_provider.is_some(),
+            string_index_provider: self.string_index_provider.is_some(),
+        };
+        WATCHED.lock().unwrap_or_else(|e| e.into_inner()).push(seen);
     }
 
     /// Use the VS-tree under `policy` (see [`VsPolicy`]) instead of the
@@ -1192,6 +1488,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// Evaluate a read query (SELECT / ASK / CONSTRUCT). Updates are handled in
     /// the db layer.
     pub fn evaluate(&self, query: &Query) -> Result<QueryResult> {
+        self.note_settings();
         let _probes = self.count_join_probes();
         self.ctx.begin_execution();
         self.check_cancel()?;
@@ -1376,6 +1673,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         insert: &[QuadPattern],
         pattern: &GraphPattern,
     ) -> Result<(Vec<(Option<String>, Triple)>, Vec<(Option<String>, Triple)>)> {
+        self.note_settings();
         let _probes = self.count_join_probes();
         self.ctx.begin_execution();
         self.check_pattern_calls(pattern)?;
