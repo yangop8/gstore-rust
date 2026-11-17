@@ -230,8 +230,23 @@ impl McpServer {
         // client, so enforce the SAME read-only gate every generated-query path
         // uses — an UPDATE/DELETE/LOAD/DROP must never reach the store.
         crate::kb::validate_readonly_sparql(q).map_err(|e| e.to_string())?;
-        let ans = self.engine.kb().query(q).map_err(|e| e.to_string())?;
-        Ok(render_sparql_answer(&ans))
+        // A partial result is useful here, but only with a visible signal
+        // (review cluster-nlqa#17).
+        let (ans, truncated) = self
+            .engine
+            .kb()
+            .query_capped(q)
+            .map_err(|e| e.to_string())?;
+        let mut out = render_sparql_answer(&ans);
+        if truncated {
+            out.push_str(&format!(
+                "\n[truncated] the result has more than {} rows; only the first {} were \
+                 fetched — add a LIMIT or narrow the query",
+                crate::kb::MAX_RESULT_ROWS,
+                ans.row_count()
+            ));
+        }
+        Ok(out)
     }
 
     fn tool_link_entity(&self, args: &Value) -> Result<String, String> {
@@ -363,7 +378,7 @@ fn render_sparql_answer(ans: &SparqlAnswer) -> String {
                 out.push_str(&cells.join("\t"));
             }
             if rows.len() > 200 {
-                out.push_str(&format!("\n… ({} rows total)", rows.len()));
+                out.push_str(&format!("\n… ({} rows fetched, 200 shown)", rows.len()));
             }
             out
         }

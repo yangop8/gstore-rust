@@ -113,15 +113,36 @@ impl SparqlAnswer {
     }
 }
 
-/// Cap on a KB response body (bytes) and on parsed result rows — bounds memory
-/// against a wildcard/huge result set.
+/// Cap on a KB response body (bytes) — bounds memory against a wildcard/huge
+/// result set.
 const MAX_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
-const MAX_RESULT_ROWS: usize = 100_000;
+/// Cap on the rows parsed from one SELECT result. A result with more rows is
+/// never silently cut (review cluster-nlqa#17): [`KbClient::query`] fails
+/// with an error that asks for a `LIMIT`, and [`KbClient::query_capped`]
+/// returns the first rows *with* a truncation flag.
+pub const MAX_RESULT_ROWS: usize = 100_000;
 
-/// Parse a SPARQL 1.1 Results JSON document into a [`SparqlAnswer`].
+/// Parse a SPARQL 1.1 Results JSON document into a [`SparqlAnswer`]. A SELECT
+/// result with more than [`MAX_RESULT_ROWS`] rows is an error (see
+/// [`parse_results_capped`] to keep the first rows instead).
 pub fn parse_results(v: &Value) -> Result<SparqlAnswer> {
+    match parse_results_capped(v, MAX_RESULT_ROWS)? {
+        (_, true) => Err(too_many_rows()),
+        (ans, false) => Ok(ans),
+    }
+}
+
+fn too_many_rows() -> Error {
+    Error::GStore(format!(
+        "the result has more than {MAX_RESULT_ROWS} rows; add a LIMIT or narrow the query"
+    ))
+}
+
+/// Parse a SPARQL 1.1 Results JSON document, keeping at most `max_rows` rows
+/// of a SELECT result; the flag says whether rows were dropped.
+pub fn parse_results_capped(v: &Value, max_rows: usize) -> Result<(SparqlAnswer, bool)> {
     if let Some(b) = v.get("boolean").and_then(Value::as_bool) {
-        return Ok(SparqlAnswer::Boolean(b));
+        return Ok((SparqlAnswer::Boolean(b), false));
     }
     let vars: Vec<String> = v["head"]["vars"]
         .as_array()
@@ -137,15 +158,16 @@ pub fn parse_results(v: &Value) -> Result<SparqlAnswer> {
             "results JSON has neither boolean nor bindings: {snippet}"
         ))
     })?;
-    let mut rows = Vec::with_capacity(bindings.len().min(MAX_RESULT_ROWS));
-    for b in bindings.iter().take(MAX_RESULT_ROWS) {
+    let mut rows = Vec::with_capacity(bindings.len().min(max_rows));
+    for b in bindings.iter().take(max_rows) {
         let mut row: Vec<Option<RdfTerm>> = Vec::with_capacity(vars.len());
         for var in &vars {
             row.push(b.get(var).and_then(parse_binding));
         }
         rows.push(row);
     }
-    Ok(SparqlAnswer::Select { vars, rows })
+    let truncated = bindings.len() > max_rows;
+    Ok((SparqlAnswer::Select { vars, rows }, truncated))
 }
 
 /// Parse one `{"type":..,"value":..,"datatype"?,"xml:lang"?}` binding cell.
@@ -244,8 +266,18 @@ impl GStoreClient {
     }
 
     /// Execute a SPARQL query (POST, `application/sparql-query`), requesting
-    /// SPARQL Results JSON, and parse the response.
+    /// SPARQL Results JSON, and parse the response. A SELECT result with more
+    /// than [`MAX_RESULT_ROWS`] rows is an error (never silently truncated).
     pub fn query(&self, sparql: &str) -> Result<SparqlAnswer> {
+        match self.query_capped(sparql)? {
+            (_, true) => Err(too_many_rows()),
+            (ans, false) => Ok(ans),
+        }
+    }
+
+    /// Like [`query`](Self::query), but a SELECT result with more than
+    /// [`MAX_RESULT_ROWS`] rows yields its first rows and `true`.
+    pub fn query_capped(&self, sparql: &str) -> Result<(SparqlAnswer, bool)> {
         // No redirects: the Basic credential must only reach the configured
         // endpoint (review cluster-nlqa#15).
         let agent = crate::net::agent();
@@ -301,10 +333,11 @@ impl GStoreClient {
         }
         if is_json {
             let v: Value = serde_json::from_slice(&buf).map_err(|e| Error::Json(e.to_string()))?;
-            parse_results(&v)
+            parse_results_capped(&v, MAX_RESULT_ROWS)
         } else {
-            Ok(SparqlAnswer::Graph(
-                String::from_utf8_lossy(&buf).into_owned(),
+            Ok((
+                SparqlAnswer::Graph(String::from_utf8_lossy(&buf).into_owned()),
+                false,
             ))
         }
     }
@@ -319,13 +352,25 @@ impl GStoreClient {
 /// Abstraction over a SPARQL-executing backend, so the QA pipeline can run
 /// against a real [`GStoreClient`] in production and a [`MockKb`] in tests.
 pub trait KbClient: Send + Sync {
-    /// Execute a SPARQL query and return the parsed answer.
+    /// Execute a SPARQL query and return the parsed answer. A backend that
+    /// caps result rows must fail rather than return a silently truncated
+    /// answer (review cluster-nlqa#17).
     fn query(&self, sparql: &str) -> Result<SparqlAnswer>;
+
+    /// Execute a query whose caller can use a partial result: rows beyond the
+    /// backend's cap are dropped and the flag is `true`. The default never
+    /// truncates.
+    fn query_capped(&self, sparql: &str) -> Result<(SparqlAnswer, bool)> {
+        self.query(sparql).map(|a| (a, false))
+    }
 }
 
 impl KbClient for GStoreClient {
     fn query(&self, sparql: &str) -> Result<SparqlAnswer> {
         GStoreClient::query(self, sparql)
+    }
+    fn query_capped(&self, sparql: &str) -> Result<(SparqlAnswer, bool)> {
+        GStoreClient::query_capped(self, sparql)
     }
 }
 
@@ -334,6 +379,9 @@ impl KbClient for GStoreClient {
 impl<T: KbClient + ?Sized> KbClient for std::sync::Arc<T> {
     fn query(&self, sparql: &str) -> Result<SparqlAnswer> {
         (**self).query(sparql)
+    }
+    fn query_capped(&self, sparql: &str) -> Result<(SparqlAnswer, bool)> {
+        (**self).query_capped(sparql)
     }
 }
 
@@ -481,6 +529,25 @@ mod tests {
             lang: None,
         };
         assert_eq!(t.to_term_string(), "\"x\\\"y\"");
+    }
+
+    #[test]
+    fn row_cap_is_an_error_or_a_flag_never_silent() {
+        // review cluster-nlqa#17
+        let rows: Vec<Value> = (0..5)
+            .map(|i| json!({"x": {"type":"uri","value": format!("u{i}")}}))
+            .collect();
+        let v = json!({"head":{"vars":["x"]},"results":{"bindings": rows}});
+        let (ans, cut) = parse_results_capped(&v, 3).unwrap();
+        assert!(cut);
+        assert_eq!(ans.row_count(), 3);
+        let (ans, cut) = parse_results_capped(&v, 5).unwrap();
+        assert!(!cut);
+        assert_eq!(ans.row_count(), 5);
+        assert!(parse_results(&v).is_ok()); // under MAX_RESULT_ROWS
+                                            // a backend without a cap never reports truncation
+        let kb = MockKb::new(vec![ans]);
+        assert!(!kb.query_capped("q").unwrap().1);
     }
 
     #[test]

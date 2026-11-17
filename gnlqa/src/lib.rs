@@ -58,8 +58,9 @@ pub use intent::{
     RelationPhrase,
 };
 pub use kb::{
-    sparql_escape_literal, validate_readonly_sparql, validate_sparql, GStoreClient, KbClient,
-    MockKb, RdfTerm, SparqlAnswer, TermKind,
+    parse_results, parse_results_capped, sparql_escape_literal, validate_readonly_sparql,
+    validate_sparql, GStoreClient, KbClient, MockKb, RdfTerm, SparqlAnswer, TermKind,
+    MAX_RESULT_ROWS,
 };
 pub use lang::{
     abstain_message, detect_script_lang, lang_instruction, language_name, resolve_lang,

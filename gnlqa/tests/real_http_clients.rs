@@ -197,3 +197,100 @@ fn embeddings_retry_a_rate_limit() {
     assert_eq!(e.embed(&["x".to_string()]).unwrap(), vec![vec![1.0, 0.0]]);
     assert_eq!(stub.recorded().len(), 2);
 }
+
+// ---- review cluster-nlqa#24: the clients' wire behaviour over a socket ----
+
+#[test]
+fn openai_client_sends_bearer_key_and_parses_the_reply() {
+    let stub = Stub::start(vec![Scripted::json(200, OPENAI_OK)]);
+    let client = OpenAiClient::new(KEY, stub.url("/v1"), "the-model");
+    let out = client
+        .complete(&LlmRequest::prompt("hi").system("be terse"))
+        .unwrap();
+    assert_eq!(out, "ok");
+    let rec = &stub.recorded()[0];
+    assert_eq!(rec.method, "POST");
+    assert_eq!(rec.path, "/v1/chat/completions");
+    assert_eq!(rec.header("Authorization"), Some(&*format!("Bearer {KEY}")));
+    let body: serde_json::Value = serde_json::from_str(&rec.body).unwrap();
+    assert_eq!(body["model"], "the-model");
+    assert_eq!(body["messages"][0]["role"], "system");
+}
+
+/// A SPARQL Results JSON document with `n` single-variable URI rows.
+fn select_json(n: usize) -> Vec<u8> {
+    let mut s = String::from(r#"{"head":{"vars":["s","o"]},"results":{"bindings":["#);
+    for i in 0..n {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&format!(
+            r#"{{"s":{{"type":"uri","value":"http://e/{i}"}},"o":{{"type":"uri","value":"http://e/{}"}}}}"#,
+            i + 1
+        ));
+    }
+    s.push_str("]}}");
+    s.into_bytes()
+}
+
+fn rows_stub(n: usize) -> Stub {
+    Stub::start(vec![Scripted::new(
+        200,
+        "application/sparql-results+json",
+        select_json(n),
+    )])
+}
+
+// ---- review cluster-nlqa#17: results over the row cap carry a signal ----
+
+#[test]
+fn rows_beyond_the_cap_are_never_silently_dropped() {
+    let stub = rows_stub(gnlqa::MAX_RESULT_ROWS + 1);
+    let kb = GStoreClient::new(stub.url("/sparql"));
+    let err = kb.query("SELECT ?s ?o WHERE { ?s ?p ?o }").unwrap_err();
+    assert!(
+        matches!(err, Error::GStore(ref m) if m.contains("LIMIT")),
+        "a truncated result must not pass as complete: {err:?}"
+    );
+    let (ans, truncated) = kb.query_capped("SELECT ?s ?o WHERE { ?s ?p ?o }").unwrap();
+    assert!(truncated);
+    assert_eq!(ans.row_count(), gnlqa::MAX_RESULT_ROWS);
+}
+
+#[test]
+fn analytics_reports_a_sample_the_client_capped() {
+    // max_edges above the client's row cap: the edge sample is cut by the
+    // client, so the result must say it was computed over a truncated graph.
+    let stub = rows_stub(gnlqa::MAX_RESULT_ROWS + 1);
+    let kb = GStoreClient::new(stub.url("/sparql"));
+    let cfg = gnlqa::AnalyticsCfg {
+        max_edges: 150_000,
+        top_k: 3,
+        path_hops: 3,
+    };
+    let res = gnlqa::run_analytics(&kb, "rank nodes by pagerank", &[], cfg).unwrap();
+    assert_eq!(res.edge_count, gnlqa::MAX_RESULT_ROWS);
+    assert!(res.truncated, "analytics claimed a complete graph: {res:?}");
+}
+
+#[test]
+fn mcp_run_sparql_flags_a_truncated_result() {
+    let stub = rows_stub(gnlqa::MAX_RESULT_ROWS + 1);
+    let engine = std::sync::Arc::new(gnlqa::SolveEngine::new(
+        Box::new(gnlqa::MockLlm::fixed("x")),
+        Box::new(GStoreClient::new(stub.url("/sparql"))),
+    ));
+    let srv = gnlqa::McpServer::new(engine);
+    let req = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"run_sparql","arguments":{"query":"SELECT ?s ?o WHERE { ?s ?p ?o }"}}}"#;
+    let v: serde_json::Value = serde_json::from_str(&srv.handle_message(req).unwrap()).unwrap();
+    let text = v["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("[truncated]"),
+        "{}",
+        &text[text.len() - 200..]
+    );
+    assert!(
+        !text.contains("rows total"),
+        "a capped count is not a total"
+    );
+}

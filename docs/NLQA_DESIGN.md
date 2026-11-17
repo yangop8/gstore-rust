@@ -307,6 +307,6 @@ CLI 打 `[provided by …]`,HTTP `/ask` 返回 `provenance` 字段,MCP `ask_kg` 
 - **拒答是基于置信度阈值且默认关闭**:`with_abstain_below` 默认 0.0(从不拒答);未在 CLI/HTTP/MCP 里接成配置项。`graphrag` 与结构化路径在阈值之上时会遵守它(含显式 `graphrag` 模式)。
 
 ### 12.8 图分析的实际机制(修正 §4.6)
-分析型问题**并非**下推到 gStore 的 `SHORTESTPATHLEN/KHOPREACHABLE/…` SPARQL 函数,而是:用普通 SPARQL 取一份**有上限的边采样**(`SELECT ?s ?o WHERE { ?s ?p ?o } LIMIT n`,默认 5 万、硬顶 20 万),在 gnlqa 进程内用 `gstore::analytics::GraphView` 计算;最短路则以两个端点为种子做 k-hop 邻域取回(无向)。支持的算子:最短路 / PageRank / 度中心性 / 弱连通分量 / 三角形;超过采样上限时结果基于子图并在文本中标注。最短路的两个端点取自**两个不同 mention** 的 top-1 候选(而非同一 mention 的多个消歧候选),否则 `run_analytics` 因端点不足两个而返回 `Err`→回退。
+分析型问题**并非**下推到 gStore 的 `SHORTESTPATHLEN/KHOPREACHABLE/…` SPARQL 函数,而是:用普通 SPARQL 取一份**有上限的边采样**(`SELECT ?s ?o WHERE { ?s ?p ?o } LIMIT n`,默认 5 万、硬顶 20 万),在 gnlqa 进程内用 `gstore::analytics::GraphView` 计算;最短路则以两个端点为种子做 k-hop 邻域取回(无向)。支持的算子:最短路 / PageRank / 度中心性 / 弱连通分量 / 三角形;超过采样上限时结果基于子图并在文本中标注;若 gStore 客户端的行数上限(`MAX_RESULT_ROWS` = 10 万)先于 `max_edges` 截断了边采样,`truncated` 同样为真(review cluster-nlqa#17)。行数上限从不静默截断:`KbClient::query` 超限返回要求加 `LIMIT` 的错误(自修复循环可据此修正),`KbClient::query_capped` 返回前 N 行并带截断标志(MCP `run_sparql` 输出 `[truncated]` 提示)。最短路的两个端点取自**两个不同 mention** 的 top-1 候选(而非同一 mention 的多个消歧候选),否则 `run_analytics` 因端点不足两个而返回 `Err`→回退。
 
 > 落地映射见 `gnlqa/src/{solve,pipeline,config,analytics,link,llm/openai,llm/anthropic,repair,session,mcp,http_server,main}.rs`;评测 harness 见 `gnlqa/src/eval.rs`(QALD/LC-QuAD + P/R/F1)。

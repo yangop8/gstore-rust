@@ -191,8 +191,10 @@ fn edge_query(limit: usize) -> String {
 /// triangles). Fetches `limit + 1` so hitting the cap is detectable exactly.
 fn project(kb: &dyn KbClient, cfg: AnalyticsCfg) -> Result<ProjectedGraph> {
     let limit = cfg.max_edges.clamp(1, MAX_EDGES_CEILING);
-    // Ask for one extra row so `rows > limit` means "there was more".
-    let ans = kb.query(&edge_query(limit + 1))?;
+    // Ask for one extra row so `rows > limit` means "there was more". The
+    // backend may cap rows below `limit` (GStoreClient: MAX_RESULT_ROWS);
+    // then the sample is truncated too (review cluster-nlqa#17).
+    let (ans, capped) = kb.query_capped(&edge_query(limit + 1))?;
     let SparqlAnswer::Select { vars, rows } = &ans else {
         return Err(Error::GStore(
             "analytics edge query did not return a SELECT".into(),
@@ -206,7 +208,7 @@ fn project(kb: &dyn KbClient, cfg: AnalyticsCfg) -> Result<ProjectedGraph> {
             "analytics edge query must bind ?s and ?o".into(),
         ));
     };
-    let truncated = rows.len() > limit;
+    let truncated = capped || rows.len() > limit;
     let mut id_of: HashMap<String, EntityLiteralId> = HashMap::new();
     let mut term_of: Vec<String> = Vec::new();
     let mut triples: Vec<IdTriple> = Vec::with_capacity(rows.len().min(limit));

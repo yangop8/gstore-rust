@@ -191,6 +191,12 @@ impl KbClient for MeteredKb {
         charge_kb_rows(ans.row_count())?;
         Ok(ans)
     }
+    fn query_capped(&self, sparql: &str) -> Result<(SparqlAnswer, bool)> {
+        check_deadline()?;
+        let (ans, truncated) = self.0.query_capped(sparql)?;
+        charge_kb_rows(ans.row_count())?;
+        Ok((ans, truncated))
+    }
 }
 
 #[cfg(test)]

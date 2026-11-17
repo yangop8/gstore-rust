@@ -217,6 +217,12 @@ protocol faults (unknown tool, malformed params) are JSON-RPC `-32602` errors.
 `run_sparql` enforces a read-only gate (SELECT/ASK only — UPDATE/DELETE/DROP/LOAD
 are rejected before reaching the store), so an injected mutation can't run.
 
+**Result size.** A SELECT result is parsed up to 100 000 rows (`MAX_RESULT_ROWS`)
+and 32 MiB. A larger result is never passed off as complete: the question-answering
+path gets an error asking for a `LIMIT` (which the self-repair loop can act on);
+`run_sparql` returns the first rows with a `[truncated]` note; graph analytics marks
+its result as computed over a capped sample.
+
 ## Evaluation
 
 `gnlqa eval` computes set-based precision / recall / F1 (the QALD empty-set
