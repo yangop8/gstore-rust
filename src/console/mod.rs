@@ -347,10 +347,13 @@ impl Source {
     fn read(&mut self, console: &mut Console, prompt: &str) -> ReadOutcome {
         match self {
             Source::Plain { prompts } => {
+                // The mark before the prompt: a Ctrl-C typed once it shows
+                // is never lost (review ext#13).
+                let mark = term::interrupts();
                 if *prompts {
                     term::show(prompt);
                 }
-                let line = console.reader.read_line();
+                let line = console.reader.read_line_since(mark);
                 if *prompts && line == ReadOutcome::Interrupted {
                     term::show("\n");
                 }

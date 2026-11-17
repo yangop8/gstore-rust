@@ -7,9 +7,17 @@
 //! Ctrl-C: [`install_sigint`] replaces `SIGINT`'s disposition with a handler
 //! that only bumps an atomic counter (async-signal-safe), and asks the C
 //! library not to restart system calls it interrupts (`siginterrupt`), so a
-//! blocking `read` of stdin returns `EINTR`: [`LineReader`] reports that as
+//! blocking wait for stdin returns `EINTR`: [`LineReader`] reports that as
 //! [`ReadOutcome::Interrupted`]. Code waiting on something else (a request
 //! to the server) polls [`interrupts`].
+//!
+//! A Ctrl-C is never lost between a prompt and the read that follows it
+//! (review ext#13): the caller takes its mark of [`interrupts`] *before* it
+//! shows the prompt ([`LineReader::read_line_since`]), the reader checks the
+//! counter before every wait, and it waits for stdin with `poll` and a short
+//! timeout rather than a blocking `read` — so a signal that lands after the
+//! check but before the wait begins (and so cannot interrupt it) is seen at
+//! the next check, within [`POLL_INTERVAL`].
 
 use std::io::{self, IsTerminal, Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -99,6 +107,10 @@ pub enum ReadOutcome {
     Eof,
 }
 
+/// How long [`LineReader`] waits for stdin before it looks at
+/// [`interrupts`] again (see the module docs).
+pub const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Lines from stdin, one `read` at a time so that a Ctrl-C (with
 /// [`install_sigint`]) interrupts the wait. Every read of stdin in the
 /// console goes through one reader, so no input is lost to a buffer.
@@ -115,7 +127,15 @@ impl LineReader {
 
     /// The next line of stdin.
     pub fn read_line(&mut self) -> ReadOutcome {
-        let mark = interrupts();
+        self.read_line_since(interrupts())
+    }
+
+    /// The next line of stdin, or [`ReadOutcome::Interrupted`] by any
+    /// Ctrl-C after `mark` (a value of [`interrupts`]) — take it before
+    /// showing the prompt, so a Ctrl-C typed once the prompt is visible
+    /// interrupts this read even if it arrives before the read begins
+    /// (review ext#13). A line already buffered is returned first.
+    pub fn read_line_since(&mut self, mark: u64) -> ReadOutcome {
         loop {
             if let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
                 let mut line: Vec<u8> = self.buf.drain(..=pos).collect();
@@ -132,19 +152,85 @@ impl LineReader {
                 let line = std::mem::take(&mut self.buf);
                 return ReadOutcome::Line(String::from_utf8_lossy(&line).into_owned());
             }
+            if interrupts() != mark {
+                // The terminal discards the line being typed.
+                self.buf.clear();
+                return ReadOutcome::Interrupted;
+            }
+            if !wait_readable(POLL_INTERVAL) {
+                continue;
+            }
             let mut chunk = [0u8; 8192];
             match io::stdin().read(&mut chunk) {
                 Ok(0) => self.eof = true,
                 Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {
-                    if interrupts() != mark {
-                        // The terminal discards the line being typed.
-                        self.buf.clear();
-                        return ReadOutcome::Interrupted;
-                    }
-                }
+                // A signal: the loop looks at the counter again.
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(_) => self.eof = true,
             }
+        }
+    }
+}
+
+/// Wait up to `timeout` for stdin to have something to read (data, its
+/// end, or an error a read reports): `false` when the time passed or a
+/// signal interrupted the wait. Where `poll` is not available, or fails
+/// for stdin, `true` (the read then blocks, as a plain read does).
+fn wait_readable(timeout: std::time::Duration) -> bool {
+    #[cfg(unix)]
+    {
+        poll::stdin_readable(timeout).unwrap_or(true)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = timeout;
+        true
+    }
+}
+
+/// `poll(2)` on stdin.
+#[cfg(unix)]
+mod poll {
+    use std::io;
+    use std::os::raw::{c_int, c_short};
+    use std::time::Duration;
+
+    /// `struct pollfd` (the same layout on every Unix).
+    #[repr(C)]
+    struct PollFd {
+        fd: c_int,
+        events: c_short,
+        revents: c_short,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    type NFds = std::os::raw::c_ulong;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    type NFds = std::os::raw::c_uint;
+
+    const POLLIN: c_short = 0x1;
+
+    extern "C" {
+        fn poll(fds: *mut PollFd, nfds: NFds, timeout: c_int) -> c_int;
+    }
+
+    /// `Some(true)`: stdin is readable (or hung up, or in error — a read
+    /// says which); `Some(false)`: `timeout` passed or a signal interrupted
+    /// the wait; `None`: `poll` failed otherwise.
+    pub(super) fn stdin_readable(timeout: Duration) -> Option<bool> {
+        let mut fd = PollFd {
+            fd: 0,
+            events: POLLIN,
+            revents: 0,
+        };
+        let ms = c_int::try_from(timeout.as_millis()).unwrap_or(c_int::MAX);
+        // SAFETY: `fd` is one valid, writable `struct pollfd`.
+        let n = unsafe { poll(&mut fd, 1, ms) };
+        match n {
+            1.. => Some(true),
+            0 => Some(false),
+            _ if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => Some(false),
+            _ => None,
         }
     }
 }
@@ -273,5 +359,32 @@ mod termios {
         unsafe {
             tcsetattr(0, TCSANOW, saved);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// review ext#13: a Ctrl-C that arrives once the caller has taken its
+    /// mark (and shown its prompt) but before the read begins interrupts
+    /// that read — it is not lost, and stdin is not touched; a line already
+    /// buffered is still returned first, and the partial one is dropped.
+    #[test]
+    fn a_ctrl_c_before_the_read_begins_is_not_lost() {
+        let mark = interrupts();
+        note_interrupt();
+        let mut reader = LineReader::new();
+        assert_eq!(reader.read_line_since(mark), ReadOutcome::Interrupted);
+        let mut reader = LineReader {
+            buf: b"use lubm;\nsel".to_vec(),
+            eof: false,
+        };
+        assert_eq!(
+            reader.read_line_since(mark),
+            ReadOutcome::Line("use lubm;".to_string())
+        );
+        assert_eq!(reader.read_line_since(mark), ReadOutcome::Interrupted);
+        assert!(reader.buf.is_empty(), "the partial line is dropped");
     }
 }

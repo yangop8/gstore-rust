@@ -2115,8 +2115,13 @@ fn ctrl_c_cancels_the_running_query_and_the_statement_being_typed() {
     let fake = Fake::start(respond);
     let cwd = scratch("gc_ctrl_c");
     let _cwd = DirGuard(cwd.clone());
+    // review ext#13 / tests-a#14: `-i` shows the prompts, and the test
+    // sends each Ctrl-C only once the prompt it is meant for is visible —
+    // the console reads with a Ctrl-C mark taken before showing its prompt
+    // (see `term::LineReader::read_line_since`) — and goes on only once
+    // the console has answered it, instead of ordering them with sleeps.
     let mut cmd = gconsole(&fake.addr, &cwd);
-    cmd.args(["-u", "root", "-p", PASSWORD]);
+    cmd.args(["-u", "root", "-p", PASSWORD, "-i"]);
     let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2124,28 +2129,36 @@ fn ctrl_c_cancels_the_running_query_and_the_statement_being_typed() {
         .spawn()
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
-    let (out, err) = collect(&mut child);
+    let out = Live::start(child.stdout.take().unwrap());
+    let mut stderr = child.stderr.take().unwrap();
+    let err = thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stderr.read_to_string(&mut s);
+        s
+    });
+    let at = out.wait_for("the first prompt", "gStore[no database]> ", 0);
     stdin.write_all(b"use slow;\n").unwrap();
-    wait_for("load", || !fake.ops("load").is_empty());
+    let at = out.wait_for("the database's prompt", "gStore[slow]> ", at);
     // Ctrl-C while a statement is being typed drops it.
     stdin.write_all(b"select * where {\n").unwrap();
-    thread::sleep(Duration::from_millis(400));
+    let at = out.wait_for("the continuation prompt", "     -> ", at);
     sigint(&child);
-    thread::sleep(Duration::from_millis(400));
+    let at = out.wait_for("a fresh prompt", "gStore[slow]> ", at);
     // Ctrl-C while the server works on a query: the connection is dropped
-    // and the server's task cancelled.
+    // and the server's task cancelled. (The console takes its Ctrl-C mark
+    // before it sends the request.)
     stdin.write_all(b"select ?x where { ?x ?p ?o };\n").unwrap();
     wait_for("the query", || !fake.ops("query").is_empty());
-    thread::sleep(Duration::from_millis(200));
     sigint(&child);
     wait_for("the cancellation", || {
         !fake.ops("operationTaskCancel").is_empty()
     });
+    let at = out.wait_for("the cancel's report", "Query cancelled.\n", at);
     // The console is still there.
     stdin.write_all(b"pdb;\n").unwrap();
     drop(stdin);
     let code = wait(&mut child);
-    let (out, err) = (out.join().unwrap(), err.join().unwrap());
+    let (out, err) = (out.finish(), err.join().unwrap());
     let queries: Vec<String> = fake
         .ops("query")
         .iter()
@@ -2165,13 +2178,63 @@ fn ctrl_c_cancels_the_running_query_and_the_statement_being_typed() {
     wait_for("the dropped connection", || {
         !fake.dropped.lock().unwrap().is_empty()
     });
-    assert!(out.contains("Query cancelled.\n"), "{out}\n{err}");
     assert!(
-        out.ends_with("slow\n\n"),
+        out[at..].starts_with("\ngStore[slow]> slow\n\n"),
         "pdb ran after the cancel: {out}\n{err}"
     );
-    // A cancelled command counts as a failure of the script.
-    assert_eq!(code, 1, "{out}\n{err}");
+    // review ext#13: `-i` makes the run interactive, whose exit status is 0
+    // whatever failed; that a cancelled command fails a script (exit 1) is
+    // asserted by `ctrl_c_cancels_the_servers_query_task`.
+    assert_eq!(code, 0, "{out}\n{err}");
+}
+
+/// A child's output as it arrives, to wait for what it printed.
+struct Live {
+    text: Arc<Mutex<Vec<u8>>>,
+    reader: thread::JoinHandle<()>,
+}
+
+impl Live {
+    fn start(mut pipe: impl Read + Send + 'static) -> Live {
+        let text = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&text);
+        let reader = thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n @ 1..) = pipe.read(&mut buf) {
+                sink.lock().unwrap().extend_from_slice(&buf[..n]);
+            }
+        });
+        Live { text, reader }
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.text.lock().unwrap()).into_owned()
+    }
+
+    /// Wait until `marker` has been printed at or after byte `from`; the
+    /// offset just past it (the timeout is only a hang guard).
+    fn wait_for(&self, what: &str, marker: &str, from: usize) -> usize {
+        let t0 = Instant::now();
+        loop {
+            let text = self.text();
+            if let Some(i) = text.get(from..).and_then(|t| t.find(marker)) {
+                return from + i + marker.len();
+            }
+            assert!(
+                t0.elapsed() < Duration::from_secs(60),
+                "timed out waiting for {what}: {text}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Everything, once the child closed its end.
+    fn finish(self) -> String {
+        let Live { text, reader } = self;
+        reader.join().unwrap();
+        let text = text.lock().unwrap();
+        String::from_utf8_lossy(&text).into_owned()
+    }
 }
 
 /// A query that runs for a long time unless cancelled (a REGEX FILTER over

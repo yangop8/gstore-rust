@@ -468,12 +468,13 @@ impl Console {
     /// Read one line for a prompt (shown only to a person), echo off when
     /// `hidden`. `None` at the end of input or on Ctrl-C.
     pub fn prompt_line(&mut self, prompt: &str, hidden: bool) -> Option<String> {
+        let mark = term::interrupts();
         if self.show_prompts {
             term::show(prompt);
         }
         let line = {
             let _echo = hidden.then(EchoOff::new);
-            self.reader.read_line()
+            self.reader.read_line_since(mark)
         };
         if hidden && self.show_prompts {
             term::show("\n");
