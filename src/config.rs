@@ -24,7 +24,8 @@
 //!   inline comment that cuts a value is reported as a
 //!   [warning](GStoreConfig::warnings) (upstream gStore reads it as part of
 //!   the value), so a value copied from an upstream file is never shortened
-//!   silently.
+//!   silently; so is a `root_password` that holds such a marker (earlier
+//!   gstore-rust versions cut it there; the warning does not quote it).
 //! * [`GStoreConfig`] — every key of upstream's `conf/conf.ini` as a typed field,
 //!   with upstream's built-in defaults (the `Util::configure()` defaults, i.e.
 //!   what an empty `conf.ini` gives). An empty value means "unset" (upstream:
@@ -150,6 +151,9 @@ pub struct Ini {
     /// Inline comments cut from values: (1-based line number, key, the
     /// comment as written).
     inline_comments: Vec<(usize, String, String)>,
+    /// Values of [`VERBATIM_KEYS`] kept whole although they hold what would
+    /// start an inline comment elsewhere: (1-based line number, key).
+    verbatim_markers: Vec<(usize, String)>,
 }
 
 /// Keys whose value is taken whole, an inline-comment marker included (see
@@ -191,6 +195,9 @@ impl Ini {
                 continue;
             }
             let (value, comment) = if VERBATIM_KEYS.contains(&key) {
+                if comment_start(v).is_some() {
+                    ini.verbatim_markers.push((line_no, key.to_string()));
+                }
                 (clean_value(v), None)
             } else {
                 split_comment(v)
@@ -971,6 +978,17 @@ impl GStoreConfig {
             self.warnings.push(format!(
                 "line {line}: '{comment}' after the value of '{key}' is read as a comment \
                  (upstream gStore reads it as part of the value; quote the value to keep it)"
+            ));
+        }
+        // A password kept whole where earlier gstore-rust versions cut it at
+        // the marker (a quoted `root_password="pw"  # note` read `pw`, and
+        // now reads all of it, as upstream does): said, without quoting it.
+        for (line, key) in &ini.verbatim_markers {
+            self.warnings.push(format!(
+                "line {line}: the value of '{key}' holds a '#' or ';' standing as a word of its \
+                 own; all of it is the value ({key} is never cut at an inline comment, as \
+                 upstream gStore reads it; earlier gstore-rust versions read the rest as a \
+                 comment)"
             ));
         }
         // Keys in their own section first, so a correctly placed key always

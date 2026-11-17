@@ -494,10 +494,31 @@ fn conf_ini_inline_comments_follow_the_documented_rule() {
     assert_eq!(c.licensetype, "#x");
     assert!(c.warnings().is_empty(), "{:?}", c.warnings());
 
-    // A password is taken whole, a word-like marker included.
-    let c = GStoreConfig::from_ini_str("[system]\nroot_password = correct horse # battery\n");
-    assert_eq!(c.root_password, "correct horse # battery");
-    assert!(c.warnings().is_empty(), "{:?}", c.warnings());
+    // A password is taken whole, a word-like marker included. Earlier
+    // gstore-rust versions cut it there — a quoted password followed by a
+    // note read the quoted part only — so keeping it whole is said, without
+    // quoting the password (review of bulkcli#9's fix: the change of the
+    // password a new user store is seeded with was silent).
+    for (text, password) in [
+        (
+            "[system]\nroot_password = correct horse # battery\n",
+            "correct horse # battery",
+        ),
+        (
+            "[system]\nroot_password = \"s3cret\"  ; the root password\n",
+            "s3cret  ; the root password",
+        ),
+    ] {
+        let c = GStoreConfig::from_ini_str(text);
+        assert_eq!(c.root_password, password);
+        assert_eq!(c.warnings().len(), 1, "{:?}", c.warnings());
+        let w = &c.warnings()[0];
+        assert!(
+            w.starts_with("line 2: the value of 'root_password' holds"),
+            "{w}"
+        );
+        assert!(!w.contains("horse") && !w.contains("s3cret"), "{w}");
+    }
 
     // A comment of its own word cuts the value — and says so.
     let c = GStoreConfig::from_ini_str(
