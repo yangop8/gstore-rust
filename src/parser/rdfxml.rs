@@ -49,7 +49,7 @@ use std::rc::Rc;
 use crate::error::{GStoreError, Result};
 use crate::model::{Term, Triple};
 use crate::parser::iri::resolve;
-use crate::parser::stream::{BlankLabeler, TermBudget};
+use crate::parser::stream::{expansion_error, BlankLabeler, TermBudget};
 
 const RDF_NS: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
@@ -1034,7 +1034,7 @@ impl Extractor {
                 "Literal" => {
                     // The content, markup included, as exclusive canonical
                     // XML (review parser#9: only the text was kept).
-                    let value = xml_literal(pe, &ctx.ns)?;
+                    let value = xml_literal(pe, &ctx.ns, &self.budget)?;
                     self.push(
                         subject.clone(),
                         predicate,
@@ -1157,10 +1157,48 @@ fn property_attributes(
 /// `&`, `<`, `>` and carriage returns, attribute values `&`, `<`, `"`,
 /// tabs, line feeds and carriage returns. CDATA sections are text, and DTD
 /// entity references are already expanded.
-fn xml_literal(pe: &XmlElement, ns: &Rc<Ns>) -> Result<String> {
-    let mut out = String::new();
+///
+/// The canonical form repeats every namespace an element uses on each
+/// top-level element of the literal, so it can be far longer than the
+/// markup: it is bounded by what is left of the document's expansion
+/// `budget` while it is written, and the document fails as soon as it
+/// passes it (round-3 review: a 1 MB document whose literal held 4000
+/// siblings using one 1 MiB namespace built a 4 GiB string first and
+/// aborted the process).
+fn xml_literal(pe: &XmlElement, ns: &Rc<Ns>, budget: &TermBudget) -> Result<String> {
+    let mut out = C14n {
+        text: String::new(),
+        limit: budget.remaining(),
+        budget: budget.budget(),
+    };
     write_c14n_content(&pe.children, ns, None, &mut out)?;
-    Ok(out)
+    Ok(out.text)
+}
+
+/// The canonical form being written, and the most bytes it may take.
+struct C14n {
+    text: String,
+    limit: usize,
+    /// The document's whole budget, for the error.
+    budget: usize,
+}
+
+impl C14n {
+    /// `Err` once the text is longer than the limit.
+    fn check(&self) -> Result<()> {
+        if self.text.len() > self.limit {
+            return Err(expansion_error(0, "the document", self.budget));
+        }
+        Ok(())
+    }
+
+    fn push(&mut self, c: char) {
+        self.text.push(c);
+    }
+
+    fn push_str(&mut self, s: &str) {
+        self.text.push_str(s);
+    }
 }
 
 /// The namespace declarations the canonical form has written on the
@@ -1186,7 +1224,7 @@ fn write_c14n_content(
     children: &[XmlChild],
     scope: &Rc<Ns>,
     rendered: Option<&Rendered<'_>>,
-    out: &mut String,
+    out: &mut C14n,
 ) -> Result<()> {
     for child in children {
         match child {
@@ -1208,6 +1246,7 @@ fn write_c14n_content(
             }
             XmlChild::Element(e) => write_c14n_element(e, scope, rendered, out)?,
         }
+        out.check()?;
     }
     Ok(())
 }
@@ -1216,7 +1255,7 @@ fn write_c14n_element(
     el: &XmlElement,
     parent_scope: &Rc<Ns>,
     rendered: Option<&Rendered<'_>>,
-    out: &mut String,
+    out: &mut C14n,
 ) -> Result<()> {
     let undefined = |prefix: &str| GStoreError::RdfParse {
         line: 0,
@@ -1267,8 +1306,11 @@ fn write_c14n_element(
                 out.push_str(p);
             }
             out.push_str("=\"");
-            push_c14n_attr(uri, out);
+            push_c14n_attr(uri, &mut out.text);
             out.push('"');
+            // Checked before the declaration is remembered too: each
+            // costs the namespace IRI once more.
+            out.check()?;
             here.own.insert(p.to_string(), uri.to_string());
         }
     }
@@ -1276,8 +1318,9 @@ fn write_c14n_element(
         out.push(' ');
         out.push_str(qname);
         out.push_str("=\"");
-        push_c14n_attr(value, out);
+        push_c14n_attr(value, &mut out.text);
         out.push('"');
+        out.check()?;
     }
     out.push('>');
     write_c14n_content(&el.children, &scope, Some(&here), out)?;

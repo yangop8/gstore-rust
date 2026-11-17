@@ -543,6 +543,23 @@ impl TermBudget {
         !self.over
     }
 
+    /// The bytes still left before the document is past its budget (`0`
+    /// once it is): a bound for a term built piece by piece, which can
+    /// stop as soon as it is too long instead of after it was built
+    /// (an RDF/XML `parseType="Literal"` value, round-3 review).
+    pub(crate) fn remaining(&self) -> usize {
+        if self.over {
+            0
+        } else {
+            self.budget.saturating_sub(self.held)
+        }
+    }
+
+    /// The document's whole budget, for error messages.
+    pub(crate) fn budget(&self) -> usize {
+        self.budget
+    }
+
     /// `Err` when the document went past its budget.
     pub(crate) fn check(&self) -> Result<()> {
         if self.over {
