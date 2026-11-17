@@ -1,10 +1,11 @@
 # Deploying gstore-rust
 
 This guide covers running `gserver` — the HTTP API server that speaks
-upstream gStore 1.4's `/api` protocol (so the upstream SDKs, the Workbench
-and `gconsole` work against it) — as a container, as a systemd service, and
-from `.deb` / `.rpm` packages; then its configuration, logs and the
-command-line tools.
+upstream gStore 1.4's `/api` protocol (upstream's Python SDK works against
+it unmodified, as `scripts/conformance.sh` checks; the other upstream SDKs
+speak the same protocol but are not tested; `gconsole` is gstore-rust's
+own) — as a container, as a systemd service, and from `.deb` / `.rpm`
+packages; then its configuration, logs and the command-line tools.
 
 | What | Where (package / systemd) | Where (container) |
 |------|---------------------------|-------------------|
@@ -47,10 +48,11 @@ the server can reach, internal ones included.
 ## Docker
 
 The `Dockerfile` at the repository root builds a two-stage image: the
-crate's MSRV toolchain (`rust:1.89-slim-bookworm`) compiles the release
-binaries; the runtime is `debian:bookworm-slim` with the binaries, `curl`
-(for the health check) and `ca-certificates`, running as the unprivileged
-user `gstore`.
+crate's MSRV toolchain (`rust:1.89-slim-bookworm`) compiles and installs
+every binary of the gstore package (`cargo install --path .`); the runtime
+is `debian:bookworm-slim` with the binaries, the health check
+(`/usr/local/bin/gstore-healthcheck`) and `ca-certificates`, running as the
+unprivileged user `gstore`.
 
 ```bash
 docker build -t gstore-rust .
@@ -104,9 +106,17 @@ docker exec -it gstore gconsole -u root                    # the console
   (up to 10 s), open transactions roll back and unsaved changes are saved
   before the process exits. Give it time (`--stop-timeout 120`, or
   `stop_grace_period: 2m` in Compose) so a large database can be saved.
-* **Health check.** `curl http://127.0.0.1:9000/api?operation=check` —
-  upstream's cheap, unauthenticated `check` operation — every 30 s. If you
-  change the port in `conf.ini`, override it (`--health-cmd`).
+* **Health check.** `gstore-healthcheck` every 30 s: healthy while the
+  server runs and accepts connections on the address it listens on. It runs
+  `gserver -S` with the server's own arguments (the container's main
+  process), which finds the server's pid file and connects to the address
+  recorded there — whatever port `conf.ini` or `-p` chose, HTTP or HTTPS
+  alike. The probe sends no request, so it is not an access-log record and
+  the IP lists do not apply to it. (Earlier images probed
+  `curl http://127.0.0.1:9000/api?operation=check`, which failed on any
+  other port or with TLS and logged every probe; the image no longer ships
+  `curl`.) If PID 1 is not `gserver` (`docker run --init`), it checks the
+  server of `/etc/gstore/conf.ini`.
 * **Logs.** With the shipped `conf.ini`, `log_mode` names
   `./conf/slog.properties`, which does not exist: the diagnostic log goes to
   standard error (`docker logs`). Copy `slog.properties.example` to
@@ -114,22 +124,39 @@ docker exec -it gstore gconsole -u root                    # the console
   The query and access logs are files below `/var/lib/gstore/dbhome/logs/`
   (`querylog_path` / `accesslog_path` are relative to `db_home`).
 
-A Compose service:
+A Compose service. The image listens on every interface of the container,
+so `gserver` will not start until root has a password of its own: the
+secret below is read once, when the user store is created (without it the
+container exits with "refusing to start" and `restart: unless-stopped`
+restarts it in a loop). The port is published on the host's loopback
+address only; publish it more widely (`"9000:9000"`) deliberately, behind
+a firewall or a TLS proxy.
 
 ```yaml
 services:
   gstore:
     build: .
-    ports: ["9000:9000"]
+    ports: ["127.0.0.1:9000:9000"]
+    environment:
+      GSTORE_ROOT_PASSWORD_FILE: /run/secrets/gstore_root
+    secrets: [gstore_root]
     volumes:
       - gstore-data:/var/lib/gstore
       - gstore-conf:/etc/gstore
     stop_grace_period: 2m
     restart: unless-stopped
+secrets:
+  gstore_root:
+    # printf '%s\n' 'a-long-random-password' > gstore_root
+    # (readable by the container's uid 10001)
+    file: ./gstore_root
 volumes:
   gstore-data:
   gstore-conf:
 ```
+
+Once root's password has been changed (or the user store exists), the
+secret is no longer read; a missing file is skipped with a warning.
 
 ## systemd
 
@@ -152,16 +179,49 @@ sudo systemctl restart gserver
 * Stopping sends `SIGTERM` to the main process only (`KillMode=mixed`) —
   exactly what `gserver -t` sends — which shuts the server down gracefully
   (see Docker above); `TimeoutStopSec=180` leaves time to save.
-* `Restart=on-failure` restarts a server that crashed: leave `conf.ini`'s
-  `deamon=off` (its supervisor would duplicate what systemd does).
+* `Restart=on-failure` restarts a server that crashed (a signal, or a
+  panic's exit status 101): leave `conf.ini`'s `deamon=off` (its supervisor
+  would duplicate what systemd does). `RestartPreventExitStatus=1 2`: a
+  server that exits with gserver's error status (a configuration it
+  refuses, such as root's default password with `listen_addr` beyond
+  loopback, or a port it cannot bind) or its usage status is not
+  restarted — the reason is in `journalctl -u gserver`. A server that keeps
+  crashing stops being restarted after 5 starts within 5 minutes
+  (`StartLimitIntervalSec=300`, `StartLimitBurst=5`; systemd's default,
+  5 starts in 10 s, was never reached with `RestartSec=5s`); after fixing
+  the cause, `systemctl reset-failed gserver` and start it again.
 * `LimitNOFILE=65535`, as upstream raises it.
-* Hardening (`ProtectSystem=strict`, `ReadWritePaths=/var/lib/gstore`, …):
-  the server writes only below `/var/lib/gstore` — the PFN functions too
-  (`pfn_base_path`, by default `<db_home>/pfn`, i.e.
+* Hardening (`systemd-analyze security gserver` rates the unit about 1.2,
+  "OK"): the server writes only below `/var/lib/gstore`
+  (`ProtectSystem=strict`, `ReadWritePaths=/var/lib/gstore`) — the PFN
+  functions too (`pfn_base_path`, by default `<db_home>/pfn`, i.e.
   `/var/lib/gstore/dbhome/pfn`; set it elsewhere and add that directory to
   `ReadWritePaths` with a drop-in). `/etc/gstore` is read-only
   to it — to manage the IP lists with the `ipmanage` operation, point
-  `ip_deny_path` / `ip_allow_path` at files below `/var/lib/gstore`.
+  `ip_deny_path` / `ip_allow_path` at files below `/var/lib/gstore`. What
+  else the unit restricts, and what it means for an administrator:
+  * `ProtectHome=yes`: `/home`, `/root` and `/run/user` are empty and
+    inaccessible to the server. A `--load-dir` there, a `/api` `build` / `batchInsert`
+    `db_path` or a `backup_path` below a home directory fails as "not
+    exist": copy the files below `/var/lib/gstore` (for example into
+    `upload/`), or relax it in a drop-in (`systemctl edit gserver`:
+    `ProtectHome=read-only`).
+  * `UMask=0027`: the databases, backups, exports and logs it creates are
+    not readable by other users (group `gstore` may read them).
+  * `CapabilityBoundingSet=` (none) and `NoNewPrivileges=yes`: a `port`
+    below 1024 needs a drop-in with
+    `AmbientCapabilities=CAP_NET_BIND_SERVICE` and
+    `CapabilityBoundingSet=CAP_NET_BIND_SERVICE`.
+  * `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`,
+    `SystemCallFilter=@system-service` without `@privileged @resources`
+    (`SystemCallErrorNumber=EPERM`: a filtered call fails instead of
+    killing the server), `SystemCallArchitectures=native`,
+    `MemoryDenyWriteExecute=yes` (the `pfn-wasm` runtime interprets
+    WebAssembly and generates no machine code), `RestrictNamespaces=yes`,
+    `RestrictRealtime=yes`, `LockPersonality=yes`, `RemoveIPC=yes`,
+    `PrivateTmp=yes`, `PrivateDevices=yes` and `Protect{KernelTunables,
+    KernelModules,KernelLogs,ControlGroups,Clock,Hostname}=yes`,
+    `ProtectProc=invisible`.
 * `gserver -S -c /etc/gstore/conf.ini` (run as `gstore`, in
   `/var/lib/gstore`) reports the server's status from its pid file
   `dbhome/gserver.pid`.
@@ -173,40 +233,89 @@ sudo systemctl restart gserver
 (`[package.metadata.deb]`, `[package.metadata.generate-rpm]`):
 
 ```bash
-cargo install cargo-deb cargo-generate-rpm
+cargo install --locked cargo-deb@3.8.0 cargo-generate-rpm@0.21.1   # the versions CI uses
 
-cargo build --release -p gstore          # add --features … as needed
-cargo deb -p gstore --no-build           # target/debian/gstore_<version>_<arch>.deb
-strip target/release/g{server,console,build,query,add,sub,drop,show,backup,restore,export,monitor,node}
+# The packages' feature set is the container image's: pfn-wasm. Stripped
+# binaries (cargo-deb strips its own; cargo-generate-rpm packages them as
+# they are).
+CARGO_PROFILE_RELEASE_STRIP=symbols cargo build --release --locked -p gstore --features pfn-wasm
+cargo deb -p gstore --no-build           # target/debian/gstore_<version>-1_<arch>.deb
 cargo generate-rpm                       # target/generate-rpm/gstore-<version>-1.<arch>.rpm
 
 sudo apt install ./target/debian/gstore_*.deb      # or: sudo dnf install ./target/generate-rpm/gstore-*.rpm
-sudo editor /etc/gstore/conf.ini                   # root_password, port, …
+sudo cat /etc/gstore/root_password                 # root's first-start password (see below)
 sudo systemctl enable --now gserver
 ```
+
+Built with other features (`--features "pfn-wasm zip tls"`, …), the same
+commands package those binaries; the packages built by CI
+(`.github/workflows/packaging.yml`) and the container image have
+`pfn-wasm` only, and the package descriptions say so.
 
 The packages install:
 
 * the binaries `gserver gconsole gbuild gquery gadd gsub gdrop gshow
-  gbackup grestore gexport gmonitor gnode` in `/usr/bin`;
+  gbackup grestore gexport gmonitor gcompact gnode` in `/usr/bin` — every
+  binary target of the gstore package (the deb takes them from Cargo, the
+  rpm lists them; `tests/packaging_layout.rs` keeps the rpm list, this one
+  and the Cargo targets in step);
 * `conf/conf.ini.example` as `/etc/gstore/conf.ini` (a configuration file:
   your edits survive upgrades — a dpkg conffile, an rpm
-  `%config(noreplace)`), readable by the `gstore` group only (`0640`), and
-  the log4cplus properties examples next to it;
+  `%config(noreplace)`), readable by the `gstore` group only (`0640`; the
+  rpm's header carries the group, its `%pre` creating the `gstore` user
+  before the files are laid down, so `rpm -V gstore` finds nothing to
+  report), and the log4cplus properties examples next to it;
 * the unit as `/lib/systemd/system/gserver.service` (deb) or
   `/usr/lib/systemd/system/gserver.service` (rpm);
 * `/usr/lib/sysusers.d/gstore.conf` (the `gstore` system user) and
   `/usr/lib/tmpfiles.d/gstore.conf` (`/var/lib/gstore`, mode `0750`, and its
-  `conf → /etc/gstore` link), applied by the post-install script
-  (`packaging/debian/postinst`, `packaging/rpm/post_install.sh`), which falls
-  back to `adduser`/`useradd` without systemd;
+  `conf → /etc/gstore` link), applied by the install scripts
+  (`packaging/debian/postinst`; the rpm's `packaging/rpm/pre_install.sh`
+  and `post_install.sh`), which fall back to `adduser` / `groupadd` and
+  `useradd` without systemd;
 * `DEPLOY.md` and `README.md` in `/usr/share/doc/gstore/`.
 
+A fresh install writes a random root password to `/etc/gstore/root_password`
+(`0640`, group `gstore`); the unit hands it to `gserver`, which sets it when
+it creates the user store at its first start. Change it after the first
+start (`gconsole` `setpswd`, or the `/api` `userPassword` operation), then
+delete the file.
+
 The service is not enabled or started on install; an upgrade restarts a
-running server (`try-restart`). Removing the package stops and disables
-the service first (a graceful stop: unsaved changes are saved). The
+running server (`try-restart`). Removing the package stops the service
+first (a graceful stop: unsaved changes are saved). Whether the service is
+enabled is the administrator's choice and is kept: the deb follows
+`dh_installsystemd`'s protocol (`deb-systemd-helper`), so a service that was
+enabled before `apt remove gstore` is enabled again by the next
+`apt install gstore` (it starts at the next boot, or with
+`systemctl start gserver`); `apt purge gstore` forgets it, and also removes
+`/etc/gstore/root_password` and the `/var/lib/gstore/conf` link. Erasing
+the rpm disables the service, as Fedora's `%systemd_preun` does. The
 databases, their reasoning rules and the PFN functions in `/var/lib/gstore`
 are never removed by the package, not even on purge.
+
+### Package smoke
+
+`scripts/package-smoke.sh` installs-and-runs what the packages and the
+image ship; `.github/workflows/packaging.yml` runs it against the .deb
+(installed on the runner, the server started by systemd with the unit's
+hardening), the .rpm (installed in a Fedora container) and the image, and
+`tests/package_smoke.rs` runs its `stage` mode in every test run:
+
+```bash
+scripts/package-smoke.sh stage                       # the .deb layout from target/release, as you (no root, no Docker)
+scripts/package-smoke.sh stage --deb target/debian/gstore_*.deb   # the built .deb's own content
+sudo scripts/package-smoke.sh installed [--service]  # the installed package (--service: through systemd)
+scripts/package-smoke.sh image gstore-rust           # the container image
+```
+
+Each checks that every binary target is installed and answers `--help`,
+that `systemd-analyze verify` accepts the unit, that the first start takes
+root's password from the first-start file (the default `123456` is
+refused), the health check, a build, an update and a query, a graceful
+stop, and a second start without the password file; the image mode also
+checks a container on another port turns healthy without an access-log
+record and that one without a root password refuses to start.
 
 ## Backups
 

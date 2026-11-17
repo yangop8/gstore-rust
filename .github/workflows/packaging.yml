@@ -1,0 +1,150 @@
+name: Packaging
+
+# The deb/rpm packages and the container image, built, installed and run
+# (review infra#7): scripts/package-smoke.sh against the .deb's content and
+# the .deb installed on the runner (the server started by systemd, so the
+# unit's hardening is exercised), the .rpm installed in a Fedora container
+# (`rpm -V` included), and the image (healthy on a non-default port without
+# an access-log record, a graceful stop, the default-password refusal). The
+# image's builder is the crate's MSRV toolchain, so its build is also the
+# MSRV build. Plus a RustSec advisory scan that does not fail the run
+# (review infra#19). docs/DEPLOY.md ("Package smoke") describes the checks.
+on:
+  push:
+    paths-ignore: ["**.md", "docs/**", "changelog.d/**"]
+  pull_request:
+    paths-ignore: ["**.md", "docs/**", "changelog.d/**"]
+  schedule:
+    - cron: "41 5 * * 2"
+  workflow_dispatch:
+
+concurrency:
+  group: packaging-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Same pin as ci.yml.
+  RUST_TOOLCHAIN: "1.99.1"
+
+jobs:
+  packages:
+    name: deb + rpm (build, install, smoke)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: packaging
+      - name: install cargo-deb and cargo-generate-rpm
+        run: cargo install --locked cargo-deb@3.8.0 cargo-generate-rpm@0.21.1
+      - name: the gstore package's binary targets (cargo metadata)
+        run: |
+          bins=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "gstore") | .targets[] | select(.kind | index("bin")) | .name' \
+            | sort | tr '\n' ' ')
+          echo "binary targets: $bins"
+          echo "BINS=$bins" >>"$GITHUB_ENV"
+      - name: build (release, stripped, the packages' features)
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: symbols
+        run: cargo build --release --locked -p gstore --features pfn-wasm
+      - name: cargo deb, cargo generate-rpm
+        run: |
+          cargo deb -p gstore --no-build
+          cargo generate-rpm
+          ls -l target/debian target/generate-rpm
+      - name: the .deb holds exactly the binary targets
+        run: |
+          have=$(dpkg-deb -c target/debian/gstore_*.deb | awk '{ print $6 }' \
+            | sed -n 's#^\./usr/bin/##p' | sort | tr '\n' ' ')
+          if [ "$have" != "$BINS" ]; then
+            echo "the .deb's /usr/bin: $have"
+            echo "the binary targets: $BINS"
+            exit 1
+          fi
+      - name: smoke the .deb's content (staged, unprivileged)
+        run: scripts/package-smoke.sh stage --deb target/debian/gstore_*.deb --bins "$BINS"
+      - name: install the .deb
+        run: sudo apt-get install -y ./target/debian/gstore_*.deb
+      - name: smoke the installed .deb, started by systemd
+        run: sudo scripts/package-smoke.sh installed --service --bins "$BINS"
+      - name: an enabled service stays enabled across remove and install (review infra#15)
+        run: |
+          sudo systemctl enable gserver.service
+          sudo apt-get remove -y gstore
+          sudo apt-get install -y ./target/debian/gstore_*.deb
+          systemctl is-enabled gserver.service
+          sudo apt-get purge -y gstore
+          if systemctl is-enabled gserver.service 2>/dev/null; then
+            echo "the purged package's unit is still enabled"
+            exit 1
+          fi
+      - name: install and smoke the .rpm in a Fedora container
+        run: |
+          docker run --rm -e BINS="$BINS" -v "$PWD:/w" -w /w fedora:latest bash -euxc '
+            dnf install -y curl findutils grep sed util-linux shadow-utils
+            dnf install -y ./target/generate-rpm/gstore-*.rpm
+            # The header and the disk agree (conf.ini root:gstore 0640).
+            rpm -V gstore
+            rpm -q --queryformat "[%{FILEGROUPNAME} %{FILEMODES:perms} %{FILENAMES}\n]" gstore \
+              | grep -x "gstore -rw-r----- /etc/gstore/conf.ini"
+            have=$(rpm -ql gstore | sed -n "s#^/usr/bin/##p" | sort | tr "\n" " ")
+            test "$have" = "$BINS"
+            scripts/package-smoke.sh installed --bins "$BINS"
+          '
+      - name: upload the packages
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: |
+            target/debian/*.deb
+            target/generate-rpm/*.rpm
+          if-no-files-found: ignore
+
+  image:
+    name: container image (build, smoke)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: docker build (the MSRV toolchain, FEATURES=pfn-wasm)
+        run: docker build -t gstore-rust:ci .
+      - name: smoke the image
+        run: |
+          bins=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "gstore") | .targets[] | select(.kind | index("bin")) | .name')
+          scripts/package-smoke.sh image gstore-rust:ci --bins "$bins"
+
+  # RustSec advisories of Cargo.lock's dependencies. Reported, never
+  # blocking: an advisory published upstream should not turn an unrelated
+  # change red; the job's failure is the signal.
+  advisories:
+    name: RustSec advisories (non-blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: advisories
+      - name: install cargo-audit
+        run: cargo install --locked cargo-audit@0.23.0
+      - name: cargo audit
+        run: cargo audit
