@@ -1290,6 +1290,64 @@ fn the_local_mode_runs_a_lowercase_sparql_load_and_reports_failures() {
     }
 }
 
+/// A snapshot-layout database `<dir>/<name>.db` holding `triples` (N-Triples).
+fn snapshot_db(dir: &Path, name: &str, triples: &str) -> PathBuf {
+    let path = dir.join(format!("{name}.db"));
+    let db = gstore::Database::build_from_str(name, triples).unwrap();
+    db.save(&path).unwrap();
+    assert_eq!(
+        gstore::Database::storage_kind(&path),
+        Some(gstore::StorageKind::Snapshot)
+    );
+    path
+}
+
+fn triples_in(dir: &Path) -> u64 {
+    gstore::Database::open(dir).unwrap().triple_num()
+}
+
+/// review ext#5: `gconsole --local` keeps the updates it acknowledged
+/// (`[updated N triple(s)]`) to a snapshot-layout database — persisted only
+/// by a save — when it leaves the database: at `quit`, at the end of the
+/// input and on `load <other>`. A new in-memory database is saved to
+/// `<name>.db`, as `save` does.
+#[test]
+fn the_local_mode_saves_acknowledged_updates_when_it_leaves_a_database() {
+    let cwd = scratch("gc_local_save");
+    let _cwd = DirGuard(cwd.clone());
+    let one = "<http://a> <http://p> <http://b> .\n";
+    let insert = "insert data { <http://a> <http://p> <http://c> };\n";
+    snapshot_db(&cwd, "other", one);
+    for (how, tail) in [
+        ("quit", "quit;\n"),
+        ("the end of the input", ""),
+        ("load <other>", "load other\nquit;\n"),
+    ] {
+        let kept = snapshot_db(&cwd, "kept", one);
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_gconsole"));
+        cmd.current_dir(&cwd).args(["--local", "kept"]);
+        let r = run(cmd, &format!("{insert}{tail}"));
+        assert_eq!(r.code, 0, "{how}: {r:?}");
+        assert!(r.out.contains("[updated 1 triple(s)]"), "{how}: {r:?}");
+        assert_eq!(triples_in(&kept), 2, "{how}: the insert is kept: {r:?}");
+        assert!(r.out.contains("saved to "), "{how}: the save is reported: {r:?}");
+        fs::remove_dir_all(&kept).unwrap();
+    }
+    // Nothing changed: nothing is written.
+    snapshot_db(&cwd, "kept", one);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_gconsole"));
+    cmd.current_dir(&cwd).args(["--local", "kept"]);
+    let r = run(cmd, "select * where { ?s ?p ?o };\nquit;\n");
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(!r.out.contains("saved to"), "{r:?}");
+    // A new in-memory database: saved where `save` saves it.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_gconsole"));
+    cmd.current_dir(&cwd).args(["--local", "fresh"]);
+    let r = run(cmd, insert);
+    assert_eq!(r.code, 0, "{r:?}");
+    assert_eq!(triples_in(&cwd.join("fresh.db")), 1, "{r:?}");
+}
+
 /// `create` / `batchinsert` / `batchremove` against a real server whose
 /// import is tolerant (upstream's): bad statements are skipped and counted,
 /// the console prints the server's `success_num` / `failed_num`, and the
