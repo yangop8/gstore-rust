@@ -16,6 +16,10 @@
 //!   answer later requests from statistics cached until the files change,
 //!   instead of opening it on every request (review gapi#17).
 //!
+//! * A `gserver` built without the `tls` feature refuses `--tls-cert` /
+//!   `--tls-key` as an argument error instead of serving plaintext HTTP
+//!   (review http#19).
+//!
 //! Every server here is in-process on `127.0.0.1:0` in a temp directory
 //! removed when the test ends (also when it fails). Synchronisation is by
 //! test hooks that park a step; a timeout only guards against a hang.
@@ -583,4 +587,58 @@ fn unloaded_disk_statistics_are_read_once_until_the_files_change() {
 #[test]
 fn unloaded_rocksdb_statistics_are_read_once_until_the_files_change() {
     unloaded_statistics_are_read_once("rocksdb");
+}
+
+// ---- gserver without the tls feature (http#19) ------------------------------
+
+/// A `gserver` built without the `tls` feature cannot serve HTTPS: given
+/// `--tls-cert` / `--tls-key` it refuses them as an argument error instead
+/// of warning and then serving plaintext HTTP.
+#[cfg(not(feature = "tls"))]
+#[test]
+fn a_gserver_without_tls_refuses_the_tls_options() {
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+
+    let home = TmpDir::new("notls");
+    let child = Command::new(env!("CARGO_BIN_EXE_gserver"))
+        .args(["-p", "0", "--addr", "127.0.0.1", "--password", "pw"])
+        .arg("--db-home")
+        .arg(&home.0)
+        .arg("--tls-cert")
+        .arg(home.0.join("cert.pem"))
+        .arg("--tls-key")
+        .arg(home.0.join("key.pem"))
+        .arg("--api")
+        .arg(&home.0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let (tx, rx) = mpsc::channel();
+    let waiter = thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    let out = match rx.recv_timeout(HANG_GUARD) {
+        Ok(out) => out.unwrap(),
+        Err(_) => {
+            // Still serving (plaintext): stop it, then fail.
+            let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
+            let _ = waiter.join();
+            panic!("gserver without tls kept serving with --tls-cert/--tls-key");
+        }
+    };
+    let _ = waiter.join();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !out.status.success(),
+        "exit status {:?}; stderr: {stderr}",
+        out.status
+    );
+    assert!(stderr.contains("--tls-cert"), "stderr: {stderr}");
+    assert!(stderr.contains("`tls` feature"), "stderr: {stderr}");
+    assert!(!stdout.contains("http://"), "it served: {stdout}");
 }

@@ -217,8 +217,13 @@
 //! with `db_name=`, else on every database); `/build` and `/drop` are
 //! reserved to `root` (and `admin` users), as upstream.
 //!
-//! As with [`crate::server`], real TLS is out of scope — terminate HTTPS in a
-//! reverse proxy and do not send credentials over plain `http://` in production.
+//! **HTTPS.** As with [`crate::server`], a build with the optional `tls`
+//! feature terminates TLS in-process: `ApiServer::serve_forever_tls` with
+//! a `rustls::ServerConfig` from `crate::server::load_tls_config`
+//! (`gserver --tls-cert FILE --tls-key FILE`; a `gserver` built without the
+//! feature refuses those options). The default, dependency-free build
+//! speaks plain HTTP only: terminate HTTPS in front of it with a reverse
+//! proxy, and do not send credentials over plain `http://` in production.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -3234,13 +3239,6 @@ impl ApiInner {
         }
     }
 
-    /// Stop serving `name` (if loaded) *without* saving: take its handle out
-    /// of the registry, then — with the state lock released — wait for any
-    /// request still using it and retire the slot (see [`DbSlot::retire`]), so
-    /// its files are closed before the caller replaces or deletes them and a
-    /// request still holding the handle can neither use nor save it. Returns
-    /// whether it was loaded. Must not be called with the state lock held
-    /// (nor a guard of the database).
     /// Open the database at `dir` with this server's open options (see
     /// [`ApiServer::with_open_options`]).
     pub(crate) fn open_db(&self, dir: &Path) -> crate::Result<Database> {
@@ -3266,6 +3264,13 @@ impl ApiInner {
             .unwrap_or(StorageKind::Snapshot)
     }
 
+    /// Stop serving `name` (if loaded) *without* saving: take its handle out
+    /// of the registry, then — with the state lock released — wait for any
+    /// request still using it and retire the slot (see [`DbSlot::retire`]), so
+    /// its files are closed before the caller replaces or deletes them and a
+    /// request still holding the handle can neither use nor save it. Returns
+    /// whether it was loaded. Must not be called with the state lock held
+    /// (nor a guard of the database).
     pub(crate) fn retire_loaded(&self, name: &str) -> Result<bool, OpError> {
         let handle = locked(&self.state).dbs.remove(name);
         match handle {
