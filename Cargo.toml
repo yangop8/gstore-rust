@@ -143,6 +143,12 @@ path = "src/bin/gcompact.rs"
 # .deb / .rpm packages from a release build: the binaries in /usr/bin, the
 # configuration in /etc/gstore, the systemd unit, the gstore system user
 # (sysusers.d) and its working directory /var/lib/gstore (tmpfiles.d).
+# The packages are built with the `pfn-wasm` feature, as the container image
+# (Dockerfile's FEATURES): `cargo build --release -p gstore --features
+# pfn-wasm` before `cargo deb --no-build` / `cargo generate-rpm` (cargo deb
+# without --no-build uses `features` below itself).
+# .github/workflows/packaging.yml builds both packages and the image, and
+# runs scripts/package-smoke.sh against each.
 [package.metadata.deb]
 name = "gstore"
 maintainer = "gstore-rust maintainers <https://github.com/yangop8/gstore-rust/issues>"
@@ -152,27 +158,21 @@ gstore-rust is a Rust rewrite of gStore, an RDF triple store / graph database \
 answering SPARQL queries by subgraph matching. This package provides gserver, \
 an HTTP server speaking upstream gStore 1.4's /api protocol (run as the gserver \
 systemd service), the gconsole client and the command-line tools gbuild, \
-gquery, gadd, gsub, gdrop, gshow, gbackup, grestore, gexport, gmonitor, gcompact and gnode."""
+gquery, gadd, gsub, gdrop, gshow, gbackup, grestore, gexport, gmonitor, gcompact and gnode. \
+Built with the pfn-wasm feature (PFN user functions run in a WebAssembly \
+sandbox)."""
 section = "database"
 priority = "optional"
 depends = "$auto, adduser"
+features = ["pfn-wasm"]
 conf-files = ["/etc/gstore/conf.ini"]
 maintainer-scripts = "packaging/debian/"
+# "$auto": every binary target of the gstore package (cargo metadata), in
+# /usr/bin, mode 755 -- no hand-kept list to fall out of step with the
+# [[bin]] targets (review infra#7) -- and the package's README, as
+# /usr/share/doc/gstore/README.md.
 assets = [
-    ["target/release/gserver", "usr/bin/", "755"],
-    ["target/release/gconsole", "usr/bin/", "755"],
-    ["target/release/gbuild", "usr/bin/", "755"],
-    ["target/release/gquery", "usr/bin/", "755"],
-    ["target/release/gadd", "usr/bin/", "755"],
-    ["target/release/gsub", "usr/bin/", "755"],
-    ["target/release/gdrop", "usr/bin/", "755"],
-    ["target/release/gshow", "usr/bin/", "755"],
-    ["target/release/gbackup", "usr/bin/", "755"],
-    ["target/release/grestore", "usr/bin/", "755"],
-    ["target/release/gexport", "usr/bin/", "755"],
-    ["target/release/gmonitor", "usr/bin/", "755"],
-    ["target/release/gcompact", "usr/bin/", "755"],
-    ["target/release/gnode", "usr/bin/", "755"],
+    "$auto",
     ["conf/conf.ini.example", "etc/gstore/conf.ini", "640"],
     ["conf/slog.properties.example", "etc/gstore/slog.properties.example", "644"],
     ["conf/slog.stdout.properties.example", "etc/gstore/slog.stdout.properties.example", "644"],
@@ -180,12 +180,19 @@ assets = [
     ["packaging/sysusers/gstore.conf", "usr/lib/sysusers.d/gstore.conf", "644"],
     ["packaging/tmpfiles/gstore.conf", "usr/lib/tmpfiles.d/gstore.conf", "644"],
     ["docs/DEPLOY.md", "usr/share/doc/gstore/DEPLOY.md", "644"],
-    ["README.md", "usr/share/doc/gstore/README.md", "644"],
 ]
 
+# cargo-generate-rpm has no automatic binary assets: the list below names
+# every [[bin]] target, and tests/packaging_layout.rs fails when it does not
+# (packaging.yml also checks the built package against cargo metadata).
+# %pre creates the gstore user and group, so conf.ini is installed with group
+# gstore as declared here (review infra#15). /etc/gstore itself is not a
+# package entry (cargo-generate-rpm 0.21's `dir = true` assets fail to
+# build), so %post gives it its group and mode.
 [package.metadata.generate-rpm]
 name = "gstore"
-summary = "gStore RDF graph database (Rust rewrite): gserver and command-line tools"
+summary = "gStore RDF graph database (Rust rewrite): gserver and command-line tools (built with pfn-wasm)"
+pre_install_script = "packaging/rpm/pre_install.sh"
 post_install_script = "packaging/rpm/post_install.sh"
 pre_uninstall_script = "packaging/rpm/pre_uninstall.sh"
 assets = [
@@ -203,7 +210,7 @@ assets = [
     { source = "target/release/gmonitor", dest = "/usr/bin/gmonitor", mode = "755" },
     { source = "target/release/gcompact", dest = "/usr/bin/gcompact", mode = "755" },
     { source = "target/release/gnode", dest = "/usr/bin/gnode", mode = "755" },
-    { source = "conf/conf.ini.example", dest = "/etc/gstore/conf.ini", mode = "640", config = "noreplace" },
+    { source = "conf/conf.ini.example", dest = "/etc/gstore/conf.ini", mode = "640", group = "gstore", config = "noreplace" },
     { source = "conf/slog.properties.example", dest = "/etc/gstore/slog.properties.example", mode = "644" },
     { source = "conf/slog.stdout.properties.example", dest = "/etc/gstore/slog.stdout.properties.example", mode = "644" },
     { source = "packaging/systemd/gserver.service", dest = "/usr/lib/systemd/system/gserver.service", mode = "644" },
