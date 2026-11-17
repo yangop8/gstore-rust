@@ -1,0 +1,4 @@
+@prefix : <http://example.org/> .
+:a :tag "x" , "y" .
+:b :tag "x" .
+:c :tag "z" .

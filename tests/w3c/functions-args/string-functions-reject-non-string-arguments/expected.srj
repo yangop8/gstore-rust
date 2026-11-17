@@ -1,0 +1,6 @@
+{
+  "head": {"vars": ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]},
+  "results": {"bindings": [
+    {}
+  ]}
+}

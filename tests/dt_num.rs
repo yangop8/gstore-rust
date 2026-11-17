@@ -60,18 +60,44 @@ fn num2_filter_nested_or() {
     }
 }
 
+/// The subjects whose salary passes `filter` (a FILTER over `?s`), sorted.
+fn earners(db: &mut Database, filter: &str) -> Vec<String> {
+    column(
+        db,
+        &format!(
+            "PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+             SELECT ?x WHERE {{ ?x foaf:salary ?s . FILTER({filter}) }}"
+        ),
+        0,
+    )
+}
+
 #[test]
 fn filter_strict_inequality_excludes_equal() {
-    // A direct check that FILTER numeric comparison is strict.
+    // A direct check that FILTER numeric comparison is strict. review
+    // tests-b#12: the threshold used to be 100000, which no salary equals
+    // (the largest is David's 10000), so a `>` evaluated as `>=` passed;
+    // the thresholds are now the largest and the smallest salaries, each
+    // compared strictly and non-strictly.
     let mut db = build();
-    let n = db
-        .select(
-            "PREFIX foaf: <http://xmlns.com/foaf/0.1/>
-             SELECT ?x WHERE { ?x foaf:salary ?s . FILTER(?s > 100000) }",
-        )
-        .unwrap()
-        .row_count();
-    assert_eq!(n, 0, "nobody earns over 100000 in num.nt");
+    assert_eq!(earners(&mut db, "?s > 10000"), Vec::<String>::new());
+    assert_eq!(
+        earners(&mut db, "?s >= 10000"),
+        vec!["<http://example/david>"]
+    );
+    assert_eq!(earners(&mut db, "?s < 2000"), Vec::<String>::new());
+    assert_eq!(
+        earners(&mut db, "?s <= 2000"),
+        vec!["<http://example/carol>"]
+    );
+    assert_eq!(
+        earners(&mut db, "?s != 2500"),
+        vec![
+            "<http://example/bob>",
+            "<http://example/carol>",
+            "<http://example/david>"
+        ]
+    );
 }
 
 #[test]
@@ -84,6 +110,11 @@ fn order_by_salary_desc() {
         )
         .unwrap();
     assert_eq!(rs.row_count(), 1);
-    // Highest salary in num.nt is David's 10000.
-    assert!(rs.rows[0][1].as_ref().unwrap().contains("10000"));
+    // Highest salary in num.nt is David's 10000 (review tests-b#12: the
+    // full typed term and the subject, not a substring of the cell).
+    assert_eq!(rs.rows[0][0].as_deref(), Some("<http://example/david>"));
+    assert_eq!(
+        rs.rows[0][1].as_deref(),
+        Some("\"10000\"^^<http://www.w3.org/2001/XMLSchema#integer>")
+    );
 }

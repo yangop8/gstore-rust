@@ -214,7 +214,7 @@ fn key_term(s: &str) -> Option<Term> {
 #[path = "topk.rs"]
 mod topk;
 use topk::PreparedBgp;
-pub use topk::{DpbMode, EvalStats, TopKOptions};
+pub use topk::{force_streaming_on_this_thread, DpbMode, EvalStats, TopKOptions};
 
 // The hash index of OPTIONAL, MINUS and the joins over maybe-unbound
 // variables, shared by both executors (review sparqlconf#2 / query#10).
@@ -852,6 +852,264 @@ pub type CsrProvider<'a> = dyn Fn() -> Result<Arc<CsrGraph>> + 'a;
 /// (an out-of-core dictionary, or one too small to index).
 pub type StringIndexProvider<'a> = dyn Fn() -> Option<Arc<StringIndex>> + 'a;
 
+/// The evaluation settings of a database — or of a read snapshot taken
+/// from it — that every [`Evaluator`] it builds must carry: captured once
+/// ([`Database::eval_settings`](crate::Database::eval_settings)), stored
+/// by every snapshot (transaction reads, [`ConcurrentDb`](crate::ConcurrentDb)
+/// snapshots), and applied by one call,
+/// [`Evaluator::with_settings`], at every construction site. A new
+/// per-database setting is one field here — it cannot be forgotten at one
+/// of the sites (review design#9: the chain of `with_*` calls was copied at
+/// six places, and a transaction read once missed the `SERVICE` policy).
+///
+/// The data (dictionary, store, named graphs) and the per-request inputs
+/// (cancel flag, the requesting user's PFN caller) are not settings; the
+/// CSR and substring-index caches are borrowed per evaluation
+/// ([`EvalProviders`]). [`Default`] is what [`Evaluator::new`] starts with.
+#[derive(Clone)]
+pub struct EvalSettings {
+    /// What `SERVICE` may contact
+    /// ([`with_service_policy`](Evaluator::with_service_policy); a
+    /// database's [`LoadPolicy::service_policy`](crate::db::LoadPolicy::service_policy)).
+    pub service_policy: crate::db::ServicePolicy,
+    /// How `/` divides two integers
+    /// ([`with_integer_division`](Evaluator::with_integer_division)).
+    pub integer_division: IntegerDivision,
+    /// The `LIMIT` / `ORDER BY` / `ASK` optimizations
+    /// ([`with_topk_options`](Evaluator::with_topk_options)).
+    pub topk: TopKOptions,
+    /// The graph-function / PFN output budget of one query
+    /// ([`with_gfun_max_output_bytes`](Evaluator::with_gfun_max_output_bytes)).
+    pub gfun_max_output_bytes: usize,
+    /// The repeated property-path solutions one query may hand out
+    /// ([`with_path_max_duplicates`](Evaluator::with_path_max_duplicates)).
+    pub path_max_duplicates: u64,
+    /// The sandbox limits every PFN call runs under, whoever the caller.
+    pub pfn_limits: crate::pfn::PfnLimits,
+    /// The database's own PFN caller ([`Database::set_pfn_caller`](crate::Database::set_pfn_caller)):
+    /// used when a request brings none.
+    pub pfn: Option<crate::pfn::PfnCaller>,
+    /// User-defined scalar functions ([`with_functions`](Evaluator::with_functions)).
+    pub functions: FunctionRegistry,
+    /// How a VS-tree is used ([`with_vs_policy`](Evaluator::with_vs_policy));
+    /// `None` = the thread's / process's policy.
+    pub vs_policy: Option<VsPolicy>,
+}
+
+impl Default for EvalSettings {
+    fn default() -> EvalSettings {
+        EvalSettings {
+            service_policy: crate::db::ServicePolicy::AnyHost,
+            integer_division: IntegerDivision::default(),
+            topk: TopKOptions::default(),
+            gfun_max_output_bytes: crate::analytics::gfun::paths::MAX_OUTPUT_BYTES,
+            path_max_duplicates: PATH_MAX_DUPLICATES,
+            pfn_limits: crate::pfn::PfnLimits::default(),
+            pfn: None,
+            functions: FunctionRegistry::new(),
+            vs_policy: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for EvalSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EvalSettings")
+            .field("service_policy", &self.service_policy)
+            .field("integer_division", &self.integer_division)
+            .field("topk", &self.topk)
+            .field("gfun_max_output_bytes", &self.gfun_max_output_bytes)
+            .field("path_max_duplicates", &self.path_max_duplicates)
+            .field("pfn_limits", &self.pfn_limits)
+            .field("pfn", &self.pfn)
+            .field("functions", &self.functions.len())
+            .field("vs_policy", &self.vs_policy)
+            .finish()
+    }
+}
+
+/// The caches an evaluation borrows from whoever builds it
+/// ([`Evaluator::with_settings`]): the per-predicate CSR of the graph
+/// functions and the dictionary substring index. Both fields must be
+/// given, so every construction site decides about both: `None` makes the
+/// evaluator build its own on first use (the right choice when the store
+/// is not the one a cache covers — a `WITH` graph, a `USING` merge).
+#[derive(Clone, Copy)]
+pub struct EvalProviders<'a> {
+    /// See [`Evaluator::with_csr_provider`].
+    pub csr: Option<&'a CsrProvider<'a>>,
+    /// See [`Evaluator::with_string_index_provider`].
+    pub string_index: Option<&'a StringIndexProvider<'a>>,
+}
+
+impl EvalProviders<'_> {
+    /// No cache: the evaluator builds what it needs per query.
+    pub const NONE: EvalProviders<'static> = EvalProviders {
+        csr: None,
+        string_index: None,
+    };
+}
+
+/// The dictionary substring index of a read snapshot, kept across its
+/// queries: seeded with the database's cached index when the snapshot is
+/// taken ([`seeded`](Self::seeded)), else built on first use and kept —
+/// unless the build was cancelled. It serves only the dictionary state it
+/// was made for (equal [`Dictionary::generation`]); a query over another
+/// state (a [`ConcurrentDb`](crate::ConcurrentDb) version that interned
+/// new terms) gets an index built for it and not kept (review design#9:
+/// transaction and `ConcurrentDb` reads rebuilt the index on every
+/// substring query). As the database's own cache does, a query that finds
+/// the first build still running goes on without the prefilter (exact all
+/// the same) instead of waiting for it.
+#[derive(Default)]
+pub struct StringIndexCell {
+    slot: std::sync::Mutex<IndexSlot>,
+}
+
+/// The state of a [`StringIndexCell`].
+#[derive(Default)]
+struct IndexSlot {
+    /// The generation it serves and its index (`None` inside: no index
+    /// helps, a small or out-of-core dictionary).
+    entry: Option<(u64, Option<Arc<StringIndex>>)>,
+    /// A first build is running.
+    building: bool,
+}
+
+impl StringIndexCell {
+    /// An empty cell (built on first use).
+    pub fn new() -> StringIndexCell {
+        StringIndexCell::default()
+    }
+
+    /// A cell holding `index`, built for a dictionary at `generation`.
+    pub fn seeded(generation: u64, index: Arc<StringIndex>) -> StringIndexCell {
+        StringIndexCell {
+            slot: std::sync::Mutex::new(IndexSlot {
+                entry: Some((generation, Some(index))),
+                building: false,
+            }),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, IndexSlot> {
+        self.slot.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The index for `dict` as it is now (see the type docs); a raised
+    /// `cancel` stops a build, which gives `None` and keeps nothing.
+    pub fn get(&self, dict: &Dictionary, cancel: Option<&AtomicBool>) -> Option<Arc<StringIndex>> {
+        let generation = dict.generation();
+        {
+            let mut slot = self.lock();
+            match &slot.entry {
+                Some((g, index)) if *g == generation => return index.clone(),
+                // Another state: an index of its own, not kept.
+                Some(_) => {}
+                None if slot.building => return None,
+                None => {
+                    slot.building = true;
+                    drop(slot);
+                    /// Ends the first build — also when it panics.
+                    struct Building<'c>(&'c StringIndexCell);
+                    impl Drop for Building<'_> {
+                        fn drop(&mut self) {
+                            self.0.lock().building = false;
+                        }
+                    }
+                    let _building = Building(self);
+                    let built = dictionary_string_index_cancellable(dict, cancel).ok()?;
+                    self.lock().entry = Some((generation, built.clone()));
+                    return built;
+                }
+            }
+        }
+        dictionary_string_index_cancellable(dict, cancel)
+            .ok()
+            .flatten()
+    }
+}
+
+/// What an evaluator was configured with, as [`watch_evaluator_settings`]
+/// reports it for every evaluation (a test hook, review design#9: every
+/// read and UPDATE construction site must apply the database's
+/// [`EvalSettings`]).
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct SeenSettings {
+    pub service_policy: crate::db::ServicePolicy,
+    pub integer_division: IntegerDivision,
+    pub topk: TopKOptions,
+    pub gfun_max_output_bytes: usize,
+    pub path_max_duplicates: u64,
+    /// The limits of the PFN caller (`None`: no caller).
+    pub pfn_limits: Option<crate::pfn::PfnLimits>,
+    /// How many user-defined functions it sees.
+    pub functions: usize,
+    pub vs_policy: Option<VsPolicy>,
+    pub csr_provider: bool,
+    pub string_index_provider: bool,
+}
+
+impl SeenSettings {
+    /// What an evaluator configured with `settings` (and a PFN caller iff
+    /// `settings.pfn` is set) and providers `csr` / `string_index` reports.
+    pub fn of(settings: &EvalSettings, csr: bool, string_index: bool) -> SeenSettings {
+        SeenSettings {
+            service_policy: settings.service_policy,
+            integer_division: settings.integer_division,
+            topk: settings.topk,
+            gfun_max_output_bytes: settings.gfun_max_output_bytes,
+            path_max_duplicates: settings.path_max_duplicates,
+            pfn_limits: settings.pfn.as_ref().map(|_| settings.pfn_limits),
+            functions: settings.functions.len(),
+            vs_policy: settings.vs_policy,
+            csr_provider: csr,
+            string_index_provider: string_index,
+        }
+    }
+}
+
+static WATCHING: AtomicBool = AtomicBool::new(false);
+static WATCHED: std::sync::Mutex<Vec<SeenSettings>> = std::sync::Mutex::new(Vec::new());
+/// One watch at a time (a second waits for the first to end).
+static WATCH_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// While the returned guard lives, every evaluation of the process — each
+/// [`Evaluator::evaluate`] and [`Evaluator::eval_update_modify`] call, on
+/// any thread — records the settings its evaluator was configured with
+/// ([`EvalWatch::take`]). A test hook (review design#9); off, it costs one
+/// relaxed atomic load per evaluation. Watches do not overlap: a second
+/// waits until the first guard is dropped.
+#[doc(hidden)]
+pub fn watch_evaluator_settings() -> EvalWatch {
+    let turn = WATCH_TURN.lock().unwrap_or_else(|e| e.into_inner());
+    WATCHED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    WATCHING.store(true, AtomicOrdering::SeqCst);
+    EvalWatch { _turn: turn }
+}
+
+/// A running [`watch_evaluator_settings`].
+#[doc(hidden)]
+pub struct EvalWatch {
+    _turn: std::sync::MutexGuard<'static, ()>,
+}
+
+impl EvalWatch {
+    /// The settings recorded since the watch began (or since the last
+    /// `take`), in evaluation order.
+    pub fn take(&self) -> Vec<SeenSettings> {
+        std::mem::take(&mut *WATCHED.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
+impl Drop for EvalWatch {
+    fn drop(&mut self) {
+        WATCHING.store(false, AtomicOrdering::SeqCst);
+        WATCHED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+}
+
 /// Per-query memoization of whole-graph analytics results (see
 /// [`Evaluator::algo_cache`]). All maps are keyed by dense node id
 /// ([`EntityLiteralId`](crate::model::id::EntityLiteralId) = `u32`).
@@ -912,37 +1170,75 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// Build an evaluator that uses `vstree` to prune entity-variable bindings.
     pub fn with_vstree(dict: &'a Dictionary, store: &'a S, vstree: &'a VsTree) -> Evaluator<'a, S> {
         Evaluator {
-            dict,
-            store,
             vstree: Some(vstree),
-            vs_policy: None,
-            named: None,
-            extras: Rc::new(std::cell::RefCell::new(Extras::default())),
-            plan_cache: std::cell::RefCell::new(HashMap::new()),
-            graph_cache: std::cell::RefCell::new(None),
-            functions: Rc::new(FunctionRegistry::new()),
-            cancel: None,
-            algo_cache: std::cell::RefCell::new(AlgoCache::default()),
-            string_index: std::cell::RefCell::new(None),
-            string_index_tried: std::cell::Cell::new(false),
-            string_index_provider: None,
-            memo: Rc::default(),
-            service_policy: crate::db::ServicePolicy::AnyHost,
-            service_denied: Rc::new(std::cell::Cell::new(false)),
-            failed: Rc::default(),
-            csr_provider: None,
-            gfun_csr: std::cell::RefCell::new(None),
-            integer_division: IntegerDivision::default(),
-            topk: TopKOptions::default(),
-            stats: Rc::default(),
-            gfun_max_output: crate::analytics::gfun::paths::MAX_OUTPUT_BYTES,
-            gfun_spent: Rc::default(),
-            pfn: None,
-            ctx: Rc::default(),
-            path_max_duplicates: PATH_MAX_DUPLICATES,
-            path_duplicates: Rc::default(),
-            path_sets: Rc::default(),
+            ..Evaluator::new(dict, store)
         }
+    }
+
+    /// Apply a database's (or snapshot's) evaluation settings in one call
+    /// (see [`EvalSettings`]): the `SERVICE` policy, integer division,
+    /// Top-K options, graph-function budget, path budget, user-defined
+    /// functions, VS-tree policy and the PFN caller — `request_pfn` (the
+    /// requesting user's) if given, else the settings' own, under the
+    /// settings' PFN limits either way — plus the CSR and substring-index
+    /// caches of `providers`. Every database read and UPDATE path and
+    /// every read snapshot builds its evaluator with this (review
+    /// design#9); the per-request cancel flag and named graphs are set
+    /// apart ([`with_cancel`](Self::with_cancel), [`with_named`](Self::with_named)).
+    pub fn with_settings(
+        mut self,
+        settings: EvalSettings,
+        providers: EvalProviders<'a>,
+        request_pfn: Option<&crate::pfn::PfnCaller>,
+    ) -> Evaluator<'a, S> {
+        let EvalSettings {
+            service_policy,
+            integer_division,
+            topk,
+            gfun_max_output_bytes,
+            path_max_duplicates,
+            pfn_limits,
+            pfn,
+            functions,
+            vs_policy,
+        } = settings;
+        self.service_policy = service_policy;
+        self.integer_division = integer_division;
+        self.topk = topk;
+        self.gfun_max_output = gfun_max_output_bytes;
+        self.path_max_duplicates = path_max_duplicates;
+        self.pfn = request_pfn
+            .cloned()
+            .or(pfn)
+            .map(|caller| caller.with_limits(pfn_limits));
+        self.functions = Rc::new(functions);
+        if vs_policy.is_some() {
+            self.vs_policy = vs_policy;
+        }
+        self.csr_provider = providers.csr;
+        self.string_index_provider = providers.string_index;
+        self
+    }
+
+    /// Record this evaluator's settings for a running
+    /// [`watch_evaluator_settings`] (a test hook).
+    fn note_settings(&self) {
+        if !WATCHING.load(AtomicOrdering::Relaxed) {
+            return;
+        }
+        let seen = SeenSettings {
+            service_policy: self.service_policy,
+            integer_division: self.integer_division,
+            topk: self.topk,
+            gfun_max_output_bytes: self.gfun_max_output,
+            path_max_duplicates: self.path_max_duplicates,
+            pfn_limits: self.pfn.as_ref().map(crate::pfn::PfnCaller::limits),
+            functions: self.functions.len(),
+            vs_policy: self.vs_policy,
+            csr_provider: self.csr_provider.is_some(),
+            string_index_provider: self.string_index_provider.is_some(),
+        };
+        WATCHED.lock().unwrap_or_else(|e| e.into_inner()).push(seen);
     }
 
     /// Use the VS-tree under `policy` (see [`VsPolicy`]) instead of the
@@ -1192,6 +1488,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// Evaluate a read query (SELECT / ASK / CONSTRUCT). Updates are handled in
     /// the db layer.
     pub fn evaluate(&self, query: &Query) -> Result<QueryResult> {
+        self.note_settings();
         let _probes = self.count_join_probes();
         self.ctx.begin_execution();
         self.check_cancel()?;
@@ -1269,6 +1566,19 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// Evaluate DESCRIBE: collect the resource ids (explicit terms + variable
     /// targets bound by the WHERE pattern) and return every triple having one of
     /// them as subject (the outgoing description), de-duplicated.
+    ///
+    /// SPARQL 1.1 §16.4 leaves the form of a description to the service;
+    /// this one is not a Concise Bounded Description: blank-node objects
+    /// are not followed, so `DESCRIBE :f` over `:f :p _:b . _:b :q "x"`
+    /// returns `:f :p _:b` only, and since a blank-node label cannot be
+    /// named in a later query, `_:b`'s own triples are reachable only
+    /// through a pattern (`SELECT … { :f :p ?b . ?b ?q ?o }`). Incoming
+    /// triples and named graphs are not described either (review
+    /// sparqlconf#19; CBD is in docs/REFACTOR_BACKLOG.md). A request's
+    /// syntax tree is bounded too ([`MAX_TREE_HEIGHT`](crate::parser::sparql::MAX_TREE_HEIGHT)
+    /// links, counting every `UNION` branch or `||` operand of a chain), so
+    /// a generated DESCRIBE — or any query — with more than about a
+    /// thousand chained alternatives is refused as nested too deeply.
     fn eval_describe(&self, d: &DescribeQuery) -> Result<Vec<Triple>> {
         // The resources in first-seen order, de-duplicated through a hash
         // set (a linear `contains` per solution was quadratic in the number
@@ -1376,6 +1686,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         insert: &[QuadPattern],
         pattern: &GraphPattern,
     ) -> Result<(Vec<(Option<String>, Triple)>, Vec<(Option<String>, Triple)>)> {
+        self.note_settings();
         let _probes = self.count_join_probes();
         self.ctx.begin_execution();
         self.check_pattern_calls(pattern)?;
@@ -2209,8 +2520,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// in order (a later one may use an earlier alias) and ORDER BY sees the
     /// aliases. A group row binds each GROUP BY variable to the group's key
     /// and, as before, every other WHERE variable to its value in the group's
-    /// first solution. `bind_only` is [`bind_only_vars`] of the pattern, for
-    /// the projected graph functions.
+    /// first solution — which the projection cannot show: projecting a
+    /// non-grouped variable, or using one in a SELECT expression outside an
+    /// aggregate, is a query error (§11.4, review sparqlconf#15; HAVING and
+    /// ORDER BY still see the first solution's value). `bind_only` is
+    /// [`bind_only_vars`] of the pattern, for the projected graph functions.
     fn eval_aggregation(
         &self,
         solutions: &[Binding],
@@ -2226,6 +2540,79 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 ))
             }
         };
+        // SPARQL 1.1 §11.4 (Aggregate Projection Restrictions): a variable
+        // of the WHERE pattern may be projected — or used in a SELECT
+        // expression outside an aggregate — only when it is a GROUP BY key.
+        // Anything else would show the value of an arbitrary solution of
+        // its group (the first one), so it is a query error (review
+        // sparqlconf#15). Allowed besides the keys: a variable of a
+        // trailing VALUES block (joined after grouping, §18.2.4.3), an
+        // earlier SELECT alias, a sub-expression equal to a GROUP BY
+        // expression (`(STR(?o) AS ?k) … GROUP BY STR(?o)`), and what the
+        // pattern never binds (unbound in every group). Graph-function and
+        // PFN projections and EXISTS are not looked into.
+        fn ungrouped<'e>(
+            e: &'e Expr,
+            keys: &[Expr],
+            allowed: &HashSet<&str>,
+            layout: &VarLayout,
+        ) -> Option<&'e str> {
+            if keys.contains(e) {
+                return None;
+            }
+            let free = |x: &'e Expr| ungrouped(x, keys, allowed, layout);
+            match e {
+                Expr::Var(v) => (layout.index.contains_key(v) && !allowed.contains(v.as_str()))
+                    .then_some(v.as_str()),
+                Expr::Const(_)
+                | Expr::Aggregate { .. }
+                | Expr::GraphFn { .. }
+                | Expr::Pfn { .. }
+                | Expr::Exists(..) => None,
+                Expr::Or(a, b)
+                | Expr::And(a, b)
+                | Expr::Compare(_, a, b)
+                | Expr::Arith(_, a, b) => free(a).or_else(|| free(b)),
+                Expr::Not(a) | Expr::Unary(_, a) => free(a),
+                Expr::Builtin(_, args) | Expr::IriCall { args, .. } => args.iter().find_map(free),
+                Expr::In { expr, list, .. } => free(expr).or_else(|| list.iter().find_map(free)),
+            }
+        }
+        let mut allowed: HashSet<&str> = q
+            .group_by
+            .iter()
+            .filter_map(|e| match e {
+                Expr::Var(v) => Some(v.as_str()),
+                _ => None,
+            })
+            .collect();
+        if let Some((vars, _)) = &q.values {
+            allowed.extend(vars.iter().map(String::as_str));
+        }
+        for it in items {
+            let bad = match it {
+                SelectItem::Var(v) => (layout.index.contains_key(v)
+                    && !allowed.contains(v.as_str()))
+                .then_some(v.as_str()),
+                SelectItem::Expr(e, _) => ungrouped(e, &q.group_by, &allowed, layout),
+            };
+            if let Some(v) = bad {
+                let what = if q.group_by.is_empty() {
+                    "an aggregate query without GROUP BY (one group)"
+                } else {
+                    "a GROUP BY query"
+                };
+                return Err(GStoreError::Query(format!(
+                    "?{v} is not grouped: {what} may project a variable of the WHERE \
+                     pattern, or use it in a SELECT expression, only as a GROUP BY key or \
+                     inside an aggregate (SPARQL 1.1 §11.4); group by ?{v} or project \
+                     (SAMPLE(?{v}) AS ?…)"
+                )));
+            }
+            if let SelectItem::Expr(_, alias) = it {
+                allowed.insert(alias);
+            }
+        }
 
         // Group key = the GROUP BY expression values (empty ⇒ one group). A
         // plain variable keys by its bound term itself (RDF term identity, in
@@ -3873,11 +4260,26 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             }
         } else {
             let key = plans_key(&plans);
-            self.plan_cache
-                .borrow_mut()
-                .entry(key)
-                .or_insert_with(|| optimizer::optimize(&plans, &counts, &candidates, layout.len()))
-                .clone()
+            let cached = self.plan_cache.borrow().get(&key).cloned();
+            match cached {
+                Some(plan) => plan,
+                None => {
+                    // The search of a large BGP is bounded and polls the
+                    // cancel check (review query#13); a plan it cut short
+                    // is not cached — the caller reports the cancel.
+                    let plan = optimizer::optimize_until(
+                        &plans,
+                        &counts,
+                        &candidates,
+                        layout.len(),
+                        &|| self.cancelled(),
+                    );
+                    if !self.cancelled() {
+                        self.plan_cache.borrow_mut().insert(key, plan.clone());
+                    }
+                    plan
+                }
+            }
         };
         PreparedBgp::Plan(topk::BgpPlan {
             plans,
@@ -5096,12 +5498,20 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             return None;
         }
         // BOUND inspects binding state directly (its arg may be unbound).
+        // §17.4.1.1: a variable the pattern never binds has no value, so
+        // BOUND is false, not an error; inside EXISTS a variable the outer
+        // solution binds was substituted by its term, which is bound
+        // (review query#14).
         if name == "BOUND" {
-            if let [Expr::Var(v)] = args {
-                let idx = *l.index.get(v)?;
-                return Some(Value::Bool(b[idx].is_some()));
-            }
-            return None;
+            return match args {
+                [Expr::Var(v)] => Some(Value::Bool(
+                    l.index
+                        .get(v)
+                        .is_some_and(|&idx| b.get(idx).is_some_and(Option::is_some)),
+                )),
+                [Expr::Const(_)] => Some(Value::Bool(true)),
+                _ => None,
+            };
         }
         match name {
             // The term's own lexical form ("05"^^xsd:unsignedByte is "05").
@@ -5112,9 +5522,13 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 },
                 lang: None,
             }),
+            // The string functions take string literals (simple,
+            // xsd:string or language-tagged) where §17.4.3 says so — an IRI,
+            // a number or another typed literal is an error (review
+            // sparqlconf#17; see `string_literal`).
             "STRLEN" => {
-                let v = self.eval_value(args.first()?, b, l)?;
-                Some(Value::Int(v.lexical().chars().count() as i64))
+                let (s, _) = string_literal(self.eval_value(args.first()?, b, l)?)?;
+                Some(Value::Int(s.chars().count() as i64))
             }
             "UCASE" => self.str1(args, b, l, |s| s.to_uppercase()),
             "LCASE" => self.str1(args, b, l, |s| s.to_lowercase()),
@@ -5185,7 +5599,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 let mut out = String::new();
                 let mut common: Option<Option<String>> = None;
                 for a in args {
-                    let (s, lang) = str_and_lang(&self.eval_value(a, b, l)?);
+                    let (s, lang) = string_literal(self.eval_value(a, b, l)?)?;
                     out.push_str(&s);
                     common = match common {
                         None => Some(lang),
@@ -5207,11 +5621,13 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             // XPath fn:matches: the s / m / i / x / q flags, any other flag
             // an error; the pattern compiled once per query (review
             // query#11, sparqlconf#8; see `xpath_regex`).
+            // §17.4.3.14: the text a string literal, the pattern and the
+            // flags simple literals (review sparqlconf#17).
             "REGEX" => {
-                let text = self.eval_value(args.first()?, b, l)?.lexical();
-                let pat = self.eval_value(args.get(1)?, b, l)?.lexical();
+                let (text, _) = string_literal(self.eval_value(args.first()?, b, l)?)?;
+                let pat = simple_literal(self.eval_value(args.get(1)?, b, l)?)?;
                 let flags = match args.get(2) {
-                    Some(a) => self.eval_value(a, b, l)?.lexical(),
+                    Some(a) => simple_literal(self.eval_value(a, b, l)?)?,
                     None => String::new(),
                 };
                 let re = self.ctx.regex(&pat, &flags)?;
@@ -5220,8 +5636,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
 
             // ---- strings (SPARQL 1.1) ------------------------------------
             "SUBSTR" => {
-                let src = self.eval_value(args.first()?, b, l)?;
-                let (s, lang) = str_and_lang(&src);
+                let (s, lang) = string_literal(self.eval_value(args.first()?, b, l)?)?;
                 let chars: Vec<char> = s.chars().collect();
                 let total = chars.len() as i64;
                 let start = self.eval_value(args.get(1)?, b, l)?.as_f64()?.round() as i64;
@@ -5248,13 +5663,15 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
             // `$N` / `\$` / `\\` syntax (`$1x` is group 1 then "x"), and a
             // pattern matching the empty string is an error (review
             // query#11, sparqlconf#8; see `xpath_regex`).
+            // §17.4.3.15: the input a string literal, the pattern, the
+            // replacement and the flags simple literals (review
+            // sparqlconf#17).
             "REPLACE" => {
-                let src = self.eval_value(args.first()?, b, l)?;
-                let (text, lang) = str_and_lang(&src);
-                let pat = self.eval_value(args.get(1)?, b, l)?.lexical();
-                let rep = self.eval_value(args.get(2)?, b, l)?.lexical();
+                let (text, lang) = string_literal(self.eval_value(args.first()?, b, l)?)?;
+                let pat = simple_literal(self.eval_value(args.get(1)?, b, l)?)?;
+                let rep = simple_literal(self.eval_value(args.get(2)?, b, l)?)?;
                 let flags = match args.get(3) {
-                    Some(a) => self.eval_value(a, b, l)?.lexical(),
+                    Some(a) => simple_literal(self.eval_value(a, b, l)?)?,
                     None => String::new(),
                 };
                 let re = self.ctx.regex(&pat, &flags)?;
@@ -5278,9 +5695,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                     lang: None,
                 })
             }
+            // §17.4.2.11: both arguments simple literals — `STRLANG("a"@fr,
+            // "en")` is an error, not a retagging (review sparqlconf#17).
             "STRLANG" => {
-                let s = self.eval_value(args.first()?, b, l)?.lexical();
-                let lang = self.eval_value(args.get(1)?, b, l)?.lexical();
+                let s = simple_literal(self.eval_value(args.first()?, b, l)?)?;
+                let lang = simple_literal(self.eval_value(args.get(1)?, b, l)?)?;
                 // A language tag by the shared LANGTAG rule, else an error:
                 // `STRLANG("x", "en> bad")` or `STRLANG("x", "")` would
                 // store a literal no reader reads back (review sparqlconf#11).
@@ -6074,7 +6493,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         Some(Value::Int(f(&p)))
     }
 
-    /// Hash an argument's lexical form to a lowercase-hex string literal.
+    /// Hash a simple literal (or xsd:string) to a lowercase-hex string
+    /// literal; anything else — a language-tagged literal, a number, an IRI
+    /// — is an error (§17.4.6, review sparqlconf#17).
     fn hash1(
         &self,
         args: &[Expr],
@@ -6082,7 +6503,7 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         l: &VarLayout,
         f: impl Fn(&str) -> String,
     ) -> Option<Value> {
-        let s = self.eval_value(args.first()?, b, l)?.lexical();
+        let s = simple_literal(self.eval_value(args.first()?, b, l)?)?;
         Some(Value::Str {
             value: f(&s),
             lang: None,
@@ -6090,7 +6511,8 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     }
 
     /// `UCASE` / `LCASE`: map the lexical form, keeping a language tag
-    /// (§17.4.3.5-6: `UCASE("foo"@en)` is `"FOO"@en`).
+    /// (§17.4.3.5-6: `UCASE("foo"@en)` is `"FOO"@en`); the argument must
+    /// be a string literal (review sparqlconf#17).
     fn str1(
         &self,
         args: &[Expr],
@@ -6098,17 +6520,21 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         l: &VarLayout,
         f: impl Fn(&str) -> String,
     ) -> Option<Value> {
-        let (s, lang) = str_and_lang(&self.eval_value(args.first()?, b, l)?);
+        let (s, lang) = string_literal(self.eval_value(args.first()?, b, l)?)?;
         Some(Value::Str { value: f(&s), lang })
     }
 
     /// `STRBEFORE` / `STRAFTER` (§17.4.3.7-8): the part of the first
     /// argument before / after the first occurrence of the second, with the
     /// first argument's language tag; no occurrence gives the empty simple
-    /// literal.
+    /// literal. Both must be string literals, argument-compatible
+    /// (§17.4.3.1.2, review sparqlconf#17).
     fn str_split(&self, args: &[Expr], b: &Binding, l: &VarLayout, before: bool) -> Option<Value> {
-        let (a, lang) = str_and_lang(&self.eval_value(args.first()?, b, l)?);
-        let c = self.eval_value(args.get(1)?, b, l)?.lexical();
+        let (a, lang) = string_literal(self.eval_value(args.first()?, b, l)?)?;
+        let (c, c_lang) = string_literal(self.eval_value(args.get(1)?, b, l)?)?;
+        if !argument_compatible(lang.as_deref(), c_lang.as_deref()) {
+            return None;
+        }
         Some(match a.split_once(&c) {
             Some((head, tail)) => Value::Str {
                 value: if before { head } else { tail }.to_string(),
@@ -6121,6 +6547,9 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         })
     }
 
+    /// `CONTAINS` / `STRSTARTS` / `STRENDS` (§17.4.3.9-11): two
+    /// argument-compatible string literals (§17.4.3.1.2), else an error
+    /// (review sparqlconf#17).
     fn str2_bool(
         &self,
         args: &[Expr],
@@ -6128,8 +6557,11 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         l: &VarLayout,
         f: impl Fn(String, String) -> bool,
     ) -> Option<Value> {
-        let a = self.eval_value(args.first()?, b, l)?.lexical();
-        let c = self.eval_value(args.get(1)?, b, l)?.lexical();
+        let (a, a_lang) = string_literal(self.eval_value(args.first()?, b, l)?)?;
+        let (c, c_lang) = string_literal(self.eval_value(args.get(1)?, b, l)?)?;
+        if !argument_compatible(a_lang.as_deref(), c_lang.as_deref()) {
+            return None;
+        }
         Some(Value::Bool(f(a, c)))
     }
 
@@ -6425,12 +6857,50 @@ fn split_date_tz(s: &str) -> (&str, &str) {
     (s, "")
 }
 
-/// A value's lexical form plus its language tag (preserved by `SUBSTR`/`REPLACE`
-/// when the input is a language-tagged string literal).
-fn str_and_lang(v: &Value) -> (String, Option<String>) {
+/// A string-literal argument of a string function — SPARQL 1.1 §17.4.3.1.1:
+/// a simple literal, an `xsd:string` (the same term under RDF 1.1) or a
+/// language-tagged literal — as its lexical form and language tag. Any
+/// other term (an IRI, a blank node, a number, another typed literal) is
+/// `None`: an error, which leaves a SELECT expression unbound and fails a
+/// FILTER (review sparqlconf#17: `STRLEN(1)`, `CONCAT("a", 1)` and
+/// `REGEX(<iri>, "x")` used to read the term's lexical form).
+///
+/// The one check `STRLEN`, `SUBSTR`, `UCASE`, `LCASE`, `STRSTARTS`,
+/// `STRENDS`, `CONTAINS`, `STRBEFORE`, `STRAFTER`, `CONCAT`, `REGEX` and
+/// `REPLACE` apply to their string arguments ([`simple_literal`] for the
+/// ones the spec types as simple literals). Still lenient, documented:
+/// `ENCODE_FOR_URI`, `LANGMATCHES`, `STRDT` and the gStore extensions
+/// (`CONTAINALL`, `CONTAINANY`, `SIMILARITY`) read any term's lexical
+/// form, and `SUBSTR`'s positions take any numeric, not only `xsd:integer`.
+fn string_literal(v: Value) -> Option<(String, Option<String>)> {
     match v {
-        Value::Str { value, lang } => (value.clone(), lang.clone()),
-        other => (other.lexical(), None),
+        Value::Str { value, lang } => Some((value, lang)),
+        _ => None,
+    }
+}
+
+/// A simple-literal argument (or `xsd:string`, the same term): the regular
+/// expression, flags and replacement of `REGEX` / `REPLACE`, both arguments
+/// of `STRLANG` and the input of the hash functions (SPARQL 1.1 §17.4.2.11,
+/// §17.4.3.14-15, §17.4.6). A language-tagged literal or any other term is
+/// `None`, an error (review sparqlconf#17).
+fn simple_literal(v: Value) -> Option<String> {
+    match v {
+        Value::Str { value, lang: None } => Some(value),
+        _ => None,
+    }
+}
+
+/// SPARQL 1.1 §17.4.3.1.2 Argument Compatibility Rules, on the language
+/// tags of two string literals: both untagged, both tagged with the same
+/// tag (compared case-insensitively, as RDF 1.1 does), or the first tagged
+/// and the second untagged — `CONTAINS("abc"@en, "b"@cy)` and
+/// `STRBEFORE("abc", "b"@en)` are errors.
+fn argument_compatible(first: Option<&str>, second: Option<&str>) -> bool {
+    match (first, second) {
+        (_, None) => true,
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        (None, Some(_)) => false,
     }
 }
 

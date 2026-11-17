@@ -1,0 +1,7 @@
+{
+  "head": {"vars": ["label", "total"]},
+  "results": {"bindings": [
+    {"label": {"type": "literal", "value": "node http://example.org/a"}, "total": {"type": "literal", "value": "3", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}},
+    {"label": {"type": "literal", "value": "node http://example.org/b"}, "total": {"type": "literal", "value": "5", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}}
+  ]}
+}

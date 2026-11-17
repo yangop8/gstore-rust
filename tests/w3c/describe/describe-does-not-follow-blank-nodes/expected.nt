@@ -1,0 +1,2 @@
+<http://example.org/f> <http://example.org/p> _:anything .
+<http://example.org/f> <http://example.org/name> "f" .

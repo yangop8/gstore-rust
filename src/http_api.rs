@@ -249,8 +249,11 @@ use crate::http_users::{
 };
 use crate::kvstore::{DiskReadView, DiskSource, ViewError};
 use crate::model::{Term, Triple};
-use crate::query::engine::CsrProvider;
-use crate::query::{Evaluator, FunctionRegistry, IntegerDivision, QueryResult, TopKOptions};
+use crate::query::engine::EvalProviders;
+use crate::query::{Evaluator, QueryResult};
+// The tests below name it through `use super::*`.
+#[cfg(test)]
+use crate::query::IntegerDivision;
 use crate::reason::rules::RULE_DIR;
 use crate::reason::store::RuleStore;
 use crate::server::{
@@ -1089,25 +1092,21 @@ pub(crate) struct ReadSnapshot {
     named: BTreeMap<u32, TripleStore>,
     /// The committed triple count at `/begin`.
     triples: u64,
-    functions: FunctionRegistry,
-    /// The database's integer-division mode at `/begin`.
-    integer_division: IntegerDivision,
-    /// The database's Top-K / early-termination options at `/begin`.
-    topk: TopKOptions,
     csr: CsrCache,
-    /// What `SERVICE` may contact: the database's load policy at `/begin`
-    /// (a server's restricted policy refuses it, `--allow-service` refuses
-    /// host-local endpoints), so a read inside a transaction cannot bypass
-    /// the `SERVICE` policy.
-    service_policy: crate::db::ServicePolicy,
-    /// The database's graph-function output bound at `/begin`.
-    gfun_max_output_bytes: usize,
-    /// The database's PFN limits at `/begin`.
-    pfn_limits: crate::pfn::PfnLimits,
-    /// The database's own PFN caller ([`Database::set_pfn_caller`]; a served
-    /// database has none — the server passes the user per read, see
-    /// [`read_as`](Self::read_as)).
-    pfn: Option<crate::pfn::PfnCaller>,
+    /// The database's evaluation settings at `/begin`
+    /// ([`Database::eval_settings`]), applied to every read of the snapshot
+    /// in one call ([`configure`](Self::configure); review design#9): the
+    /// `SERVICE` policy (a server's restricted policy refuses it,
+    /// `--allow-service` refuses host-local endpoints — a read inside a
+    /// transaction cannot bypass it), the integer-division mode, the Top-K
+    /// options, the graph-function bound, the user-defined functions and
+    /// the PFN limits and own caller (a served database has none — the
+    /// server passes the user per read, see [`read_as`](Self::read_as)).
+    settings: crate::query::engine::EvalSettings,
+    /// The snapshot's dictionary substring index: the database's cached one
+    /// when there was one at `/begin`, else built on the first substring
+    /// query and kept for the next (review design#9: rebuilt per query).
+    string_index: crate::query::engine::StringIndexCell,
 }
 
 impl ReadSnapshot {
@@ -1330,16 +1329,18 @@ impl ReadSnapshot {
                 .map(|(&g, s)| (g, s.clone()))
                 .collect(),
             triples: db.triple_num(),
-            functions: db.functions().clone(),
-            integer_division: db.integer_division(),
-            topk: db.topk_options(),
             csr: db
                 .cached_csr()
                 .map_or_else(CsrCache::new, |g| CsrCache::seeded(generation, g)),
-            service_policy: db.load_policy().service_policy(),
-            gfun_max_output_bytes: db.gfun_max_output_bytes(),
-            pfn_limits: db.pfn_limits(),
-            pfn: db.pfn_caller(),
+            settings: db.eval_settings(),
+            // The database's index serves the snapshot's dictionary (a
+            // clone at the same generation) while it is current.
+            string_index: db.cached_string_index().map_or_else(
+                crate::query::engine::StringIndexCell::new,
+                |index| {
+                    crate::query::engine::StringIndexCell::seeded(db.dict().generation(), index)
+                },
+            ),
         })
     }
 
@@ -1390,7 +1391,15 @@ impl ReadSnapshot {
                         CsrGraph::build_from_memory(store, flag.as_deref())
                     })
                 };
-                let mut eval = self.configure(Evaluator::new(&self.dict, store), &csr, pfn);
+                let string_index = || self.string_index.get(&self.dict, flag.as_deref());
+                let mut eval = self.configure(
+                    Evaluator::new(&self.dict, store),
+                    EvalProviders {
+                        csr: Some(&csr),
+                        string_index: Some(&string_index),
+                    },
+                    pfn,
+                );
                 if let Some(c) = cancel {
                     eval = eval.with_cancel(c);
                 }
@@ -1424,8 +1433,16 @@ impl ReadSnapshot {
                             }
                         })
                     };
+                    let string_index = || self.string_index.get(&self.dict, Some(&**gate_cancel));
                     let eval = self
-                        .configure(Evaluator::new(&self.dict, &src), &csr, pfn)
+                        .configure(
+                            Evaluator::new(&self.dict, &src),
+                            EvalProviders {
+                                csr: Some(&csr),
+                                string_index: Some(&string_index),
+                            },
+                            pfn,
+                        )
                         .with_cancel(Arc::clone(gate_cancel));
                     evaluate_in_scope(eval, q)
                 });
@@ -1447,29 +1464,23 @@ impl ReadSnapshot {
         }
     }
 
-    /// The snapshot's evaluation settings, applied to `eval`.
+    /// The snapshot's evaluation settings and named graphs, applied to
+    /// `eval` in one call ([`Evaluator::with_settings`], review design#9),
+    /// with the snapshot's caches (`providers`) and the requesting user's
+    /// PFN caller (`pfn`, under the snapshot's PFN limits; `None` falls
+    /// back to the database's own caller).
     fn configure<'a, S: TripleSource>(
         &'a self,
         eval: Evaluator<'a, S>,
-        csr: &'a CsrProvider<'a>,
+        providers: EvalProviders<'a>,
         pfn: Option<&crate::pfn::PfnCaller>,
     ) -> Evaluator<'a, S> {
-        let mut eval = eval
-            .with_service_policy(self.service_policy)
-            .with_csr_provider(csr)
-            .with_integer_division(self.integer_division)
-            .with_topk_options(self.topk)
-            .with_gfun_max_output_bytes(self.gfun_max_output_bytes);
-        if !self.named.is_empty() {
-            eval = eval.with_named(&self.named);
+        let eval = eval.with_settings(self.settings.clone(), providers, pfn);
+        if self.named.is_empty() {
+            eval
+        } else {
+            eval.with_named(&self.named)
         }
-        if !self.functions.is_empty() {
-            eval = eval.with_functions(self.functions.clone());
-        }
-        if let Some(caller) = pfn.or(self.pfn.as_ref()) {
-            eval = eval.with_pfn(caller.clone().with_limits(self.pfn_limits));
-        }
-        eval
     }
 
     fn triple_num(&self) -> u64 {

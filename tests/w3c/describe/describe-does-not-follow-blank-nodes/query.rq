@@ -1,0 +1,6 @@
+# spec: SPARQL 1.1 Query §16.4 DESCRIBE (Informative) leaves the description to the service; a
+# Concise Bounded Description would add _:b's own triple (_:b :q "blank"), this service does not
+# follow blank-node objects: the documented limitation of review sparqlconf#19 (the blank
+# node's triples are reached through a pattern instead)
+PREFIX : <http://example.org/>
+DESCRIBE :f

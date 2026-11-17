@@ -1,0 +1,7 @@
+{
+  "head": {"vars": ["a", "b", "c", "d", "e"]},
+  "results": {"bindings": [
+    {"a": {"type": "literal", "value": "900150983cd24fb0d6963f7d28e17f72"},
+     "b": {"type": "literal", "value": "900150983cd24fb0d6963f7d28e17f72"}}
+  ]}
+}

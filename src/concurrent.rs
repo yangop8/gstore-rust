@@ -119,7 +119,8 @@ use crate::dict::Dictionary;
 use crate::error::{GStoreError, Result};
 use crate::model::{IdTriple, Triple};
 use crate::parser::sparql;
-use crate::query::{Evaluator, FunctionRegistry, IntegerDivision, QueryResult, TopKOptions};
+use crate::query::engine::{EvalProviders, EvalSettings, StringIndexCell};
+use crate::query::{Evaluator, QueryResult};
 use crate::store::read_scope::ReadScope;
 use crate::store::{TripleSource, TripleStore};
 
@@ -241,24 +242,19 @@ pub struct Snapshot {
     store: TripleStore,
     named: BTreeMap<u32, TripleStore>,
     version: u64,
-    functions: FunctionRegistry,
-    /// The database's integer-division mode when the snapshot was published.
-    integer_division: IntegerDivision,
-    /// The database's Top-K / early-termination options when the snapshot
-    /// was published.
-    topk: TopKOptions,
     csr: CsrCache,
-    /// What `SERVICE` may contact: the database's
-    /// [`LoadPolicy::service_policy`](crate::db::LoadPolicy::service_policy),
-    /// so snapshot reads follow the same policy as [`Database::query`].
-    service_policy: crate::db::ServicePolicy,
-    /// The database's graph-function output bound when the snapshot was
-    /// published.
-    gfun_max_output_bytes: usize,
-    /// The database's PFN caller (with its PFN limits) when the snapshot was
-    /// published ([`Database::set_pfn_caller`]): `PFN.name(…)` queries on the
-    /// snapshot call the same user's functions as the database's own.
-    pfn: Option<crate::pfn::PfnCaller>,
+    /// The database's evaluation settings when the snapshot was published
+    /// ([`Database::eval_settings`]), applied to its reads in one call
+    /// (review design#9): the `SERVICE` policy of its
+    /// [`LoadPolicy`](crate::db::LoadPolicy) — snapshot reads follow the
+    /// same policy as [`Database::query`] —, the integer-division mode,
+    /// the Top-K options, the graph-function bound, the user-defined
+    /// functions, and the PFN caller and limits (`PFN.name(…)` queries on
+    /// the snapshot call the same user's functions as the database's own).
+    settings: EvalSettings,
+    /// The snapshot's dictionary substring index, kept across its queries
+    /// (review design#9: rebuilt per substring query before).
+    string_index: StringIndexCell,
     /// A read error recorded while the store was copied (a backend with no
     /// in-RAM store): every query of this snapshot fails with it.
     capture_error: Option<String>,
@@ -298,15 +294,17 @@ impl Snapshot {
                 .map(|(&g, s)| (g, s.clone()))
                 .collect(),
             version,
-            functions: db.functions().clone(),
-            integer_division: db.integer_division(),
-            topk: db.topk_options(),
             csr: db
                 .cached_csr()
                 .map_or_else(CsrCache::new, |g| CsrCache::seeded(0, g)),
-            service_policy: db.load_policy().service_policy(),
-            gfun_max_output_bytes: db.gfun_max_output_bytes(),
-            pfn: db.pfn_caller(),
+            settings: db.eval_settings(),
+            // The database's index serves the snapshot's dictionary (a
+            // clone at the same generation) while it is current.
+            string_index: db
+                .cached_string_index()
+                .map_or_else(StringIndexCell::new, |index| {
+                    StringIndexCell::seeded(db.dict().generation(), index)
+                }),
             capture_error,
         }
     }
@@ -361,22 +359,20 @@ impl Snapshot {
     pub fn query(&self, sparql: &str) -> Result<QueryResult> {
         self.check_captured()?;
         let q = sparql::parse(sparql)?;
-        // The snapshot never changes: one CSR generation for its lifetime.
+        // The snapshot never changes: one CSR generation for its lifetime,
+        // and one substring index.
         let csr = || self.csr.get_or_build(0, || CsrGraph::build(&self.store));
-        let mut eval = Evaluator::new(&self.dict, &self.store)
-            .with_service_policy(self.service_policy)
-            .with_csr_provider(&csr)
-            .with_integer_division(self.integer_division)
-            .with_topk_options(self.topk)
-            .with_gfun_max_output_bytes(self.gfun_max_output_bytes);
+        let string_index = || self.string_index.get(&self.dict, None);
+        let mut eval = Evaluator::new(&self.dict, &self.store).with_settings(
+            self.settings.clone(),
+            EvalProviders {
+                csr: Some(&csr),
+                string_index: Some(&string_index),
+            },
+            None,
+        );
         if !self.named.is_empty() {
             eval = eval.with_named(&self.named);
-        }
-        if !self.functions.is_empty() {
-            eval = eval.with_functions(self.functions.clone());
-        }
-        if let Some(caller) = &self.pfn {
-            eval = eval.with_pfn(caller.clone());
         }
         evaluate_scoped(eval, &q)
     }
@@ -1176,44 +1172,54 @@ impl VersionView<'_> {
     /// Run a read query as of this view's version. Materializes the visible
     /// default-graph state on demand — the base snapshot plus chain overrides
     /// `<= version` — then evaluates against it (so a graph-function query
-    /// builds its CSR from that state). User-defined functions are the ones
-    /// of the latest published snapshot: they are not versioned data. The
+    /// builds its CSR from that state; when no override is visible the state
+    /// is the base snapshot's, and its cached CSR and substring index serve).
+    /// The evaluation settings — user-defined functions among them — are the
+    /// latest published snapshot's: they are not versioned data. The
     /// materialization and the evaluation run inside a [`ReadScope`]: a read
     /// error fails the query.
     pub fn query(&self, sparql: &str) -> Result<QueryResult> {
         self.db.base.check_captured()?;
         let mut dict = self.db.base.dict.clone();
         let mut store = self.db.base.store.clone();
+        // Whether no chain record is visible at this version: the
+        // materialized state is then the base snapshot's own, and so are
+        // its CSR and substring index (review design#9: built per query).
+        let as_base;
         {
             let scope = ReadScope::enter();
-            let materialized = self.db.versioned.read().unwrap().materialize_into(
-                self.version,
-                &mut dict,
-                &mut store,
-            );
+            let versioned = self.db.versioned.read().unwrap();
+            as_base = versioned
+                .chains
+                .values()
+                .all(|c| c.visible(self.version).is_none());
+            let materialized = versioned.materialize_into(self.version, &mut dict, &mut store);
+            drop(versioned);
             if let Some(e) = scope.take_error() {
                 return Err(read_failure("materializing the version", e));
             }
             materialized.map_err(|e| read_failure("materializing the version", e.to_string()))?;
         }
         let q = sparql::parse(sparql)?;
+        // The settings — user-defined functions and the PFN caller among
+        // them — are the latest snapshot's (they are not versioned data).
         let latest = self.db.snapshot();
-        let functions = latest.functions.clone();
-        let mut eval = Evaluator::new(&dict, &store)
-            .with_service_policy(latest.service_policy)
-            .with_integer_division(latest.integer_division)
-            .with_topk_options(latest.topk)
-            .with_gfun_max_output_bytes(latest.gfun_max_output_bytes);
-        if !self.db.base.named.is_empty() {
-            eval = eval.with_named(&self.db.base.named);
-        }
-        if !functions.is_empty() {
-            eval = eval.with_functions(functions);
-        }
-        // Like the user-defined functions, the PFN caller is the latest
-        // snapshot's (functions are not versioned data).
-        if let Some(caller) = &latest.pfn {
-            eval = eval.with_pfn(caller.clone());
+        let base = &self.db.base;
+        let csr = || base.csr.get_or_build(0, || CsrGraph::build(&base.store));
+        // The base's index when the dictionary is the base's (same
+        // generation), else one built for this query.
+        let string_index = || base.string_index.get(&dict, None);
+        let mut eval = Evaluator::new(&dict, &store).with_settings(
+            latest.settings.clone(),
+            EvalProviders {
+                // Over another state the evaluator builds its own CSR.
+                csr: if as_base { Some(&csr) } else { None },
+                string_index: Some(&string_index),
+            },
+            None,
+        );
+        if !base.named.is_empty() {
+            eval = eval.with_named(&base.named);
         }
         evaluate_scoped(eval, &q)
     }

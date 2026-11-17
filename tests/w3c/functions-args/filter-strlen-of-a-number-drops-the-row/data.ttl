@@ -1,0 +1,4 @@
+@prefix : <http://example.org/> .
+:a :v 30 .
+:b :v "Al" .
+:c :v :xy .

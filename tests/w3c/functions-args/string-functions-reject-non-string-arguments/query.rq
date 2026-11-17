@@ -1,0 +1,10 @@
+# spec: SPARQL 1.1 Query §17.4.3 Functions on Strings — STRLEN, UCASE, CONCAT and SUBSTR take
+# string literals (§17.4.3.1.1: simple, xsd:string or language-tagged), REGEX a string
+# literal text; §17.4.6 the hash functions a simple literal / xsd:string; §17.4.2.11 STRLANG a
+# simple literal. Any other argument is an error, and an error leaves the SELECT expression
+# unbound (§17.2, §18.2.5) — review sparqlconf#17: these returned "1", "a1", true, hashes, …
+PREFIX : <http://example.org/>
+SELECT (STRLEN(1) AS ?a) (CONCAT("a", 1) AS ?b) (REGEX(:a, "ex") AS ?c) (SHA1("abc"@en) AS ?d)
+       (STRLANG("a"@fr, "en") AS ?e) (MD5(1) AS ?f) (STRLEN(:a) AS ?g) (UCASE(1.5) AS ?h)
+       (SUBSTR(:a, 1, 2) AS ?i) (LCASE(true) AS ?j)
+WHERE {}

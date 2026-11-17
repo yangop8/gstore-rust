@@ -1,0 +1,6 @@
+# spec: SPARQL 1.1 Query §11.4 Aggregate Projection Restrictions: a SELECT expression may use
+# the grouping variable ?s (here inside STR and CONCAT) and aggregates — ?v appears only
+# inside SUM, so the query is legal (review sparqlconf#15)
+PREFIX : <http://example.org/>
+SELECT (CONCAT("node ", STR(?s)) AS ?label) (SUM(?v) AS ?total)
+WHERE { ?s :v ?v } GROUP BY ?s

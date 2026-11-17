@@ -1,0 +1,5 @@
+# spec: SPARQL 1.1 Query §11.4 Aggregate Projection Restrictions and §18.2.4.1: GROUP BY
+# (STR(?t) AS ?k) groups on the expression and binds ?k, a grouping variable, so ?k may be
+# projected next to the aggregate (review sparqlconf#15: the restriction keeps this legal)
+PREFIX : <http://example.org/>
+SELECT ?k (COUNT(?s) AS ?n) WHERE { ?s :tag ?t } GROUP BY (STR(?t) AS ?k)

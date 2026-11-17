@@ -1,0 +1,6 @@
+# spec: SPARQL 1.1 Query §16.4 DESCRIBE (Informative) — "the description is determined by the
+# query service"; this service describes a resource by the triples it is the subject of (its
+# outgoing triples, not incoming ones such as :carol :knows :alice), for explicit IRIs and for
+# the values of a WHERE variable alike (review sparqlconf#19: documented, not a CBD)
+PREFIX : <http://example.org/>
+DESCRIBE :alice ?x WHERE { :alice :knows ?x }

@@ -1,0 +1,7 @@
+# spec: SPARQL 1.1 Query §11.4 Aggregate Projection Restrictions ("variables ... not in the
+# GROUP BY clause, can only be projected ... if they are aggregated") and §18.5.1.8 Sample:
+# ?name is not grouped, so it is projected through SAMPLE; each group has one name, so the
+# sample is that name (review sparqlconf#15: projecting ?name bare is a query error)
+PREFIX : <http://example.org/>
+SELECT ?s (SAMPLE(?name) AS ?n) (COUNT(?f) AS ?friends)
+WHERE { ?s :name ?name ; :knows ?f } GROUP BY ?s
