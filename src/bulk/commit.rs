@@ -1,9 +1,11 @@
 //! The staged, crash-safe install of a bulk build.
 //!
-//! The build holds the directory's [`DirLock`] (another process holding the
-//! directory makes it fail, and so does a database of this process that has
-//! it open) and a [`BuildGuard`] (another bulk build of this process makes
-//! it fail), and writes everything into `<dir>/.bulk-tmp/`, which no
+//! The build claims the directory with [`BuildGuard::lock`], which takes
+//! its [`DirLock`] in the same step (another process holding the directory
+//! makes it fail, and so do a database of this process that has it open and
+//! another bulk build of this process; while the claim lives no other thread
+//! of this process can open it), and writes everything into
+//! `<dir>/.bulk-tmp/`, which no
 //! layout detection looks at. A stale `.bulk-tmp/` from a crashed build is
 //! removed first. Once both files are complete and `fsync`ed, the install
 //! runs; after each step a crash leaves a directory that an unmodified
@@ -12,7 +14,7 @@
 //! | # | step | a crash after it leaves |
 //! |---|------|-------------------------|
 //! | 1 `staged` | `kvstore.kv` + `vstree.kv` complete and synced in `.bulk-tmp/` | the old database |
-//! | 2 `marked` | `.bulk-tmp/COMMIT` written and synced | the old database |
+//! | 2 `marked` | `.bulk-tmp/COMMIT` written and synced (advisory, see below) | the old database |
 //! | 3 `cleared` | a stale `kvstore.kv.wal` replayed into the old file (what any open does) and removed — a replay that fails stops the install with the log in place; the old `vstree.kv` and its WAL removed; synced | the old database (a missing `vstree.kv` is rebuilt at open) |
 //! | 4 `kv-renamed` | `.bulk-tmp/kvstore.kv` renamed over `kvstore.kv` | the new database (no `vstree.kv` yet: rebuilt at open), or — under an existing `rocksdb/`, which detection prefers — still the old one |
 //! | 5 `kv-synced` | directory synced | as 4, durably |
@@ -33,10 +35,21 @@
 //! the new store is durable; a crash in that short window leaves them
 //! beside the new database.
 //!
-//! Crash tests: the `GSTORE_BULK_CRASH=<step>` environment variable aborts
-//! the process right after that step (read once per install, never on the
-//! hot path), and [`debug_crash_at`] makes an in-process build of one
-//! directory stop there with an error, leaving its files as a crash would.
+//! **The `COMMIT` marker is advisory** (review durability#12, bulkcli#15):
+//! it records that the staged files were complete and synced when the
+//! install began — a forensic aid for whoever finds a `.bulk-tmp/` a crash
+//! left behind — and nothing reads it. No recovery rolls an interrupted
+//! install forward: before step 4 the old database is the database (the
+//! next build, or `gbuild --force`, deletes the staging area, marked or
+//! not), and from step 4 on the new store is in place without it. The
+//! format is unchanged (D7); the step costs one fsync.
+//!
+//! Crash tests: the `GSTORE_BULK_CRASH=<step>` environment variable — a
+//! test failpoint live in every build, reported on standard error whenever
+//! it is set ([`CRASH_ENV`]) — aborts the process right after that step
+//! (read once per install, never on the hot path), and [`debug_crash_at`]
+//! makes an in-process build of one directory stop there with an error,
+//! leaving its files as a crash would.
 
 use std::fs::{self, File};
 use std::io::Write;
@@ -44,7 +57,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::db::dirlock::{BuildGuard, DirLock};
+use crate::db::dirlock::BuildGuard;
 use crate::db::fsutil::{remove_dir_if_exists, remove_file_if_exists, sync_dir};
 use crate::db::persist::remove_other_layouts;
 use crate::db::StorageKind;
@@ -64,7 +77,8 @@ pub const STAGING_DIR: &str = ".bulk-tmp";
 /// [`BulkReport::opens_as_built`]): the staging area not removed — no
 /// layout detection reads it, and the next build removes it.
 pub(crate) const STAGING_CLEANUP: &str = "removing the staging area";
-/// The commit marker inside the staging directory.
+/// The commit marker inside the staging directory: advisory, read by no
+/// recovery (see the module docs).
 const COMMIT_MARKER: &str = "COMMIT";
 /// The disk layout's files (`db::KV_FILE`, `db::VSTREE_KV_FILE`).
 const KV_FILE: &str = "kvstore.kv";
@@ -91,9 +105,34 @@ pub const CRASH_POINTS: [&str; 8] = [
 ];
 
 /// The environment variable naming the step after which an install aborts
-/// the process (crash tests).
+/// the process — a **test failpoint** of the crash tests, live in every
+/// build (review tests-a#19). Set, it makes every bulk install of the
+/// process (`gbuild --disk` / `--rocksdb`, a server's bulk build) say so on
+/// standard error and abort right after that step, leaving the old or the
+/// new database; unset it outside crash tests. A value that names no
+/// install step of the build is reported and ignored.
 #[doc(hidden)]
 pub const CRASH_ENV: &str = "GSTORE_BULK_CRASH";
+
+/// The install step [`CRASH_ENV`] names among `points`, reported on standard
+/// error whenever the variable is set (an operator who left it in an
+/// environment sees why the build aborts, or that it is ignored).
+pub(crate) fn crash_env(points: &[&str]) -> Option<String> {
+    let v = std::env::var(CRASH_ENV).ok().filter(|s| !s.is_empty())?;
+    if points.contains(&v.as_str()) {
+        eprintln!(
+            "{CRASH_ENV}={v} is set: this bulk build aborts right after its install step '{v}' \
+             (a crash-test failpoint; unset it outside crash tests)"
+        );
+        Some(v)
+    } else {
+        eprintln!(
+            "{CRASH_ENV}={v} is set but names no install step of this bulk build ({}); ignored",
+            points.join(", ")
+        );
+        None
+    }
+}
 
 /// Per-directory simulated crash points (see [`debug_crash_at`]).
 fn hooks() -> &'static Mutex<Vec<(PathBuf, String)>> {
@@ -132,7 +171,7 @@ impl Failpoints {
                 .map(|(_, p)| p.clone())
         };
         Failpoints {
-            abort_at: std::env::var(CRASH_ENV).ok().filter(|s| !s.is_empty()),
+            abort_at: crash_env(&CRASH_POINTS),
             fail_at,
             crashed: false,
         }
@@ -185,17 +224,13 @@ pub(crate) fn build_disk(
 ) -> Result<BulkReport> {
     let started = Instant::now();
     fs::create_dir_all(dir)?;
-    let _guard = BuildGuard::enter(dir)?;
-    if DirLock::held_here(dir) {
-        // A database of this process has the directory open: replacing its
-        // files under it would strand its later writes (and a WAL of the
-        // old store could replay into the new one).
-        return Err(GStoreError::Database(format!(
-            "database directory '{}' is open in this process; close it before rebuilding it",
-            dir.display()
-        )));
-    }
-    let _lock = DirLock::acquire(dir)?;
+    // The claim and the lock in one step (review bulkcli#13): refused while
+    // a database of this process has the directory open (replacing its
+    // files under it would strand its later writes, and a WAL of the old
+    // store could replay into the new one), while another build of this
+    // process rebuilds it, or while another process holds it — and while
+    // the claim lives no other thread of this process opens it.
+    let (_guard, _lock) = BuildGuard::lock(dir)?;
     // `Database::open` takes the directory lock for the RocksDB layout too,
     // but an older binary does not (it relies on RocksDB's own
     // `rocksdb/LOCK`): the lock above cannot see it serving the store.

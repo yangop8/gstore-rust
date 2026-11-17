@@ -1135,18 +1135,11 @@ impl Database {
         let dir = dir.as_ref();
         fs::create_dir_all(dir)?;
         // Another build of this process rebuilding `dir` would share the
-        // staging area below: refused, as between bulk builds.
-        let _guard = super::dirlock::BuildGuard::enter(dir)?;
-        // Replacing the files of a database another process serves (or one
-        // of this process has open) would strand its later writes: refused,
-        // as the bulk build refuses, and the directory held meanwhile.
-        if super::dirlock::DirLock::held_here(dir) {
-            return Err(GStoreError::Database(format!(
-                "database directory '{}' is open in this process; close it before rebuilding it",
-                dir.display()
-            )));
-        }
-        let _lock = super::dirlock::DirLock::acquire(dir)?;
+        // staging area below, and replacing the files of a database another
+        // process serves (or one of this process has open) would strand its
+        // later writes: refused, as the bulk build refuses, the claim and the
+        // lock taken in one step and held meanwhile (review bulkcli#13).
+        let (_guard, _lock) = super::dirlock::BuildGuard::lock(dir)?;
         crate::bulk::commit::refuse_open_store(dir)?;
         // The new store and VS-tree are built in the bulk build's staging
         // area, which no layout detection reads, and installed by its
@@ -1425,19 +1418,12 @@ impl Database {
         } = acc;
         fs::create_dir_all(dir)?;
         // A database of this process serving `dir` would lose its files below
-        // (and a RocksDB one its store) — refused, like a bulk build; another
-        // process holding `dir` is refused by the lock, which the new database
-        // then keeps for as long as it lives (as `open` does).
-        if super::dirlock::DirLock::held_here(dir) {
-            return Err(GStoreError::Database(format!(
-                "database directory '{}' is open in this process; close it before rebuilding it",
-                dir.display()
-            )));
-        }
-        // Another build of this process rebuilding `dir` would share the
-        // staging directory below: refused, as between bulk builds.
-        let _guard = super::dirlock::BuildGuard::enter(dir)?;
-        let lock = super::dirlock::DirLock::acquire(dir)?;
+        // (and a RocksDB one its store), and another build of this process
+        // would share the staging directory — refused, like a bulk build, the
+        // claim and the lock taken in one step (review bulkcli#13); another
+        // process holding `dir` is refused by the lock, which the new
+        // database then keeps for as long as it lives (as `open` does).
+        let (_guard, lock) = super::dirlock::BuildGuard::lock(dir)?;
         let rocks_dir = dir.join(ROCKS_SUBDIR);
         // Finish a swap a crash interrupted (as every open does) before
         // anything is staged: its `rocksdb.new` may be the database.

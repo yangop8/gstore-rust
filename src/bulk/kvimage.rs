@@ -375,6 +375,25 @@ impl FixedTreeWriter {
     }
 }
 
+/// Check that a writer filled exactly the page range reserved for it — in
+/// every build profile, not only under `debug_assert` (review bulkcli#12).
+/// The POS, OSP, statistics and dictionary writers run side by side in
+/// ranges reserved from predicted page counts; a writer that needs more
+/// pages than predicted has written over the start of the next range, and
+/// one that needs fewer leaves pages nothing references. Either is a
+/// predictor bug that would otherwise install a corrupt `kvstore.kv`: the
+/// build fails (before its install, the old database untouched).
+pub(crate) fn check_range(what: &str, used: u64, reserved: u64) -> Result<()> {
+    if used == reserved {
+        return Ok(());
+    }
+    Err(GStoreError::Database(format!(
+        "bulk build: the {what} took {used} page(s), but {reserved} were reserved for it \
+         (the page ranges of the parallel writers would overlap or leave a gap); nothing was \
+         installed"
+    )))
+}
+
 /// Recover a fill percentage that reproduces `shape` (debug check only).
 fn fill_from_shape(shape: &FixedShape) -> u8 {
     (50..=100u8)
@@ -553,7 +572,7 @@ impl VarTreePlan {
             child_ids = up_ids;
             child_first = up_first;
         }
-        debug_assert_eq!(u64::from(id - base), self.pages());
+        check_range("variable-key tree", u64::from(id - base), self.pages())?;
         Ok(child_ids[0])
     }
 }
@@ -772,6 +791,42 @@ mod tests {
     use crate::kvstore::bptree::BTree;
     use crate::kvstore::{IvArray, Pager};
     use std::ops::ControlFlow;
+
+    /// Review bulkcli#12: a writer that outgrows the range reserved for it
+    /// — here a tree given more keys than its reservation was predicted for,
+    /// what a predictor/writer divergence would cause — is an error in every
+    /// build profile, not a `debug_assert` (a release build installed the
+    /// overlapping image).
+    #[test]
+    fn a_writer_outside_its_reserved_range_fails_the_build() {
+        let path = tmp("range_check");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        let reserved = fixed_tree_pages(1000, 12, 90);
+        let mut out = PageOut::new(&file);
+        let mut w = FixedTreeWriter::new(1, 12, 90);
+        for i in 0..5000u32 {
+            let mut k = [0u8; 12];
+            k[8..].copy_from_slice(&i.to_be_bytes());
+            w.push(&mut out, &k).unwrap();
+        }
+        let (_, used) = w.finish(&mut out).unwrap();
+        assert!(used > reserved);
+        let e = check_range("POS index", used, reserved).unwrap_err();
+        assert!(e.to_string().contains("POS index took"), "{e}");
+        // Fewer pages than reserved is a predictor bug too (a gap of pages
+        // nothing references).
+        assert!(check_range("OSP index", reserved - 1, reserved).is_err());
+        check_range("statistics array", reserved, reserved).unwrap();
+        drop(out);
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+    }
 
     fn tmp(tag: &str) -> std::path::PathBuf {
         let p =

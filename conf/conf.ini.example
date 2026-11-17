@@ -1,18 +1,29 @@
 # gStore server configuration (conf.ini) -- example shipped with gstore-rust.
 #
 # This mirrors upstream gStore 1.4's conf/conf.ini key for key and value for
-# value. Copy it to conf/conf.ini (gserver reads ./conf/conf.ini when it exists)
-# or pass it explicitly:  gserver -c conf/conf.ini
+# value, except where a comment says otherwise (upload_max_body_size,
+# upload_allow_extensions, build_multi_thread). Copy it to conf/conf.ini
+# (gserver reads ./conf/conf.ini when it exists) or pass it explicitly:
+#   gserver -c conf/conf.ini
 #
 # Syntax: [section] headers, key=value lines; whitespace around keys and values
 # is trimmed and double quotes are removed from values. Lines starting with '#'
-# or ';' are comments, and so is the rest of an unquoted value after
-# whitespace + '#' or ';'. An empty value (key=) means "use the built-in
-# default". If a key appears twice, the first one wins. Unknown keys are
-# reported as warnings and ignored.
+# or ';' are comments. After a value, a '#' or ';' that stands as a word of its
+# own (whitespace before and after it, or the end of the line) starts a
+# comment:  thread_num=30  # workers  reads 30 (gstore-rust only, reported
+# as a warning: upstream reads it as part of the value). A marker glued to
+# more text stays in the value (Tr0ub4dor #3 reads "Tr0ub4dor #3"), nothing
+# inside double quotes is a comment, and root_password is never cut. An empty
+# value (key=) means "use the built-in default". If a key appears twice, the
+# first one wins. Unknown keys are reported as warnings and ignored, and so
+# are settings that cannot take effect (resource_check=on, or a build_threads
+# that build_multi_thread=off overrides).
 #
 # Precedence: command-line flag (e.g. -p/--port, --password, --no-checkpoint,
 # --addr, or a database directory argument) > this file > built-in default.
+# The environment variables GSTORE_DISK_QUERY_MODE, GSTORE_DISK_CACHE_MB,
+# GSTORE_VSTREE_ON_OPEN, GSTORE_ID_RECLAIM and GSTORE_ROCKS_BLOCK_CACHE_MB
+# override their keys in this file (gserver logs the values in effect).
 # Relative paths are relative to the directory gserver is started from.
 
 [server]
@@ -139,7 +150,10 @@ ip_deny_path="./conf/ipDeny.config"
 ;allow_default_root_password=off
 
 [system]
-# unit MB
+# unit MB -- upstream's resource check (resource_check=on refuses builds and
+# loads on a machine below these). gstore-rust performs no resource check:
+# these are parsed for compatibility, and resource_check=on is reported as a
+# warning.
 min_memory=1024
 min_million_disk=200
 min_million_memory=200
@@ -152,6 +166,8 @@ resource_check=off
 
 # which suffix do you want to add to your database name? please set it here
 # NOTICE:all database name ends with ".db" by default, but you shouldn't add ".db" to the name you pass to system
+# (gstore-rust: databases always end with ".db"; gserver warns about another
+# suffix)
 # db_suffix=".db"
 
 # root username
@@ -171,15 +187,18 @@ check_point=on
 # database's copy for it. A transaction of a deleted user is rolled back too.
 # 0 = never (upstream behaviour; gserver warns at startup) (Rust extension)
 txn_idle_timeout=600
-# build use multi thread increase efficiency
-build_multi_thread=off
+# build use multi thread increase efficiency. off makes the bulk builds
+# (gbuild --disk / --rocksdb, the servers' builds) use one thread, whatever
+# build_threads says. Upstream's conf.ini ships off; this example leaves the
+# default, on (default on)
+# build_multi_thread=on
 # gbuild --disk builds the indexes in bulk (sorted, bottom-up). Its sort
 # buffers stay within this many MiB, spilling sorted runs to disk beyond it;
 # the dictionary under construction (about 26 bytes plus the term per term)
 # comes on top (Rust extension)
 # build_memory_mb=1024
 # threads of that bulk build, 0 = every core; build_multi_thread=off means 1
-# (Rust extension)
+# (a build_threads other than 1 is then reported as a warning) (Rust extension)
 # build_threads=0
 # where it spills sorted runs (default: inside the database directory)
 # (Rust extension)

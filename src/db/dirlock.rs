@@ -32,6 +32,21 @@
 //! [`DirLock::writing`], so two saves into the same directory, in this
 //! process or in two, never interleave their files.
 //!
+//! **Bulk builds.** A directory a bulk build (or any other replacement of
+//! a database's files: [`crate::bulk::build`], the incremental builds) is
+//! rebuilding is claimed with [`BuildGuard::lock`], which takes the lock and
+//! the claim in one step under the registry's mutex: it fails while any
+//! holder of this process — a [`Database`](super::Database) that has the
+//! directory open, another build — holds the directory, and while the claim
+//! lives every [`DirLock::acquire`] of *another thread* of this process is
+//! refused like another process's (review bulkcli#13: the "open in this
+//! process?" check and the lock were two steps, and an open after them
+//! shared the build's lock and wrote into the files the install then
+//! replaced). The thread that holds the claim may still take the lock — the
+//! save of the database it builds, a nested build, its own reopen — so a
+//! tool can claim a directory before it prepares its input and keep the
+//! claim through the build (`gbuild`).
+//!
 //! **Which file is locked.** The registry is keyed by the identity of the
 //! locked `LOCK` file — its (device, inode) on Unix — not by the directory's
 //! path: a restore or an `/api` rename moves a locked directory (its `LOCK`
@@ -50,6 +65,7 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::thread::{self, ThreadId};
 
 use crate::error::{GStoreError, Result};
 
@@ -67,6 +83,33 @@ fn lock_io_error(what: String, e: &dyn std::fmt::Display, kind: io::ErrorKind) -
 /// a conflict, [`GStoreError::Locked`] (review design#3).
 fn lock_conflict(msg: String) -> GStoreError {
     GStoreError::Locked(msg)
+}
+
+/// The directory is claimed by a bulk build of this process
+/// ([`BuildGuard`]): a conflict, like another process's lock.
+fn being_rebuilt(dir: &Path) -> GStoreError {
+    lock_conflict(format!(
+        "database directory '{}' is being rebuilt by another bulk build of this process",
+        dir.display()
+    ))
+}
+
+/// Another process keeps moving the directory (a restore, a rename):
+/// contention, to retry once it is done.
+fn keeps_being_replaced(dir: &Path) -> GStoreError {
+    lock_conflict(format!(
+        "cannot lock database directory '{}': its lock file keeps being replaced",
+        dir.display()
+    ))
+}
+
+/// How [`DirLock::take`] takes a directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// [`DirLock::acquire`]: shared with this process's other holders.
+    Share,
+    /// [`BuildGuard::lock`]: a bulk build's claim.
+    Build,
 }
 
 /// A lock this process holds, shared by every [`SideLock`] on the file.
@@ -128,6 +171,10 @@ struct DirHeld {
     /// Serializes the writers of this process that hold
     /// [`DirLock::writing`].
     writer: Arc<Mutex<()>>,
+    /// The thread whose bulk build claims the directory
+    /// ([`BuildGuard::lock`]) and how many claims it holds: while set,
+    /// [`DirLock::acquire`] on every other thread is refused.
+    builder: Option<(ThreadId, usize)>,
 }
 
 /// The directory locks this process holds, by the identity of the locked
@@ -155,10 +202,20 @@ impl DirLock {
     /// merely a lock taken under the same path: see the module docs), else
     /// takes `<dir>/LOCK` exclusively — failing with a
     /// [`GStoreError::Locked`] that names the holder when another process
-    /// has it, or with a [`GStoreError::Io`] when the lock cannot be taken
-    /// at all (the directory or its lock file cannot be opened, the lock
-    /// call fails).
+    /// has it, or when a bulk build on another thread of this process claims
+    /// the directory ([`BuildGuard::lock`]), or with a [`GStoreError::Io`]
+    /// when the lock cannot be taken at all (the directory or its lock file
+    /// cannot be opened, the lock call fails).
     pub fn acquire(dir: &Path) -> Result<DirLock> {
+        DirLock::take(dir, Mode::Share).map(|(lock, _)| lock)
+    }
+
+    /// [`acquire`](Self::acquire) (`Mode::Share`), or a bulk build's claim
+    /// (`Mode::Build`, see [`BuildGuard::lock`]) — the lock and the claim
+    /// taken in one step under the registry's mutex. With the lock, whether
+    /// this call made the claim (`false` when the thread already held one
+    /// and this one nests in it, and for `Mode::Share`).
+    fn take(dir: &Path, mode: Mode) -> Result<(DirLock, bool)> {
         let cannot = |e: &io::Error| {
             lock_io_error(
                 format!("cannot lock database directory '{}'", dir.display()),
@@ -168,6 +225,7 @@ impl DirLock {
         };
         let canonical = fs::canonicalize(dir).map_err(|e| cannot(&e))?;
         let path = canonical.join(LOCK_FILE);
+        let me = thread::current().id();
         let mut reg = registry().lock().unwrap_or_else(PoisonError::into_inner);
         // A few rounds: another process's restore or rename may move the
         // directory (its lock file with it) between our open and our lock.
@@ -181,16 +239,54 @@ impl DirLock {
                 .map_err(|e| cannot(&e))?;
             let key = key_of(&file, &canonical).map_err(|e| cannot(&e))?;
             if let Some(held) = reg.get_mut(&key) {
+                match (mode, &mut held.builder) {
+                    // A bulk build of another thread is replacing the files:
+                    // sharing its lock would write into files its install
+                    // replaces, and a second build would share its staging
+                    // area (review bulkcli#13).
+                    (_, Some((t, _))) if *t != me => return Err(being_rebuilt(dir)),
+                    // The claiming thread's own build nests in its claim.
+                    (Mode::Build, Some((_, claims))) => *claims += 1,
+                    // A holder of this process (an open database): replacing
+                    // its files under it would strand its later writes (and
+                    // a WAL of the old store could replay into the new one).
+                    (Mode::Build, None) => {
+                        return Err(GStoreError::Database(format!(
+                            "database directory '{}' is open in this process; close it before \
+                             rebuilding it",
+                            dir.display()
+                        )))
+                    }
+                    (Mode::Share, _) => {}
+                }
                 // This process holds the very file `<dir>/LOCK` names: share
                 // it. (Dropping the probe descriptor keeps the lock: an
                 // advisory file lock belongs to the descriptor that took it.)
                 held.holders += 1;
-                return Ok(DirLock {
-                    dir: canonical,
-                    key,
-                    writer: Arc::clone(&held.writer),
-                });
+                return Ok((
+                    DirLock {
+                        dir: canonical,
+                        key,
+                        writer: Arc::clone(&held.writer),
+                    },
+                    false,
+                ));
             }
+            // Not held here. A build's claim also enters the directory into
+            // the set of directories being rebuilt (which an older-style
+            // claim, [`BuildGuard::enter`], may hold already): checked and
+            // entered under the registry's mutex (lock order: registry, then
+            // the set).
+            let mut set = match mode {
+                Mode::Build => {
+                    let set = building().lock().unwrap_or_else(PoisonError::into_inner);
+                    if set.contains(&canonical) {
+                        return Err(being_rebuilt(dir));
+                    }
+                    Some(set)
+                }
+                Mode::Share => None,
+            };
             let locked = match file.try_lock() {
                 // Moved away (or replaced) since the open: start over on the
                 // file the path names now.
@@ -225,20 +321,24 @@ impl DirLock {
                     locked,
                     holders: 1,
                     writer: Arc::clone(&writer),
+                    builder: (mode == Mode::Build).then_some((me, 1)),
                 },
             );
-            return Ok(DirLock {
-                dir: canonical,
-                key,
-                writer,
-            });
+            if let Some(set) = &mut set {
+                set.insert(canonical.clone());
+            }
+            return Ok((
+                DirLock {
+                    dir: canonical,
+                    key,
+                    writer,
+                },
+                mode == Mode::Build,
+            ));
         }
         // Another process keeps moving the directory (a restore, a
         // rename): contention, to retry once it is done.
-        Err(lock_conflict(format!(
-            "cannot lock database directory '{}': its lock file keeps being replaced",
-            dir.display()
-        )))
+        Err(keeps_being_replaced(dir))
     }
 
     /// Lock `dir` like [`acquire`](Self::acquire) when it is a directory;
@@ -519,18 +619,29 @@ fn building() -> &'static Mutex<HashSet<PathBuf>> {
 }
 
 /// This process's claim on a directory a bulk build is rebuilding
-/// ([`crate::bulk::build`]). The [`DirLock`] keeps other processes out; this
-/// keeps a second build in the same process out (the `DirLock` is shared
-/// within a process). Released when dropped.
+/// ([`crate::bulk::build`], the incremental builds). The [`DirLock`] keeps
+/// other processes out; the claim keeps a second build of this process out
+/// (the `DirLock` is shared within a process) and — when taken with
+/// [`lock`](Self::lock), as every build takes it — every other thread's
+/// [`DirLock::acquire`] too, so no database of this process opens the
+/// directory while its files are replaced. Released when dropped.
 #[derive(Debug)]
 pub struct BuildGuard {
+    /// The canonical directory.
     dir: PathBuf,
+    /// Whether this guard put `dir` into [`building`] (the outermost claim).
+    registered: bool,
+    /// The claimed lock file's key and the claiming thread, for a guard from
+    /// [`lock`](Self::lock).
+    claim: Option<(LockKey, ThreadId)>,
 }
 
 impl BuildGuard {
-    /// Claim directory `dir` (which must exist); fails with a
-    /// [`GStoreError::Locked`] if a build of this process already rebuilds
-    /// it (an [`GStoreError::Io`] if `dir` cannot be resolved).
+    /// Claim directory `dir` (which must exist) by its path only, without
+    /// its lock; fails with a [`GStoreError::Locked`] if a build of this
+    /// process already rebuilds it (an [`GStoreError::Io`] if `dir` cannot be
+    /// resolved). The builds use [`lock`](Self::lock), which also takes the
+    /// directory's lock in the same step.
     pub fn enter(dir: &Path) -> Result<BuildGuard> {
         let canonical = fs::canonicalize(dir).map_err(|e| {
             lock_io_error(
@@ -541,12 +652,36 @@ impl BuildGuard {
         })?;
         let mut set = building().lock().unwrap_or_else(PoisonError::into_inner);
         if !set.insert(canonical.clone()) {
-            return Err(lock_conflict(format!(
-                "database directory '{}' is being rebuilt by another bulk build of this process",
-                dir.display()
-            )));
+            return Err(being_rebuilt(dir));
         }
-        Ok(BuildGuard { dir: canonical })
+        Ok(BuildGuard {
+            dir: canonical,
+            registered: true,
+            claim: None,
+        })
+    }
+
+    /// Claim directory `dir` (which must exist) for a bulk build and take its
+    /// [`DirLock`] — one atomic step under the lock registry's mutex (review
+    /// bulkcli#13). Fails with a [`GStoreError::Locked`] when another process
+    /// holds the directory, or a build on another thread of this process
+    /// claims it; with a [`GStoreError::Database`] ("open in this process")
+    /// when a holder of this process — an open database — has it; with a
+    /// [`GStoreError::Io`] when the lock cannot be taken at all.
+    ///
+    /// While the claim lives, [`DirLock::acquire`] on any *other* thread of
+    /// this process is refused like another process's. The claiming thread
+    /// itself may still take the lock and nest further claims in this one:
+    /// a tool claims the directory before it prepares its input and then
+    /// runs the build (and the save, and its own reopen) under it.
+    pub fn lock(dir: &Path) -> Result<(BuildGuard, DirLock)> {
+        let (lock, outermost) = DirLock::take(dir, Mode::Build)?;
+        let guard = BuildGuard {
+            dir: lock.dir.clone(),
+            registered: outermost,
+            claim: Some((lock.key.clone(), thread::current().id())),
+        };
+        Ok((guard, lock))
     }
 
     /// Whether a build of this process is rebuilding `dir`.
@@ -563,10 +698,27 @@ impl BuildGuard {
 
 impl Drop for BuildGuard {
     fn drop(&mut self) {
-        building()
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&self.dir);
+        if let Some((key, me)) = &self.claim {
+            let mut reg = registry().lock().unwrap_or_else(PoisonError::into_inner);
+            // The entry may be gone (its last `DirLock` dropped first) or be
+            // another claim's by now: only this thread's claim count drops.
+            if let Some(held) = reg.get_mut(key) {
+                if let Some((t, claims)) = &mut held.builder {
+                    if t == me {
+                        *claims = claims.saturating_sub(1);
+                        if *claims == 0 {
+                            held.builder = None;
+                        }
+                    }
+                }
+            }
+        }
+        if self.registered {
+            building()
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&self.dir);
+        }
     }
 }
 

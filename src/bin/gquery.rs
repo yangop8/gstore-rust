@@ -12,7 +12,11 @@
 //! applies the update and re-saves the database. Every database layout
 //! (snapshot, on-disk, RocksDB) is opened via [`Database::open`]. Upstream's
 //! `-f`/`--resultfile FILE` writes the result to `FILE` instead of standard
-//! output (the counts still go to standard error).
+//! output (the counts still go to standard error) — under a temporary name
+//! beside it, renamed over `FILE` once complete: a query that fails leaves
+//! an existing `FILE` as it was. A symbolic link stays a link (the file it
+//! names is replaced, keeping its permission bits); a FIFO or a device
+//! (`/dev/null`) is written in place once the result is ready.
 //!
 //! Exit status: 0 answered, 1 failed, 2 invalid arguments; `-h`/`--help`.
 
@@ -20,6 +24,7 @@
 mod cli;
 
 use std::io::Write;
+use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -98,16 +103,19 @@ fn main() -> ExitCode {
         }
     };
     let name = &name;
-    // Where the result goes: standard output, or upstream's `-f FILE`.
-    let mut out: Box<dyn Write> = match args.value(2) {
-        Some(path) => match std::fs::File::create(path) {
-            Ok(f) => Box::new(std::io::BufWriter::new(f)),
+    // Upstream's `-f FILE`: written beside FILE under a temporary name and
+    // renamed over it once the whole result is there — a database that does
+    // not open, a query that fails or a write error leaves an existing FILE
+    // as it was (review bulkcli#10: it was truncated first).
+    let mut result_file = match args.value(2) {
+        Some(path) => match cli::OutputFile::create(Path::new(path)) {
+            Ok(f) => Some((path, f)),
             Err(e) => {
                 eprintln!("cannot create result file '{path}': {e}");
                 return ExitCode::FAILURE;
             }
         },
-        None => Box::new(std::io::stdout().lock()),
+        None => None,
     };
 
     let dir = db_dir_for(name);
@@ -130,21 +138,32 @@ fn main() -> ExitCode {
     };
     let elapsed = started.elapsed();
 
-    let written = match &result {
-        QueryResult::Select(rs) => write!(out, "{}", rs.to_table_string()),
-        QueryResult::Ask(b) => writeln!(out, "{b}"),
-        // The escaping serializer (review sparqlconf#11).
-        QueryResult::Construct(triples) => triples
-            .iter()
-            .try_for_each(|t| writeln!(out, "{}", t.to_ntriples())),
-        QueryResult::Update { .. } => Ok(()),
+    let write = |out: &mut dyn Write| -> std::io::Result<()> {
+        match &result {
+            QueryResult::Select(rs) => write!(out, "{}", rs.to_table_string()),
+            QueryResult::Ask(b) => writeln!(out, "{b}"),
+            // The escaping serializer (review sparqlconf#11).
+            QueryResult::Construct(triples) => triples
+                .iter()
+                .try_for_each(|t| writeln!(out, "{}", t.to_ntriples())),
+            QueryResult::Update { .. } => Ok(()),
+        }?;
+        out.flush()
     };
-    // A reader that stopped early (`gquery … | head`) is not an error.
-    if let Err(e) = gstore::stdout::quiet_broken_pipe(written.and_then(|()| out.flush())) {
-        eprintln!("cannot write the result: {e}");
+    let written = match result_file.take() {
+        Some((path, mut file)) => file
+            .writer()
+            .and_then(|w| write(w))
+            .and_then(|()| file.commit())
+            .map_err(|e| format!("cannot write result file '{path}': {e}")),
+        // A reader that stopped early (`gquery … | head`) is not an error.
+        None => gstore::stdout::quiet_broken_pipe(write(&mut std::io::stdout().lock()))
+            .map_err(|e| format!("cannot write the result: {e}")),
+    };
+    if let Err(e) = written {
+        eprintln!("{e}");
         return ExitCode::FAILURE;
     }
-    drop(out);
     match result {
         QueryResult::Select(rs) => {
             eprintln!(

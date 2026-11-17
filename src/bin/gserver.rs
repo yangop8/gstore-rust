@@ -154,13 +154,19 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long `-b` waits for the detached server to answer.
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Exit status: `0` success, `1` the command failed (the server could not
+/// start, stop, …), `2` invalid arguments — the convention of every other
+/// tool (`src/bin/common/cli.rs`'s `EXIT_USAGE`, `load_config`'s bad
+/// `--db-home` / `--thread-num`; review bulkcli#18: an
+/// argument error was `1`, which a script or service manager could not tell
+/// from a failed start).
 fn main() -> ExitCode {
     let cli = match Cli::parse(std::env::args_os().skip(1)) {
         Ok(c) => c,
         Err(msg) => {
             eprintln!("gserver: {msg}");
             eprintln!("Invalid arguments! Input \"gserver -h\" for help.");
-            return ExitCode::from(1);
+            return ExitCode::from(2);
         }
     };
     if cli.mode() == Mode::Help {
@@ -616,7 +622,10 @@ impl Target {
             (Some(d), true) => Kind::Api(d.clone()),
             // The legacy `--api` without a directory served `.`.
             (None, true) if !cfg.is_set("db_home") => Kind::Api(PathBuf::from(".")),
-            (None, _) => Kind::Api(cfg.db_home.clone()),
+            // The databases' directory, as `GStoreConfig::db_path` places
+            // them (review design#11: one definition for the servers and
+            // the library).
+            (None, _) => Kind::Api(cfg.db_root().to_path_buf()),
         };
         let pid_file = cli.pid_file.clone().unwrap_or_else(|| match &kind {
             Kind::Api(root) => root.join("gserver.pid"),

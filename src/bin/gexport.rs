@@ -26,12 +26,17 @@
 //! `-z` / `--zip` (upstream's `gexport -z 1`), or an `<out>` ending in `.zip`,
 //! writes a zip archive instead (feature `zip`): `<out>` with its extension
 //! replaced by `.zip`, holding the export file by its name (`out.nt`).
+//!
+//! The output is written under a temporary name beside its destination and
+//! renamed into place once complete and synced: an export that fails (a
+//! full disk, a write error) leaves no partial file, and an existing file of
+//! that name as it was. A symbolic link stays a link (the file it names is
+//! replaced, keeping its permission bits); a FIFO or a device is written in
+//! place.
 
 #[path = "common/cli.rs"]
 mod cli;
 
-use std::fs::File;
-use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -236,9 +241,14 @@ fn main() -> ExitCode {
         }
     };
 
-    // A zip's export file is written beside it under a temporary name and
-    // packed as `<base name>[.<ext>]`.
-    let (file_path, archive) = if zip {
+    // The export file is written under a temporary name beside where it
+    // goes and renamed into place once complete and synced; a zip's export
+    // file is packed from there as `<base name>[.<ext>]` (and the archive
+    // itself is written to `.part` and renamed). A failed export removes its
+    // temporary file and leaves whatever the destination held (review
+    // bulkcli#11: it wrote in place, leaving a partial file — or a
+    // `.export-tmp` beside an archive — behind).
+    let (dest, archive) = if zip {
         let mut entry = base
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -246,43 +256,55 @@ fn main() -> ExitCode {
         if ExportFormat::from_path(&base).is_none() {
             entry = format!("{entry}.{}", format.extension());
         }
-        let mut tmp = archive_path.clone().into_os_string();
-        tmp.push(".export-tmp");
-        (PathBuf::from(tmp), Some((archive_path, entry)))
+        (archive_path.clone(), Some((archive_path, entry)))
     } else {
         (base, None)
     };
-
-    let file = match File::create(&file_path) {
+    // A zip's export file is always a temporary file beside the archive
+    // (packed from there, never committed); a plain export goes where its
+    // destination is (a link's file, a FIFO or a device written in place).
+    let created = if archive.is_some() {
+        cli::OutputFile::beside(&dest)
+    } else {
+        cli::OutputFile::create(&dest)
+    };
+    let mut out = match created {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("cannot create '{}': {e}", file_path.display());
+            eprintln!("cannot create '{}': {e}", dest.display());
             return ExitCode::FAILURE;
         }
     };
-    let mut w = BufWriter::new(file);
-    let count = match zipio::write_export(&db, format, &mut w).and_then(|n| {
-        w.flush()?;
-        Ok(n)
-    }) {
+    let count = match out
+        .writer()
+        .map_err(gstore::GStoreError::from)
+        .and_then(|w| zipio::write_export(&db, format, w))
+        .and_then(|n| {
+            out.finish()?;
+            Ok(n)
+        }) {
         Ok(n) => n,
         Err(e) => {
-            eprintln!("write error on '{}': {e}", file_path.display());
+            eprintln!("write error on '{}': {e}", dest.display());
             return ExitCode::FAILURE;
         }
     };
-    drop(w);
     let written = match archive {
         Some((archive, entry)) => {
-            let packed = zipio::pack_file(&file_path, &archive, &entry);
-            let _ = std::fs::remove_file(&file_path);
-            if let Err(e) = packed {
+            // `out` (the export file) is removed when it goes out of scope.
+            if let Err(e) = zipio::pack_file(out.path(), &archive, &entry) {
                 eprintln!("gexport: export compress fail: {e}");
                 return ExitCode::FAILURE;
             }
             archive
         }
-        None => file_path,
+        None => {
+            if let Err(e) = out.commit() {
+                eprintln!("write error on '{}': {e}", dest.display());
+                return ExitCode::FAILURE;
+            }
+            dest
+        }
     };
     let what = match format {
         ExportFormat::NTriples => "triple(s)",

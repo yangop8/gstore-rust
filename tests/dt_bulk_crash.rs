@@ -257,10 +257,13 @@ fn every_crash_point_leaves_the_old_or_the_new_database() {
 /// A real crash: `gbuild --disk --force` aborted at each step through the
 /// environment failpoint, then SIGKILLed at moments spread over a whole
 /// build — every time the directory opens as the old or the new database.
-/// Bounded to well under 30 s.
+/// review bulkcli#17: the kills used to stop at a 25 s wall-clock budget
+/// and the test required at least 6 of them, which a slow or loaded runner
+/// could miss without any product bug; the kills are now a fixed number of
+/// moments spread over the build time measured on the same runner, so a
+/// slower machine stretches the test instead of failing it.
 #[test]
 fn killed_gbuild_leaves_the_old_or_the_new_database() {
-    let started = Instant::now();
     let base = tmp("kill");
     let gbuild = env!("CARGO_BIN_EXE_gbuild");
     let old_nt = base.join("old.nt");
@@ -311,14 +314,10 @@ fn killed_gbuild_leaves_the_old_or_the_new_database() {
         .unwrap();
     assert!(out.status.success(), "{out:?}");
     let full = t.elapsed();
-    let mut kills = 0;
     let mut seen = [false; 2];
-    for i in 0..24u32 {
-        if started.elapsed() > Duration::from_secs(25) {
-            break;
-        }
+    for i in 0..12u32 {
         rebuild_old();
-        let delay = full.mul_f64(f64::from(i % 12) / 11.0 * 1.1);
+        let delay = full.mul_f64(f64::from(i) / 11.0 * 1.1);
         let mut child = Command::new(gbuild)
             .args(["--disk", "--force"])
             .arg(&name)
@@ -330,10 +329,9 @@ fn killed_gbuild_leaves_the_old_or_the_new_database() {
         std::thread::sleep(delay);
         let _ = child.kill();
         let _ = child.wait();
-        kills += 1;
         seen[usize::from(classify(count()))] = true;
     }
-    assert!(kills >= 6, "only {kills} kills in time");
+    // The first kill comes right after the spawn, long before the install.
     assert!(seen[0], "no kill landed before the install");
     let _ = fs::remove_dir_all(&base);
 }

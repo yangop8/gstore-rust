@@ -29,8 +29,9 @@
 //! filter). A counter that would be zero is absent, as the incremental
 //! writers leave it.
 //!
-//! The install ([`super::ROCKS_CRASH_POINTS`]): the build holds the
-//! directory's [`DirLock`] and [`BuildGuard`] and refuses a directory whose
+//! The install ([`super::ROCKS_CRASH_POINTS`]): the build claims the
+//! directory and takes its lock in one step ([`BuildGuard::lock`]) and
+//! refuses a directory whose
 //! RocksDB store is open anywhere; the new store replaces `rocksdb/`
 //! through `fsutil::install_staged_dir` (its rename into place is the
 //! commit point), then the replaced database's reasoning rules, the other
@@ -48,7 +49,7 @@ use crate::backend::rocks::{
     CF_OSP, CF_POS, CF_SPO, CF_STATS, K_OBJECTS, K_PREDS, K_SUBJECTS, K_TRIPLES, LAYOUT_VERSION,
     META_LAYOUT_KEY, META_NAME_KEY, T_CARD, T_OBJ, T_PO, T_POBJ, T_PS, T_PSUBJ, T_SUB,
 };
-use crate::db::dirlock::{BuildGuard, DirLock};
+use crate::db::dirlock::BuildGuard;
 use crate::db::fsutil::{self, remove_dir_if_exists, sync_dir};
 use crate::db::persist::remove_other_layouts;
 use crate::db::StorageKind;
@@ -117,7 +118,7 @@ impl Failpoints {
             .find(|(d, _)| *d == canonical)
             .map(|(_, p)| p.clone());
         Failpoints {
-            abort_at: std::env::var(CRASH_ENV).ok().filter(|s| !s.is_empty()),
+            abort_at: super::commit::crash_env(&ROCKS_CRASH_POINTS),
             fail_at,
             crashed: false,
         }
@@ -768,20 +769,14 @@ pub(crate) fn build_rocksdb(
 ) -> Result<BulkReport> {
     let started = Instant::now();
     fs::create_dir_all(dir)?;
-    let _guard = BuildGuard::enter(dir)?;
-    if DirLock::held_here(dir) {
-        // A database of this process has the directory open: replacing its
-        // files under it would strand its later writes.
-        return Err(GStoreError::Database(format!(
-            "database directory '{}' is open in this process; close it before rebuilding it",
-            dir.display()
-        )));
-    }
-    // Another process holding the directory (a server, a tool) is refused
-    // here; an older binary serving the RocksDB store (it takes only the
-    // store's own lock, not the directory's) is refused below, through
-    // that lock.
-    let _lock = DirLock::acquire(dir)?;
+    // The claim and the lock in one step (review bulkcli#13): a database of
+    // this process that has the directory open (replacing its files under
+    // it would strand its later writes), another build of this process and
+    // another process holding the directory (a server, a tool) are refused
+    // here, and no other thread of this process opens it meanwhile; an
+    // older binary serving the RocksDB store (it takes only the store's own
+    // lock, not the directory's) is refused below, through that lock.
+    let (_guard, _lock) = BuildGuard::lock(dir)?;
     // Finish a swap a crash interrupted (as every open does) before looking
     // at the store: its `rocksdb.new` may be the committed database.
     fsutil::recover_dir_swap(&dir.join(ROCKS_SUBDIR))?;
