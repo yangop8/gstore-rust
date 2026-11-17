@@ -1605,6 +1605,8 @@ fn inspect(ctx: &Ctx<'_>, db: &str) -> Result<Inspection, GResp> {
     // once it is closed again.
     drop(copy);
     let print = DirPrint::of(&dir);
+    // Neither map keeps a database directory that is gone.
+    locked(unloaded_reads()).retain(|d, _| d.is_dir());
     let mut cache = locked(unloaded_stats());
     cache.retain(|d, _| d.is_dir());
     cache.insert(
@@ -1621,15 +1623,23 @@ fn inspect(ctx: &Ctx<'_>, db: &str) -> Result<Inspection, GResp> {
 }
 
 /// What a walk of a database directory sees of its files (review
-/// gapi#17): how many there are, their total size and the latest
+/// gapi#17): how many there are, their total size, the latest
 /// modification of any of them or of a directory (a file created, removed,
-/// renamed or written changes it). The cached statistics of an unloaded
-/// database hold while its directory shows the same.
+/// renamed or written changes it), and a digest of each file and
+/// directory's path, inode, size and modification time — so a file or
+/// directory replaced by another (a save renamed over it, a directory
+/// swapped in) changes the print even when sizes and timestamps cannot
+/// tell them apart (a copy that kept the timestamps, a file system with
+/// coarse ones). The cached statistics of an unloaded database hold while
+/// its directory shows the same.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DirPrint {
     files: u64,
     bytes: u64,
     latest: Option<std::time::SystemTime>,
+    /// The sum (wrapping) of one hash per file and directory seen: the
+    /// same whatever order the walk lists them in.
+    digest: u64,
 }
 
 impl DirPrint {
@@ -1638,11 +1648,12 @@ impl DirPrint {
             files: 0,
             bytes: 0,
             latest: None,
+            digest: 0,
         };
         let mut stack = vec![dir.to_path_buf()];
         while let Some(d) = stack.pop() {
             if let Ok(m) = fs::metadata(&d) {
-                print.saw(&m);
+                print.saw(&d, &m);
             }
             let Ok(rd) = fs::read_dir(&d) else { continue };
             for e in rd.flatten() {
@@ -1652,7 +1663,7 @@ impl DirPrint {
                         if let Ok(m) = e.metadata() {
                             print.files += 1;
                             print.bytes += m.len();
-                            print.saw(&m);
+                            print.saw(&e.path(), &m);
                         }
                     }
                     _ => {}
@@ -1662,10 +1673,19 @@ impl DirPrint {
         print
     }
 
-    fn saw(&mut self, m: &fs::Metadata) {
-        if let Ok(t) = m.modified() {
-            self.latest = self.latest.max(Some(t));
-        }
+    fn saw(&mut self, path: &Path, m: &fs::Metadata) {
+        use std::hash::{Hash, Hasher};
+        let modified = m.modified().ok();
+        self.latest = self.latest.max(modified);
+        #[cfg(unix)]
+        let inode = std::os::unix::fs::MetadataExt::ino(m);
+        #[cfg(not(unix))]
+        let inode = 0u64;
+        // A fixed-key hasher: the same entry hashes alike for the life of
+        // the process (the cache lives in memory only).
+        let mut h = std::hash::DefaultHasher::new();
+        (path, inode, m.len(), modified).hash(&mut h);
+        self.digest = self.digest.wrapping_add(h.finish());
     }
 }
 

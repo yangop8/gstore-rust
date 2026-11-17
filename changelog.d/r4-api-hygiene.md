@@ -46,7 +46,10 @@ Behaviour changes first.
   statistics** (review gapi#17): the first request reads the database (as
   before); later ones walk its directory — the walk `diskUsed` needs anyway —
   and reuse the statistics while the directory shows the same files (count,
-  total size, latest modification of any file or directory). Before, every
+  total size, latest modification of any file or directory, and a digest of
+  each one's path, inode, size and modification time, so a directory
+  swapped for a look-alike — same names, sizes and timestamps — is read
+  anew). Before, every
   request opened the database (or read its whole snapshot), made a pass over
   its data and held its name busy meanwhile, refusing a concurrent `load`
   by root and a second `monitor` (1007).

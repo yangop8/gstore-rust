@@ -594,6 +594,100 @@ fn unloaded_rocksdb_statistics_are_read_once_until_the_files_change() {
     unloaded_statistics_are_read_once("rocksdb");
 }
 
+/// Set the modification time of every file and directory under `dir`
+/// (`dir` included) to `t`.
+fn set_mtimes(dir: &Path, t: std::time::SystemTime) {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in fs::read_dir(&d).unwrap() {
+            let e = e.unwrap();
+            if e.file_type().unwrap().is_dir() {
+                stack.push(e.path());
+            } else {
+                fs::File::options()
+                    .write(true)
+                    .open(e.path())
+                    .unwrap()
+                    .set_modified(t)
+                    .unwrap();
+            }
+        }
+        fs::File::open(&d).unwrap().set_modified(t).unwrap();
+    }
+}
+
+/// The relative paths and sizes of the files under `dir`, sorted.
+fn file_sizes(dir: &Path) -> Vec<(PathBuf, u64)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in fs::read_dir(&d).unwrap() {
+            let e = e.unwrap();
+            if e.file_type().unwrap().is_dir() {
+                stack.push(e.path());
+            } else {
+                let rel = e.path().strip_prefix(dir).unwrap().to_path_buf();
+                out.push((rel, e.metadata().unwrap().len()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The cached statistics of an unloaded database are keyed by its files
+/// themselves, not only by what their count, sizes and times add up to: a
+/// directory swapped for a look-alike — the same file names and sizes, the
+/// same timestamps (a copy that kept them, or a file system whose
+/// timestamps are too coarse to tell two saves apart) — is read anew
+/// instead of answered with the other database's statistics (review
+/// gapi#17).
+#[cfg(unix)]
+#[test]
+fn unloaded_statistics_are_read_again_for_a_look_alike_directory() {
+    let srv = Srv::start("lookalike");
+    // Two databases whose files have the same names and sizes.
+    srv.ok(
+        "POST",
+        "/build?db_name=cold",
+        "<http://ex/a> a <http://ex/K1> .\n",
+    );
+    srv.ok(
+        "POST",
+        "/build?db_name=twin",
+        "<http://ex/a> a <http://ex/K2> .\n",
+    );
+    srv.ok("POST", "/unload?db_name=cold", "");
+    srv.ok("POST", "/unload?db_name=twin", "");
+    let (cold, twin) = (srv.db_dir("cold"), srv.db_dir("twin"));
+    assert_eq!(file_sizes(&cold), file_sizes(&twin), "look-alike files");
+    let t = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+    set_mtimes(&cold, t);
+    set_mtimes(&twin, t);
+    let classes = || {
+        let j = srv.api_ok(&[("operation", "monitor"), ("db_name", "cold")]);
+        j.get("subjectList")
+            .map(Json::to_string)
+            .unwrap_or_default()
+    };
+    assert!(classes().contains("K1"), "cold's own classes");
+    let reads = gstore::gapi::unloaded_stats_reads(&cold);
+    // `twin`'s directory takes `cold`'s place, timestamps and all.
+    fs::rename(&cold, srv.root.0.join("cold.moved")).unwrap();
+    fs::rename(&twin, &cold).unwrap();
+    set_mtimes(&cold, t);
+    let after = classes();
+    assert!(
+        after.contains("K2") && !after.contains("K1"),
+        "the statistics of the directory now in place: {after}"
+    );
+    assert_eq!(
+        gstore::gapi::unloaded_stats_reads(&cold) - reads,
+        1,
+        "read anew"
+    );
+}
+
 // ---- gserver without the tls feature (http#19) ------------------------------
 
 /// A `gserver` built without the `tls` feature cannot serve HTTPS: given
