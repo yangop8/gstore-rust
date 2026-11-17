@@ -3854,6 +3854,13 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// The bit classes of the predicate bits in `bits` (see
     /// [`BitClass`]), with the store's predicates behind each; `None` when
     /// some bit has no predicate with a triple, so no entity has it.
+    ///
+    /// A per-predicate count is a statistic: the disk layout keeps it in a
+    /// `u32` that saturates at `u32::MAX` (review gap-accel-soundness#4,
+    /// bulkcli#14; it used to wrap, and a count wrapped to 0 dropped the
+    /// predicate here, so `Auto` answered no rows). Only a count of 0 decides
+    /// absence; a saturated count is an unknown, at least that large one,
+    /// and orders its class last.
     fn predicate_bit_classes(&self, bits: &Signature) -> Option<Vec<BitClass>> {
         let limit = self.dict.id_limit(Space::Predicate);
         let mut classes = Vec::new();
@@ -3862,10 +3869,15 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
                 let mut preds = Vec::new();
                 let mut card = 0u64;
                 for p in Signature::predicates_with_bit(bit, dir, limit) {
-                    let c = self.store.pred_card(p) as u64;
+                    let c = self.store.pred_card(p);
                     if c > 0 {
                         preds.push(p);
-                        card += c;
+                        let c = if c >= u32::MAX as usize {
+                            u64::MAX
+                        } else {
+                            c as u64
+                        };
+                        card = card.saturating_add(c);
                     }
                 }
                 if preds.is_empty() {

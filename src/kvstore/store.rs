@@ -93,6 +93,25 @@ const OVERFLOW_TAG: u8 = 1;
 /// A per-predicate statistics record: `(num, distinct_subj, distinct_obj)`.
 type PredStat = (u32, u32, u32);
 
+/// A per-predicate triple count of `u32::MAX` is saturated: the record is a
+/// `u32` on disk (no format change, D7), so the count stops there — "at
+/// least this many", an unknown count — instead of wrapping to 0, which made
+/// the predicate look absent (review gap-accel-soundness#4, bulkcli#14). A
+/// delete leaves a saturated count where it is;
+/// [`rebuild_stats`](DiskStore::rebuild_stats) recounts.
+fn count_up(n: u32) -> u32 {
+    n.saturating_add(1)
+}
+
+/// One triple fewer; a saturated count stays saturated (see [`count_up`]).
+fn count_down(n: u32) -> u32 {
+    if n == u32::MAX {
+        n
+    } else {
+        n.saturating_sub(1)
+    }
+}
+
 /// The in-memory counters a write operation may change, restored if it fails.
 #[derive(Clone, Copy)]
 struct Counters {
@@ -1299,7 +1318,11 @@ impl DiskStore {
         self.set_pred_stat(
             pager,
             t.pred,
-            (num + 1, dsub + sp_is_new as u32, dobj + po_is_new as u32),
+            (
+                count_up(num),
+                dsub.saturating_add(sp_is_new as u32),
+                dobj.saturating_add(po_is_new as u32),
+            ),
         )?;
 
         if self.compacted {
@@ -1345,7 +1368,7 @@ impl DiskStore {
             pager,
             t.pred,
             (
-                num.saturating_sub(1),
+                count_down(num),
                 dsub.saturating_sub(sp_gone as u32),
                 dobj.saturating_sub(po_gone as u32),
             ),
@@ -1556,7 +1579,7 @@ impl DiskStore {
             subs.insert(t.sub);
             objs.insert(t.obj);
             if let Some(p) = num.get_mut(t.pred as usize) {
-                *p += 1;
+                *p = count_up(*p);
                 psub[t.pred as usize].insert(t.sub);
                 pobj[t.pred as usize].insert(t.obj);
             }

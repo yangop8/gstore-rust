@@ -707,7 +707,7 @@ fn write_pred_counters(stats: &Stats, out: Out<'_>) -> Result<Vec<(&'static str,
 /// computed.
 fn check_counters(store_dir: &Path, tuning: &RocksTuning, stats: &Stats) -> Result<()> {
     let store = RocksStore::open_with(store_dir, tuning)?;
-    let live: Vec<(PredId, (u32, u32, u32))> = stats
+    let live: Vec<(PredId, (u64, u32, u32))> = stats
         .preds
         .iter()
         .enumerate()
