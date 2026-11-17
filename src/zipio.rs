@@ -435,8 +435,14 @@ const EOCD64_SIG: [u8; 4] = *b"PK\x06\x06";
 /// The fixed part of an end-of-central-directory record.
 const EOCD_LEN: u64 = 22;
 #[cfg(feature = "zip")]
-/// The fixed part of a central-directory file header.
+/// The fixed part of a central-directory file header, its signature
+/// included: the least a header takes, what the zip reader assumes when it
+/// checks a zip64 record's entry count against the record's offset.
 const CDFH_LEN: u64 = 46;
+#[cfg(feature = "zip")]
+/// The smallest "size of the zip64 end of central directory record" field
+/// the zip reader accepts.
+const EOCD64_MIN_RECORD_SIZE: u64 = 40;
 /// How far from the end an end-of-central-directory record may start: its
 /// fixed part, its signature again and the longest comment (64 KiB) — the
 /// window zip readers search.
@@ -512,19 +518,33 @@ fn declared_entries<R: io::Read + io::Seek>(r: &mut R) -> io::Result<u64> {
                 io::Read::read_exact(r, &mut z)
                     .map_err(|_| unsupported("truncated zip64 record"))?;
                 let (size, z_on_disk, z_total) = (le64(&z, 4), le64(&z, 24), le64(&z, 32));
-                let z_cd_offset = le64(&z, 48);
+                let (z_disk, z_cd_disk, z_cd_offset) = (le32(&z, 16), le32(&z, 20), le64(&z, 48));
+                // Every check the zip reader (zip 9.2,
+                // `find_central_directory_end`) applies to the record the
+                // locator names. A record that fails one is not simply
+                // skipped by the reader: it scans the bytes from there to the
+                // locator for another zip64 record and takes the first
+                // consistent one — which may sit inside this record's
+                // extensible data and declare any count (review of
+                // bulkcli#5's fix). That scan is not followed here: such a
+                // package is refused.
                 let fits = z[..4] == EOCD64_SIG
+                    && size >= EOCD64_MIN_RECORD_SIZE
                     && size.checked_add(12) == Some(at - 20 - eocd64_at)
+                    && z_disk == 0
+                    && z_cd_disk == le32(&loc, 4)
+                    && z_on_disk == z_total
                     && z_total
-                        .checked_mul(4 + CDFH_LEN)
+                        .checked_mul(CDFH_LEN)
                         .and_then(|n| n.checked_add(z_cd_offset))
                         .is_some_and(|end| end <= eocd64_at);
                 if !fits {
                     return Err(unsupported(
-                        "the zip64 end of central directory is not where its locator says",
+                        "the zip64 end of central directory is not where its locator says, \
+                         or is inconsistent",
                     ));
                 }
-                most = most.max(z_on_disk).max(z_total);
+                most = most.max(z_total);
                 continue;
             }
         }
@@ -1076,6 +1096,142 @@ mod tests {
         };
         assert_eq!(open_archive(&zip, &ok).unwrap().len(), 11);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review bulkcli#5 (review of the fix): when the zip64 end record at
+    /// the locator's offset fails one of the zip reader's own consistency
+    /// checks, the reader does not stop there — it scans the bytes between
+    /// that offset and the locator for another zip64 end record and uses the
+    /// first consistent one. A package whose named record declares one entry
+    /// but is inconsistent (multi-disk counts, a disk number, a disk that
+    /// disagrees with the locator), with a consistent record declaring the
+    /// real central directory hidden in its extensible data, was counted
+    /// from the named record and passed the limit, and the reader then
+    /// decoded the whole directory. The declared count must cover the
+    /// record the reader uses, or the package is refused.
+    #[cfg(feature = "zip")]
+    #[test]
+    fn a_zip64_record_the_reader_would_skip_is_not_taken_for_the_count() {
+        const N: u64 = 20;
+        let plain = written(N as usize, b"");
+        let eocd = plain.len() - EOCD_LEN as usize;
+        let (cd_size, cd_offset) = (le32(&plain, eocd + 12), le32(&plain, eocd + 16));
+        // (disk, disk with the directory, entries on this disk, entries) of
+        // the record the locator names, and the locator's disk with the
+        // directory.
+        for (disk, cd_disk, on_disk, total, loc_cd_disk) in [
+            (0u32, 0u32, 1u64, 2u64, 0u32),
+            (1, 0, 1, 1, 0),
+            (0, 1, 1, 1, 0),
+        ] {
+            let mut z = plain[..eocd].to_vec();
+            let named_at = z.len() as u64;
+            let record =
+                |z: &mut Vec<u8>, size: u64, disks: (u32, u32), n: (u64, u64), off: u64| {
+                    z.extend_from_slice(&EOCD64_SIG);
+                    z.extend_from_slice(&size.to_le_bytes());
+                    z.extend_from_slice(&45u16.to_le_bytes()); // made by
+                    z.extend_from_slice(&45u16.to_le_bytes()); // needed
+                    z.extend_from_slice(&disks.0.to_le_bytes());
+                    z.extend_from_slice(&disks.1.to_le_bytes());
+                    z.extend_from_slice(&n.0.to_le_bytes());
+                    z.extend_from_slice(&n.1.to_le_bytes());
+                    z.extend_from_slice(&cd_size.to_le_bytes());
+                    z.extend_from_slice(&off.to_le_bytes());
+                };
+            // The named record (56 bytes) with 56 bytes of extensible data…
+            record(&mut z, 100, (disk, cd_disk), (on_disk, total), 0);
+            // …holding a consistent record of the real directory, relative to
+            // the archive offset the reader then assumes (56).
+            record(&mut z, 44, (0, 0), (N, N), cd_offset - 56);
+            z.extend_from_slice(&EOCD64_LOCATOR_SIG);
+            z.extend_from_slice(&loc_cd_disk.to_le_bytes());
+            z.extend_from_slice(&named_at.to_le_bytes());
+            z.extend_from_slice(&1u32.to_le_bytes());
+            z.extend_from_slice(&EOCD_SIG);
+            z.extend_from_slice(&[0; 4]);
+            z.extend_from_slice(&[0xFF; 12]); // counts, size, offset: zip64
+            z.extend_from_slice(&[0; 2]);
+            let case = (disk, cd_disk, on_disk, total);
+            // The reader takes the hidden record: it decodes all N entries.
+            let read = zip::ZipArchive::new(io::Cursor::new(&z))
+                .map(|a| a.len() as u64)
+                .unwrap_or_else(|e| panic!("{case:?}: the reader refused it: {e}"));
+            assert_eq!(read, N, "{case:?}");
+            match declared_entries(&mut io::Cursor::new(&z)) {
+                Ok(n) => assert!(n >= N, "{case:?}: declared {n}, the reader decodes {N}"),
+                Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{case:?}: {e}"),
+            }
+        }
+    }
+
+    /// A zip64 package of empty stored entries named `names`, written by
+    /// hand: local headers, the central directory, a zip64 end record and
+    /// its locator right after it, and an end record that defers to them.
+    #[cfg(feature = "zip")]
+    fn zip64_of(names: &[&str]) -> Vec<u8> {
+        let mut z = Vec::new();
+        let mut offsets = Vec::new();
+        for name in names {
+            offsets.push(z.len() as u32);
+            z.extend_from_slice(b"PK\x03\x04");
+            z.extend_from_slice(&20u16.to_le_bytes()); // version needed
+            z.extend_from_slice(&[0; 4]); // flags, method (stored)
+            z.extend_from_slice(&[0, 0, 0x21, 0]); // time, date (1980-01-01)
+            z.extend_from_slice(&[0; 12]); // crc, sizes
+            z.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            z.extend_from_slice(&[0; 2]); // extra
+            z.extend_from_slice(name.as_bytes());
+        }
+        let cd_start = z.len() as u64;
+        for (name, off) in names.iter().zip(&offsets) {
+            z.extend_from_slice(b"PK\x01\x02");
+            z.extend_from_slice(&20u16.to_le_bytes()); // made by
+            z.extend_from_slice(&20u16.to_le_bytes()); // needed
+            z.extend_from_slice(&[0; 4]); // flags, method
+            z.extend_from_slice(&[0, 0, 0x21, 0]); // time, date
+            z.extend_from_slice(&[0; 12]); // crc, sizes
+            z.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            z.extend_from_slice(&[0; 12]); // extra, comment, disk, attributes
+            z.extend_from_slice(&off.to_le_bytes());
+            z.extend_from_slice(name.as_bytes());
+        }
+        let eocd64_at = z.len() as u64;
+        let n = names.len() as u64;
+        z.extend_from_slice(&EOCD64_SIG);
+        z.extend_from_slice(&44u64.to_le_bytes());
+        z.extend_from_slice(&45u16.to_le_bytes());
+        z.extend_from_slice(&45u16.to_le_bytes());
+        z.extend_from_slice(&[0; 8]); // disk, disk with the directory
+        z.extend_from_slice(&n.to_le_bytes());
+        z.extend_from_slice(&n.to_le_bytes());
+        z.extend_from_slice(&(eocd64_at - cd_start).to_le_bytes());
+        z.extend_from_slice(&cd_start.to_le_bytes());
+        z.extend_from_slice(&EOCD64_LOCATOR_SIG);
+        z.extend_from_slice(&[0; 4]);
+        z.extend_from_slice(&eocd64_at.to_le_bytes());
+        z.extend_from_slice(&1u32.to_le_bytes());
+        z.extend_from_slice(&EOCD_SIG);
+        z.extend_from_slice(&[0; 4]);
+        z.extend_from_slice(&[0xFF; 12]); // counts, size, offset: zip64
+        z.extend_from_slice(&[0; 2]);
+        z
+    }
+
+    /// Review of bulkcli#5's fix: the entry-count check of the zip64 record
+    /// assumed 50 bytes per central-directory header where the reader (and
+    /// the format) assume 46, so a valid zip64 package with short entry
+    /// names (a directory of fewer than 50 bytes per entry) was refused as
+    /// unsupported although the reader reads it.
+    #[cfg(feature = "zip")]
+    #[test]
+    fn a_zip64_package_with_short_names_is_counted_not_refused() {
+        let z = zip64_of(&["a", "b", "c"]);
+        let read = zip::ZipArchive::new(io::Cursor::new(&z))
+            .map(|a| a.len())
+            .unwrap_or_else(|e| panic!("the reader refused it: {e}"));
+        assert_eq!(read, 3);
+        assert_eq!(declared_entries(&mut io::Cursor::new(&z)).unwrap(), 3);
     }
 
     #[cfg(feature = "zip")]
