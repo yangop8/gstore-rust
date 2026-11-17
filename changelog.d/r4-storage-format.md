@@ -6,21 +6,30 @@
   is an error** (`GStoreError::Io`, `NotFound`, naming the file) and creates
   nothing; an empty file is refused as corrupt. It used to create the file
   through the pager and return an empty tree (no filtering). A database
-  whose `vstree.kv` is empty now fails to open with "VS-tree file … is empty
-  (corrupt; remove it to rebuild the index)"; a missing `vstree.kv` is
-  rebuilt or skipped as before (the open paths check for it first).
+  whose `vstree.kv` is empty, or whose header names a root outside the file
+  or more entities than it can hold, now fails to open with "VS-tree file …
+  is empty / is corrupt … (remove it to rebuild the index)"; a missing
+  `vstree.kv` is rebuilt or skipped as before (the open paths check for it
+  first).
 - **Behaviour change (review disk#4): the out-of-core VS-tree validates what
   it reads.** A scan checks every node it visits — kind byte 0/1, entry
   count ≤ 32 (`DISK_FANOUT`), child ids inside the file, never the header
   page and below their parent's (both writers write children first, so a
-  valid tree is acyclic), every leaf at one depth, no path longer than 8
-  nodes — and `open_disk` checks the header (root id inside the file, an
-  entity count the file can hold). A violation is a corruption error
-  (`GStoreError::Serialize`, `ErrorKind::Corrupt`: "VS-tree file '…' is
-  corrupt: … (remove it to rebuild the index)"). As a candidate filter the
-  tree then answers "no filtering", which is sound. Before, an entry count
-  above 32 panicked with an index out of range, child id 0 read the header
-  as a node, and a cycle overflowed the stack and aborted the process.
+  valid tree is acyclic), a node signature equal to the union of its
+  entries' and to the union its parent's entry stores for it, every leaf
+  at one depth, no path longer than 8
+  nodes, no scan visiting more nodes than the file holds — and `open_disk`
+  checks the header (root id inside the file, an entity count the file can
+  hold). A violation is a corruption error (`GStoreError::Serialize`,
+  `ErrorKind::Corrupt`: "VS-tree file '…' is corrupt: … (remove it to
+  rebuild the index)"). As a candidate filter the tree then answers "no
+  filtering", which is sound. Before, an entry count above 32 panicked with
+  an index out of range, child id 0 read the header as a node, a cycle
+  overflowed the stack and aborted the process, a child id redirected to a
+  sibling hid the subtree it used to name and a node signature that lost
+  its bits pruned subtrees holding matches (false negatives), and a file
+  whose entries all name one child made a scan grow as 32^depth (a 5-page
+  file answered 1,048,576 candidates).
 - **disk#5: `VsTree::build_disk` replaces an existing file.** It removes the
   file and its write-ahead log (`Pager::remove_with_wal`) before building,
   as its docs always said; before, the pager opened the old file and
@@ -35,6 +44,10 @@
   `<s> <p> ?o` silently having no values. `kvstore::vlist::decode_u32s`
   refuses a count its remaining bytes cannot hold before allocating (a
   garbage count of `u32::MAX` used to request 16 GiB and abort the process).
+  An overflow record's length is checked too: one larger than every page of
+  the file can carry is refused before the chain is followed (a damaged
+  chain that cycles was read for up to 4 GiB), and a chain that ends before
+  its length is a read error.
 - **db#21:** `dict::prefix::decode_block` bounds its allocation the same way
   (two bytes per entry at least; `u32::MAX` entries asked for 96 GiB); its
   module docs say the front-coding codec is library-only (no on-disk
@@ -108,9 +121,14 @@ none
   an increment holding a `CLEAR DEFAULT` written by this version.
 - **docs/STORAGE_BACKEND.md**, format registry: `vstree.kv` is validated
   while read (kind byte, entry count ≤ 32, child ids in `1..page` below
-  their parent, uniform leaf depth, depth ≤ 8, header root and count); a
-  damaged file filters nothing and `open_disk` refuses a missing, empty or
-  header-damaged one ("remove it to rebuild the index"). The per-predicate
+  their parent, each node's signature the union of its entries' and equal
+  to its parent's entry for it, uniform leaf depth, depth ≤ 8, at most one
+  visit per node, header root and count); a damaged file filters nothing
+  and `open_disk` refuses a missing, empty or header-damaged one ("remove
+  it to rebuild the index"). Without a page checksum some damage stays
+  invisible (an entity id changed in a leaf, or a bit lost from one leaf
+  entry that another entry of the leaf also sets, can still hide a match).
+  The per-predicate
   `pred_stats` count is a `u32` that saturates at `u32::MAX` (an unknown
   count, at least that large); RocksDB's `c|p` is exact (`u64`), bulk or
   incremental. No format change.
@@ -125,10 +143,20 @@ none
   the open of a pre-statistics file); widening the record to `u64` needs a
   feature bit (D7) and was not worth one at this scale (2^32 triples of one
   predicate).
-- **docs/REFACTOR_BACKLOG.md** (review robust#11): `kvstore::overflow::read_chain`
-  still follows a chain until it has `len` bytes; a damaged chain that
-  cycles reads up to the record's length (≤ 4 GiB) before the VList decode
-  refuses it — a visited-page bound would close that.
+- **docs/REFACTOR_BACKLOG.md** (review robust#11): reads of an overflow
+  chain are bounded now (a record's length is at most the file's pages'
+  payload, and a chain that ends early is an error), but
+  `kvstore::overflow::free_chain`, which `DiskStore::compact` runs over the
+  previous index, still follows a damaged chain unchecked: a chain that
+  cycles frees a page twice and leaves the free list cyclic. A visited-page
+  bound (or a check against the free list) would close that write path.
+- **docs/REFACTOR_BACKLOG.md** (review disk#4, disk#15): a `vstree.kv` whose
+  header is damaged, or which is empty, now fails `Database::open` of the
+  disk layout with "remove it to rebuild the index" (before, the open went
+  on and the scan degraded or the tree was empty). The file is a derived
+  index: `load_disk_stream` / `load_disk_materialize` (src/db/persist.rs,
+  outside this package) could treat a refused `vstree.kv` as stale and
+  rebuild it, as they do for a missing one.
 
 ## Measured numbers
 
@@ -194,6 +222,20 @@ none
   allocation of 103079215080 bytes failed"; a damaged VList — `Ok([])`;
   `bulk::Stats` past `u32::MAX` and the forced `pred_stats` count — "attempt
   to add with overflow".
+- **Independent review** (same worktree, tests built with `cargo +1.99.1
+  test`, the package's sources swapped for their unfixed versions with the
+  new tests kept, then restored): every test above fails against the
+  unfixed code as stated, except `building_drops_a_stale_write_ahead_log`,
+  which passed there (a torn log is discarded by any open) and was
+  strengthened (see Requests/Not yet). The reviewer's additions, run
+  against the code before them: a child redirected to its sibling —
+  `Ok(Some(..))` with the first leaf twice and the second leaf missing; an
+  emptied root signature — `Ok(Some(..))` unnoticed (any query with a bit
+  pruned to nothing); every entry naming one child on four levels — 1,048,576
+  candidates from a five-page file; a complete stale log, against the code
+  before disk#5 — the new 10-entity file was 679,936 bytes instead of
+  8,192; an overflow record of
+  `u32::MAX` bytes — `Ok(..)` after following the chain.
 
 ## Requests/Not yet
 
@@ -219,6 +261,27 @@ none
   (comment "review disk#5" in the test). `bulk::stats::tests::taps_equal_set_counts`
   compares the triple count as `u64` (the field's new type); nothing it
   checks changed.
+- **Test strengthened (review, D6):**
+  `signature::disk_vstree::validation_tests::building_drops_a_stale_write_ahead_log`
+  wrote a garbage log, which any open discards as torn, so it passed
+  against the unfixed code. It now also leaves a complete log behind (a
+  build whose log removal fails, through the pager's `fail_wal_delete`
+  failpoint), removes the file and checks that the next build neither
+  replays that batch nor keeps the log (the file is exactly two pages).
+- **Review additions (disk#4, robust#11):** the scan also checks that each
+  node's signature is the union of its entries' and equals its parent's
+  entry for it, and bounds a scan to one visit per node (tests
+  `a_child_redirected_to_another_subtree_is_an_error_not_a_false_negative`,
+  `a_node_signature_that_is_not_the_union_of_its_entries_is_an_error`,
+  `a_child_named_by_every_entry_is_an_error_not_an_exponential_scan`; the
+  intact-tree test now covers the streaming writer too);
+  `materialize_vlist` bounds an overflow record's length by the file's
+  pages and reports a chain shorter than it (test
+  `a_vlist_overflow_record_whose_length_the_file_cannot_hold_is_a_read_error`
+  in `tests/storage_corruption.rs`). `tests/format_compat.rs` and
+  `tests/storage_corruption.rs` now assert that the eaf5320 and the bulk
+  build's `vstree.kv` pass the validation (a refused tree only filters
+  nothing, which answers cannot show).
 - **disk#15** is fixed in its trivial half only (see Docs notes: the
   read-only pager mode is a D8 backlog entry).
 - **gap-doc-claims#8 / disk#5 for an old file:** the eaf5320 `vstree.kv`
