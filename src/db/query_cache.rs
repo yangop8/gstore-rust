@@ -14,8 +14,8 @@
 //!   byte count (the result's strings plus per-row/per-cell overhead and the
 //!   key), [`DEFAULT_QUERY_CACHE_BYTES`] by default and set with
 //!   [`Database::set_query_cache_size`](super::Database::set_query_cache_size)
-//!   (0 disables caching). The proposed `conf.ini` key is
-//!   `query_cache_size` (bytes) in the `[system]` section. A single result
+//!   (0 disables caching); `conf.ini`'s `query_cache_size` key (bytes, in
+//!   the `[query]` section, see [`crate::config`]) sets it. A single result
 //!   larger than an eighth of the budget is not cached (upstream: 1 % of its
 //!   total), so one huge answer cannot flush everything else. Least-recently
 //!   used entries are evicted first.
