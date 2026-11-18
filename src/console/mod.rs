@@ -626,7 +626,15 @@ mod tests {
 
     #[test]
     fn ports_come_from_the_configuration() {
+        /// Removes the scratch directory also when an assertion fails.
+        struct Rm(std::path::PathBuf);
+        impl Drop for Rm {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
         let dir = std::env::temp_dir().join(format!("gconsole_conf_{}", std::process::id()));
+        let _rm = Rm(dir.clone());
         std::fs::create_dir_all(&dir).unwrap();
         let conf = dir.join("conf.ini");
         std::fs::write(&conf, "[server]\nport=9123\n").unwrap();
@@ -646,7 +654,6 @@ mod tests {
             ..Options::default()
         };
         assert!(resolve_port(&o).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

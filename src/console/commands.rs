@@ -2532,8 +2532,16 @@ mod tests {
 
     #[test]
     fn history_is_kept_and_capped() {
+        /// Removes the history file also when an assertion fails.
+        struct Rm(std::path::PathBuf);
+        impl Drop for Rm {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
         let dir = std::env::temp_dir().join(format!("gconsole_hist_{}", std::process::id()));
         let _ = std::fs::remove_file(&dir);
+        let _rm = Rm(dir.clone());
         let mut h = History::open(Some(dir.clone()));
         h.add("use lubm;");
         h.add("use lubm;");
@@ -2556,6 +2564,5 @@ mod tests {
             std::fs::read_to_string(&dir).unwrap().lines().count(),
             History::MAX
         );
-        let _ = std::fs::remove_file(&dir);
     }
 }
