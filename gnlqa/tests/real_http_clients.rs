@@ -369,3 +369,19 @@ fn gstore_reply_size_is_capped() {
         "{err:?}"
     );
 }
+
+/// Round-5 review follow-up (tests-a#7): the "dead" endpoint of these tests
+/// must stay dead while other tests of the binary bind ephemeral ports. It
+/// was a port bound and released, which any later bind to port 0 — a stub or
+/// server of a test running in parallel — could be handed; port 0 cannot be
+/// listened on.
+#[test]
+fn the_dead_port_cannot_be_taken_over_by_another_listener() {
+    let port = common::closed_port();
+    let other = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    assert_ne!(
+        other.local_addr().unwrap().port(),
+        port,
+        "a listener of another test could serve the dead endpoint"
+    );
+}

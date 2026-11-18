@@ -36,7 +36,9 @@ fn serve(engine: SolveEngine) -> SocketAddr {
 }
 
 fn assert_clean(text: &str, port: u16) {
-    for secret in ["s3cret", "admin:", &format!(":{port}"), "/sparql"] {
+    // review tests-a#7: the dead port is now 0, and ":0" alone also occurs
+    // in JSON (`"rounds":0`), so the address is checked with its host.
+    for secret in ["s3cret", "admin:", &format!("127.0.0.1:{port}"), "/sparql"] {
         assert!(!text.contains(secret), "client saw {secret:?}: {text}");
     }
 }

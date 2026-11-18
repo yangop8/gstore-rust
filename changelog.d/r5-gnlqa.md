@@ -34,6 +34,21 @@ Behaviour changes first:
   the deadline is reported as the spent time budget (`503`
   `limit_exceeded`), not as an outage of a healthy upstream. MCP tool calls run under the same budget
   (`McpServer::with_limits`; `gnlqa mcp` uses the configured limits).
+  The limiter tracks at most 10000 clients; when that table is full, it
+  forgets clients whose bucket has refilled, then clients with a token left,
+  never one that is being limited; while every tracked client is limited,
+  new clients share one overflow bucket.
+- **Per-client connection cap (cluster-nlqa#13, round-5 review follow-up).**
+  A connection takes its slot when it is accepted, but the rate limit and
+  the token check see a request only once it is complete, so one address
+  that opened `max_conn` connections and never finished a request held
+  every slot (an authenticated client elsewhere got `503 server busy`).
+  Connections are now also capped per client — the rate limit's key, an IP
+  address or an IPv6 /64 — at an eighth of the total (8 of 64; at least 1),
+  checked at accept time: beyond it the connection gets `429` "too many
+  connections from this client", answered without reading the request
+  (`HttpServer::with_max_conn_per_client`; behind a reverse proxy every
+  client is the proxy's address, so raise it there).
 - **Error responses are redacted (cluster-nlqa#18).** `/ask`, `/gSolve`
   and MCP tool errors no longer echo the internal error text (ureq printed
   the endpoint URL with its `user:password@`; provider bodies such as an
@@ -85,7 +100,9 @@ Behaviour changes first:
   through to Text-to-SPARQL either. Citation and explanation failures are logged. The linker is
   built lazily (`SolveEngine::with_linker_builder`, `prepare_linker`): a KB
   unreachable at startup is logged and retried on a later request (at most
-  once a minute in `gnlqa`), even after a panicking build.
+  once a minute in `gnlqa`), also after a build that panicked (the attempt
+  is recorded before the build runs; the panic still reaches the request
+  that ran it, which answers `500`).
 - **Results over the 100000-row cap are never silently truncated
   (cluster-nlqa#17).** `KbClient::query` / `GStoreClient::query` /
   `parse_results` fail with a repairable error asking for a `LIMIT`; the new
@@ -114,8 +131,10 @@ Behaviour changes first:
   and truncation are logged — and cached on disk per KB fingerprint
   (`kb_fingerprint`: endpoint, label settings and two predicate-bound
   `COUNT`s; `LinkerCache`, 0600 files — a directory the cache creates is
-  0700, an existing one keeps its permissions, and a cache file that other
-  users can access is not trusted — one day maximum age;
+  0700, an existing one keeps its permissions, and only a regular file
+  owned by the process's effective user and not accessible to other users is
+  trusted, checked on the opened file (a symbolic link or a `0600` file of
+  another user is rebuilt, not reused) — one day maximum age;
   `Linker::build_cached`). A capped entity index is the first entities in
   IRI order. A repeated one-shot `gnlqa "<question>"` costs two
   `COUNT` queries instead of full-store `DISTINCT` scans. New keys
@@ -137,7 +156,9 @@ New files and tests:
   mode), `config_trust.rs` (runs the binary with a planted `gnlqa.conf`),
   `provider_failures.rs`, `error_redaction.rs`, `answer_cache_bounds.rs`,
   `readonly_gate.rs` (SERVICE placements, repair proposing UPDATE),
-  `linker_cache.rs`. gnlqa now has 187 unit and 73 integration tests.
+  `linker_cache.rs`, `http_server_connection_caps.rs` (Linux: a second
+  loopback source address). gnlqa now has 189 unit and 77 integration
+  tests.
 - Corrected tests (D6): `session::tests::auto_mode_rewrite_includes_prior_answer`
   asserted the cluster-nlqa#14 leak; it is now
   `auto_mode_rewrite_omits_prior_gstore_answer` (review comment), and the
@@ -163,6 +184,27 @@ New files and tests:
   optional setting on its own line: `parse_config` keeps everything after
   `=` as the value, so the former inline comments became part of a value
   once a line was uncommented.
+- Round-5 review follow-up (each with a test that fails without the fix):
+  a flood of new clients no longer resets a throttled client's bucket
+  (`http_server::tests::a_flood_of_new_clients_never_resets_a_throttled_one`;
+  before, a full table of non-refilled buckets was cleared, so 10000
+  requests from the /64s of one IPv6 /48 gave the flooder's throttled
+  address a fresh bucket); the per-client connection cap
+  (`http_server_connection_caps::idle_connections_from_one_address_do_not_lock_out_another`,
+  the reviewer's probe: 8 idle connections from 127.0.0.1, then
+  127.0.0.2's `/health` got `503`; plus
+  `http_server::tests::one_client_cannot_take_every_connection_slot`); a
+  panicking linker build waits for the retry interval
+  (`provider_failures::a_panicking_linker_build_is_retried_only_after_the_interval`:
+  three calls, one build); the linker cache refuses a symlink and a file of
+  another user (`linker_cache::a_planted_link_or_a_file_of_another_user_is_not_trusted`;
+  the foreign-owner half needs `chown` and runs only as root, the symlink
+  half everywhere). Tests: `common::closed_port()` returns port 0 (nothing
+  can listen on it; a bound-and-released port could be handed to a stub of
+  a test running in parallel, tests-a#7), guarded by
+  `real_http_clients::the_dead_port_cannot_be_taken_over_by_another_listener`;
+  `error_redaction`'s check for the dead address now matches
+  `127.0.0.1:<port>` (`:0` alone also occurs in JSON).
 
 ## GAP_PLAN status line
 
@@ -179,7 +221,7 @@ none
   the follow-up rewrite now honours the table (a locally computed answer is
   never replayed outside `graphrag` mode) and structured mode never sends
   supporting triples, even with `with_explain`. The test count line
-  ("incl. 159 for gNLQA") becomes 260 (187 unit + 73 integration).
+  ("incl. 159 for gNLQA") becomes 266 (189 unit + 77 integration).
 - **docs/DEPLOY.md** (secure defaults and switches table): `gnlqa serve`
   client authentication — secure default: refuses to start without
   `GNLQA_HTTP_TOKEN`; switch `GNLQA_HTTP_ALLOW_UNAUTHENTICATED=on` (an
@@ -190,18 +232,24 @@ none
   `scripts/conformance.sh`. Also list the gnlqa limits
   (`GNLQA_HTTP_RATE_PER_MIN` 30, `GNLQA_MAX_QUESTION_BYTES` 4096,
   `GNLQA_MAX_LLM_CALLS` 16, `GNLQA_MAX_KB_ROWS` 200000,
-  `GNLQA_REQUEST_TIMEOUT_SECS` 120) and that gnlqa reads its config only
+  `GNLQA_REQUEST_TIMEOUT_SECS` 120; 64 connections, 8 per client) and
+  that gnlqa reads its config only
   from `$GNLQA_CONFIG` / `~/.config/gnlqa/gnlqa.conf`.
 - **CHANGELOG.md**: the bullets above, behaviour changes first; the
   `gnlqa.conf` location and the serve token are upgrade notes.
 - **docs/REFACTOR_BACKLOG.md** (remaining, not refactors done here):
   cluster-nlqa#13 — the rate limiter keys on the TCP peer address (IPv6:
   its /64), so behind a reverse proxy all clients share one bucket (gnlqa
-  has no trusted-proxy setting; use the proxy's own limits there); and its
-  table of at most 10000 clients is cleared when a flood from more
-  networks than that (e.g. the /64s of one IPv6 /48) fills it with
-  non-refilled buckets, which resets every client's bucket — bounded
-  memory was chosen over refusing new clients. cluster-nlqa#22
+  has no trusted-proxy setting; use the proxy's own limits there); the
+  per-client connection cap uses the same key, so behind a proxy it must be
+  raised (`with_max_conn_per_client`; there is no environment key for it or
+  for `max_conn`). A client with more addresses than the cap allows for
+  (e.g. the /64s of an IPv6 /48) can still hold every slot with idle
+  connections, each for up to the 30 s read deadline; a separate, shorter
+  deadline for the request head and an accept-rate limit per network would
+  narrow that. While every one of the 10000 tracked clients is being
+  limited, new clients share one overflow bucket (no client is ever
+  reset). cluster-nlqa#22
   — the KB fingerprint (two `COUNT`s) does not see a change that keeps the
   number of `rdfs:label` and `rdf:type` triples (e.g. a new predicate
   without labels or types); the one-day maximum age bounds that staleness,
@@ -230,7 +278,7 @@ instead of 3+ paged `DISTINCT` scans (`tests/linker_cache.rs`
   `Error::Limit`, `Error::{is_fatal, code, client_message}`,
   `error::redact_userinfo`, `HttpAuth`, `HttpLimits`,
   `HttpServer::{with_token, allow_unauthenticated_loopback, with_auth,
-  with_limits, with_read_deadline, auth}`, `McpServer::with_limits`, `net`
+  with_limits, with_read_deadline, with_max_conn_per_client, auth}`, `McpServer::with_limits`, `net`
   module and `RetryPolicy`, `with_retry` on the four clients,
   `KbClient::query_capped` (provided method), `GStoreClient::query_capped`,
   `parse_results_capped`, `MAX_RESULT_ROWS`,

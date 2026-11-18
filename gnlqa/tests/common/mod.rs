@@ -233,10 +233,13 @@ fn read_one(conn: &mut TcpStream) -> Option<Recorded> {
     })
 }
 
-/// A port on 127.0.0.1 with nothing listening (bound, then released).
+/// A port on 127.0.0.1 with nothing listening: port 0, which nothing can
+/// listen on, so a connection to it is refused at once. (Round-5 review
+/// follow-up of tests-a#7: a port bound and released here could be taken
+/// by a server or stub that a test running in parallel binds to port 0, and
+/// the "dead" endpoint then answered.)
 pub fn closed_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
+    0
 }
 
 /// A uniquely named temporary directory, removed (recursively) on drop —
