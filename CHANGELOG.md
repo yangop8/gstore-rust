@@ -11,10 +11,2331 @@ developed in parallel from the same base and merged; Phase 5 (RDF import,
 gconsole, zip, logging and packaging) was developed from the Phase 1 head
 and merged after them; Phase 4 (reasoning rules and PFN functions) was
 developed from the Phases 0–3 head and merged after Phase 5; Phase 6 (scale
-and performance) was developed on the merged Phases 0–5 and comes first
-below, followed by the CI notes. Then the integration sections record what
-joining the earlier phases changed, newest first, and the remaining ones
-each phase, newest first (Phase 5, then Phase 4, …).
+and performance) was developed on the merged Phases 0–5. A review-fix
+campaign then fixed the findings of a code review of the Phase 6 tree; it
+comes first below, followed by Phase 6 and the CI notes. Then the
+integration sections record what joining the earlier phases changed, newest
+first, and the remaining ones each phase, newest first (Phase 5, then
+Phase 4, …).
+
+### Review-fix campaign (after Phase 6)
+
+A code review of the Phase 6 tree (`7bbf4ae`: 24 reviewers, 382 finding ids
+after 3 refuted ones, merged into 291 items — 2 critical, 19 high, 76
+medium, 159 low, 35 info) was fixed in five rounds of parallel work packages
+(37 packages). Each round was merged, its merged tree reviewed again and the
+confirmed findings fixed before the next round was cut. Round 1 took the
+most urgent items (both critical findings and most of the high ones): the
+storage failure state, durable acknowledgements, RocksDB statement
+atomicity, request ingest caps and framing, the browser-facing HTTP surface,
+downloads and the crash / denial-of-service reproductions. Round 2: term
+consistency, the transaction lifecycle, limits and authentication,
+cancellable index builds, layout replacement and directory locks,
+graph-function limits and a W3C-style SPARQL test subset. Round 3: SPARQL
+result correctness (property paths, joins, functions and aggregates), REST
+parity and typed errors, the redo log and incremental backup, the RDF
+parsers and the storage kernel. Round 4: the executor differential guard,
+storage validation and cross-version fixtures, command-line tools and
+configuration, reasoning and PFN, `ConcurrentDb`, API hygiene and graph
+management. Round 5: gconsole, the experimental cluster, gnlqa, the
+test-suite audits, gstore-bench and packaging. The 372 finding ids assigned
+to packages were worked off, every behavioural fix with a regression test
+that fails without it; a few were fixed only in part (for example design#6,
+cluster-nlqa#9, cluster-nlqa#12), and their remainders, the 10 deferred ids
+(four of the frozen cluster, three info and three low items), the 3 refuted
+findings and every follow-up a package left open are in
+[`docs/REFACTOR_BACKLOG.md`](docs/REFACTOR_BACKLOG.md) with their review ids
+and reasons.
+
+Review ids are written `<area>#<n>` (`sec#1`, `durability#6`, …); C-1, C-2,
+H-1 … H-19 and M1 … M15 are the review's priority list. Insecure upstream
+behaviour is off by default and comes back only through an explicit
+upstream-compat switch, which gserver reports at startup
+(`upstream-compat: <key>=<value>`); [`docs/DEPLOY.md`, "Secure defaults and
+upstream-compat
+switches"](docs/DEPLOY.md#secure-defaults-and-upstream-compat-switches)
+lists every switch with its secure default, the upstream value, the risk and
+whether `scripts/conformance.sh` turns it on. The upstream `/api` keeps HTTP
+200 with its StatusCodes. No database file format changed (the redo log's
+new framing is read by older binaries, see below), and no public API or
+cargo feature was removed; the new error variants
+`GStoreError::StorageFailed`, `GStoreError::Timeout` and
+`GStoreError::Locked` (and gnlqa's `Error::Limit`) need an arm in exhaustive
+matches.
+
+#### Upgrade notes
+
+- **An API-mode gserver refuses to start while root's password is
+  `123456`**, on loopback too (H-10: sec#8, infra#3). Change the password
+  first, or start once on `127.0.0.1` with
+  `[server] allow_default_root_password=on`, change it (gconsole `setpswd`,
+  `/api userPassword`) and remove the switch. Fresh deb / rpm installs get a
+  random password in `/etc/gstore/root_password`.
+- **Request bodies before authentication are capped at 64 MiB**
+  (`[upload] preauth_max_body_size`) and `upload_max_body_size` now defaults
+  to 256 MiB (it was upstream's 1 GiB) (C-2). Upstream clients that put
+  their credentials in the body (SDK `/api` JSON, the Workbench's
+  `/file/upload` form) are held to 64 MiB unless the credentials go in the
+  URL query string or the cap is raised.
+- **Browsers and reverse proxies** (H-10): no response carries
+  `Access-Control-Allow-Origin` unless the origin is listed in
+  `[server] cors_allow_origin`; a state-changing request with a foreign
+  `Origin`, and a loopback request naming a foreign `Host`, get 403; a
+  request a proxy forwards (`Forwarded`, `X-Forwarded-For`, `X-Real-IP`)
+  loses loopback privileges. Behind a proxy that rewrites `Host`, list the
+  public origin in `cors_allow_origin`.
+- **`/file/download` needs credentials** (`[upload] anonymous_download=on`
+  restores upstream's public export directory); recorded uploads, exports
+  and query-result files are removed after `[upload] file_retention_hours`
+  (168) (sec#4, sec#14).
+- **GET never runs an UPDATE**, `POST /update` with `text/plain` or
+  `multipart/form-data` answers 415 (`[server] allow_get_update=on` restores
+  both), and the dataset protocol parameters (`default-graph-uri`, …) are
+  refused (H-10, gap-doc-claims#2).
+- **Slow clients and crowded addresses**: a request body must arrive at
+  `[server] min_body_rate` (64 KiB/s on average after a 30 s grace) and one
+  address holds at most `[server] max_conns_per_ip` (64) connections; raise
+  them behind NAT or a reverse proxy (H-1, sec#3).
+- **Failed logins lock the account at that address** (the 5th failure,
+  back-off up to 15 minutes; `[server] upstream_login_lockout=on` restores
+  upstream's rule), **idle transactions are rolled back after 600 s**
+  (`[system] txn_idle_timeout=0` restores "never"), and **statements stop
+  after `[server] query_timeout` (3600 s), answers at
+  `[server] max_result_bytes` (1 GiB)** (M6, M3, M7).
+- **A write applied in memory but not saved answers a failure** — REST 500,
+  `/api` 1005, `"applied in memory but not durable: …"` — instead of success
+  with a warning (H-7).
+- **SPARQL**: a failed non-`SILENT` `SERVICE` fails the query (add `SILENT`
+  to keep the empty answer); blank nodes are refused in `DELETE DATA`,
+  `DELETE WHERE` and DELETE templates (delete a stored blank node's triples
+  with `FILTER(sameTerm(?o, _:x))`); an aggregate query may project only
+  grouped variables; string and hash functions refuse non-string arguments
+  (`STRLEN(STR(?v))` gives the old reading); `CREATE` / `DROP` /
+  `CLEAR GRAPH` follow the graph-existence rule (`SILENT` keeps the old
+  no-op).
+- **Exit statuses**: `gbuild` exits 3 when tolerant mode skipped statements
+  (the database is built), `gserver` exits 2 on an argument error, and a
+  gserver built without the `tls` feature refuses `--tls-cert` / `--tls-key`
+  instead of serving plain HTTP.
+- **conf.ini**: a `#` or `;` starts an inline comment only as a word of its
+  own after the value; a marker glued to text
+  (`db_home=/srv/gstore #primary`) is now part of the value, as upstream
+  reads it, and `root_password` is never cut. Every cut, and every value an
+  earlier version would have cut, is a startup warning.
+- **systemd**: files gserver creates are no longer world-readable
+  (`UMask=0027`), a port below 1024 needs a drop-in granting
+  `CAP_NET_BIND_SERVICE`, and `--load-dir`, `db_path` and `backup_path`
+  cannot be under `/home`, `/root` or `/run/user` (`ProtectHome=yes`).
+- **Other tools**: `gnode cluster` needs `--state-dir DIR` or `--ephemeral`;
+  `gnlqa serve` needs `GNLQA_HTTP_TOKEN` (or
+  `GNLQA_HTTP_ALLOW_UNAUTHENTICATED=on`, loopback only), and gnlqa reads its
+  configuration from `$GNLQA_CONFIG` or `~/.config/gnlqa/gnlqa.conf` only (a
+  `gnlqa.conf` in the working directory is ignored);
+  `cargo test -p gstore-bench` on its own needs `cargo build --profile test
+  -p gstore --bin gbuild` first; `scripts/conformance.sh` fails when a suite
+  is skipped (`--allow-skip` accepts it).
+
+#### Behaviour changes: security defaults and upstream-compat switches
+
+Each `conf.ini` switch set to its upstream value makes gserver print one
+`upstream-compat: <key>=<value>` line at startup
+(`GStoreConfig::upstream_compat_warnings()`). `scripts/conformance.sh` turns
+on exactly `allow_default_root_password=on` and `anonymous_download=on`
+(upstream's scripts log in as root / 123456 and download anonymously) and
+fails the run when gserver does not report them (`check_compat_switches`).
+The risk of each upstream value is in
+[`docs/DEPLOY.md`](docs/DEPLOY.md#secure-defaults-and-upstream-compat-switches).
+
+| switch | secure default | upstream value | review |
+|---|---|---|---|
+| `[server] allow_default_root_password` | `off`: an API-mode gserver does not start while root's password is `123456` | `on`: the password accepted on a loopback address, from local clients only | H-10, sec#8, sec#9, infra#3 |
+| `[server] cors_allow_origin` | empty: no CORS headers; listed origins get their own origin echoed | `*`: `Access-Control-Allow-Origin: *` | H-10, infra#3 |
+| `[server] allowed_hosts` | empty: a loopback request must name a local host | `*`: no `Host` check | H-10 |
+| `[server] allow_get_update` | `off`: GET never updates; `/update` refuses `text/plain` and multipart bodies | `on` | H-10, http#2, design#2, sec#8 |
+| `[server] trust_proxy_headers` | `off`: a forwarding loopback peer is remote | `on`: every loopback peer is local | sec#9, gapi#22 |
+| `[server] upstream_login_lockout` | `off`: lockout per account and address on every password path | `on`: upstream's per-address lockout | gapi#5, sec#7, http#6 |
+| `[system] txn_idle_timeout` | `600`: idle transactions rolled back after 600 s | `0`: transactions never expire | gap-txn-lifecycle#1 |
+| `[upload] anonymous_download` | `off`: `/file/download` needs credentials | `on`: a public export directory | sec#4, gapi#2 |
+
+Two opt-ins outside `conf.ini` print their own startup warning instead of an
+`upstream-compat:` line: `gserver --allow-local-hosts` (with
+`--allow-service`, lets `SERVICE` and `/api remote=true` reach host-local
+endpoints again; sec#6, robust#9) and gnlqa's
+`GNLQA_HTTP_ALLOW_UNAUTHENTICATED=on` (serves loopback clients without a
+token; cluster-nlqa#13, sec#18).
+
+- **Root's default password is refused on every address** (H-10: infra#3,
+  sec#9, sec#8). In API mode a root that still has `123456` (a new user
+  store seeded with it, or an existing one) makes gserver refuse to start,
+  on loopback too (it used to warn there); the message names both remedies.
+  With `allow_default_root_password=on` gserver starts on a loopback address
+  only (still refused beyond loopback) and accepts the password from local
+  clients only.
+- **Packages set a random root password on a fresh install** (infra#3,
+  sec#8). When no user store exists under `/var/lib/gstore` and
+  `/etc/gstore/conf.ini` still names the default password, the deb postinst
+  and the rpm `%post` write a random 32-hex-digit password to
+  `/etc/gstore/root_password` (0640 root:gstore; written beside it, synced
+  and renamed into place, every step checked) and print where it is; the
+  systemd unit sets `GSTORE_ROOT_PASSWORD_FILE=/etc/gstore/root_password`,
+  so gserver seeds the user store with it at the first start. `conf.ini`
+  stays byte-identical (a dpkg conffile); a deb purge removes the password
+  file; upgrades, existing stores and set passwords are left alone. gserver
+  now skips, with a warning, a `$GSTORE_ROOT_PASSWORD_FILE` that does not
+  exist (in Docker it stopped gserver); `--password-file` must still be
+  readable.
+- **CORS only for listed origins** (H-10, infra#3). No response carries
+  `Access-Control-Allow-Origin` by default (it was `*` on every response).
+  `[server] cors_allow_origin` lists origins (`scheme://host[:port]`,
+  separated by `|`, `,` or spaces) that get their own origin echoed with
+  `Vary: Origin`; `*` restores upstream's `ACAO: *`. A preflight from a
+  listed origin gets 200 with the `Access-Control-Allow-*` headers, from any
+  other origin 403 without CORS headers, without `Origin` 200 without
+  `ACAO`. `cors=off` still turns CORS processing off; the shipped
+  `conf.ini.example` no longer turns on `ACAO *`.
+- **DNS-rebinding guard** (H-10). A request arriving over loopback must name
+  a local host in `Host`: an IP literal, `localhost` / `*.localhost`, a
+  dotless name, the configured `listen_addr` when it is a name, or a name in
+  the new `[server] allowed_hosts` (`*` turns the check off); any other name
+  answers 403 (`/api`: HTTP 200, StatusCode 1101). A request without `Host`
+  is accepted; non-loopback peers are not checked.
+- **CSRF guard** (H-10). On both servers a state-changing request (any
+  method but GET, HEAD, OPTIONS) whose `Origin` names neither the server
+  itself (`http(s)://` + the request's own `Host`) nor an origin of
+  `cors_allow_origin` answers 403 (`/api`: 1101). Clients that send no
+  `Origin` (curl, the SDKs, upstream scripts, gconsole) are unaffected; the
+  bundled web consoles match when opened at the server's own address. Behind
+  a reverse proxy that rewrites `Host` (nginx's default `proxy_pass`) list
+  the public origin in `cors_allow_origin`, or keep the client's `Host`
+  (`proxy_set_header Host $host;`) and list it in `allowed_hosts`; a front
+  end served from another origin (upstream's Workbench) needs its origin in
+  `cors_allow_origin`.
+- **GET never runs a SPARQL UPDATE, and `/update` takes typed bodies**
+  (H-10: http#2, design#2, sec#8). `GET /sparql` with an UPDATE answers 400
+  (classified by a parse before anything runs; only texts holding an update
+  keyword or a backslash are parsed twice); `POST /update` with `text/plain`
+  or `multipart/form-data` — the types a page can POST cross-site without a
+  preflight — answers 415, on both servers. Accepted:
+  `application/sparql-update`, a form, an unlabelled body, or any other type
+  (taken verbatim). An UPDATE POSTed to `/sparql` still runs (REST: with the
+  Update privilege). `[server] allow_get_update=on` restores both upstream
+  behaviours.
+- **Proxies are not local clients** (sec#9, gapi#22). One predicate,
+  `server::peer_is_trusted_local`, decides locality: a loopback peer
+  forwarding `Forwarded`, `X-Forwarded-For` or `X-Real-IP` is a reverse
+  proxy speaking for remote clients and loses loopback privileges. The
+  unauthenticated single-database server refuses it (403), root's default
+  password is refused from it (REST Basic and `/login`: 401; `/api`: 1001,
+  plaintext or `encryption=1`; a constant comparison that does not count
+  towards the lockout), `/api`'s `trust_inner_localhost` no longer applies,
+  and the pre-body credential check leaves its credentials unchecked (body
+  held to the pre-auth cap). `[server] trust_proxy_headers=on` restores
+  upstream's rule. Detection relies on the proxy adding one of those
+  headers: nginx without `proxy_set_header X-Forwarded-For
+  $proxy_add_x_forwarded_for;`, HAProxy without `option forwardfor`, stunnel
+  and ssh / socat tunnels cannot be told apart.
+- **`/file/download` (and `/grpc/file/download`) needs credentials** (sec#4,
+  gapi#2): `username` / `password` parameters as before or HTTP
+  `Authorization: Basic`; without them HTTP 401 with
+  `WWW-Authenticate: Basic` and a 1001 envelope, before anything is
+  resolved. `[upload] anonymous_download=on` restores upstream's public
+  export directory.
+- **Failed-login lockout per account and client address, on every password
+  path** (M6: gapi#5, sec#7, http#6). Failures are counted per account and
+  address (an IPv6 client by its /64, an IPv4-mapped one by its IPv4
+  address); after more than `login_lockout_failures` failures (default 4, so
+  the 5th locks, as upstream's `errornum > 4`) that account is locked for
+  that address — 1 s at first, each further failure doubling the lock up to
+  `login_lockout_max_seconds` (default 900) — and the counts are forgotten
+  after an hour without a failure. Every path that checks a password asks
+  the lockout before the PBKDF2 hash runs: `/api` `login`, `testConnect` and
+  every authenticated operation (also `/shutdown`, `/restart`), the pre-body
+  credential check, REST `/login` and Basic credentials, and the
+  single-database server's Basic auth. A refused attempt costs no hash and
+  is answered `/api` 1101, REST and single-database `429 Too Many Requests`
+  with `Retry-After`. A success clears only its own account's count at that
+  address; a lock refuses only that account's password checks (other users,
+  other operations and logged-in sessions from the address keep working).
+  More than `8 × login_lockout_failures` (32) failures of any accounts from
+  one address lock the address's password checks too ("too many failed
+  logins from this address"), except for accounts that authenticated from it
+  within the last hour. The key is the TCP peer's address (behind a reverse
+  proxy all clients share the proxy's). `refreshconf` applies the three
+  keys. `[server] upstream_login_lockout=on` restores upstream's rule (per
+  address; `login`, `testConnect` and REST `/login` exempt and still
+  evaluating guesses; any successful login resets the address; until
+  restart).
+- Library: `IpFilter::locked_out` (with `note_failure`, upstream's
+  per-address lockout) locks out only a filter built
+  `with_upstream_lockout(true)`; a filter from `IpFilter::new` counts
+  `note_failure`s but `locked_out` stays `false` — the default lockout is
+  `auth_refusal` / `note_auth_failure` (gapi#5). Embedders that used `new` +
+  `note_failure` + `locked_out` add `.with_upstream_lockout(true)`.
+- **`gserver --allow-service` no longer lets SPARQL `SERVICE` reach
+  host-local addresses** (M8: sec#6, robust#9, tests-b#1). An endpoint
+  resolving only to loopback, link-local or another host-local address is
+  refused before anything connects and the query fails with an error naming
+  the refusal, `SILENT` or not. The new flag `--allow-local-hosts` (only
+  with `--allow-service`) restores the reach for `SERVICE` and
+  `/api remote=true` downloads alike and prints a startup warning; given
+  alone it only warns that it has no effect. The library default
+  (`LoadPolicy::permissive`, used by `gquery` and embedders) still reaches
+  every host.
+- **SERVICE endpoint IRIs with whitespace or control characters are
+  refused** (M8: sec#6, robust#9): the SPARQL lexer decodes `\u000D\u000A`
+  inside an IRIREF, and host and path went verbatim into the request line
+  and the `Host` header (`SERVICE <http://h/x\u000D\u000AX-Injected: yes>`
+  injected a header). Such a pattern fails like any other endpoint failure,
+  without connecting.
+- **More special-purpose ranges count as host-local** (sec#13):
+  `http_client::is_local_addr` adds 100.64.0.0/10 (cloud metadata at
+  100.100.100.200), 198.18.0.0/15, 240.0.0.0/4, unique-local fc00::/7 (IPv6
+  metadata fd00:ec2::254), site-local fec0::/10, IPv4-compatible ::/96 and
+  the NAT64 (64:ff9b::/96) and 6to4 (2002::/16) forms of host-local IPv4,
+  besides loopback, 0.0.0.0/8, link-local, multicast and broadcast. It
+  applies to `SERVICE` under `--allow-service`, `remote=true` downloads and
+  asynchronous-operation callbacks (unless `callback_allow_local`); private
+  networks (10/8, 172.16/12, 192.168/16) stay reachable by design.
+
+#### Behaviour changes: HTTP, REST and `/api`
+
+- **Request bodies before authentication are capped** (C-2: sec#1, gapi#1,
+  infra#1). Both servers decide a body's cap between head and body: every
+  request may carry `[upload] preauth_max_body_size` (64 MiB,
+  `HttpOptions::preauth_max_body`); only a request authenticated from its
+  head on a payload route may carry `upload_max_body_size` — API mode: HTTP
+  Basic, a REST session token (`Authorization: Bearer`, `X-Session-Token`,
+  `session=` / `token=` URL parameters) or upstream's `username` /
+  `password` (`encryption=1`) in the URL query string, under the IP lists
+  and the lockout. Payload routes: `/file/upload` (also `/grpc/`), `/api`
+  (and `/grpc/api`, `/ghttp/api`, `POST /`) when the URL names no operation
+  or `query` / `tquery`, REST `/upload`, `/build`, `/update`, `/tquery`,
+  `/batchInsert`, `/batchRemove`; the single-database server checks Basic
+  credentials on `POST /update` and `POST /sparql`. A request the browser
+  policy refuses before routing is held to the pre-auth cap whatever it
+  carries (answered 403 after its body). A larger `Content-Length` is
+  answered 413 without reading a body byte, a chunked body is cut off at its
+  cap (413), and `Expect: 100-continue` is answered only after the decision.
+  Head credentials that fail are answered 401 before the body and count once
+  towards the lockout; a locked-out or blocked address is held to the
+  pre-auth cap, also with a valid session token. An upstream inner request
+  (`inner=true`) is never checked before its body. The check runs only for a
+  body that may exceed the pre-auth cap.
+- **All request bodies in memory share a budget per server** (C-2: sec#1,
+  gapi#1): `[upload] request_body_budget` (`HttpOptions::body_budget`;
+  512 MiB, never below `upload_max_body_size`). Bodies are charged as their
+  bytes arrive and held until the response is written; a request whose
+  announced body does not fit is answered 503 before its body is read, one
+  that runs out part-way 503 too, and the connection is closed after either.
+- **`upload_max_body_size` defaults to 256 MiB** in the code and the shipped
+  configuration (was 1 GiB, upstream's value) (infra#1); the `/api` upload
+  check (`1005 "Upload file more than max_body_size!"`) follows it.
+- **`/api` request bodies are parsed within bounds** (gapi#1): a JSON body
+  holds at most 65,536 values (a wider one answers `1003 "the request body
+  is not valid JSON (… too many JSON values …)"` before more of the tree is
+  built), a URL query string, form body or multipart body at most 65,536
+  parameters / parts (1003).
+- **Multipart boundaries follow RFC 2046** (H-2: sec#2, robust#2): 1 to 70
+  `bchars` (letters, digits, `'()+_,-./:=?` and an inner space); a longer
+  boundary or another character is answered 1003. The boundary search is
+  linear (memchr two-way) instead of body × boundary (a 60,000-character
+  boundary made one 8 MiB request cost 11 s of CPU before authentication).
+- **A slow client can no longer hold a worker thread** (H-1: sec#3, http#1,
+  robust#3, http#3). A request body must arrive at `[server] min_body_rate`
+  (bytes/s, default 65,536; `0` = the per-read timeout alone) on average
+  after a grace of `read_timeout` from the end of its head: t seconds in, at
+  least (t − read_timeout) × min_body_rate bytes received, an allowance
+  earned only by bytes actually received. So no body holds a worker longer
+  than `read_timeout + length / min_body_rate`; before, only a single read
+  was bounded (30 s), one byte every 29 s held a worker indefinitely and
+  thread_num + 1 connections disabled the server. Under TLS the handshake
+  and every record of the head count against the head deadline and body
+  records against the body deadline (enforced below rustls at every socket
+  read); the idle wait between kept-alive TLS requests is bounded the same
+  way. A request that misses its deadline is answered `400 bad request: the
+  request did not arrive in time` and the connection closed. A legitimate
+  upload slower than 64 KiB/s on average after the 30 s grace is cut off.
+- **A chunked body's framing counts against the body cap** (sec#3, http#1):
+  chunk-size lines with extensions, CRLFs and trailers may take 64 KiB plus
+  a sixteenth of the cap besides the data; more is answered 413 (80 one-byte
+  chunks with 60 KiB extensions each, 4.9 MB on the wire, passed a 1 KiB
+  pre-auth cap).
+- **A streamed response must be read at `min_body_rate`** after a grace of
+  `write_timeout` (gapi#4, sec#3); a client that falls behind loses its
+  connection, freeing its worker and its `download_max_concurrent` slot
+  (eight slow readers, the default slot count, turned every other download
+  away with 503).
+- **New `[server] max_conns_per_ip`** (`HttpOptions::max_conns_per_ip`,
+  default 64, `0` = no limit) (sec#3): a further connection from an address
+  that already has that many open (waiting for a worker included) is closed
+  as soon as it is accepted, logged at most once a second (`refused a
+  connection from <ip>: it already has <n> open ([server]
+  max_conns_per_ip)`). IPv4-mapped IPv6 peers count as their IPv4 address.
+  Clients behind one NAT and every client of a reverse proxy share an
+  address: raise the key (or set `0`) there.
+- **Strict HTTP/1.1 request framing** (sec#16, http#14; RFC 9112 §5, §6,
+  §7.1), answered 400 with the connection closed: `Content-Length` together
+  with `Transfer-Encoding` (accepted before, connection kept); differing
+  (the last won) or non-decimal `Content-Length` values (`+5`, `-5`, `0x5`,
+  empty, `5, 5`); any `Transfer-Encoding` other than exactly `chunked`
+  (`gzip`, `identity`, `xchunked`, `gzip, chunked`, `chunked, chunked`, a
+  `chunked` line followed by an `identity` line) and any `Transfer-Encoding`
+  in HTTP/1.0; chunk sizes that are not bare hex; header lines without a
+  colon (skipped before), with an empty or non-token name, whitespace before
+  the colon, or an obs-fold continuation. Identical duplicate
+  `Content-Length`, `Transfer-Encoding: Chunked` in any case, chunk
+  extensions and trailers are still accepted.
+- **Control characters in request heads are refused** (robust#14): a request
+  line, header line, chunk-size line or trailer holding a control character
+  other than HTAB (bare CR, NUL, ESC, DEL, …), or ending in CR CR LF, is
+  answered `400 bad request: control character in a request line, header or
+  chunk line` (a bare CR in a header value was kept and a CORS preflight
+  reflected it into `Access-Control-Allow-Headers`).
+- **Request parameters follow the Content-Type** on the single-database
+  `Server` and the REST endpoints of `ApiServer` (H-9: design#1, http#5).
+  Parameters come from the URL query string and from a form body only
+  (`application/x-www-form-urlencoded`, or an unlabelled body shaped like a
+  form); an `application/sparql-query` or `application/sparql-update` body
+  and any other raw body is the statement or document verbatim. An IRI or
+  literal containing `&update=…`, `&query=…`, `&sparql=…`, `&db_name=…` or
+  `&db_path=…` no longer runs another statement (`INSERT DATA {
+  … <http://ex/x?a=1&update=CLEAR%20DEFAULT> }` ran `CLEAR DEFAULT`),
+  switches the database or names a server-side file. A form body without
+  `query=` / `update=` is a missing statement (400). The upstream `/api`
+  keeps upstream's parameter rules (`gapi::params`), except that since round
+  4 a body labelled `application/sparql-query` or
+  `application/sparql-update` is never read as a form there either
+  (design#17), so `&sparql=DELETE WHERE {…}&db_name=other` inside it can no
+  longer replace the statement or the database of the URL.
+- **Session tokens are read from the request head or URL only** (http#4):
+  `Authorization: Bearer`, `X-Session-Token`, `session=` / `token=` URL
+  parameters; a `session=` body parameter no longer works. REST `/login`
+  reads `username` / `password` with the server-wide state lock released (a
+  `Basic` header on `/login` is not looked at); `/update`'s 415 check
+  decides by Content-Type alone, before authentication.
+- **Dataset parameters are refused** (gap-doc-claims#2): `/sparql` with
+  `default-graph-uri` / `named-graph-uri` and `/update` with
+  `using-graph-uri` / `using-named-graph-uri` answer
+  `400 … dataset parameter … is not supported` on both servers instead of
+  silently evaluating over the whole default graph; an empty value is
+  ignored. `FROM` / `FROM NAMED` in the query text are still skipped (known
+  gap).
+- **`/api` accepts a `POST /login` session in place of the password**
+  (ext#12; a gstore-rust extension of the upstream protocol). A request
+  without a `password` parameter may authenticate with a live session token
+  presented as the REST endpoints take it; the same holds for `/file/upload`
+  and, when it names a `username`, `/file/download`. A `username` given must
+  name the session's user; an unknown, expired, logged-out or revoked token
+  is answered `1001 "The session is invalid or has expired: log in again."`.
+  A request carrying a password is checked exactly as before (the token is
+  then ignored). No password is checked on this path, so it neither adds to
+  nor clears the failed-login lockout at the caller's address
+  (`Ctx::session_auth`); IP allow / deny lists and the upstream-lockout
+  check run before it as for every operation.
+- **Every file the server writes for a client has an owner** (sec#4,
+  gapi#14). An upload, export or `format=file` / `n-triple-file` query
+  result gets an owner record in `<db home>/file_owners/` (path, kind,
+  database, user; never served), written atomically and durably before the
+  answer names the file. A user other than root / admin reads such a file
+  (download, or a `build` / `batchInsert` / `batchRemove` source via `file`
+  or a file of `dir`) only when the record allows: an export with the
+  `export` privilege on its database, a query result with `query` on it, an
+  upload he uploaded. Files in the export and upload directories without a
+  record (operator files, older versions) are root's and admin's alone. A
+  refused download is upstream's `FileNotFound` (StatusCode 11), a refused
+  source 1003 (for a `dir`, the answer names the directory only).
+- **Export and query-result file names carry 128 random bits** (sec#4,
+  gapi#2): `<db>_<YYYYmmddHHMMSS>_<32 hex>.nt|nq|zip` and
+  `<db>_<threadId>_<UTC YYYYmmddHHMMSS>_<32 hex>.json|txt`; clients use the
+  reported `filepath` / `FileName` (wire format unchanged).
+- **Downloads are streamed** (gapi#4, robust#7, sec#11): the file (or Range)
+  is copied to the connection in 64 KiB chunks with its `Content-Length` (it
+  was read whole into memory and copied again, about twice the file; backups
+  and database files too). A streamed download is never compressed, even
+  with the `gzip` feature and `Accept-Encoding: gzip`; JSON envelopes are
+  compressed as before. New `[upload] download_max_concurrent` (default 8,
+  `0` = no limit); further downloads answer 503 with `Retry-After: 1`.
+- **Retention** (sec#14, gapi#13): new `[upload] file_retention_hours`
+  (default 168, `0` = keep forever). Recorded uploads, exports and query
+  results older than this are removed with their records, records whose file
+  is gone are dropped, operator files are never touched; spilled
+  asynchronous results under `<root>/tasks` that belong to no task of the
+  running server are removed too. The sweep is lazy (uploads, exports,
+  downloads, `format=file` queries and async submissions, at most once a
+  minute per server). An unparsable entry of `file_owners/` (torn by a crash
+  under the old code) is dropped once older than the retention (one hour
+  when retention is off), with its file once that has expired too. Exports
+  and query results are therefore deleted after a week by default.
+- **New `[upload] upload_user_quota`** (bytes of retained uploads per user;
+  default `0`, no quota) (gapi#14, sec#14): an upload beyond it answers
+  `1005 "Upload quota exceeded: …"`. Uploads stay open to every user, as
+  upstream's privilege table says.
+- **Login sessions are bounded** (sec#12, http#12): a login sweeps expired
+  sessions once the table has grown (next sweep when it has doubled:
+  amortised O(1) per login); one user holds at most `MAX_SESSIONS_PER_USER`
+  (1024) sessions, a further login ending that user's oldest session, never
+  another user's; a session expires once its age reaches the TTL. New
+  `UserStore::session_count()` and `UserStore::set_session_ttl()`.
+- **User-store changes whose `users.db` save fails change nothing**
+  (sec#15): `UserStore::add`, `drop_user`, `set_password`, `forget_database`
+  and `copy_database_privileges` roll the in-memory table back (a "failed"
+  password change stayed live until a restart), and sessions are revoked
+  only after a successful save. A save whose new `users.db` was renamed into
+  place but whose directory fsync failed (twice) keeps the change in memory
+  too and logs a durability warning.
+- **Startup reconcile forgets only databases confirmed gone** (gapi#9): if
+  the server root cannot be listed the registry is not reconciled ("cannot
+  list the database directories"); a `<db>.db` that exists but cannot be
+  examined (a dangling symbolic link to an unmounted volume, a failing stat)
+  keeps its registration, creator and grants ("stays registered"); only a
+  NotFound directory unregisters a database and forgets its grants.
+- **`ipmanage` saves only entries its loader reads back** (gapi#7): the list
+  loader keeps a line shorter than 7 characters when it is a valid entry
+  (`::1`, `::`, `1::`; upstream skips every such line), and `IpFilter::save`
+  refuses a list the loader would not read back whole (an allow list of
+  `::1` came back empty and locked everyone out). A save whose file was
+  replaced but whose directory fsync failed puts the new list in effect and
+  logs a durability warning.
+- **Idle transactions are rolled back after `[system] txn_idle_timeout`**
+  (M3: gap-txn-lifecycle#1; seconds, default 600, `0` = never, upstream's
+  behaviour, reported as `upstream-compat: txn_idle_timeout=0`). A
+  transaction with no statement running for that long is rolled back and
+  logged `ABORTED` (`txn.log`: `aborted`; "rolled back after
+  txn_idle_timeout"); one whose owner was deleted is rolled back whatever
+  the timeout ("rolled back because its owner was deleted"). Reaping happens
+  at a new `begin` on the database (which is no longer refused by such a
+  transaction), on any request once the earliest idle deadline passed (one
+  atomic read per request otherwise) and in a background pass every
+  `min(txn_idle_timeout / 4, 30 s)`; neither the request path nor the
+  background pass waits for a database (a busy one is retried later), so
+  `/cancel` and other requests stay immediate. A statement in flight, and a
+  `/commit` or `/rollback` in flight, are activity. `/tquery`, `/commit` or
+  `/rollback` of an expired transaction answers "not running (rolled back
+  after txn_idle_timeout)" (409 / 1005). Before, one `/begin` by any user
+  with the update privilege, or that user's crashed client, blocked every
+  write and maintenance operation of the database until root found the TID
+  or the server restarted.
+- **Who may end a transaction** (gap-txn-lifecycle#5): any superuser
+  (`root`, or a user with the `admin` privilege) may `/tquery`, `/commit` or
+  `/rollback` any transaction (before, only the literal `root`); `rollback`
+  no longer needs the update privilege (the handlers let only the owner or a
+  superuser end it), so an owner whose update privilege was revoked can roll
+  back their own transaction; committing still needs it. Diverges from
+  upstream's `check_privilege`.
+- **Stale transaction ids never end another transaction** (M4:
+  gap-txn-lifecycle#2). REST and `/api` share one TID parser
+  (`http_api::parse_tid`): a positive integer or the transaction log's
+  `<begin>_<tid>` form (REST no longer accepts a sign, `+2`). The begin time
+  of a `<begin>_<tid>` id must be the transaction's; otherwise the id names
+  no open transaction and gets the remembered end of the earlier transaction
+  it names ("not running (already committed …)"), else "Wrong transaction
+  id" (REST 404, `/api` 1005). Before, the begin time was ignored, so after
+  a reload or restart the Workbench's "roll back the stale RUNNING row"
+  ended the new transaction with the same number. Ended outcomes keep their
+  database's load generation and begin time and survive reloads; at start a
+  server marks transactions a previous process left `RUNNING` in
+  `logs/transaction.json` as `ABORTED`. `begin` still answers the bare id.
+- **Open transactions are reported** (gap-txn-lifecycle#1): REST `/show` and
+  `/monitor` and `/api` `show` and `monitor` give each database's open
+  transaction as a `transaction` object with `TID`, `txnlog_TID`
+  (`<begin>_<tid>`), `user`, `isolation`, `begin_time`, `idle_seconds` and
+  `running_statements`.
+- **Statements stop after `[server] query_timeout`** (sec#10, robust#5;
+  seconds, fractions allowed, default 3600, `0` = off). A statement still
+  running then — REST `/sparql`, `/update` and `/tquery`, `/api` `query`
+  (synchronous or `async`) and `tquery`, the single-database server's
+  `/sparql` and `/update` — is stopped at its next cancellation check and
+  answered as timed out: REST and single-database 503 `{"error":"query timed
+  out after … (query_timeout) …"}`, `/api`
+  `1005 "Query fail: query timed out …"` (`"Transaction query fail: …"` in a
+  transaction, which stays open). It releases the database it held, so an
+  UPDATE queued behind a runaway read completes. The deadline counts the
+  statement's evaluation only (from when it holds its database's guard until
+  the evaluation returns; neither the wait behind another statement, a save
+  or a backup nor the check_point save after an UPDATE counts). A
+  multi-operation UPDATE stopped part-way says "operations before the
+  failing one were applied" (also in a transaction, where they stay applied
+  until rollback); on the single-database server such an UPDATE, like a
+  timed-out one, is 503. The evaluator polls the cancel flag inside one join
+  step (BGP loop, binding extension, between joins, property-path frontier
+  steps), so `/cancel` and a shutdown also stop a cross product or a closure
+  promptly.
+- **Answers stop at `[server] max_result_bytes`** (sec#10; bytes, default
+  1 GiB, `0` = off). An answer whose serialization passes it is refused as
+  soon as it does — REST and single-database 503
+  `{"error":"result too large: …"}`, `/api` 1005 (an upper bound of the
+  returned rows' size counted as escaped JSON strings, `json::escaped_len`,
+  summed before the document is built). A streamed single-database answer
+  (`?stream=true`) is cut off without its closing chunk; REST `/tquery` and
+  `/api` `tquery` are bounded too; `format=file` / `n-triple-file` results
+  (written to disk) are not.
+- **Failed `/api` queries are recorded in the query log** with their real
+  `statusCode` / `statusMsg` (gapi#8): query errors, unknown formats,
+  timeouts, too-large answers; before, only successes were recorded.
+- **One HTTP status per kind of failure, the same on every endpoint**
+  (design#3, disk#9). Errors are classified once (`GStoreError::kind()`,
+  mapped by `OpErrorKind::of` and shared by REST, the upstream `/api` layer
+  and the single-database server): a database directory or paged file
+  another process holds (gserver, gquery, gconsole, a bulk build) is 409 on
+  every REST endpoint (`/load` and `/upload` answered 500); an I/O error
+  taking that lock (EACCES, a failed lock call) is 500 (409 on `/drop`,
+  `/build`, `/restore` before); a store read error while a statement runs
+  (contract C2) and a store broken by an earlier write error
+  (`storage failed: …`) are 500 on REST `/sparql`, `/update`, `/tquery` and
+  the single-database server (400 before); a statement cancelled by
+  `/cancel`, `operationTaskCancel` or a shutdown is 503 with an
+  `{"error":…}` body (400 before); `query_timeout` stays 503; syntax and
+  evaluation errors stay 400; unclassified errors keep their status. The
+  upstream `/api` keeps HTTP 200, its StatusCodes and messages.
+- Library: `GStoreError::kind()` and `gstore::error::ErrorKind`
+  (`#[non_exhaustive]`: `Parse`, `Query`, `Locked`, `Conflict`, `Corrupt`,
+  `Storage`, `Cancelled`, `Timeout`, `Other`); the new variant
+  `GStoreError::Locked` displays as `Database` did, so messages read as
+  before; `DirLock::acquire`, `SideLock::acquire` and `BuildGuard::enter`
+  return `Locked` for a lock held elsewhere and `Io` (with the path) when
+  the lock cannot be taken at all; `store::read_scope::READ_FAILURE` and
+  `read_failure()` name the statement read error (design#3).
+- **REST `/export` writes every quad and runs as a cancellable, streamed
+  task** (M13: http#11). It uses the `/api` export serializer: N-Quads
+  (default graph, then every named graph) when the database has a non-empty
+  named graph, else N-Triples; new `format=nt|nq` parameter (another value
+  is 400), with Content-Type and attachment name (`<db>.nq` / `<db>.nt`) to
+  match. Before, it silently dropped every named graph. In a transaction it
+  exports the committed state, named graphs included. It is listed by
+  `/tasklist` (operation `export`) and stopped by `/cancel` at its next
+  statement (503 `{"error":"export cancelled"}`); it is written to an
+  unnamed scratch file in the export directory under the shared guard and
+  streamed in bounded chunks once the guard is released (it held a CONSTRUCT
+  result and its N-Triples text in memory, guard included).
+- **REST `/upload` that creates a database registers it** (http#16): it
+  joins `system.json` with the uploading user as creator, and a registered
+  name whose directory was removed outside the server loses its grants
+  first, as REST `/build` and `/restore` do (a user granted on the vanished
+  database could read the new one).
+- **A failed REST `/build` keeps the old database's reasoning rules and
+  ledgers** (http#10): a snapshot-layout rebuild removes the replaced
+  database's `reason_rule_files` only once the new database is saved; a
+  failed save serves the previous database again with its rules; a rebuild
+  whose rule removal fails is registered but not served (500 naming the
+  directory to remove).
+- **REST and `/api` lifecycle operations agree** (design#4). `/api load`
+  finishes a restore a crash left half-way (`<db>.db.restore-old` /
+  `<db>.db.restore-new`) and loads it (it answered 1005 "does not exist");
+  REST `/restore` registers a database it creates at the backup's time, as
+  `/api restore` does; REST `/batchInsert` / `/batchRemove` report
+  `success_num` and `failed_num` as `/api` does (REST's own `failed` field
+  unchanged). REST `/backup` records `BACKUP_OF` only once the backup is
+  complete — it first writes `BACKUP_OF.partial` — removes a directory it
+  created when the backup fails, empties again an empty directory it wrote
+  into and keeps the record of an earlier backup it was replacing; a
+  directory holding a partial marker of the same database may be backed up
+  into again, and REST `/restore` and `/api restore` refuse it (409 /
+  "incomplete"); `/api backup` writes the marker too and its listing skips
+  such directories.
+- **`/api show` lists every database the registry finds** (gapi#15): it
+  scanned the root with `/api`'s own name rule (three bytes at least), so a
+  database REST `/build` or `gbuild` created as `ab` was missing; it now
+  uses `sysdb::database_dirs` plus its storage check. `/api` operations on
+  such a name still answer upstream's 1003.
+- **The transaction log is rotated at 32 MiB and read incrementally**
+  (gapi#18). An append that would take `logs/transaction.json` past
+  `TXN_LOG_MAX_BYTES` moves it to `transaction.json.1` (hard-linked first,
+  so the log is never missing) and starts a new file holding the records of
+  the transactions still running; `txnlog` lists the current generation. A
+  `txnlog` read parses only the lines appended since the previous one
+  (before, every call parsed the whole file, about 8× its size in memory).
+- **A torn last line of an API log no longer swallows the next record**
+  (durability#13): an append to the transaction, query or access log first
+  ends an unterminated last line, so the torn line stays one unparsable
+  line, which readers skip (the first transaction record after a restart
+  could be lost and its transaction listed as `RUNNING`).
+- **`monitor` / `schema` of an unloaded database use cached statistics**
+  (gapi#17): the first request reads the database; later ones walk its
+  directory (the walk `diskUsed` needs anyway) and reuse the statistics
+  while the files are the same (count, total size, latest modification and a
+  digest of each file's path, inode, size and mtime). Statistics are cached
+  only under the files they were read from. Before, every request opened the
+  database, made a pass over its data and held its name busy, refusing a
+  concurrent root `load` and a second `monitor` (1007).
+- **Creating a database handle no longer holds the server-wide state lock
+  during the directory walk** (http#13, conc#7): REST `/load`, `/build`,
+  `/upload` into an unloaded or new name, `/restore`, the reopen of a broken
+  store, a failed rebuild's re-serve and `/api` `load` / `restore` lock the
+  database directory and measure its size before taking the lock; only
+  inserting the handle runs under it, so `/status`, `/cancel`, logins and
+  every other request no longer wait for a walk of a RocksDB store's
+  thousands of files.
+- **Keep-alive is decided with the response** (http#15): while connections
+  wait for a worker, a response says `Connection: close` and the connection
+  closes after it, instead of promising keep-alive and closing the idle
+  connection a moment later while the client may be sending its next
+  request; a connection that promised keep-alive yields its worker only
+  after a last 1 ms look finds no request on its way.
+- **`/cancel` and a shutdown stop CSR and substring-index builds** (conc#5,
+  analytics#6): the CSR build of the graph functions (plain read, an
+  UPDATE's WHERE clause, a transaction snapshot's read) and the
+  substring-index build of a `CONTAINS`-style filter watch the request's
+  cancel flag; a cancelled build caches nothing (it ran to completion, about
+  0.3 s per million triples in Stream mode, and was cached after the
+  cancel). `loadcsr` / `load csr=1` build the CSR as a registered,
+  cancellable task listed by `/tasklist`.
+- **A shutdown saves every free database first** (conc#5): `ApiServer`
+  locked the databases in name order, so one a long read kept busy held up
+  the save of every database after it; busy ones are now waited for after
+  the others are saved, and the read, cancelled, stops at its next check.
+- **Background statistics refreshes** (after a change, started by
+  `/api monitor`) run their three passes each under a shared guard of its
+  own, so a queued writer waits for one pass instead of the whole refresh; a
+  refresh checks a cancel flag before each pass, is stopped and joined by a
+  shutdown, and is dropped when the data changed between passes (conc#9).
+- **No server thread outlives `serve_forever`** (conc#14):
+  `Server::serve_forever` and `ApiServer::serve_forever[_tls]` join their
+  connection workers (at most 2 s), the statistics refreshes, the
+  cancel-bridge thread, the idle-transaction reaper (bounded at 10 s) and
+  the asynchronous operations' runner and callback threads; only a runner
+  whose operation ignored its cancel past `shutdown_wait`, or a callback
+  still being delivered (bounded by `callback_timeout`), finishes on its
+  own.
+
+#### Behaviour changes: durability and storage
+
+- **A failed commit of an on-disk database can no longer tear its file**
+  (C-1: durability#1, disk#1). If a commit fails after its write-ahead log
+  got its name (applying a page, an fsync, removing the log — say the disk
+  filled up while the batch was applied), the pager is *failed*: every later
+  write, page allocation and commit is refused with the new
+  `GStoreError::StorageFailed`, reads keep working, and nothing writes the
+  file again until the database is reopened; the reopen replays the complete
+  log, so the file holds exactly the last batch whose log was complete.
+  Before, the next commit point, save, shutdown or drop retried the commit,
+  truncated the only complete log, failed again while rewriting it and left
+  a database that no longer opened
+  (`I/O error: failed to fill whole buffer`), data committed long before
+  included.
+- **Materialize mode breaks on a failed commit point** (durability#1,
+  disk#1), as a failed write-through already did: every later commit point
+  reports `storage failed: …` instead of retrying, and dropping the database
+  commits nothing. In Stream mode a failing commit made by the out-of-core
+  dictionary (a term write that outgrew the page cache) breaks the store
+  too. Recover by reopening (server: `unload` + `load`, or just `load`).
+- **A broken database can be unloaded and reloaded through the servers**
+  (M5: gap-txn-lifecycle#4). `/api unload` and REST `/unload` of a database
+  whose on-disk store failed retire it without a commit point and add a
+  `warning` field (the failure and how many changes since the last
+  successful commit point are discarded); `/api` keeps HTTP 200, StatusCode
+  0, `"Database unloaded."`, REST answers 200. `load` of a loaded broken
+  database reopens it in place (`/api`: "Database loaded successfully." +
+  `warning`; REST: `database '…' reopened` + `warning`); a healthy loaded
+  database keeps the upstream answer ("The database already load yet." /
+  "already loaded") at once, without waiting for or reserving the database.
+  REST `/build` over a loaded broken database replaces it instead of failing
+  on the save. Before, unload answered 1005 / 500 "it stays loaded" and only
+  a server restart recovered.
+- **The write-ahead log is never truncated or rewritten in place**
+  (durability#1, durability#8, robust#12): a commit stages `<file>.wal.tmp`,
+  fsyncs it, renames it to `<file>.wal` and fsyncs the directory before the
+  main file is touched, and fsyncs the directory again after removing the
+  log. A failure before the rename changes nothing on disk and stays
+  retryable; a leftover `*.wal.tmp` (a crash while staging) is not a commit
+  and the next open removes it. WAL framing unchanged; older binaries ignore
+  a leftover `*.wal.tmp`.
+- **An unreadable write-ahead log fails the open** (M1: disk#2,
+  durability#7, robust#12): only "not found" means "no log"; any other read
+  error (EIO, EACCES, a directory in its place, …), or a log that cannot be
+  removed after its replay, fails `Pager::open` and so the database open,
+  instead of opening a possibly half-applied file whose log the next commit
+  would overwrite.
+- **A `kvstore.kv` (or `vstree.kv`) shorter than its header's page count**
+  (page_count × 4096) is refused at open as torn or truncated instead of
+  failing later reads (robust#12, disk#2).
+- **A write applied in memory but not saved is never acknowledged** (H-7:
+  durability#2, durability#18). A write whose check_point save failed (or,
+  with check_point off, whose commit point failed) answered success with a
+  `"warning"`; it now answers a failure with `"applied in memory but not
+  durable: <cause>"`, keeping the operation's fields and the `warning` as
+  detail. REST `/update`, `/sparql` UPDATE, `/upload`, `/batchInsert`,
+  `/batchRemove`, `/commit`: HTTP 500
+  `{"StatusCode":500,"StatusMsg":"applied in memory but not durable: …",…}`;
+  single-database gserver (`/update`, `/sparql` UPDATE, also with
+  `--no-checkpoint`): HTTP 500 `{"error":"applied in memory but not durable:
+  …","changed":N,"warning":…}`; `/api` keeps HTTP 200 and answers StatusCode
+  1005 for `query` updates, `commit` and `reasonManage` execute (as
+  `batchInsert` already did). An UPDATE that fails part-way and whose
+  applied part cannot be saved answers REST 500 and `/api` 1005 with the
+  same message (new `OpErrorKind::Persist`); the REST query log records such
+  a write with statusCode 500. The write stays applied in memory: on the
+  snapshot layout the next successful save, `/checkpoint`, `/unload` or
+  graceful shutdown saves it, a crash first loses it; on the on-disk layouts
+  the database is broken until reopened, and `unload` or the reopen-in-place
+  `load` discards those writes (the warning says so).
+- **A commit whose commit point fails is rolled back, or answered as not
+  durable** (M2: gap-txn-lifecycle#3, http#18, gap-rocksdb-exec#5).
+  `Database::commit` dropped the undo log before the write-through, commit
+  point and redo flush, so a Materialize-mode commit failing on a full disk
+  was answered "commit failed" while its writes stayed visible and became
+  durable at the next save, and a RocksDB commit whose undo journal could
+  not be deleted stayed visible with its redo records logged. The undo log
+  is now kept until the commit point succeeded. When it fails before
+  anything of the transaction can have reached the store, the transaction is
+  rolled back (RocksDB by replaying its journal) and nothing stays visible
+  or becomes durable later; otherwise (log complete and replayed at the next
+  open; RocksDB journal already deleted) the writes stay applied and the
+  outcome says they are not durable. Only a committed transaction reaches
+  the redo log, and the outcome is recorded only after the commit returned.
+  HTTP: rolled back → REST 500 / `/api` 1005 `"commit failed and transaction
+  N was rolled back: <cause>"` (`txn.log`: `commit-failed-rolled-back`); not
+  undoable → REST 500 / `/api` 1005 `"applied in memory but not durable: the
+  commit point of transaction N failed: …; the database needs a reload
+  (unload, then load)"` (`commit-failed-not-durable`); both logged `ABORTED`
+  in the `/api` transaction log, and a retried commit is told which.
+  Library: `Database::commit_checked` → `Result<(), CommitFailure>`
+  (`NotCommitted`, `RolledBack`, `NotDurable`, `CommittedWithError`);
+  `Database::commit` keeps its signature.
+- **An unreadable `named.bin` fails the open** (H-6: db#1, robust#4,
+  durability#3, db#24). Every read error of a snapshot database's
+  `named.bin` (truncation, a decode error, EIO, EACCES, EMFILE, a dangling
+  symbolic link) read as "no named graphs", and the next check_point save or
+  `gcompact --reclaim` overwrote the graphs with an empty map and freed
+  their terms. `Database::open` / `load` / `read_copy` (so gserver loads,
+  every CLI tool and `gcompact --reclaim`) now fail with an error naming the
+  file; a missing `named.bin` (a database older than named graphs) still
+  opens without named graphs; the legacy RocksDB migration refuses an
+  unreadable `named.bin` before retiring any file.
+- **RocksDB auto-commit statements are crash-atomic** (H-11:
+  gap-rocksdb-exec#1). Every SPARQL UPDATE request (`INSERT DATA`, `DELETE`
+  / `INSERT … WHERE`, `LOAD`, `CLEAR`, `DROP`, `ADD` / `COPY` / `MOVE`) and
+  every `insert_sources` / `remove_sources` import (`gadd`, `gsub`,
+  `/api batchInsert` / `batchRemove`) is journaled in the store's undo
+  journal, so a crash part-way (SIGKILL, an OOM kill, power loss) is undone
+  as a whole at the next open. A statement that fails part-way keeps what it
+  applied (documented semantics) and its journal is committed, also when it
+  panics (the servers answer 500 and keep serving); a failed `LOAD` stays
+  "no change at all". Not covered (atomic per triple, a crash leaves a
+  prefix): direct-API writes, REST `/batchInsert` / `/batchRemove` and REST
+  `/upload` into a loaded database; on the disk layout a statement is
+  crash-atomic only while its dirty pages fit the page cache (D12).
+- **No orphan dictionary terms after a crash on RocksDB**
+  (gap-rocksdb-exec#4): terms written new inside a transaction or a
+  journaled statement are recorded in the journal in the same batch; a
+  rollback replays the journal without journaling its own writes and deletes
+  the terms it leaves unreferenced in the same batch as the journal. Older
+  binaries replay the new term record as a no-op removal.
+- **Crash recovery of a long RocksDB journal is bounded and resumable**
+  (gap-rocksdb-exec#1, #4): the open replays the newest 65,536 records at a
+  time and deletes exactly each chunk's records in one batch with its
+  reclamation candidates, written to a pending range of the `meta` column
+  family; a crash during recovery resumes where it stopped, and the
+  `Database` settles pending candidates in batches of 65,536 before serving.
+  Before, the open read the whole journal into memory and deleted it only
+  after the full replay, so an open that ran out of memory on a 90M-record
+  journal did so again at every open.
+- **`check_point` no longer flushes RocksDB's memtables on every write**
+  (H-12: gap-rocksdb-exec#2): a save at a RocksDB database's home (the
+  servers' check_point save after every acknowledged write) is a commit
+  point only, an fsync of RocksDB's WAL. Each save used to flush all seven
+  column families, leaving about three table files per write, making writes
+  5–13× slower and ending in EMFILE after a few hundred writes under
+  `ulimit -n 1024`. Memtables are flushed by an explicit
+  `Database::checkpoint` (`gcompact`), a backup and close.
+- **RocksDB opens with a bounded number of files** (gap-rocksdb-exec#2): new
+  key `[storage] rocksdb_max_open_files` (default 4096, `0` = unlimited,
+  RocksDB's own default; `RocksTuning::max_open_files`); four old info logs
+  are kept (`LOG.old.*`; each open added one and backups copied them all)
+  and the WALs' total is bounded to 256 MiB. Options only, files unchanged.
+- **A damaged RocksDB store is reported, never a panic** (disk#11,
+  gap-rocksdb-exec#6): every decoded key's length is checked, and a key of
+  the wrong length fails the statement with a read error naming the column
+  family instead of a slice-index panic in a query, `gcompact --check`,
+  `gexport` or an open with `vstree_on_open`. A dictionary id beyond its
+  space fails the open ("corrupt RocksDB dictionary: entity id N is beyond
+  its id space") instead of aborting the process on a 100 GB allocation
+  (db#18).
+- **`gcompact --check` checks RocksDB's statistics** (gap-rocksdb-exec#7):
+  `Database::verify_integrity` runs the new `RocksStore::verify_stats`
+  (every `stats` counter equals a recount from SPO; POS and OSP hold exactly
+  the SPO triples; global, cached and mirrored counters agree; streamed,
+  constant memory). A wrong, missing or stray counter passed `--check`, and
+  `--reclaim` then freed terms the data still used.
+- **A failed `gbuild --incremental --force` keeps the old database** (M12:
+  durability#5). The incremental disk build deleted the old `kvstore.kv`
+  (and every other layout) before importing, and the incremental RocksDB
+  build (`create_rocksdb`, behind every `Database::build_rocksdb_*`)
+  discarded the old store first, so a strict parse error, a full disk or a
+  crash left an empty or unopenable database. The disk build now builds in
+  `<db>.db/.bulk-tmp/` and installs with the bulk build's crash-safe
+  install; the RocksDB build writes `rocksdb.tmp/` and swaps it in as a
+  whole (a build stuck past its swap's commit point is refused, and the next
+  open moves it into place). Both hold the in-process build guard and refuse
+  a RocksDB store another process has open. `build_disk_incremental` /
+  `build_disk_from_sources_incremental` now also remove the replaced
+  database's `reason_rule_files/`.
+- **Drops never leave a half-deleted database** (durability#10): `gdrop`,
+  REST `/drop` and `/api drop` with `is_backup=false` rename `<name>.db` to
+  `<name>.db.drop-old`, fsync the parent directory (from then on the
+  database is gone), then delete it; a leftover is no database to any scan
+  and the next drop of the name removes it. The `/api` logical deletion
+  (`is_backup=true`) is durable too. New `Database::drop_dir(dir)`.
+- **`gbackup` refuses a destination inside the database** (bulkcli#4):
+  `gbackup x x.db` (also `./x.db/`, a directory inside it, a link to it)
+  printed "Backed up", made no backup and deleted the database's pending
+  `kvstore.kv.wal`. It is refused before anything is touched (exit 1),
+  zipped backups too; `Database::backup_dir` refuses the same and takes the
+  lock of a destination that holds a database.
+- **`/api rename` is durable and reports registry and grant failures**
+  (durability#14): the directory rename is fsynced before anything records
+  the new name; a failure saving `system.json` or `users.db` (ignored
+  before, silently losing the renamed database's grants) answers
+  `1005 "Rename fail: …; nothing was renamed"` and is undone.
+- **A save into another directory takes that directory's lock, whatever it
+  holds** (db#11): two savers creating the same new database (two `gbuild`
+  of one name, a build beside a gserver `/build`) both reported success over
+  an unopenable directory. The target is now created and locked for every
+  save not at home; a directory another process holds fails at once with the
+  usual "is locked by another process" error and nothing is written, and
+  within one process two saves into one directory are serialized. A new or
+  empty save target and a backup directory written by `Database::backup`
+  hold a `LOCK` file afterwards, and a zipped backup of one carries a `LOCK`
+  entry (a few bytes; no restore path copies it).
+- **`Database::load_disk` / `load_disk_with` take the directory lock** as
+  `Database::open` does and hold it for the database's life (db#17): they
+  open and write an on-disk database but took no lock, so an embedder beside
+  a gserver had two writers on `kvstore.kv`.
+- **A paged file is locked against other processes** (disk#9): `Pager::open`
+  (so every `kvstore.kv` / `vstree.kv` open) takes an advisory exclusive
+  lock before it looks at the WAL, held while any pager of the process on
+  the file lives. An open from another process fails with `'…/kvstore.kv' is
+  in use: another process has it open` (`GStoreError::Locked`, REST 409) and
+  touches nothing (two processes could replay and delete each other's log
+  and overwrite pages); a file system without advisory locks opens unlocked.
+- **One WAL path rule** (disk#9): `Pager::wal_path(path)` is the only
+  derivation of `<path>.wal`, and `Pager::remove_with_wal(path)` removes a
+  paged file with its log (and a staged `.wal.tmp`), log first, with a
+  directory fsync, ignoring only not-found; `Database::use_streaming_vstree`
+  uses it, so a stale log that cannot be removed fails the call before
+  anything is built.
+- **The free-id format of a file is an explicit choice** (disk#8, design#6):
+  an existing `kvstore.kv` keeps the format its header records whatever the
+  process policy (`GSTORE_ID_RECLAIM`, `[system] id_reclaim`); only
+  `gcompact --enable-reclaim` upgrades. The policy chooses the format of new
+  files only (`BulkOptions::free_ids`, `OpenOptions::free_ids_if_new`).
+- **A panic under the pager's write lock no longer makes every read panic**
+  (conc#8): `Pager::lock_read` / `lock_write` recover a poisoned lock and
+  mark the pager failed, so reads go on and every later write and commit is
+  refused with `StorageFailed`.
+- **The out-of-core VS-tree validates what it reads** (disk#4, disk#15).
+  `VsTree::open_disk` on a missing path is a `NotFound` error and creates
+  nothing, and an empty file or a header naming a root outside the file or
+  more entities than it can hold is refused as corrupt ("VS-tree file … is
+  corrupt … (remove it to rebuild the index)"); a missing `vstree.kv` is
+  rebuilt or skipped as before. A scan checks every node it visits (kind
+  byte, at most 32 entries, child ids inside the file and below their
+  parent, node signature equal to the union of its entries and to its
+  parent's entry, one leaf depth, at most 8 levels, no more visits than the
+  file has nodes); a violation is a corruption error (`ErrorKind::Corrupt`)
+  and the tree then answers "no filtering", which is sound. Before, an entry
+  count above 32 panicked, a cycle overflowed the stack, a redirected child
+  or a signature that lost bits hid matches, and a 5-page file could answer
+  1,048,576 candidates.
+- **A corrupt VList is a read error** (robust#11): `DiskStore::try_o_by_sp`
+  reports a compacted `sp2o_vlist` record that does not decode as
+  `InvalidData` ("corrupt kvstore: …"), so the statement fails (contract C2)
+  instead of `<s> <p> ?o` silently having no values; `vlist::decode_u32s`
+  refuses a count its bytes cannot hold before allocating (`u32::MAX` asked
+  for 16 GiB), and an overflow record longer than the file can carry, or a
+  chain ending before its length, is refused.
+- **New directories are created durably at every acknowledged commit point**
+  (tests-b#3, db#12). The disk and RocksDB bulk builds (`gbuild`,
+  `Database::build_disk`, `gstore::bulk::build`),
+  `Database::build_rocksdb_from_str` / `build_rocksdb_from_files`,
+  `Database::backup_dir`, REST `/upload` into a new name, the servers'
+  backups and exports, a user's PFN directories, a restore's new parent, a
+  server's new root directory, saves into a new directory and snapshot
+  writes used `create_dir_all` and synced only the new directory, never the
+  parent naming it, so a power cut after the success answer could lose the
+  whole database, backup or function. All use `fsutil::create_dir_durable`
+  (the parent of every created directory is fsynced); builds and saves into
+  an existing non-home directory sync its parent too
+  (`fsutil::ensure_dir_durable`), and `gbuild` claims its directory with
+  `BuildGuard::create_and_lock`. `reason_rule_files/` and its `inferred/`
+  ledger directory are fsynced into their parents when created, so a rule's
+  ledger is durable before its rule file and the insert it records.
+- **The redo log and the update log are crash-consistent** (durability#6,
+  db#8; library API only — `Database::enable_redo_log*`,
+  `enable_update_log*`, `replay_*`, `backup_incremental`,
+  `restore_incremental`; no server or CLI turns them on). The records of one
+  commit (an auto-commit UPDATE, a transaction, a direct-API mutation, a
+  `materialize_rdfs` / `run_rules` run) are appended with one write — an
+  UPDATE's or a transaction's after its commit point, then `fdatasync`ed; a
+  direct-API mutation when applied, synced by the next commit point
+  (`Database::sync()` is now also the logs' commit point); direct-API batch
+  calls (`insert_data`, `try_insert_data`, `delete_data`, `insert_sources`,
+  `remove_sources`) are one commit. Before: four unbuffered writes and an
+  open / close per triple (a 50-triple `INSERT DATA` opened `redo.log` 50
+  times), nothing synced, and an UPDATE logged before its commit point. The
+  update log takes committed statements only (a rolled-back transaction's
+  statements used to be replayed).
+- **Redo record framing** (durability#6): every record carries a CRC-32
+  header token `c=<8 hex>`, the last record of a commit `e=<8 hex>`
+  (`REDO I 0 44 e=1a2b3c4d`), and replay applies a commit only once it read
+  its `e=` record; records without the token (every log written before)
+  replay as before, each a commit of its own, and older readers ignore the
+  token. An incomplete last commit is skipped with a warning by
+  `replay_redo_log` / `replay_update_log` and cut off by the next append or
+  backup (the next session used to append after the torn bytes, making every
+  later record unreachable); a damaged record in the middle is corruption
+  (`redo.log is corrupt at byte N: …`), never skipped. An increment's
+  `incr.log` must replay whole.
+- **A failed log append is reported and nothing is lost** (robust#10,
+  durability#6, db#2): an append failing (ENOSPC, EFBIG, a failed fdatasync)
+  is cut off at once and its records stay owed, in order, to the next
+  append. An auto-commit UPDATE whose records could not be appended returns
+  an error ("the update is applied and committed, but appending to redo.log
+  '…' failed: …"), `commit()` reports `CommitFailure::CommittedWithError`,
+  `sync()` reports it, and `backup_incremental` refuses while commits are
+  owed; an unreadable log is an error for `backup` / `backup_incremental`.
+  Committed records survive a later `rollback()` and `disable_redo_log` /
+  `disable_update_log`. After a failed commit point the logs follow what a
+  reopen keeps; when that is in doubt they are marked so and
+  `backup_incremental` refuses until a full `backup()`, which starts a new
+  chain. `backup_incremental` walks the copied range as the restore does and
+  fails on a damaged commit (it copied it and answered `Ok`).
+- **Redo replay refuses what it cannot read** (db#9, gap-doc-claims#1): a
+  length field beyond `usize` or an overflowing sum fails `replay_redo_log`,
+  `replay_update_log` and `restore_incremental` (it panicked); an op other
+  than `I`, `D`, `C`, `N` is refused before its body is read
+  (`unknown redo.log op 'X' at byte N`), as are an `I` / `D` record without
+  a triple and a malformed clear record. `CLEAR` / `DROP` / `MOVE` / `COPY`
+  records now carry the placeholder body
+  `<urn:x-gstore:redo> <urn:x-gstore:redo#op> "clear" .`, which pre-Phase-6
+  readers refuse with "unknown redo.log op 'C'"; the empty-bodied clear
+  records written until now still replay here (and are skipped silently by
+  pre-Phase-6 binaries — do not downgrade across one).
+- **`restore_incremental` never writes the base backup** (db#13): a snapshot
+  base is read in place without taking its lock; a disk or RocksDB base is
+  copied into a scratch directory created exclusively beside it
+  (`<base>.restore-tmp-<pid>-<n>-<nonce>`, mode 0700; the system temporary
+  directory only when the base's parent is not writable), opened there and
+  removed, so a base on read-only media can be restored with about its size
+  of free space. `Database::backup` inside an open transaction is refused
+  (db#14): it captured uncommitted writes no later increment undid.
+- **`update.log` files written by earlier versions replay** (sparqlconf#16,
+  parser#13): a record is read as the version that logged it did — a
+  labelled blank node in `DELETE DATA` / `DELETE WHERE` / a DELETE template
+  names the stored node, `CREATE` / `DROP` / `CLEAR GRAPH` are `SILENT`, and
+  the older grammar leniencies are accepted; the first record that still
+  fails stops the replay with its error.
+
+#### Behaviour changes: SPARQL
+
+- **A failed non-`SILENT` `SERVICE` fails the query** (robust#6, tests-b#2,
+  sec#17). A variable endpoint, an inner pattern the request cannot carry
+  (anything but triple patterns, groups and `UNION`), a connection, HTTP or
+  JSON error used to make the `SERVICE` yield no solutions (200 with no
+  rows, or under `OPTIONAL` every remote variable unbound). As SPARQL 1.1
+  Federated Query §4 requires, the statement now fails with a query error
+  naming the endpoint and the cause (`query error:
+  SERVICE <http://host/sparql>: endpoint returned HTTP 500`,
+  `… bad JSON: …`, `SERVICE ?ep: a variable endpoint is not supported …`);
+  `SERVICE SILENT` is unchanged (the one empty solution). Clients that
+  relied on the empty answer add `SILENT`. Once a `SERVICE` has failed the
+  query no further request is sent.
+- **A sub-SELECT parses as a whole group in every position** (M14: parser#3,
+  sparqlconf#5): `WHERE { SELECT … }`, `ASK { SELECT … }`, `OPTIONAL` /
+  `MINUS` / `GRAPH ?g` / `SERVICE` / `FILTER (NOT) EXISTS { SELECT … }`,
+  `CONSTRUCT` / `DESCRIBE` / `INSERT` / `DELETE … WHERE { SELECT … }` and
+  `{ SELECT … } UNION { … }` failed ("found 'SELECT'"); only
+  `{ { SELECT … } }` was honoured. A pattern after the sub-query inside the
+  same braces stays a syntax error, whose message now says to nest the
+  sub-query as a group of its own. A direct `{ SELECT … }` costs one nesting
+  level, so twice as many sub-queries can nest (127 direct levels).
+- **Negated property sets walk the right direction** (H-16: query#2,
+  sparqlconf#3). `!(p1|…|^q1|…)` is evaluated as SPARQL 1.1 §18.2.2.3
+  translates it, `alt(NPS({p…}), inv(NPS({q…})))`. Before, a set walked
+  backwards (the default for `?x !:p :o`) banned nothing (`?x !:knows :a`
+  returned the very subject linked by `:knows`) and inverse members never
+  walked reversed edges; `!^p`, `!(p|^q)`, `^(!p)` and `!a` now give the
+  spec's answers from a constant subject, a constant object and with both
+  ends free, on every layout and in both executors.
+- **Sequence and alternative paths are multisets** (M14: query#9,
+  sparqlconf#4). `X P/Q Y` is a join through a fresh variable and `P|Q` a
+  union (§18.4): `:x :p/:q ?y` with two intermediate nodes has two
+  solutions, a node reached by both alternatives of `:p|:r` comes twice, and
+  `COUNT(*)` counts every route; `*`, `+`, `?` still return each node once.
+  A walk keeps the multiset as counts and hands the copies out lazily, so
+  `/` and `|` cost the distinct nodes of each step and `ASK`, `EXISTS` and
+  `LIMIT` stop early. Every copy past a pair's first is charged to a
+  per-query budget (`Evaluator::with_path_max_duplicates`, default
+  `PATH_MAX_DUPLICATES` = 4,194,304, no configuration key); a query that
+  would hand out more fails with a query error ("a property path of this
+  query has more than … repeated solutions …"). Where only existence or
+  distinctness matters (`ASK`, `EXISTS`, `SELECT DISTINCT` without
+  aggregates or per-solution functions) each pair is handed out once and
+  nothing is charged.
+- **Zero-length paths match constants that are not in the data** (M14:
+  sparqlconf#13): `<unknown> :p* ?x` and `<unknown> :p? ?x` bind `?x` to
+  `<unknown>`, `ASK { <u> :p* <u> }` is true, also for a predicate IRI or a
+  literal in no subject / object position (§18.4). A variable end point
+  bound by another pattern still matches only the active graph's nodes at
+  length zero.
+- **Property-path solutions come in a fixed order** (gap-accel-soundness#1):
+  reached nodes follow the stores' sorted lists, closures breadth first in
+  discovery order, instead of hash sets with per-evaluation random keys, so
+  `LIMIT` / `OFFSET` pages of a path query tile its solutions and `ORDER BY`
+  ties over path solutions repeat from run to run. This closes the Phase 3
+  known gap about property-path solutions coming out of hash sets.
+- **A path whose end point another pattern binds is evaluated from the bound
+  values** (sparqlconf#9; answers unchanged, cost and plan changed). In a
+  group such as `?s :id 2990 . ?s :next* ?x` a path with two variable end
+  points ran from every node of the graph and was joined afterwards (4.5
+  million path steps, 1.7 s, 290 MB for a 10-row answer on a 3,000-node
+  chain); the group's BGPs are now joined smallest and connected first and
+  the path extends every solution from the bound value (10 path steps on
+  3,000 or 6,000 nodes), also on the right side of an `OPTIONAL` whose left
+  side binds the end point. Both executors follow the same plan and give the
+  same rows in the same order.
+- **`GRAPH ?g { P }` joins `?g` with P's own binding of it** (H-17: query#3,
+  sparqlconf#1). Both executors set `?g` to each named graph's name over
+  whatever P had bound it to, so `SELECT ?g ?t WHERE { GRAPH ?g { ?g
+  :created ?t } }` returned a row for every subject and `INSERT { ?g :meta
+  ?t } WHERE { GRAPH ?g { ?g :created ?t } }` wrote wrong triples durably. A
+  solution is now kept only when it leaves `?g` unbound or binds it to that
+  graph (§18.5), also with `?g` in predicate position.
+- **`EXISTS` / `NOT EXISTS` honour the current solution inside `VALUES`
+  blocks and sub-SELECTs** (query#4): `?s :p ?o FILTER EXISTS { VALUES ?s {
+  :a } }` kept every `?s`, and a sub-SELECT's projected `?s` was accepted
+  whatever it bound. A variable the substituted pattern can still bind (a
+  `VALUES` variable, a sub-SELECT projection, a `BIND` target) must now
+  agree with the current solution; a sub-SELECT's unprojected variables stay
+  independent (§12).
+- **SELECT expressions extend the solution left to right, each evaluated
+  once** (query#6, sparqlconf#6): without `ORDER BY` an expression could not
+  see an earlier alias (`SELECT (1 AS ?a) (?a + 1 AS ?b) {}` left `?b`
+  unbound); with `ORDER BY` every expression was evaluated a second time at
+  projection (`(RAND() AS ?r) … ORDER BY ?r` printed unsorted values). All
+  paths (materializing, streaming `LIMIT`, bounded heap, DP-B) now evaluate
+  each expression once per solution, seeing exactly the aliases to its left.
+- **`BNODE()` and `BNODE(str)` are fresh blank nodes** (H-18: query#5).
+  `BNODE()` minted `_:b0`, `_:b1`, … from a counter that restarted with
+  every process, so two processes or a restarted server inserting
+  `BIND(BNODE() AS ?b)` wrote the same stored node and merged two resources
+  for good; it now mints the engine's fresh labels
+  (`genid-<per-process nonce>-<counter>`). `BNODE(str)` was
+  `_:b<hash of the string>`, one node for every solution, query and process;
+  it is now one fresh node per string within a solution mapping (§17.4.2.9),
+  each solution of a multiset (a repeated `VALUES` row, a path reached by
+  two routes) getting its own. Only labels change; nothing on disk.
+- **A labelled blank node in a CONSTRUCT / INSERT template is a fresh node
+  per solution** (query#5; Query §16.2.1, Update §3.1.3), the same across
+  the template triples of one solution; it was copied verbatim, so every
+  solution and request wrote the one stored node `_:v`. A CONSTRUCT whose
+  template holds one is no longer served from the query cache. Labelled
+  blank nodes in WHERE patterns and `INSERT DATA` are unchanged.
+- **`UUID()` / `STRUUID()` / `RAND()` are safe under concurrency** (M10:
+  conc#1). They shared one process-wide xorshift state advanced by a
+  non-atomic load-then-store, so about 0.5% of concurrent `STRUUID()` calls
+  returned a duplicate; `UUID()` / `STRUUID()` now take 16 bytes of OS
+  randomness each and format a version-4 UUID, and `RAND()` draws from a
+  per-query `xoshiro256**` generator seeded from OS randomness.
+- **`NOW()` is one instant per query** (query#16, §17.4.5.1), shared with
+  `GRAPH` blocks; every `Evaluator::evaluate` / `eval_update_modify` call is
+  a new execution with its own instant and `BNODE` nodes.
+- **`REGEX` and `REPLACE` follow XPath `fn:matches` / `fn:replace`** (M14:
+  query#11, sparqlconf#8). Flags `s`, `m`, `i`, `x` and `q` are honoured
+  (only `i` was); any other flag character is an error (FORX0001), so
+  `REGEX(?x, "a", "u")` filters the row out instead of ignoring the flag.
+  `REPLACE`'s replacement uses XPath syntax: `$N` with XPath's digit rule
+  (`$1x` is group 1 then `x`), `\$` / `\\` for a literal `$` / backslash, a
+  group above the count up to 9 is the empty string, a lone `$` or backslash
+  is an error (FORX0004), with `q` the replacement is literal; a pattern
+  matching the empty string is an error (FORX0003; `REPLACE("abc", "", "-")`
+  was `"-a-b-c-"`). Pattern syntax stays the regex crate's (no
+  back-references, class subtraction or `\p{IsBlock}`).
+- **`MIN` / `MAX` use the ORDER BY order and return the stored term** (M14:
+  query#8, sparqlconf#7): they used the partial `<`, so for an IRI and a
+  literal, or a number and a string, the first value seen won
+  (plan-dependent). They now pick by the ORDER BY order, equal to the first
+  / last row of ORDER BY; `MIN`, `MAX` and `SAMPLE` return the group's term
+  as stored and `GROUP_CONCAT` joins the terms' lexical forms
+  (`"5"^^xsd:int` came back `xsd:integer`, `"01"^^xsd:integer` as `"1"`).
+- **`AVG` divides by the number of values it summed** (query#7): `SUM` /
+  `AVG` skip non-numeric values (a documented extension), but `AVG` divided
+  by the number of all values — `AVG` over 10 and `"x"` was 5.0, now 10.0. A
+  group with no numeric value averages `0` (`xsd:integer`, §18.5.1.4).
+- **`DISTINCT` in `COUNT` / `SUM` / `AVG` / `GROUP_CONCAT` compares RDF
+  terms, in linear time** (query#12, sparqlconf#10): it compared values
+  pairwise with `Vec::contains` (80,000 distinct values took 13 s; a million
+  minutes to hours of uncancellable CPU), and `"01"^^xsd:integer` and
+  `"1"^^xsd:integer` counted as one; they now count as two (a Phase 3 known
+  gap).
+- **SPARQL UPDATE refuses the literals the tolerant loader refuses**
+  (sparqlconf#12): `INSERT DATA` and the instantiated `INSERT` templates of
+  `DELETE` / `INSERT … WHERE` apply the loader's numeric check
+  (`parser::import::upstream_literal_check`): `"x"^^xsd:integer`,
+  `"300"^^xsd:byte`, an `xsd:integer` beyond 64 bits or a `NaN` double fails
+  the operation before any of it is applied ("cannot insert the literal …: …
+  (the loader refuses it, so it would not load back from an export)").
+  Before, UPDATE stored them, `gexport` wrote them and a tolerant `gbuild`
+  dropped them. A strict import still stores such a literal as written; an
+  `INSERT … WHERE` copying one into a template fails as a whole. Not covered
+  (open): REST `POST /batchInsert` and `Database::insert_triple`.
+- **`IRI()` / `URI()`, `STRLANG()` and `STRDT()` validate their results**
+  (M9: sparqlconf#11): a string with a space, a control character or one of
+  `` <>"{}|^`\ `` is no IRI (an expression error, so the variable stays
+  unbound and an INSERT template skips the triple), `STRLANG()` requires a
+  LANGTAG (`STRLANG("x", "en> bad")`, `STRLANG("x", "")` are errors),
+  `STRDT()`'s datatype given as a string must be IRIREF text, and a
+  user-defined function returning such an IRI or tag fails.
+- **N-Triples output escapes every term** (M9: sparqlconf#11):
+  `Term::to_ntriples` / `Triple::to_ntriples` is the one serializer for
+  CONSTRUCT / DESCRIBE responses (`/sparql`, REST and `/api`), `gquery`,
+  gconsole's local mode, the TSV and `n-triple-file` formats and the exports
+  (`gexport`, `/api export`, `Database::export_ntriples`). It escapes an
+  IRI's excluded characters and a literal's control characters and makes a
+  legacy label or tag valid, so a stored term can no longer end its line and
+  forge a statement — `CONSTRUCT` over `IRI(CONCAT(…))` printed a forged
+  triple with no write access needed. Well-formed terms print as before;
+  `Term`'s `Display` (the stored form) is unchanged.
+- **Result serializers decode each cell as a stored term** (query#15): JSON,
+  XML, CSV, TSV and upstream's `/api` JSON shapes read each cell with
+  `Term::from_dict_key` first, so an IRI a lenient reader stored with `>` in
+  it is `"type":"uri"` (it became a literal). XML stays well-formed XML 1.0:
+  a carriage return is written `&#xD;`, a tab or newline in an attribute
+  `&#x9;` / `&#xA;`, and a character XML 1.0 cannot carry is written as
+  U+FFFD; the JSON format carries such values exactly.
+- **`sameTerm` follows the store's term identity** (sparqlconf#14), the one
+  BGP matching, joins, `DISTINCT` and `GROUP BY` use:
+  `sameTerm("abc", "abc"^^xsd:string)` is now false, as the store keeps two
+  terms; language tags compare as written.
+- **Substring filters over typed literals no longer lose rows** (query#1,
+  gap-accel-soundness#2). The dictionary substring index pruning `CONTAINS`
+  / `STRSTARTS` / `STRENDS` / plain `REGEX` held each term under its value's
+  canonical form while `STR(?v)` compares the lexical form:
+  `FILTER(CONTAINS(STR(?c), "001"))` missed `"0012"^^xsd:integer`, and
+  leading-zero decimals, signed and derived integers, exponent floats and
+  padded or numeric booleans were missed on every layout with an in-memory
+  dictionary. A term whose two forms differ is indexed under both.
+- **Graph management follows one existence rule** (sparqlconf#16; SPARQL 1.1
+  Update §3.1.5, §3.2): a named graph exists while it holds a triple, the
+  default graph always. `CREATE GRAPH <g>` of a graph that exists, and
+  `DROP GRAPH <g>` / `CLEAR GRAPH <g>` of one that does not, now fail with a
+  request error (`CREATE GRAPH failed: the graph <g> already exists (it
+  holds triples); use CREATE SILENT GRAPH …`), as `COPY` / `MOVE` / `ADD`
+  from a missing source already did; the failing operation changes nothing
+  and ends the request (earlier operations stay). `SILENT` makes each a
+  no-op; `DEFAULT`, `NAMED`, `ALL` never fail; `ADD` / `MOVE` / `COPY` of a
+  graph onto itself stays a no-op. Before, these reported 0 changed triples.
+- **Blank nodes are refused at parse time in `DELETE DATA`, `DELETE WHERE`
+  and DELETE templates** (sparqlconf#16, parser#13), the labelled ones
+  (`_:b`) too (only `[]` was refused). `INSERT DATA`, INSERT templates and
+  WHERE patterns keep them, and a labelled blank node in a WHERE pattern
+  still names the stored node, so the triples of one stored blank node are
+  deleted with `DELETE { <a> <p> ?o } WHERE { <a> <p> ?o FILTER(sameTerm(?o,
+  _:x)) }` (`_:x` being the label a query result shows). Clients deleting
+  the upstream way (`DELETE DATA { <a> <p> _:x }`) get a parse error; no
+  switch restores it (a conformance change with no security side). A
+  reasoning rule's retraction is unaffected.
+- **The SPARQL grammar's structure is enforced** where a lenient reading
+  changed the request (parser#13): `PREFIX foaf:knows <…>` is a syntax error
+  (it silently declared `foaf:`); two triple statements need a `.` between
+  them (`{ ?s ?p ?o ?a ?b ?c }` was two patterns; stray `.` tokens are still
+  skipped); `ORDER BY`, `LIMIT` and `OFFSET` come at most once each,
+  `ORDER BY` first (`LIMIT 1 LIMIT 2` was `LIMIT 2`), `LIMIT` and `OFFSET`
+  in either order.
+- **`SECONDS` returns an exact `xsd:decimal`** (sparqlconf#16, §17.4.5.7):
+  `SECONDS("…T14:45:13.815-05:00"^^xsd:dateTime)` is
+  `"13.815"^^xsd:decimal`, whole seconds `"7"^^xsd:decimal` (it returned
+  `xsd:integer` or an `xsd:double` with a binary fraction); on a value
+  without a time it is an error, not `0`.
+- **A non-grouped variable in an aggregate query's projection is a query
+  error** (sparqlconf#15, §11.4): with `GROUP BY`, or an aggregate in SELECT
+  / `HAVING` / `ORDER BY`, a WHERE variable may be projected, or used
+  outside an aggregate in a SELECT expression, only as a GROUP BY key.
+  `SELECT ?s ?o … GROUP BY ?s` showed each group's first solution; it now
+  fails with `?o is not grouped: … group by ?o or project (SAMPLE(?o) AS
+  ?…)`. GROUP BY keys (also `GROUP BY (expr AS ?k)`), aggregates, earlier
+  aliases, trailing `VALUES` variables, variables the pattern never binds
+  and a sub-expression equal to a GROUP BY expression stay legal;
+  sub-SELECTs follow the same rule.
+- **String and hash functions check their argument types** (sparqlconf#17):
+  `STRLEN`, `SUBSTR`, `UCASE`, `LCASE`, `CONTAINS`, `STRSTARTS`, `STRENDS`,
+  `STRBEFORE`, `STRAFTER`, `CONCAT`, `REGEX`, `REPLACE`, `STRLANG` and `MD5`
+  / `SHA1` / `SHA256` / `SHA384` / `SHA512` read the lexical form of any
+  term before (`STRLEN(1)` was 1, `REGEX(<iri>, "x")` true, `SHA1("abc"@en)`
+  a hash). Now per SPARQL 1.1: a string literal where the spec says so
+  (§17.4.3.1.1), a simple literal for the regex pattern, flags and
+  replacement, both `STRLANG` arguments and the hash input, and argument
+  compatibility (§17.4.3.1.2) for `CONTAINS` / `STRSTARTS` / `STRENDS` /
+  `STRBEFORE` / `STRAFTER`; any other argument is an error (unbound in a
+  SELECT expression, false in a FILTER). Write `STRLEN(STR(?v))`,
+  `REGEX(STR(?iri), …)` for the old reading. Still lenient:
+  `ENCODE_FOR_URI`, `LANGMATCHES`, `STRDT`'s lexical form, the gStore
+  extensions (`CONTAINALL`, `CONTAINANY`, `SIMILARITY`) and `SUBSTR`
+  positions of any numeric type. This resolves the Phase 3 known gap on
+  argument compatibility.
+- **`BOUND` of a variable the pattern never binds is false**, and `BOUND` of
+  a substituted term is true (query#14): it was an error, so
+  `FILTER(!BOUND(?z))` dropped every row and
+  `FILTER EXISTS { … FILTER(BOUND(?outer)) }` was always false.
+
+#### Behaviour changes: RDF parsers
+
+- **One term validator for every reader** (H-13: parser#1;
+  `gstore::model::term`): RDF/XML, JSON-LD, RDFa, N-Triples, N-Quads, Turtle
+  / TriG, the SPARQL lexer and the term built-ins. A language tag is LANGTAG
+  (`[a-zA-Z]+(-[a-zA-Z0-9]+)*`). Where a format writes the tag as an
+  attribute or string value (RDF/XML `xml:lang`, JSON-LD `@language`, RDFa
+  `lang` / `xml:lang`), surrounding whitespace is dropped and `_` reads as
+  `-` (`zh_CN` is stored as `zh-CN`), an empty value means no language
+  (JSON-LD used to store `"x"@`), and any other value fails the document
+  (`invalid language tag "en US" …`). In N-Triples, N-Quads, Turtle and
+  SPARQL only LANGTAG is a tag: `"x"@`, `"x"@-`, `"x"@-en`, `"x"@en-` and
+  `"x"@1en` are syntax errors.
+- **Blank-node labels outside BLANK_NODE_LABEL are stored hashed**
+  (parser#1): a JSON-LD `"_:a b"`, an RDF/XML `rdf:nodeID` ending in `.` or
+  an RDFa `_:` CURIE holding a control character is stored as `h<16 hex
+  digits>-<label with every other character as _>`, the digits being a
+  stable FNV-1a hash of the whole label, so one label stays one node and
+  `a b` / `a_b` stay two.
+- **N-Triples / N-Quads: a trailing `.` ends the statement, not the
+  blank-node label** (parser#6): `_:g.` and `_:g .` are the same node or
+  graph, as in Turtle / TriG, and the W3C `minimal_whitespace` form
+  `_:s<http://p>_:o.` reads `_:o` (a minimal-whitespace dump split a blank
+  node or named graph in two).
+- **One RFC 3986 resolver for every RDF reader** (parser#4;
+  `parser::iri::resolve`, §5.2): Turtle / TriG (`@base`, `BASE`), RDF/XML
+  (`xml:base`, `rdf:about`, `rdf:ID`, `rdf:resource`, `rdf:datatype`),
+  JSON-LD (`@base`, `@id`) and RDFa (`<base href>`, `xml:base`, `about` /
+  `resource` / `href` / `src`). With base `http://a/b/c/d;p?q`, RDF/XML,
+  JSON-LD and RDFa gave `http://a/b/c/../g` for `../g`, `http://a/b/c///g`
+  for `//g` and `http://a/b/c/?y` for `?y`; now `http://a/b/g`, `http://g`
+  and `http://a/b/c/d;p?y`, as Turtle. A relative `xml:base`, a nested
+  JSON-LD `@base` or an RDFa `xml:base` resolves against the base in force;
+  an empty RDFa `about` / `resource` names the base. Databases loaded before
+  keep their stored IRIs; rebuild to fix them. (SPARQL's `BASE` still
+  concatenates.)
+- **RDF/XML literals keep their data** (parser#9): a literal property
+  element's value is its text exactly (§7.2.16; it was trimmed);
+  `rdf:parseType="Literal"` gives an `rdf:XMLLiteral` whose value is the
+  content as exclusive canonical XML with comments (§7.2.17; only text
+  children were kept), written against the document's expansion budget; an
+  empty property element with property attributes (§7.2.21) has
+  `rdf:resource`, `rdf:nodeID` or a fresh blank node as object, described by
+  the attributes (they were dropped).
+- **RDF/XML: `xmlns:p` declarations on any element are read** (parser#7
+  area): a declaration on a node or property element (not `rdf:RDF`) failed
+  the whole document with "undefined namespace prefix 'xmlns:'".
+- **Turtle / TriG numbers follow the grammar** (parser#10): `1.e5` and
+  `123.E+1` are `xsd:double` (refused before; a tolerant import stored
+  `"1"^^xsd:integer`); `1e`, `1E+`, `1e-`, `1.5e`, `1.5.5`, `1e5e5`, `1e5.5`
+  fail their statement (stored as numbers silently); a `.` followed by a
+  digit never ends a statement.
+- **Prefixes with inner dots** (parser#11): `@prefix ex.v2: <…>` (and
+  `PREFIX`) declares a prefix that names like `ex.v2:s` can use (PN_PREFIX);
+  every statement using it failed. A prefix that starts or ends with `.` or
+  holds a term separator is refused.
+- **Invalid UTF-8 in a Turtle / TriG comment is an error of the comment's
+  line** ("invalid UTF-8 in a comment") and the statements around it load
+  (parser#12); the next statement used to be dropped and reported.
+- **New limit: one token of a streaming RDF reader** (parser#5): a Turtle /
+  TriG string, IRI, name, number or language tag, or one N-Triples / N-Quads
+  line, is capped by `[upload] rdf_max_token_size` (default 64 MiB, `0` = no
+  limit; `ImportOptions::max_token_bytes`,
+  `StatementSink::max_token_bytes`). A longer token fails its statement once
+  the reader has held the limit's worth; the rest is skipped without being
+  held and a tolerant import continues. Before, an unterminated `"""` string
+  or a newline-free line was held whole; the N-Triples / N-Quads scanner now
+  reads the line in place (it copied it into a `Vec<char>`, six times the
+  line).
+- **New limit: one SPARQL request in gserver** (parser#8):
+  `[upload] sparql_max_size` (default 16 MiB, `0` = no limit; installed by
+  gserver and gbuild, also on `refreshconf`) refuses a longer query or
+  update before it is tokenized ("the request is N bytes long, more than the
+  limit of M bytes ([upload] sparql_max_size)"). Upstream has no limit;
+  processes that install no configuration (`gquery`, gconsole, library
+  callers, gnode) have none. The tokenizer lexes in place (it copied the
+  request into a `Vec<char>` plus an offset table, 12 bytes per request
+  byte).
+
+#### Behaviour changes: command-line tools and configuration
+
+| key | default | effect |
+|---|---|---|
+| `[server] min_body_rate` | 65536 | bytes/s a request body must average after `read_timeout`; `0` = per-read timeout only |
+| `[server] max_conns_per_ip` | 64 | open connections per client address; `0` = no limit |
+| `[server] cors_allow_origin`, `allowed_hosts`, `allow_get_update`, `trust_proxy_headers`, `allow_default_root_password`, `upstream_login_lockout` | secure (off / empty) | upstream-compat switches, see above |
+| `[server] login_lockout_failures` / `login_lockout_max_seconds` | 4 / 900 | failures before a lock; longest lock |
+| `[server] query_timeout` | 3600 | seconds a statement may evaluate; `0` = off |
+| `[server] max_result_bytes` | 1073741824 | bytes of one answer; `0` = off |
+| `[system] txn_idle_timeout` | 600 | seconds before an idle transaction is rolled back; `0` = never |
+| `[upload] upload_max_body_size` | 268435456 | body cap of an authenticated payload request (was 1 GiB) |
+| `[upload] preauth_max_body_size` | 67108864 | body cap before authentication |
+| `[upload] request_body_budget` | 536870912 | bytes of all request bodies in memory |
+| `[upload] anonymous_download` | off | upstream-compat switch |
+| `[upload] download_max_concurrent` | 8 | concurrent streamed downloads; `0` = no limit |
+| `[upload] file_retention_hours` | 168 | lifetime of recorded uploads, exports, query results; `0` = forever |
+| `[upload] upload_user_quota` | 0 | bytes of retained uploads per user; `0` = no quota |
+| `[upload] rdf_max_token_size` | 67108864 | one token of a streaming RDF reader; `0` = no limit |
+| `[upload] sparql_max_size` | 16777216 | one SPARQL request in gserver; `0` = no limit |
+| `[pfn] pfn_fuel_per_query` | 10000000000 | fuel of all PFN calls of one request; `0` = unlimited |
+| `[storage] rocksdb_max_open_files` | 4096 | RocksDB's open files; `0` = unlimited |
+| `gserver --allow-local-hosts` | off | with `--allow-service`: SERVICE and remote downloads may reach host-local addresses |
+
+- **`gbuild` exits with status 3 when the build completed but tolerant mode
+  skipped statements** (sparqlconf#12): each skipped statement is still
+  listed in `parse_error.log` and `RDF parse error num N` still printed; it
+  exited 0, so a scripted `gexport` → `gbuild` migration could lose data
+  unnoticed. Statuses: 0 built, 1 failed, 2 invalid arguments, 3 built with
+  statements skipped (also `gbuild --rocksdb`, bulk and `--incremental`).
+  `gadd` still exits 0 when it skipped statements.
+- **`gserver` answers invalid arguments with exit status 2** (bulkcli#18),
+  as every other tool does (it was 1, which a script or a service manager
+  could not tell from a failed start), and **a gserver built without the
+  `tls` feature refuses `--tls-cert` / `--tls-key`** with an argument error
+  (http#19), where it printed a warning and served plain HTTP.
+- **A bulk build keeps the rest of its process out of the directory it
+  rebuilds** (bulkcli#13). The bulk and incremental builds checked "open in
+  this process?" and then took the re-entrant directory lock in a second
+  step, so another thread (a REST `/load` of the `foo.db` alias while
+  `/build?db_name=foo` ran) shared the build's lock and its acknowledged
+  writes went to files the install then replaced. New `BuildGuard::lock(dir)
+  -> (BuildGuard, DirLock)` claims the directory and takes its lock in one
+  step; while the claim lives, `DirLock::acquire` (every open, save, drop or
+  restore of that directory) on any other thread is refused as a lock
+  conflict ("… is being rebuilt by another bulk build of this process",
+  `ErrorKind::Locked`, REST 409).
+- **`gbuild` claims the database directory before it writes anything**
+  (bulkcli#2): it decided once at startup that a new directory was its own
+  and removed it on any failure without its lock, so of two `gbuild` of one
+  new name the loser deleted the winner's directory. `gbuild` now creates
+  and claims the directory before the parse error log is reset or a package
+  unpacked, removes a directory it created only under that claim and only
+  while it holds no database, fails at once with status 1 when another
+  process holds the directory, and without `--force` refuses a name another
+  process created between its check and its claim.
+- **`gbuild` keeps a database it built when its summary cannot be printed**
+  (bulkcli#3): `gbuild newdb data.nt > /dev/full` panicked (status 101) and
+  deleted `newdb.db`; it now keeps it and exits 1 ("built '…', but its
+  summary could not be printed").
+- **Zip packages are unpacked into fresh, unpredictable scratch
+  directories** (bulkcli#6): `gbuild` / `gadd` / `gsub` unpacked into
+  `<db>.db.unzip-tmp-<i>`, removing whatever was there (and `gbuild` before
+  taking any lock, wiping a concurrent `gadd`'s scratch); each unpack now
+  creates `<db>.db.unzip-tmp-<pid>-<random>` exclusively (mode 0700;
+  `zipio::ScratchDir::create_unique`).
+- **The zip entry limit holds before the central directory is decoded**
+  (bulkcli#5): every central-directory record (about 190 bytes per entry)
+  was decoded before `unzip_max_entries` was compared. The
+  end-of-central-directory records are now read first, and a package any of
+  whose usable records declares more entries than the limit is refused
+  (`ZipCode` 3); a zip64 end record that is not where its locator says, or
+  fails the consistency checks, is refused as unsupported (code 1).
+- **`gquery -f` and `gexport` replace their output only with a complete
+  one** (bulkcli#10, bulkcli#11): `gquery -f FILE` truncated FILE before
+  opening the database, and `gexport` wrote in place, so a failure destroyed
+  an existing file. Both now write `<dest>.part-<pid>-<n>` (created
+  exclusively, private `0600` until complete), sync it and rename it over
+  the destination; a failure removes it. A symbolic link stays a link, a
+  replaced file keeps its permission bits and, where possible, its owner,
+  and a FIFO, a device or a dangling link is written in place. `gexport -z`
+  and `zipio::pack_file` / `pack_dir` write their archives the same way
+  (`gexport -z` went through a fixed `<archive>.part`, following a planted
+  link); new `zipio::pack_file_to`.
+- **conf.ini's inline-comment rule** (bulkcli#9): an unquoted value was cut
+  at any whitespace + `#` / `;`, so `root_password = Tr0ub4dor #3` silently
+  set `Tr0ub4dor`. A `#` or `;` now starts an inline comment only when it
+  stands as a word of its own (whitespace before, whitespace or end of line
+  after) after some of the value (`port=9000  # http` reads `9000`); a
+  marker glued to more text stays in the value, as upstream reads it;
+  nothing inside double quotes is a comment; `root_password` is never cut;
+  every cut is a startup warning. For earlier gstore-rust files:
+  `root_password="s3cret"  ; the root password` now reads the whole text (it
+  only seeds a new user store), and `db_home=/srv/gstore #primary` reads
+  `/srv/gstore #primary` — each such value is reported at startup with its
+  line, key and kept text. gserver also warns about a configured
+  `ip_allow_path` / `ip_deny_path` it cannot read. Upstream files, which
+  have no inline comments, parse as before. New `Ini::inline_comments()`,
+  `IpFilter::list_file_warnings`.
+- **Settings that cannot take effect are reported** (design#11, bulkcli#8):
+  `resource_check=on` (gstore-rust performs no resource check) and a
+  `build_threads` other than 1 under `build_multi_thread=off` are startup
+  warnings. The shipped `conf/conf.ini.example` no longer forces
+  single-threaded bulk builds (it copied upstream's
+  `build_multi_thread=off`; existing installations keep their `conf.ini`).
+  `gbuild` reports `conf.ini` warnings and read errors on standard error
+  (`gbuild: conf.ini warning: …`) and loads the file once (bulkcli#7).
+- **`GStoreConfig::db_path` names the directory the servers use**
+  (design#11): `<db_home>/<name>.db`, no longer
+  `<db_home>/<name><db_suffix>`, which no server opened; new
+  `GStoreConfig::db_root()`.
+- **The bulk build checks its page ranges in release builds** (bulkcli#12):
+  a POS / OSP / statistics / dictionary writer that took more or fewer pages
+  than reserved fails the build before its install, the old database
+  untouched (a `debug_assert` before).
+- **`GSTORE_BULK_CRASH` announces itself** (tests-a#19): every bulk install
+  prints what the crash-test failpoint will do, or that its value names no
+  install step and is ignored.
+
+#### Behaviour changes: extensions (graph functions, PFN, reasoning, `ConcurrentDb`, gconsole)
+
+- **`gfun_max_output_bytes` is a per-query budget** (gap-gfun-fuzz#5): every
+  advanced graph-function and `PFN.name` call of a query is charged against
+  one shared counter (each `GROUP BY` group and calls inside `GRAPH` blocks
+  and sub-SELECTs too), and each call runs bounded by what is left; a query
+  passing it fails with `<function>: more than N bytes of output in this
+  query (…)`. Before, the bound applied per call: 2000 groups of a 22 KB
+  `WCC({})` produced 88 MB of rows. A graph function whose vertex arguments
+  name no variable is computed once per query under `GROUP BY`.
+- **`PR`, `louvain` and `labelProp` stop at an iteration-work bound**
+  (gap-gfun-fuzz#2): `PR` with `tol < 0` and `louvain` with `increase < 0`
+  never converge and ran up to 2^31 sweeps (about 45 minutes on a 3-vertex
+  graph). Every sweep beyond the first `gfun::FREE_ITERATION_SWEEPS` = 1024
+  is charged with the vertices, edges and comparisons it visits against
+  `gfun::MAX_ITERATION_WORK` = 2^34 steps; past it the call fails ("not
+  converged within the iteration bound of 17179869184 steps …; lower maxIter
+  or use a positive tol"). Every `maxIter` up to 1024 still runs to the end;
+  library users set the bound per call with
+  `GFunCtx::with_max_iteration_work`.
+- **Graph functions stop at `/cancel` from inside their long loops**
+  (analytics#8, gap-gfun-fuzz#3): WCC polled only between components,
+  triangle counting / clusterCoeff / labelProp per 1024 vertices whatever
+  their degree, closeness / betweenness / degreeCorrelation /
+  diameterEstimation / confidenceDegree never inside a BFS, the kplex
+  `Searcher` never in its O(n²) initialisation. A weighted ticker charges
+  each vertex expansion with its degree and polls every 4096 units; the
+  legacy `rs:` built-ins and `SIMILARITY` are cancellable too.
+- **`maximumKplex`, `coreTruss`, `confidenceDegree` and `louvain` stop at
+  the output bound while they build their text** (gap-gfun-fuzz#4):
+  `maximumKplex({}, 65536)` with a 200-byte IRI for vertex 0 peaked at 52 MB
+  before failing at a 1 MiB bound; it now fails having allocated about the
+  bound.
+- **`rs:LOUVAIN` is deterministic** (analytics#3): equal modularity gains
+  were resolved by `HashMap` iteration order (12 runs gave four partitions);
+  ties go to the smallest community id, in `GraphView::louvain_directed`
+  too.
+- **PFN: a per-request fuel budget, and instantiation is charged** (ext#1).
+  New `[pfn] pfn_fuel_per_query` (`PfnLimits::fuel_per_query`, default
+  10^10, ten calls' worth of the default `pfn_fuel_per_call`; `0` =
+  unlimited) bounds the fuel all PFN calls of one request use together
+  (every argument combination, sub-queries, `GRAPH` blocks and all
+  operations of one UPDATE); past it `run f fail: the instruction budget of
+  N for the PFN calls of one query (pfn_fuel_per_query) is exhausted`.
+  Before, one query could make 1,000,000 calls of a billion instructions
+  each. A call's instantiation is charged before it runs — one unit per
+  8 bytes of the module's initial linear memory and data section — and
+  refused before any memory is allocated when it does not fit (a module
+  declaring 1024 pages costs 8 Mi units per call). API: `PfnCaller` counts
+  fuel (clones share the count; `for_query()`, `fuel_spent()`,
+  `limited(limits)`), `CallOptions::spent`.
+- **PFN compile builds what `data.json` records** (ext#8): `funcudb` type 4
+  / `PfnRegistry::compile` compiles `generate_source(record)` and rewrites
+  the `.wat` source file when it differs, so an update interrupted between
+  the source file and `data.json` can no longer make a function run code
+  `funquery` does not show.
+- **RDFS materialization never makes a literal or blank node a predicate**
+  (ext#3; `Database::materialize_rdfs`, library API): a literal or blank
+  node in an `rdfs:subPropertyOf` (or `domain` / `range`) position
+  (`:p rdfs:subPropertyOf [ owl:inverseOf :q ]`) was interned as a predicate
+  and data copied under it, which no reader loads back (export → gbuild lost
+  statements, exit 3). Only IRIs are properties now; `subPropertyOf` stays
+  transitive through a blank node.
+- **Textual rules are strict** (ext#4, ext#7; `Database::add_rule` /
+  `RuleSet`): non-ASCII or malformed rule text is an error (the tokenizer
+  sliced by bytes and panicked on `é <p> ?y => …`); terms go through the
+  crate's term validator and `Term::from_dict_key` instead of a forked
+  parser, so a rule IRI with a space or `` <>"{}|^`\ ``, a literal escape
+  other than `\\ \" \n \r \t`, an invalid language tag, blank label or
+  variable name is refused. The body join is a hash join over dictionary ids
+  (a two-hop rule over 8000 edges: 20 ms instead of 2.6 s). Textual rules
+  are documented as not persisted.
+- **Rule directories are written all-or-nothing** (durability#11):
+  `reason::store::copy_rule_dir` (backups, restores) and
+  `write_memory_rules` stage the new `reason_rule_files/` beside the
+  destination, fsync every file and directory and swap it in with
+  `fsutil::StagedDir`; a removal renames the directory aside durably first.
+  They removed the destination and wrote file by file without fsync, so a
+  crash or a full disk lost the old rules and left rule files without
+  ledgers (which `reasonManage` takes for upstream rules). An interrupted
+  swap is finished by the next operation taking the rule lock;
+  `write_memory_rules`, and a detached database's `save` that writes
+  in-memory rules, take that lock without waiting and are refused, changing
+  nothing, while another operation holds it.
+- **A forced rebuild removes the replaced database's rules, also an
+  interrupted swap's staged copy** (durability#11): `gbuild --force` deleted
+  only `reason_rule_files/`, without the rule lock, so a
+  `reason_rule_files.new` left by an interrupted swap brought the old rules
+  back at the rebuilt database's first rule operation. New
+  `reason::store::remove_rule_dir` / `remove_rule_dir_locked` (rule lock,
+  rename aside, then delete), used by `gbuild`, the bulk install and REST
+  `/build`.
+- **`ConcurrentDb` (library only) publishes exactly what the database
+  holds** (gap-txn-lifecycle#3, conc#4, http#9, robust#13): a commit the
+  database rolled back publishes nothing (a version-pinned reader saw a
+  rolled-back transaction's writes; `apply_txn_ops` asks
+  `Database::commit_checked`); an UPDATE that fails part-way is published
+  and recorded as a non-transactional write when it changed the database, so
+  an overlapping `RepeatableRead` / `Serializable` transaction conflicts
+  (readers kept the old snapshot and the change surfaced later inside an
+  unrelated version).
+- **`ConcurrentDb`: no lock stays poisoned and no double panic** (conc#3,
+  http#17): one panicking `write()` closure made every later `update` /
+  `sync` / `Txn::commit` panic with `PoisonError`, and a panic inside a
+  commit made `Txn::drop` panic again during the unwind (process abort). A
+  panicking `write()` closure now has its open database transaction rolled
+  back, what it applied otherwise published, the locks released and the
+  panic continued; a commit that panics while applying rolls back; poisoned
+  locks are recovered (every transaction live at the panic conflicts); `Txn`
+  and `VersionView` drops never panic.
+- **`gconsole --local` keeps the updates it acknowledged** (ext#5): a
+  snapshot-layout or new in-memory database was persisted only by a `save`,
+  so leaving it (`quit`, end of input, `load <other>`) dropped acknowledged
+  updates. The console now saves before leaving a changed database
+  (`saved to <dir>`); when that save fails, `load <other>` keeps the current
+  database, an interactive `quit` stays (a second `quit` leaves), and at the
+  end of input the failure is reported (exit 1). Ctrl-C no longer ends the
+  local console: as in the remote console it discards the statement being
+  typed. On-disk and RocksDB databases write each update through. A console
+  killed by `SIGTERM`, `SIGHUP` or `SIGKILL` still does not save.
+- **`gconsole --local` ends statements like the remote console** (ext#9): a
+  `;` ends a statement only outside `{…}` groups, string literals, `<IRI>`s
+  and `#` comments (a multi-line SELECT with a `;` predicate-object list, a
+  long literal whose first line ends in `;` and two statements on one line
+  failed); a script's final statement may lack its `;` (it was dropped
+  silently).
+- **gconsole logs in once and sends a session, not the password** (ext#12):
+  `POST /login`, then the session token (`Authorization: Bearer`) with every
+  `/api` request, so the password crosses the network once per login; an
+  ended session (`1001`) is renewed and the request repeated once, and the
+  console logs out at the end. Against an upstream gserver or an older
+  gstore-rust one it falls back to upstream's `/api login` and the
+  per-request password.
+- **`gconsole --tls [--ca-file FILE]`** (feature `tls`; ext#12) talks to a
+  gserver serving HTTPS over rustls, verifying the server certificate
+  against `--ca-file`, `$SSL_CERT_FILE` or the system bundle (an unvouched
+  certificate is a connection failure and nothing is sent; the handshake is
+  bounded at 30 s). Without the feature `--tls` is refused (exit 2), as is
+  `--ca-file` without `--tls`. A plain-HTTP connection to a non-loopback
+  host warns that the password and every statement cross the network in
+  clear text.
+- **`setpriv` validates its answer and changes privileges as one step**
+  (ext#11): an answer that is not a list of privilege numbers (a typo such
+  as `q`, an out-of-range number, an empty line) is refused and nothing is
+  sent (it revoked every privilege of the user on the database and printed
+  `Privilege set successfully.`); the console grants what is missing first,
+  then revokes what is left over, and takes the grant back when the revoke
+  fails.
+- **Server text cannot drive the operator's terminal** (ext#10): every
+  server field gconsole prints (`StatusMsg`, table cells, `backup` /
+  `export` paths, counts and times, login refusals, non-envelope answers)
+  has its control characters escaped (`\u001B` …).
+- **A Ctrl-C typed at a gconsole prompt is never lost** (ext#13,
+  tests-a#14): the Ctrl-C mark is taken before the prompt is shown and the
+  reader waits for stdin with `poll` (100 ms), checking the counter before
+  each wait.
+
+#### Behaviour changes: experimental cluster and gnlqa
+
+- **`gnode cluster <id> <bind_addr> [peer_id@addr …]` requires
+  `--state-dir DIR` or `--ephemeral`** (cluster-nlqa#11). Every replica used
+  to be ephemeral: one that voted in term T and restarted came back at term
+  0 and voted again in term T (two leaders of one term), and with an empty
+  log could help elect a leader lacking committed writes. Shard mode is
+  unchanged.
+- **New `ClusterNode::bind_persistent(id, peers, state_dir, addr, cfg)`**
+  (cluster-nlqa#11): term, vote and log changes go to an append-only,
+  CRC-checked journal `state_dir/raft.journal` (magic `GSRAFTJ1` and the
+  owning node id), fsynced before the node answers a vote or append, sends a
+  message or counts its own entry toward a commit; a restart reloads them
+  and rebuilds the triple store as the log is re-committed. A torn tail is
+  cut off; an intact record that does not decode, or a damaged record a
+  crash cannot have left, refuses the start naming the byte offset and
+  leaves the file untouched. A directory of another node id or a second
+  running copy of the node (advisory lock) is refused; a journal write
+  failure stops the node for good (fail-stop). A single-node leader commits
+  its log when elected.
+- **Forged Raft terms are refused** (cluster-nlqa#2): one `RequestVote` at
+  term `u64::MAX` wedged a cluster for good (a panic in debug builds, a wrap
+  to 0 in release). A message may move a node's term forward by at most
+  2^32; elections use checked arithmetic; a lying `AppendAck` match index is
+  clamped to the leader's log; an `InstallSnapshot` beyond index 2^62 is
+  refused.
+- **`ShardedRaftCluster` reports only committed writes** (cluster-nlqa#4,
+  cluster-nlqa#12): `insert` / `remove` return `Some(true)` only once the
+  write is committed and `None` when it could not be committed now (retry is
+  safe); `insert_all` counts committed triples only. New
+  `ReplicaGroup::commit(op) -> Result<index, ProposeError>`.
+- **A `ClusterNode` routes shard inserts through the Raft log and refuses
+  `PurgeShard`** (cluster-nlqa#3): `Request::Insert` answers `Bool` once
+  committed (as `RemoteShard::insert` expects) and `Error` with the leader
+  hint otherwise; `PurgeShard`, which deleted a bucket on one replica
+  outside the log and diverged the replicas for good, is refused.
+- **`ShardCluster` membership changes are resumable and never lose data**
+  (cluster-nlqa#1, cluster-nlqa#10): a migration that fails part way leaves
+  its buckets stranded (new `ShardCluster::stranded_buckets`) and returns
+  the error; repeating the change, or new `ShardCluster::resume_migrations`,
+  finishes them, and any other membership change is refused while one stays
+  stranded. `remove_node` drains every bucket of the leaving node and
+  refuses to remove the last member while it holds triples; nothing is
+  purged before the copy reached its target; re-adding a member never
+  replaces its endpoint. Before, a failed join's retry was a silent no-op
+  and a later leave dropped the stranded triples (128 of 400 in the review's
+  run), every call returning `Ok`.
+- **Shard-node connections time out and frames are read as they arrive**
+  (cluster-nlqa#9, sec#19, conc#11, robust#15): `ShardNode` bounds each read
+  and write (`ShardNode::DEFAULT_IO_TIMEOUT` = 60 s, `with_io_timeout`);
+  `rpc::read_message` grows its buffer with the bytes received instead of
+  allocating the size an unauthenticated length prefix announces (up to
+  256 MiB for four bytes); a reply larger than one frame is answered with
+  `Response::Error` naming its size (`rpc::encode_reply`) and the connection
+  stays usable.
+- **`gnlqa serve` requires a client token** (cluster-nlqa#13, sec#18):
+  `/ask` and `/gSolve` run LLM-chosen read-only SPARQL with the server's
+  gStore credentials and spend the operator's LLM credit, so `gnlqa serve`
+  refuses to start unless `GNLQA_HTTP_TOKEN` is set (clients send
+  `Authorization: Bearer <token>`, compared in constant time). The only
+  alternative, `GNLQA_HTTP_ALLOW_UNAUTHENTICATED=on`, answers loopback
+  clients only, refuses a non-loopback bind and prints a startup warning. In
+  the library `HttpServer::bind` starts in `HttpAuth::Unconfigured` (401
+  with `WWW-Authenticate: Bearer`) until `with_token`,
+  `allow_unauthenticated_loopback` or `with_auth`. `/health` stays open.
+- **gnlqa rate, size and cost limits** (cluster-nlqa#13, sec#18): each
+  client (an IPv6 client per /64) may send `GNLQA_HTTP_RATE_PER_MIN` (30)
+  question requests per minute, counted before authentication, and gets 429
+  with `Retry-After` beyond; a question over `GNLQA_MAX_QUESTION_BYTES`
+  (4096) gets 413; each request runs under a cost budget (`gnlqa::budget`,
+  `CostLimits`) of `GNLQA_MAX_LLM_CALLS` (16) LLM calls, `GNLQA_MAX_KB_ROWS`
+  (200000) KB rows and `GNLQA_REQUEST_TIMEOUT_SECS` (120 s), the clients'
+  network timeouts capped by the time left; an exhausted budget is the new
+  `Error::Limit` (`/ask` 503, `/gSolve` `status:"error"`, code
+  `limit_exceeded`). MCP tool calls run under the same budget. Connections
+  are capped per client at an eighth of the total (8 of 64;
+  `HttpServer::with_max_conn_per_client`), so one address holding idle
+  connections no longer turns every other client away with 503. The limiter
+  tracks at most 10000 clients without ever forgetting one being limited.
+- **gnlqa errors are redacted** (cluster-nlqa#18): `/ask`, `/gSolve` and MCP
+  tool errors no longer echo internal error text (ureq printed the endpoint
+  URL with its `user:password@`; provider bodies were passed through);
+  clients get a generic message, a stable `code` (`upstream_unavailable`,
+  `kb_error`, `llm_error`, `no_answer`, `limit_exceeded`, `config_error`)
+  and a `request_id`, and the full error goes to stderr under that id; URL
+  userinfo is stripped from every error and log line.
+- **gnlqa reads no configuration from the working directory**
+  (cluster-nlqa#15): the config file is `$GNLQA_CONFIG`, else
+  `$XDG_CONFIG_HOME/gnlqa/gnlqa.conf`, else `~/.config/gnlqa/gnlqa.conf`; a
+  `gnlqa.conf` in the current directory is ignored with a note
+  (`GNLQA_CONFIG=./gnlqa.conf` opts in) and a world-writable config file is
+  refused. Its clients follow no redirects (ureq kept every header but
+  `Authorization` / `Cookie` across hosts, so Anthropic's `x-api-key`
+  followed a `302` anywhere), and a credential sent over plain `http://` to
+  a non-loopback host draws a startup warning.
+- **gnlqa honours its privacy table** (cluster-nlqa#14, cluster-nlqa#21):
+  the follow-up rewrite replays an earlier answer to the LLM only where the
+  current mode allows that data to leave the machine (a default `auto` chat
+  and a `structured` → `open` switch sent locally computed KB answers), and
+  structured mode with `with_explain(true)` no longer sends the answer's
+  supporting triples.
+- **gnlqa retries transient failures and surfaces outages**
+  (cluster-nlqa#16): LLM and embedding clients retry 429 / 500 / 502 / 503 /
+  504 / 529, `GStoreClient` 429 / 502 / 503 / 504, with exponential back-off
+  from 500 ms honouring `Retry-After` (capped at 30 s and by the request
+  budget; `GNLQA_RETRIES`, default 3). A persisting provider or KB outage
+  ends the request instead of becoming an ungrounded guess; the linker is
+  built lazily and retried after a failure (at most once a minute in
+  `gnlqa`).
+- **gnlqa results over the 100000-row cap are never silently truncated**
+  (cluster-nlqa#17): `KbClient::query` / `GStoreClient::query` fail with a
+  repairable error asking for a `LIMIT`; `query_capped` returns the first
+  rows and a truncation flag (MCP `run_sparql` appends `[truncated]`).
+- **gnlqa bounds and hardening** (cluster-nlqa#19, conc#10, cluster-nlqa#20,
+  cluster-nlqa#23, cluster-nlqa#22): the answer cache is bounded by
+  estimated bytes (`GNLQA_CACHE_MAX_BYTES`, 64 MiB) and
+  `GNLQA_CACHE_TTL_SECS` defaults to 3600 (was 0, never expire); a handler
+  panic is answered 500 and releases its connection slot (`max_conn` panics
+  meant a permanent 503) and the read deadline bounds the socket read
+  timeout; the read-only gate refuses `SERVICE` anywhere in a query; the
+  linker index is fetched in ordered pages of 10,000 and cached on disk per
+  KB fingerprint for a day (0600 files trusted only when owned by the
+  process's user; `GNLQA_LINKER_MAX_LABELS`, `GNLQA_LINKER_CACHE`,
+  `GNLQA_LINKER_CACHE_DIR`), so a repeated one-shot `gnlqa "<question>"`
+  costs two `COUNT` queries instead of full-store `DISTINCT` scans.
+- gnlqa library: the `Error::Limit` variant and new `Config` fields break
+  exhaustive matches and struct literals in downstream code (none in the
+  workspace); `GStoreClient::query` now errors instead of truncating beyond
+  100000 rows; `SolveEngine::linker()` may run a deferred build. Nothing was
+  removed.
+
+#### Behaviour changes: tests, CI, gstore-bench and packaging
+
+- **The smoke gate sees sub-millisecond regressions** (infra#2, infra#4).
+  The per-query timing gate's floor drops from 2 ms to 0.1 ms
+  (`(m + 0.1 ms) / (b + 0.1 ms) > 3` fails); the per-backend query geomean
+  takes every query as `(m + 0.05 ms) / (b + 0.05 ms)`, each ratio clamped
+  to [1/3, 3], instead of only queries with a baseline median of at least
+  1 ms, and its limit is `max(1.5, s)` with `s` the baseline run's own
+  process spread (`gates::query_spread`), never above `geomean.max_spread`
+  1.6. 41 of the smoke baseline's 68 queries answer in 0.01–0.7 ms; the
+  review's repro (all regressed to 3 ms, 4–298×) passed all 456 gates
+  before. Any single query slowed 50× now fails and the canary fails at 2×
+  as well as 3×. `bench/thresholds.json` gains `geomean.floor_ms`,
+  `geomean.max_spread` and a `bless` section (files without them keep their
+  old meaning).
+- **gstore-bench checks how a run was measured** (infra#10): a new exact
+  gate `exact.config` requires the baseline run's builder, warm repetitions
+  and query processes (`check` takes them from the baseline unless given);
+  `bless` refuses (exit 1) a result from a debug build of the harness, a
+  dirty tree or no recorded commit, the library builder or a debug `gbuild`,
+  a 1-minute load above 1.0 per CPU, or query processes spread wider than
+  `geomean.max_spread`, unless `--provisional` marks it; `ci` refuses
+  (exit 2) a provisional baseline unless `--allow-provisional`.
+- **gstore-bench arguments are validated** (infra#16, infra#5):
+  `--conc-secs` and `--mixed-secs` must be finite, positive and at most
+  3600, `--conc-clients` at least 1, and a mixed point may not need more
+  than 100,000 writes (`--mixed-secs 1e9` asked for 480 GB up front and the
+  phase child panicked); stray positional arguments are usage errors (exit
+  2; `check --from X other.json` gated X against the default baseline).
+- **gstore-bench's update phase detects lost writes** (infra#9): it
+  checkpoints and reopens while the update chunk is inserted and re-runs
+  every query on the database reopened after the final checkpoint; new
+  optional `UpdateResult` fields record it (older result files read as
+  before).
+- **gstore-bench tests fail on a missing, stale or RocksDB-less `gbuild`**
+  (infra#18) instead of silently using the library builder
+  (`GSTORE_BENCH_TEST_BUILDER=lib` chooses it explicitly);
+  `cargo test -p gstore-bench` alone now needs `cargo build --profile test
+  -p gstore --bin gbuild [--features rocksdb]` first. Reports match sections
+  by workload (infra#8).
+- **CI** (infra#2, infra#6, infra#8, infra#13): the smoke job and the test
+  job check the generated tables of every tracked Markdown file with a
+  marker (`docs/BENCHMARKS.md` and `bench/README.md` were never checked);
+  the canary runs at 2× and 3×; the weekly reference job records the
+  reference profile as the Phase 6 closure did and compares with
+  `bench/results/phase6-final-*.json`; ci.yml's table check runs
+  `target/debug/gstore-bench` instead of compiling gstore a second time.
+- **`scripts/conformance.sh` fails when a suite is skipped** (infra#11): the
+  Python SDK suite, which needs python3's `requests`, counted as passed when
+  skipped; it is now `SKIP` and the run exits 1 unless `--allow-skip`. The
+  server picks its own port (tests-b#17): `conf/conf.ini` says `port=0` and
+  the script writes the bound port from the pid file into `conf/conf.ini`
+  for the upstream scripts (the port came from a probe socket closed before
+  gserver bound it).
+- **systemd unit hardening** (infra#14): `UMask=0027`, an empty
+  `CapabilityBoundingSet`, `ProtectKernelLogs`, `ProtectClock`,
+  `ProtectHostname`, `ProtectProc=invisible`, `RestrictRealtime`,
+  `RestrictNamespaces`, `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`,
+  `MemoryDenyWriteExecute`, `RemoveIPC`, `SystemCallArchitectures=native`,
+  `SystemCallFilter=@system-service` without `@privileged @resources`;
+  `systemd-analyze security --offline` rates the unit 1.2 (was 6.8). Files
+  gserver creates are no longer world-readable, a port below 1024 needs a
+  drop-in granting `CAP_NET_BIND_SERVICE`, and `ProtectHome=yes` (unchanged,
+  now documented) hides `/home`, `/root` and `/run/user`. A crash loop ends
+  (infra#12): `StartLimitIntervalSec=300`, `StartLimitBurst=5` and
+  `RestartPreventExitStatus=1 2`, so a refused configuration is not
+  restarted forever.
+- **Packages** (infra#15, infra#7, infra#19, infra#17): the deb keeps an
+  administrator's enablement across `apt remove` + `apt install`
+  (dh_installsystemd's protocol: prerm only stops, postrm masks on remove
+  and forgets on purge, postinst unmasks and re-enables; `DPKG_ROOT`
+  honoured); the rpm installs `conf.ini` with group `gstore` from a new
+  `%pre` that creates the user and group first (`rpm -V` reported a
+  mismatch); the image and both packages ship every binary target
+  (`cargo install --path .`, the deb's `$auto`, a checked rpm list) and are
+  built with `pfn-wasm`; gnlqa's `rust-version` is the workspace MSRV 1.89.
+  The container health check is `/usr/local/bin/gstore-healthcheck`
+  (`gserver -S` with PID 1's arguments: it connects to the address the
+  server bound, without a request), so another port, TLS or an IP allow list
+  no longer makes the container unhealthy and probes leave no access-log
+  record; the image no longer installs `curl`.
+
+#### Fixes
+
+Crashes and denial of service:
+
+- **A hostile SERVICE reply can no longer abort the process** (H-3: sec#5,
+  gapi#3, robust#1; gapi#10, robust#8): replies are read with the crate's
+  depth-limited `json::parse` instead of a private recursive reader (about
+  50 KB of `[` overflowed an 8 MiB worker stack, SIGABRT); escaped surrogate
+  pairs decode to the right non-BMP character (two U+FFFD before) and a lone
+  surrogate makes the reply malformed. `SERVICE` requests name the
+  endpoint's port in `Host:` when it is not 80 (sec#6).
+- **`shortestPathCount` cannot blow up on wrapped path counts** (H-8:
+  analytics#1): once a count wrapped to exactly 0 (2^32 paths, a 2-wide
+  ladder of 33+ levels) the frontier doubled every level and a 400-triple
+  ladder aborted the process on a failed allocation; the search tests the
+  maps' stamps and the printed count is still upstream's wrapping C `int`
+  value byte for byte.
+- **The SPARQL lexer is linear on long name runs** (H-14: parser#2):
+  `a-a-a-…` / `a.a.a…` without a `:` re-scanned the rest of the run for
+  every word (160 KB about 6 s, 1.6 MB about ten minutes of uncancellable
+  CPU per request).
+- **Log retention skips foreign file names** (M15: bulkcli#1): a file such
+  as `diag.log.<CJK text>` next to the log made gserver exit with 101 at
+  startup (and the daily roll of `access.log` / `query.log` panic in the
+  first request of a day).
+- `maximumKplex` on a graph without vertices answers the empty k-plex for
+  every k (gap-gfun-fuzz#1; k ≤ 2 panicked, k = 3 printed
+  `{"kplex":[,,,]}`). REST log lines (`access.log`, `query.log`, `txn.log`)
+  are written with one `write(2)` and no longer interleave (conc#6).
+
+Storage and durability:
+
+- **Quad-aware frees** (disk#3): a term used only by a named-graph quad's
+  subject, predicate or object was freed and its id reused, silently
+  changing the quad; the store keeps reference counts of the quads' terms.
+  Out-of-core dictionary caches never cache a value read before a free after
+  it (disk#6, conc#12, db#20; a racing resolve could cache a freed id's
+  string, or make `intern` answer a freed id for a second term).
+  `remove_sorted_from` skips a value the list does not hold in release
+  builds too (db#19).
+- **A backup never pairs a new `kvstore.kv` with an old `vstree.kv`**
+  (durability#4): the destination's VS-tree and WALs are removed durably
+  before the new store lands, `backup_dir` removes stale files the source
+  lacks first and copies `meta.bin` last, and a stale destination `rocksdb/`
+  is discarded first (`GSTORE_VS_POLICY=tree` pruned every entity added
+  since the previous backup).
+- **The legacy-shadow reconcile survives a crash part-way** (durability#9):
+  the decision to apply a shadow is recorded first in a durable marker
+  `SHADOW.apply` bound to the store file's device and inode, and an open
+  that finds it applies the shadow again before retiring it (an open after a
+  second crash served a mix).
+- Developers: the crate-internal `fsutil` has one stage + swap + fsync
+  primitive for replacing and removing directories, `StagedDir` (staged
+  beside its target, the whole tree fsynced, swapped in with the parent
+  fsynced; `InstallError::committed` tells a failure after the commit point
+  apart), used by the incremental builds, drops, backups and rule
+  directories (durability#15); crash-test hooks `GSTORE_DROP_PARK` and
+  `GSTORE_SHADOW_PARK=<n>`.
+- **The directory-lock registry is keyed by the locked file** (db#10): a
+  directory moved away with its lock lent its in-process entry to a new
+  directory at the old path (`restore_into` an open directory left the
+  restored database unlocked); the registry is keyed by the `LOCK` file's
+  device and inode, and `DirLock::holds(dir)` is new.
+- **Redo log and incremental backups replay every stored term** (parser#1):
+  a record names the stored term exactly (`model::term::record_key`); the
+  first record holding `"x"@zh_CN`, `"x"@`, `"x"@en US` or `_:a b` failed
+  the replay and no later increment could be restored. Records of
+  well-formed terms are byte-identical.
+- `materialize_rdfs` and `run_rules` log the triples they add (db#3);
+  `backup` / `backup_incremental` copy the reasoning rules before taking
+  `persist_lock` (contract C8 order) and take the target directory's lock
+  first (conc#13); a backup's checkpoint moves only once its `BACKUP_OFFSET`
+  marker is written.
+- **Commits let readers run and checksum faster** (disk#10):
+  `DiskStore::commit` writes, applies and fsyncs the batch under the pager's
+  shared guard (`Pager::commit_shared`), only taking the batch and marking
+  it clean hold the exclusive guard; the CRC-32 is table-driven (slicing
+  by 8) and the log is streamed through a 1 MiB buffer; log format
+  unchanged.
+- `VsTree::build_disk` and `VsTree::write_disk_sorted` replace an existing
+  file and its write-ahead log (disk#5; three builds of 5,000 entities grew
+  the file to 2,007,040 bytes and a stale `.wal` was replayed into it);
+  `dict::prefix::decode_block` bounds its allocation (db#21; a `u32::MAX`
+  count asked for 96 GiB).
+- **Per-predicate triple counts saturate instead of wrapping**
+  (gap-accel-soundness#4, bulkcli#14): the disk `pred_stats` record stays a
+  `u32` (no format change) and stops at `u32::MAX`, the bulk build counts in
+  `u64`; a count that wrapped to 0 made `VsPolicy::Auto` drop the predicate
+  on an out-of-core VS-tree and answer no rows.
+- **The in-memory VS-tree is rebuilt after a clear** (db#4) of the default
+  graph (`CLEAR` / `DROP DEFAULT` or `ALL`, the clears of `COPY` / `MOVE`;
+  inside a transaction at its end) instead of staying unused until reopen;
+  reasoning folds inferred triples into it. `COPY` / `MOVE` / `ADD` copy by
+  id in chunks of 65,536 (db#16; every triple was turned into three terms
+  and interned again), and `Database::build_from_ntriples_batched` indexes
+  in one bulk load (db#15; it re-sorted the whole store per batch,
+  O(N²/batch)).
+- `Database::try_materialize_rdfs()` / `try_run_rules()` return
+  `Result<usize>`, so a Stream-mode or RocksDB read error fails the run
+  instead of leaving an incomplete closure with only a log line (design#7);
+  `reasonManage` execute's rule ledger reads inside a read scope. An empty
+  rollback no longer advances `mutation_count` nor drops the query cache and
+  the CSR (db#7).
+
+Server and concurrency:
+
+- **RocksDB `/begin` no longer blocks the database's readers**
+  (gap-rocksdb-exec#3): the whole-store copy for the transaction's snapshot
+  is taken under the shared guard and registered after checking nothing
+  changed (after three copies the last is taken under the exclusive guard);
+  concurrent RocksDB `begin`s copy the store one at a time.
+- **Password hashing and `users.db` writes no longer hold the server-wide
+  lock** (gapi#6, http#7): `/api` `usermanage` / `userpassword`, REST
+  `/user/create` and `/user/password` hash and rewrite `users.db` with the
+  state lock released; a change overtaken by another save is prepared again,
+  and a user dropped meanwhile is reported instead of resurrected.
+- **Asynchronous callbacks run on their own threads** (gapi#12;
+  `TaskConfig::callback_workers`, default 2), so a slow callback host no
+  longer starves other users' asynchronous operations; the queue is bounded
+  by count, bytes (64 MiB) and per user (32), and a queued callback holds a
+  spilled result by its file name. `http_client` bounds name resolution and,
+  with `tls`, every read of the TLS handshake by the request's deadline.
+  Asynchronous operations and callbacks run on threads with the HTTP
+  workers' stack size (design#8), and a runner that panics outside the
+  operation's `catch_unwind` gives its slot back (gapi#20).
+- **Index builds no longer block readers** (conc#5, db#5): a CSR build runs
+  with the cache's lock released (concurrent callers share one build), and a
+  reader finding a substring-index build running goes on without the
+  prefilter. A write no longer throws the substring index away: the next
+  substring query extends it with the new or changed terms (db#5), a full
+  rebuild coming only after a quarter of the dictionary changed. The CSR
+  build reads one predicate at a time and copies only entity pairs
+  (analytics#6). The cached substring index keeps candidates only, about a
+  third less memory (gap-accel-soundness#3; `StringIndex::candidates_only` /
+  `build_candidates`; the serde form of `StringIndex` changed, no database
+  persists it).
+- **`ConcurrentDb` version-chain GC is incremental** (conc#2, http#8): it
+  walked every chain on every commit, conflict and drop, quadratic over a
+  wrapper's life (8.3 ms per commit after 20,000 transactional inserts); a
+  GC now examines only the keys of the versions the oldest live pin has
+  passed. New `ConcurrentDb::version_chain_stats()`.
+- `format=file` and `n-triple-file` results are written row by row through a
+  buffered writer (gapi#11; output byte-identical), and
+  `Params::to_redacted_json` builds its object in linear time (gapi#19;
+  32,000 parameters took 1.19 s). One form / URL decoder and one base64
+  decoder (`gstore::util::form`, `gstore::util::base64`) serve the servers,
+  `/api` and PFN (gapi#15, robust#16, design#13; behaviour unchanged).
+
+Query engine and parsers:
+
+- **`OPTIONAL`, `MINUS` and joins over maybe-unbound variables are hash
+  joins in both executors** (H-19: sparqlconf#2, query#10; answers and order
+  unchanged): the materializing executor compared every left solution with
+  every right one for `OPTIONAL`, both scanned the right side per left
+  solution for `MINUS`, and a join after an `OPTIONAL` fell back to the
+  cross product (14.7 s at 20,000 subjects); new `query::probe::RowIndex`,
+  whose partial indexes hold at most 4× its rows together.
+- `REGEX` / `REPLACE` compile a pattern once per query (a per-query cache
+  bounded by weight: 64 patterns of up to 256 KiB, or 8 larger ones), and
+  `REPLACE` reads a long `$` reference in linear time; `DESCRIBE`
+  de-duplicates its resources with a hash set (query#11, sparqlconf#8,
+  query#12, sparqlconf#10).
+- **The large-BGP plan search is bounded and cancellable** (query#13): a BGP
+  of more than 14 patterns was refined with up to 16 2-opt passes that never
+  looked at the cancel flag (a 400-pattern star planned for 6 s); orders are
+  scored with reusable prefix statistics (plans unchanged), the search stops
+  after `OPT_WORK_BUDGET` = 2^21 work units, skips 2-opt above
+  `MAX_2OPT_PATTERNS` = 256 and polls every 4,096 units; a plan cut short is
+  not cached.
+- **One `EvalSettings` at every evaluator construction site** (design#9):
+  `Database::read_as`, the UPDATE WHERE clause (default graph, `WITH`,
+  `USING`), an HTTP transaction's snapshot and `ConcurrentDb` snapshots and
+  version views apply one value (`EvalSettings`, `EvalProviders`,
+  `Evaluator::with_settings`, `StringIndexCell`,
+  `Database::eval_settings()`), so transaction-snapshot and `ConcurrentDb`
+  reads keep their substring index across queries and `WITH` / `USING`
+  updates use the database's.
+- **RDF parsing is linear in the input** (parser#15, parser#7, parser#14):
+  relative IRI resolution walks the path once (11 s for one 1.4 MB relative
+  IRI before); JSON-LD contexts, RDFa prefix maps and RDF/XML namespace
+  bindings and `xml:base` are shared as layers instead of copied per node
+  (5000 node objects with `"@context": {}` under 4000 terms 1.8 s → 4 ms);
+  the "blank graph label used before" check in large N-Quads / TriG is a
+  growing Bloom filter with about 0.5% false positives (the old fixed filter
+  reached 4.5% at 1M labels and 51% at 5M, each keeping a graph apart from
+  the statements describing its label).
+- RDFa: a minted blank node can no longer be forged with `&#0;` in an author
+  label (parser#16).
+
+Graph functions and PFN:
+
+- The legacy `rs:` built-ins share the database's CSR (analytics#4):
+  `rs:CYCLEBOOLEAN` is computed once per query on the CSR view (44 s → 55 ms
+  on 22,264 rows) and `rs:CLOSENESSCENTRALITY(<x>)` runs one BFS.
+  `SIMILARITY`'s Jaro loop visits only each character's window and is
+  cancellable (analytics#5). Less memory per call (gap-gfun-fuzz#3,
+  analytics#9, analytics#7): the kplex `Searcher` keeps bits and 16-bit
+  counts (136 MiB instead of 320 MiB at the 8192-vertex limit), and
+  degreeCorrelation, closeness, betweenness and JaccardSimilarity allocate
+  their working sets once per call. The duplicate unpolled
+  `metrics::k_hop_neighbor` is gone (analytics#10, design#15). The rustdoc
+  of each graph function documents the upstream quirks it reproduces
+  (analytics#2).
+- **PFN functions of any size run** (ext#2): wasmi translates modules
+  eagerly at compile / load; with lazy translation a function body above
+  about 150 KB failed at its first call, also with `pfn_fuel_per_call=0`.
+
+Documentation:
+
+- `docs/DESIGN.md` §1–§7 describe the current architecture and `src/lib.rs`
+  carries a module map by layer (design#16); every reasoner is documented as
+  working on the default graph only (ext#15); stale parser docs fixed
+  (parser#17). `docs/CPP_PARITY.md`'s three status tables are rewritten from
+  the code, marking library-only and experimental items and correcting
+  earlier claims inline (gap-doc-claims#3, #4, #5); `kvstore::vlist`
+  describes the overflow page chain (disk#14) and `eval_describe` DESCRIBE's
+  description and the syntax-tree cap (sparqlconf#19); `src/concurrent.rs`
+  documents `ConcurrentDb` as a library-only second concurrency model
+  (design#14). `docs/PFN.md` documents fuel, `pfn_fuel_per_query`, eager
+  translation and compile-from-record. The bulk install's `COMMIT` marker is
+  documented as advisory (durability#12, bulkcli#15). The `http_api` module
+  docs describe the in-process TLS of the `tls` feature (http#19), and
+  `TaskConfig::spill_threshold` names `<root>/tasks` (sec#21). `README.md`
+  no longer says that a Stream-mode database opens in milliseconds whatever
+  its size (named graphs are read whole at open, gap-doc-claims#6) nor that
+  every upstream SDK works unchanged (the Python SDK is checked by
+  `scripts/conformance.sh`; the Java, C++, Node.js, PHP and Go SDKs speak
+  the same protocol but are not tested, gap-doc-claims#9).
+
+#### New tests, tools and files
+
+- **W3C-style SPARQL subset** (parser#18, query#18, sparqlconf#18):
+  `tests/w3c_subset.rs` and `tests/w3c/<area>/<case>/` (`data.ttl` /
+  `data.trig`, `query.rq` / `update.ru`, `expected.srj` / `.nt` / `.nq`, an
+  optional `xfail` marker naming a review id, or `expected.error` for a
+  negative case), hand-authored from the SPARQL 1.1 text with a `# spec:`
+  line each; every case runs on the in-memory build, a reopened snapshot,
+  the disk store in Materialize and Stream mode and RocksDB, through the
+  materializing evaluator and the streaming executor (bounded heap and
+  DP-B). 120 cases at round 2, 219 at round 4; every `xfail` marker of a
+  fixed bug was removed by its fix, and one stays
+  (`tricky/avg-over-an-error-is-unbound`: `SUM` / `AVG` skip non-numeric
+  values, a documented extension, query#7). Format in `tests/w3c/README.md`;
+  `W3C_FILTER=<substring>` runs a subset.
+- **Executor differential suite** (query#17, design#10):
+  `tests/executor_differential.rs` requires the materializing and streaming
+  executors to answer every W3C case, the 14 LUBM queries (also with `LIMIT`
+  and `ORDER BY … LIMIT`) and a 92-query probe battery alike on every layout
+  — 7,060 runs (8,825 with RocksDB), no divergence; its `KNOWN` list is
+  empty.
+- **Layout matrix** (db#6, design#5, gap-doc-claims#7):
+  `src/db/layout_matrix_tests.rs` runs every public write and maintenance
+  operation on every layout and requires content, `triple_num` and
+  `verify_integrity` equal to the snapshot layout's, across a checkpoint and
+  a reopen; exhaustive matches over `StorageKind` and `DiskQueryMode` make a
+  new layout fail to compile until it joins.
+- **Backend conformance suite** (design#17):
+  `tests/storage_backend_conformance.rs` runs one generic suite over
+  `TripleStore`, every `Backend`, `DiskTriples`, `DiskStore`, `DiskSource`,
+  `OverlayView`, `ShardedStore` and `RocksStore` (contract order, write
+  answers, contract C1); the REST parity suite `tests/rest_api_parity.rs`
+  covers REST, the single-database server and `/api` (design#4).
+- **fsync audit** (tests-b#3, tests-a#13): the doc-hidden
+  `gstore::sync_probe` records every fsync a commit point relies on, and
+  `tests/fsync_audit.rs` (23 tests, 4 more with `rocksdb`) requires around
+  every acknowledged commit point — auto-commit updates on every layout,
+  commits, saves, checkpoints, backups, restores, the databases the `/api`
+  server creates, bulk installs, WAL handling, redo appends, rule and PFN
+  writes — that every changed file was synced after its last write (by
+  content digest) and every changed directory after its last entry change,
+  with each documented intermediate state recorded by a directory sync in
+  order. Disabling the 37 sync sites these commit points reach one at a
+  time, every one but `write_vstree_kv`'s directory sync fails an audit
+  test.
+- **Adversarial coverage map** (sec#20, http#20, robust#17, gapi#21):
+  `tests/adversarial_coverage.rs` maps every DoS / hostile-input category of
+  the review to its regression test and adds the two missing ones (more than
+  256 header fields, a header line or request target over 64 KiB, refused
+  with 400 before authentication).
+- **Shared test helpers** (tests-a#16, tests-a#8, tests-b#11, tests-b#16):
+  `tests/common/` (unique temp paths removed also on panic, an HTTP client
+  with one overall deadline per request, `Running<S>` guards that stop and
+  join in-process servers, guards restoring the process-wide logger and
+  default open options, a per-thread allocation counter); the fixed
+  temporary paths and bound-and-released ports of the tests the review named
+  became unique paths and kernel-chosen ports (db#22, disk#13, tests-a#6,
+  tests-b#9, tests-a#7), no HTTP read in the suite blocks without a bound,
+  and the audited tests' wall-clock assertions became latches, counters,
+  byte bounds and hang guards (http#20, gapi#21, conc#16).
+- **Cross-version fixtures** (gap-doc-claims#8):
+  `scripts/compat-fixtures.sh` builds the pre-Phase-6 commit `eaf5320` in a
+  scratch worktree and checks the compatibility matrix with the real old
+  binary (its snapshot and version-1 disk databases open here; it reads a
+  snapshot and a `GSTORE_ID_RECLAIM=off` disk database written here and
+  refuses version 2 and the new clear records); `--generate` rewrites
+  `testdata/compat/eaf5320/`, which `tests/format_compat.rs` checks in every
+  `cargo test`. New workflow `.github/workflows/compat.yml` (weekly and on
+  demand).
+- **Packaging smoke** (infra#7): `scripts/package-smoke.sh`
+  (`stage [--deb FILE]`, `installed [--service]`, `image IMAGE`: every
+  binary answering `--help`, `systemd-analyze verify`, the first-start root
+  password, the health check, `/api` and REST round trips, a graceful stop)
+  and `.github/workflows/packaging.yml` (`packages`: deb and rpm built at
+  pinned tool versions, installed and smoked on the runner and in a Fedora
+  container with `rpm -V`, enable → remove → install → purge; `image`:
+  `docker build`, also on the MSRV, and the image smoke; `advisories`:
+  `cargo audit`, non-blocking). New `packaging/rpm/pre_install.sh`,
+  `packaging/docker/gstore-healthcheck`.
+- **Fault-injection and crash suites**: `tests/storage_fault_injection.rs`
+  (ENOSPC through `RLIMIT_FSIZE` children, gserver + `kill -9`),
+  `tests/save_failure_ack.rs`, `tests/server_broken_store_recovery.rs`,
+  `tests/rocksdb_statement_atomicity.rs` (SIGKILL at exact write batches),
+  `tests/rocksdb_checkpoint_resources.rs`, `tests/rocksdb_damaged_store.rs`,
+  `tests/txn_lifecycle.rs` and `src/txn_commit_tests.rs` (commit outcomes
+  under `RLIMIT_FSIZE` in both disk modes), `tests/layout_replacement.rs`,
+  `tests/redo_log_durability.rs` (torn tails at every cut, SIGXFSZ
+  mid-append, old-format logs), `tests/storage_corruption.rs` and
+  `tests/storage_kernel_regressions.rs`, the perturbation battery of
+  `tests/dt_vs_policy.rs` (insert churn, id reuse, rolled-back transactions
+  and restarts against an oracle database on every layout under every VS
+  policy; gap-accel-soundness#5), plus the test-only pager failpoints
+  (`kvstore::pager::failpoints`: the apply-phase fault injection disk#12 /
+  durability#16 asked for) and `RocksStore::debug_set_write_hook`.
+- **Behaviour suites by area** (each failing before its fix): HTTP —
+  `http_preauth_limits`, `http_framing_deadlines`, `http_request_semantics`,
+  `http_browser_surface`, `gapi_download_policy`, `login_lockout`,
+  `query_limits`, `error_status_mapping`, `api_hygiene`,
+  `api_session_tokens`; SPARQL — `sparql_paths`, `sparql_join_semantics`,
+  `sparql_builtins`, `graph_management`,
+  `aggregate_projection_must_be_grouped`,
+  `eval_settings_reach_every_read_path`, `term_roundtrip`,
+  `accelerator_soundness`; parsers — `rdf_parser_conformance`,
+  `parser_limits_from_config`; analytics and extensions — `gfun_limits`
+  (analytics#11, gap-gfun-fuzz#6: mid-run cancellation of every long-running
+  function, every function on graphs without vertices), `cancellation`,
+  `csr_build_memory`, `reason_pfn_regressions` (ext#14), `concurrent_db`
+  (conc#15); CLI — `cli_failure_paths`, `zip_central_directory_bound`,
+  `dirlock_saves`; crash and DoS — `service_hardening`, `crash_regressions`;
+  bench — `bench/tests/smoke_gate_sensitivity.rs`, `baseline_validity.rs`,
+  `cli_arguments.rs`, `update_phase_reopen.rs`, `reference_compare.rs`;
+  packaging — `conformance_harness`, `packaging_scripts`,
+  `packaging_layout`, `container_healthcheck`, `package_smoke`; cluster —
+  `cluster::review_fix_tests`, `rpc_frame_reader_allocates_what_arrives`,
+  `gnode_restarted_replica_votes_once_per_term`; gnlqa — 77 integration
+  tests in the new `gnlqa/tests/` (cluster-nlqa#24), against scripted
+  in-process HTTP stubs. Every round's review fixes added a test named after
+  the defect.
+- **Corrected tests** (D6: never weakened or deleted; each with a
+  `review <id>` comment): tests that pinned a wrong or vacuous result now
+  check the right one.
+  - Storage and durability: `dt_reclaim` bounds each id space by its peak of
+    live terms after a final reopen (tests-b#4); `dt_reclaim_crash` waits
+    for the child's first acknowledgement (tests-b#8) and also kills
+    multi-operation auto-commit requests and rolled-back transactions,
+    allowing no orphan term on RocksDB (gap-rocksdb-exec#8, as do
+    `dt_rocksdb`'s pid-unique paths); `dt_bulk_crash` proves WAL replay on
+    any file system (tests-a#5), checks after every crash that the VS-tree
+    the directory opens with agrees with its store (durability#17) and no
+    longer depends on a 25 s budget (bulkcli#17); `dt_persist_backends` sets
+    the shadow's mtime instead of sleeping 20 ms (tests-b#15); the RocksDB
+    crash test of `dt_phase0_review` checks that the child applied its
+    writes and died of SIGABRT (tests-b#7); `dt_load_import` runs a failed
+    64 Ki-batch `LOAD` on both disk modes and RocksDB with reopens
+    (tests-a#1); `a_read_error_fails_only_its_own_statement` checks what it
+    claims (tests-b#18).
+  - Servers: `dt_http_durability` uses kill-on-drop gserver guards in
+    per-test directories and parses StatusCodes instead of `contains("1")`
+    (tests-a#9, tests-a#11); `dt_rw_crash`'s acknowledgement rule ignores
+    persistence-failure replies (durability#18); `upstream_transaction`
+    expects a reload to remember how earlier ids ended
+    (gap-txn-lifecycle#6); `dt_rw_server_stress`'s `/api` test requires an
+    acknowledged two-operation write (tests-b#19); `dt_snapshot_disk` waits
+    for its own server's expired-read count (tests-b#10); `dt_gapi_users`'
+    log tests re-run when the local date changed while they ran
+    (tests-a#15); `dt_cross_phase_api`, `dt_cross_phase5_api` and
+    `dt_phase4_wiring` remove their scratch directories (tests-a#10);
+    `dt_security_review` expects the host-local refusal (tests-b#1) and
+    `dt_service` a failed non-SILENT SERVICE to fail (tests-b#2).
+  - Query and data: `dt_sparql11` and `dt_cross_phase_api` compare full
+    typed terms (sparqlconf#18, tests-a#2); `dt_graph` checks the graphs
+    left after `CLEAR GRAPH` exactly (tests-a#3); `dt_bulk_import` pins
+    blank-node scoping against the memory build (tests-a#4); `dt_num`
+    compares against the largest and smallest values strictly and
+    non-strictly (tests-b#12); `numeric_tower` asserts exact decimal sums
+    (tests-b#13); `dt_optimizer` checks that each bow-tie query got a bushy
+    plan and its no-bridge data reaches the optimizer (tests-b#14);
+    `dt_disk_stream`'s corpus test reads its own corpus files and requires a
+    floor of non-empty answers (tests-a#17).
+  - Other: `dt_bulk_rocks`' FIFO feeder can no longer hang (tests-a#12);
+    `dt_phase4_review_fixes` requires a cancellation in
+    `a_cancelled_execute_leaves_the_rule_as_it_was` (tests-b#5) and bounds
+    work by bytes and thread CPU time instead of the wall clock (conc#16);
+    `bench/tests/gates.rs` expects a sub-millisecond query slowed 50× to
+    fail (infra#2).
+  - Tests broken by an intended secure default changed only their setup (an
+    explicit root password, credentials or the compat switch). Three
+    load-dependent tests were made deterministic.
+- **New public API** (additions only, D2), besides the items named above:
+  `Pager::{failure, failure_flag, mark_failed, wal_path, remove_with_wal,
+  lock_read, lock_write, commit_shared, finish_commit, wal_batches}`,
+  `DiskTriples::unsynced_writes`, `Database::{storage_failure,
+  read_named_graphs, csr_cancellable, string_index_cancellable,
+  preload_csr_cancellable}`; `RocksStore::{verify_stats, pending_reclaim,
+  settle_pending, rollback_uncleared_journal}`; `gstore::preauth`
+  (`PREAUTH_MAX_BODY`, `DEFAULT_BODY_BUDGET`), `json::parse_with_limits` /
+  `json::Limits` / `json::escaped_len`, `gapi::auth::check_before_body`,
+  `HttpOptions` fields for the new keys, `server::{peer_is_trusted_local,
+  FORWARDING_HEADERS, write_response_streamed}`, `GResp::file`,
+  `TaskManager::{remove_orphan_results, join_threads}`, `gstore::deadline`,
+  `Server::{with_query_timeout, with_max_result_bytes}`,
+  `gapi::ipfilter::{LoginLockout, LockoutPolicy}`; `db::ServicePolicy`,
+  `Evaluator::with_service_policy`,
+  `EvalStats::{path_steps, join_probe_rows}`; `parser::iri::{resolve,
+  is_absolute, is_valid_scheme}`, `parser::stream::{DEFAULT_MAX_TOKEN_BYTES,
+  set_default_max_token_bytes}`,
+  `parser::sparql::lexer::{DEFAULT_MAX_REQUEST_BYTES, check_request_size}`,
+  `parser::import::check_update_literals`; `gstore::util::{form, base64}`;
+  `analytics::Interrupt`, `GraphView::{from_csr, closeness_of}`,
+  `gfun::{MAX_ITERATION_WORK, FREE_ITERATION_SWEEPS}`;
+  `http_client::tls_client_stream` (feature `tls`); and in gnlqa the
+  `budget` and `net` modules, `CostLimits`,
+  `Error::{is_fatal, code, client_message}`, `error::redact_userinfo`,
+  `HttpAuth`, `HttpLimits`, `HttpServer::{with_token,
+  allow_unauthenticated_loopback, with_auth, with_limits,
+  with_read_deadline, with_max_conn_per_client}`, `McpServer::with_limits`,
+  `RetryPolicy`, `KbClient::query_capped`,
+  `graphrag::try_retrieve_subgraph`, `SolveEngine::{with_linker_builder,
+  prepare_linker, with_cache_max_bytes, cache_usage}`, `LinkerLabels`,
+  `LinkerCache`, `kb_fingerprint`, `Linker::build_cached` and new `Config`
+  fields. Test hooks are doc-hidden and not a supported API.
+
+#### Measured numbers
+
+Measured on the shared campaign VM (4 vCPUs, 15 GB) while other work
+packages built and tested (load averages of 5–15 were common), so every
+timing is indicative; base and branch were measured back to back in one
+session, and the quiet re-measurements some packages asked for were not
+made.
+
+- **Bench smoke gate** (`target/release/gstore-bench ci --baseline
+  bench/baselines/smoke.json`, release `gbuild` + `gstore-bench`,
+  `GSTORE_BENCH_CACHE` warm): every package on a hot path (pager, RocksDB,
+  engine, string index, optimizer, graph functions, HTTP read path) passed
+  base and branch back to back (456 gates; 460 since gstore-bench's
+  `exact.config`), each round's integration head passed too. At the round-5
+  head `03ad265`: PASS, 460 gates, 0 failed; query geomean vs the committed
+  baseline LUBM-like snapshot 0.99 (limit 1.56), disk 1.02, WatDiv-like
+  snapshot 1.06, disk 1.08 (limit 1.50); calibration 67.85 ms; the 2× and 3×
+  canaries each exit 1. Under the new gates one query slowed 50× fails
+  (`time.query` 7.03 > 3.00) where the old rules passed it.
+- **Commit cost of the staged WAL** (durability#1): a disk single-triple
+  update (one commit) rose from 1.285 to 1.878 ms (insert) and 1.290 to
+  1.908 ms (delete) on LUBM-like, about +0.4–0.6 ms for the rename and the
+  two directory fsyncs; 5,716-triple chunk updates within noise.
+- **RocksDB with `check_point` on** (gap-rocksdb-exec#2; 200 single-triple
+  `INSERT DATA` requests, LUBM fixture of 100,543 triples, test profile):
+  9.01 → 0.73 ms per update; table files after 200 writes 633 → 11; memtable
+  flushes 1000 → 0.
+- **Pre-auth and download memory**: a 26 MB `{"a":[0,0,…]}` POSTed
+  unauthenticated to `/api` is refused in 0.03 s with VmHWM 39,812 kB
+  (867,044 kB before, C-2; debug `gserver --api`); a 64 MiB download peaks
+  at 83,775 bytes of heap above the request's start (201,344,287 before;
+  `cargo test --test gapi_download_policy -- --nocapture`, counting
+  allocator, gapi#4); a 60,001-character multipart boundary over 8 MiB is
+  refused in 0.01 s (11.5 s, sec#2).
+- **SPARQL**: `ASK { FILTER(?x = a-a-…-a) }` at 160 KB 7.70 s → 0.035 s
+  (`gquery`, release; H-14); a 400-triple ladder through `shortestPathCount`
+  aborted after 11.7 s, now answers in 0.010 s (H-8);
+  `?s :id 2990 . ?s :next* ?x` on a 3,000-node chain 1.15–1.27 s → 7 ms for
+  the whole `gquery` process (sparqlconf#9); a join after `OPTIONAL` at
+  20,000 subjects 14.6 s → 25.5 ms (test profile, H-19);
+  `COUNT(DISTINCT ?o)` over 160,000 strings 37.3 s → 39 ms (test profile,
+  query#12); a 400-pattern star plans in 6.5 ms (6,074 ms, test profile,
+  query#13); `FILTER(rs:CYCLEBOOLEAN())` over 22,264 rows about 44 s → 55 ms
+  (release `gquery`, analytics#4); a substring query after an `INSERT`
+  277.8 → 7.3 ms (db#5).
+- **Other**: a `ConcurrentDb` commit after 20,000 commits
+  11.534 ms → 11.0 µs (debug test profile, conc#2); the WAL CRC of a 16 MiB
+  batch 68.0 → 11.3 ms (disk#10); a two-hop textual rule over 8000 edges
+  2.58 s → 20 ms (ext#7); `systemd-analyze security --offline` 6.8 → 1.2
+  (infra#14).
+- **Final check of round 5** (`03ad265`, toolchain 1.99.1):
+  `cargo test --workspace` 3,316 passed, 0 failed, 10 ignored with
+  `GSTORE_DISK_QUERY_MODE=memory` and again with `stream`; feature entries
+  gzip 2,961, tls 2,966, zip 2,983, readline 2,957, pfn-wasm 2,986,
+  `zip pfn-wasm readline` 3,012 passed (0 failed);
+  `cargo test -p gstore --features rocksdb` 3,055 passed; `cargo test -p
+  gstore-bench --features rocksdb` 93 passed; `scripts/conformance.sh` all
+  six suites (parser's known cases 15 and 17); fmt, clippy `-D warnings` and
+  rustdoc `-D warnings` clean; MSRV 1.89 `cargo check --locked --workspace
+  --all-targets` clean; the test binaries also pass as an unprivileged uid.
 
 ### Phase 6: scale and performance (GAP_PLAN §8 stage 6, `docs/PHASE6_PLAN.md`)
 
@@ -111,8 +2432,13 @@ the exit-gate verdicts.
 - **`CLEAR`, `DROP`, `MOVE` and `COPY` are in `redo.log`** (`C` for one
   graph, `N` for all named graphs; a RocksDB clear refused part-way is
   logged per removed triple), so `replay_redo_log` and `restore_incremental`
-  reproduce them. A binary older than this one cannot restore an
-  incremental backup that holds them ("unknown redo.log op 'C'").
+  reproduce them. *Corrected by the review-fix campaign (durability#6,
+  gap-doc-claims#1):* the clear records written by Phase 6 have an empty
+  body, which binaries older than Phase 6 skip silently, so restoring such
+  an increment with them brings the cleared data back without an error;
+  clear records written since the campaign's round 3 carry a placeholder
+  triple, which those binaries refuse with "unknown redo.log op 'C'". Do not
+  downgrade across one.
 - **Command-line tools no longer panic on a closed pipe** (`gquery … |
   head`): the first broken-pipe write closes standard output for the rest of
   the process, which finishes its work and exits with its usual status.
@@ -675,7 +3001,10 @@ with RocksDB); `scripts/conformance.sh` 6 / 6 suites; 0 failures.
   `Parser::parse_gfn_args` passes its error-context closure by value. No
   `#[allow]` was added.
 - No CI job builds on the MSRV (1.89); the Docker image (`rust:1.89`) is the
-  only MSRV build.
+  only MSRV build. (Since the review-fix campaign, `packaging.yml`'s `image`
+  job builds that image, `--features pfn-wasm`, in CI; the default feature
+  set, the other features and the tests are still not built on 1.89 there,
+  review infra#19.)
 
 ### Integrating Phase 4 with Phases 0–3 and 5
 
@@ -934,7 +3263,11 @@ A review of the merged tree found these; each has a regression test
   graph's `urn:gstore:bnode:` IRI too, so `GRAPH ?g { … } ?g <p> ?o` joins —
   unless `_:g` was used as a subject or object before it named a graph:
   then it stays a blank node throughout (a warning says so; nothing read is
-  rewritten and no node is split in two).
+  rewritten and no node is split in two). In a document with millions of
+  blank labels, the bounded-memory "used before" check also keeps a graph
+  whose label was not used before apart, about 0.5% of the time since the
+  review-fix campaign (parser#14; the earlier filter reached 4.5% at 1M
+  labels and 51% at 5M); a warning names each such graph.
 - **Bounded import memory.** Each quad holds its own copy of every IRI a
   prefix, namespace or base expanded, so a small file with a long prefix
   could take gigabytes. An import batch is now handed over at
@@ -1217,7 +3550,9 @@ A review of the merged tree found these; each has a regression test
 #### Not yet
 
 - The Docker image and the deb / rpm packages were built and linted but not
-  yet installed and run on a live host in CI.
+  yet installed and run on a live host in CI. (Since the review-fix
+  campaign, `.github/workflows/packaging.yml` installs and smokes them,
+  review infra#7.)
 - `gconsole`'s `backup` / `export` have no compress or format switch (as
   upstream's console); use the `/api` or `gbackup` / `gexport`.
 - The legacy REST payload endpoints (`/upload`, the `/batchInsert` body)
@@ -1619,28 +3954,29 @@ functions) are now evaluated only for the solutions actually consumed.
 #### Known gaps
 
 - A labelled blank node `_:b` in a WHERE pattern still matches only that
-  stored node (upstream's reading), and in templates / `INSERT DATA` it
-  names the same node for every solution and request; only `[ … ]` and
-  `( … )` have SPARQL's fresh-node semantics.
+  stored node (upstream's reading), and in `INSERT DATA` it names the same
+  node for every request. (Since the review-fix campaign a labelled `_:b` in
+  a CONSTRUCT / INSERT template is a fresh node per solution, query#5, and
+  blank nodes are refused in `DELETE DATA`, `DELETE WHERE` and DELETE
+  templates, sparqlconf#16; `[ … ]` and `( … )` were already fresh.)
 - CONSTRUCT, ASK and DESCRIBE do not accept `GROUP BY` / `HAVING`; DESCRIBE
   ignores `ORDER BY` and `LIMIT`. `FROM` / `FROM NAMED` are skipped; `BASE`
   resolution is concatenation, not RFC 3986.
 - `SELECT (expr AS ?v)` / `BIND(… AS ?v)` with `?v` already in scope is not
   rejected at parse time.
-- `COUNT(DISTINCT …)` compares values, so `"01"^^xsd:integer` and
-  `"1"^^xsd:integer` count as one there; `SUM` /
-  `AVG` skip non-numeric values instead of failing.
-- String functions do not apply SPARQL's argument-compatibility rules
-  (`STRBEFORE("abc"@en, "b"@cy)` should be an error; `CONTAINS`,
-  `STRSTARTS`, `STRENDS` do not check either), and `UCASE` / `LCASE` on an
-  IRI or a number return a string instead of an error.
+- `SUM` / `AVG` skip non-numeric values instead of failing (since the
+  review-fix campaign `AVG` divides by the number of values it summed,
+  query#7, and `COUNT(DISTINCT …)` compares terms, so `"01"^^xsd:integer`
+  and `"1"^^xsd:integer` count as two, query#12).
+- Since the review-fix campaign the string and hash functions check their
+  argument types (sparqlconf#17); still lenient: `ENCODE_FOR_URI`,
+  `LANGMATCHES`, `STRDT`'s lexical form, the gStore extensions
+  (`CONTAINALL`, `CONTAINANY`, `SIMILARITY`) and `SUBSTR` positions of any
+  numeric type.
 - DP-B handles tree-shaped BGPs and integer keys only (upstream also cuts
   one cycle); other `ORDER BY … LIMIT` queries use the bounded heap. The
   join-order cost model does not yet know that a mixed predicate variable's
   hidden slot and the variable are linked.
-- Property-path solutions come out of hash sets, so
-  `{ ?a :p+ ?b } LIMIT n` without a total `ORDER BY` can return different
-  rows on different runs (with or without the Top-K optimizations).
 
 ### Phase 2 (breaking): SPARQL graph functions follow gStore 1.4
 
