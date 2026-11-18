@@ -20,6 +20,14 @@ Description=gStore RDF graph database server (gserver)
 Documentation=https://github.com/yangop8/gstore-rust
 After=network-online.target
 Wants=network-online.target
+# A server that keeps failing stops being restarted (review infra#12): at
+# most 5 starts within 5 minutes, then the unit stays failed: a start is
+# refused until `systemctl reset-failed gserver` or until those 5 minutes
+# have passed. Manual starts and restarts count toward the limit too. With
+# systemd's default (5 starts in 10 s) and RestartSec=5s below the limit
+# was never reached, so a crash loop restarted forever.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 # gserver -s runs in the foreground and does not fork.
@@ -44,27 +52,60 @@ Environment=GSTORE_ROOT_PASSWORD_FILE=/etc/gstore/root_password
 KillSignal=SIGTERM
 KillMode=mixed
 TimeoutStopSec=180
+# Restart a server that crashed (a signal, a panic's exit status 101), not
+# one that exited with gserver's error status 1 or its usage status 2: a
+# configuration it refuses — for instance root's default password on a
+# non-loopback listen_addr — or a port it cannot bind. Restarting those
+# cannot help; the reason is in the journal.
 Restart=on-failure
 RestartSec=5s
+RestartPreventExitStatus=1 2
 # Upstream raises the descriptor limit to 65535 for its server.
 LimitNOFILE=65535
 
-# Hardening: gserver writes only below its working directory. (/etc/gstore is
-# read-only to it: to let operation=ipmanage edit the IP lists, point
-# ip_deny_path / ip_allow_path at files below /var/lib/gstore. A
-# pfn_base_path outside /var/lib/gstore needs its own ReadWritePaths= line in
-# a drop-in: systemctl edit gserver.)
+# Hardening (review infra#14; docs/DEPLOY.md lists what each one means for
+# an administrator). gserver writes only below its working directory.
+# (/etc/gstore is read-only to it: to let operation=ipmanage edit the IP
+# lists, point ip_deny_path / ip_allow_path at files below /var/lib/gstore.
+# A pfn_base_path outside /var/lib/gstore needs its own ReadWritePaths= line
+# in a drop-in: systemctl edit gserver.) ProtectHome=yes hides /home, /root
+# and /run/user: --load-dir directories, /api build / batchInsert db_path
+# files and backup_path cannot be there (copy the files below
+# /var/lib/gstore, e.g. into upload/, or relax it in a drop-in).
+# Files gserver creates are not readable by other users (UMask=0027).
+UMask=0027
 NoNewPrivileges=yes
+# No capabilities: a port below 1024 needs a drop-in with
+# AmbientCapabilities=CAP_NET_BIND_SERVICE and
+# CapabilityBoundingSet=CAP_NET_BIND_SERVICE.
+CapabilityBoundingSet=
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectSystem=strict
 ProtectHome=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
+ProtectKernelLogs=yes
 ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
 ReadWritePaths=/var/lib/gstore
 RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+# IPv4/IPv6 for the listener, SERVICE and remote downloads; local sockets
+# for the resolver and the journal.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LockPersonality=yes
+# Compatible with the pfn-wasm runtime: wasmi interprets WebAssembly, it
+# generates no machine code.
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target

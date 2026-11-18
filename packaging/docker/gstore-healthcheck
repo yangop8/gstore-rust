@@ -1,0 +1,57 @@
+#!/bin/sh
+# gstore-healthcheck: the HEALTHCHECK of the gstore-rust container image
+# (Dockerfile; installed as /usr/local/bin/gstore-healthcheck). Exit status 0
+# while the gserver running as the container's main process is alive and
+# accepts connections on the address it listens on; 1 otherwise.
+#
+# It asks `gserver -S` (status) with the arguments the server was started
+# with — PID 1's command line, its mode flag dropped — run in PID 1's
+# working directory, so it finds the server's pid file wherever conf.ini,
+# --db-home or --pid-file put it. The pid file holds the address the server
+# really bound: whatever port conf.ini, -p or --addr chose, HTTP or HTTPS
+# alike. -S connects to it and sends no request, so a probe is neither an
+# access-log record nor subject to the IP lists. (review infra#17: the probe
+# was `curl http://127.0.0.1:9000/api?operation=check`, so another port or
+# TLS made the container unhealthy, an allow list without 127.0.0.1 refused
+# it, and every probe was logged as client traffic.) When PID 1 is not
+# gserver (an init process), the image's -c /etc/gstore/conf.ini is used.
+#
+# For tests: GSTORE_HEALTHCHECK_PID names another process than 1, and
+# GSTORE_GSERVER another gserver than the one on PATH.
+pid=${GSTORE_HEALTHCHECK_PID:-1}
+if [ ! -r "/proc/$pid/cmdline" ]; then
+    echo "gstore-healthcheck: no process $pid"
+    exit 1
+fi
+cd "/proc/$pid/cwd" 2>/dev/null || :
+status=$(GSTORE_GSERVER=${GSTORE_GSERVER:-gserver} xargs -0 sh -c '
+    case "${1##*/}" in
+        gserver) shift ;;
+        *) set -- -c /etc/gstore/conf.ini ;;
+    esac
+    for a do
+        shift
+        case $a in
+            -s | --start | -b | --background) ;;
+            *) set -- "$@" "$a" ;;
+        esac
+    done
+    exec "$GSTORE_GSERVER" -S "$@"
+' gstore-healthcheck <"/proc/$pid/cmdline" 2>/dev/null) || {
+    echo "gstore-healthcheck: gserver -S failed"
+    exit 1
+}
+case $status in
+    *"Active: active (running)"*) ;;
+    *)
+        echo "gstore-healthcheck: gserver is not running"
+        exit 1
+        ;;
+esac
+# "Address: http://HOST:PORT", with " (not answering)" appended when a
+# connection to it fails.
+if printf '%s\n' "$status" | grep -q 'Address: http://[^ ]*$'; then
+    exit 0
+fi
+echo "gstore-healthcheck: gserver does not accept connections"
+exit 1

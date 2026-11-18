@@ -2,7 +2,7 @@
 name = "gnlqa"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.89"
 description = "gNLQA — an LLM + gStore natural-language question-answering system (see docs/NLQA_DESIGN.md)"
 license = "BSD-3-Clause"
 repository = "https://github.com/yangop8/gstore-rust"

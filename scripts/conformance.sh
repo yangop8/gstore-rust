@@ -2,47 +2,58 @@
 # Upstream conformance suite: run upstream gStore 1.4's own test scripts and
 # Python SDK against the Rust `gserver`.
 #
-#   scripts/conformance.sh [--release] [--keep] [--no-build] [SUITE...]
+#   scripts/conformance.sh [--release] [--keep] [--no-build] [--allow-skip] [SUITE...]
 #
 # SUITE is any of: basic update transaction api parser python (default: all).
-#   --release   build and run the release binaries (default: the dev profile)
-#   --keep      keep the temporary server home (and its logs) afterwards
-#   --no-build  use the binaries already built
+#   --release     build and run the release binaries (default: the dev profile)
+#   --keep        keep the temporary server home (and its logs) afterwards
+#   --no-build    use the binaries already built
+#   --allow-skip  accept a suite that cannot run here (see below) as skipped
 #
 # What it does:
 #   1. builds the Rust binaries (`cargo build --bins`);
 #   2. lays out a temporary GSTORE_HOME the way upstream's scripts expect it
 #      (they run from GSTORE_HOME and use relative paths): conf/conf.ini (from
-#      conf/conf.ini.example, with a free port), bin/ (the built binaries),
-#      data/ (testdata/upstream/data, plus testdata/lubm/lubm.nt),
-#      scripts/test/ (tests/upstream_scripts/*.sh and the parser_test data),
+#      conf/conf.ini.example), bin/ (the built binaries), data/
+#      (testdata/upstream/data, plus testdata/lubm/lubm.nt), scripts/test/
+#      (tests/upstream_scripts/*.sh and the parser_test data),
 #      api/http/python/ (tests/upstream_scripts/python);
 #   3. starts `bin/gserver -b` there (background mode, as upstream's
-#      scripts/test/test.sh does), allowed to read data/ and scripts/test/;
+#      scripts/test/test.sh does), allowed to read data/ and scripts/test/,
+#      on a port the server picks itself (conf.ini `port=0`: the kernel
+#      assigns a free one at bind time, so no other process can take it
+#      between a check and the bind); then writes the port the server
+#      reports in its pid file into conf/conf.ini, where the upstream
+#      scripts read it;
 #   4. runs each suite from GSTORE_HOME and checks what it printed (the
 #      upstream scripts print the server's answers but mostly do not judge
 #      them; the checks below do, see check_<suite>);
 #   5. stops the server (`bin/gserver -t`) and prints a pass/fail summary.
-#      The exit status is non-zero when a suite failed.
+#      The exit status is non-zero when a suite failed, and when a suite
+#      was skipped unless --allow-skip is given: a skipped suite is not a
+#      passed one (review infra#11).
 #
 # The upstream scripts are copied verbatim from upstream commit bebe1ea
 # (tests/upstream_scripts/README.md lists the adaptations: none for the shell
 # scripts, which find the port in conf/conf.ini and their data relative to
-# GSTORE_HOME; two for the Python examples). The Python suite is skipped when
-# python3 or its `requests` module is missing.
+# GSTORE_HOME; two for the Python examples). The Python suite cannot run
+# without python3 and its `requests` module; it is then reported as SKIP,
+# which fails the run unless --allow-skip.
 set -uo pipefail
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PROFILE=dev
 KEEP=0
 BUILD=1
+ALLOW_SKIP=0
 SUITES=()
 for arg in "$@"; do
     case "$arg" in
         --release) PROFILE=release ;;
         --keep) KEEP=1 ;;
         --no-build) BUILD=0 ;;
-        -h|--help) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --allow-skip) ALLOW_SKIP=1 ;;
+        -h|--help) awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit 0 ;;
         basic|update|transaction|api|parser|python) SUITES+=("$arg") ;;
         *) echo "conformance: unknown argument '$arg' (try --help)" >&2; exit 2 ;;
     esac
@@ -66,25 +77,22 @@ fi
 [ -x "$BIN_DIR/gserver" ] || { echo "conformance: no $BIN_DIR/gserver" >&2; exit 1; }
 
 # ---- 2. the server home --------------------------------------------------------
-free_port() {
-    if command -v python3 >/dev/null 2>&1; then
-        python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'
-        return
-    fi
-    local p
-    for _ in $(seq 1 50); do
-        p=$((20000 + RANDOM % 40000))
-        if ! (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null; then echo "$p"; return; fi
-    done
-    echo 19000
+# The upstream scripts take the first line of conf/conf.ini containing
+# "port=" as the server's port. set_port <value> rewrites that line and
+# fails the run unless it reads port=<value> afterwards (review tests-b#17:
+# a sed that matched nothing used to go unnoticed).
+set_port() {
+    sed -i -e "0,/port=/s/^port=[0-9]*\$/port=$1/" "$GHOME/conf/conf.ini"
+    [ "$(grep -m 1 'port=' "$GHOME/conf/conf.ini")" = "port=$1" ] \
+        || { echo "conformance: cannot set conf/conf.ini's port to $1" >&2; exit 1; }
 }
 
 GHOME=$(mktemp -d "${TMPDIR:-/tmp}/gstore-conformance.XXXXXX")
 GHOME=$(cd "$GHOME" && pwd -P)
 LOGS="$GHOME/conformance-logs"
-PORT=$(free_port)
+PORT=0
 mkdir -p "$GHOME/conf" "$GHOME/bin" "$GHOME/data/lubm" "$GHOME/scripts/test" "$GHOME/api/http" "$LOGS"
-sed -e "s/^port=9000\$/port=$PORT/" "$REPO/conf/conf.ini.example" >"$GHOME/conf/conf.ini"
+sed -e "s/^port=9000\$/port=0/" "$REPO/conf/conf.ini.example" >"$GHOME/conf/conf.ini"
 # --- upstream compat switches (D1; see docs/DEPLOY.md) ---
 COMPAT_KEYS=""
 compat_switch() { # <section> <key> <value>: the first occurrence in the home section wins
@@ -129,17 +137,30 @@ trap cleanup EXIT
 trap 'exit 130' INT TERM
 
 # ---- 3. start the server -------------------------------------------------------
-say "starting gserver -b on port $PORT in $GHOME"
+# Port 0: the server binds a free port of the kernel's choosing.
+set_port 0
+say "starting gserver -b in $GHOME"
 if ! (cd "$GHOME" && bin/gserver -b --load-dir data --load-dir scripts/test) >"$LOGS/gserver-start.log" 2>&1; then
     cat "$LOGS/gserver-start.log"
     exit 1
 fi
 check_compat_switches || exit 1
 cat "$LOGS/gserver-start.log"
+# `gserver -b` returned once the server answered on the address its pid file
+# names (line 4, host:port): the port it bound. The upstream scripts find it
+# in conf/conf.ini.
+PORT=$(sed -n 4p "$GHOME/dbhome/gserver.pid" 2>/dev/null)
+PORT=${PORT##*:}
+case "$PORT" in
+    '' | 0 | *[!0-9]*) echo "conformance: no port in $GHOME/dbhome/gserver.pid" >&2; exit 1 ;;
+esac
+set_port "$PORT"
+say "gserver listens on port $PORT"
 
 # ---- 4. the suites -------------------------------------------------------------
 SUMMARY=()
 FAILED=0
+SKIPPED=""
 
 strip_colors() { sed 's/\x1b\[[0-9;]*m//g' "$1"; }
 # Every "StatusCode":N of a log, in order, space-separated.
@@ -289,6 +310,7 @@ for suite in "${SUITES[@]}"; do
     if [ "$suite" = python ] && ! { command -v python3 >/dev/null 2>&1 && python3 -c 'import requests' 2>/dev/null; }; then
         say "suite python: SKIPPED (python3 with the requests module is not available)"
         SUMMARY+=("$(printf '  %-12s %-5s' "$suite" SKIP)")
+        SKIPPED+="$suite "
         continue
     fi
     say "suite $suite"
@@ -315,6 +337,14 @@ if [ "$FAILED" = 1 ]; then
     echo "conformance: FAILED"
     KEEP=1
     exit 1
+fi
+if [ -n "$SKIPPED" ]; then
+    if [ "$ALLOW_SKIP" = 0 ]; then
+        echo "conformance: FAILED: suite(s) skipped: ${SKIPPED% } (--allow-skip accepts a skipped suite)"
+        exit 1
+    fi
+    echo "conformance: the other suites passed; skipped (--allow-skip): ${SKIPPED% }"
+    exit 0
 fi
 echo "conformance: all suites passed"
 exit 0

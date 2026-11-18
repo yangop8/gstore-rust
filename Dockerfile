@@ -15,13 +15,19 @@
 # Cargo features: FEATURES defaults to "pfn-wasm" -- the sandboxed
 # WebAssembly runtime of PFN user functions (pure Rust: wasmi + wat), so the
 # image compiles and calls them; the default `cargo build` stays without it.
-# Add others with --build-arg FEATURES="pfn-wasm gzip tls zip readline" (all
-# pure Rust; readline only changes gconsole); "rocksdb" also works (the
-# builder then installs clang for bindgen). FEATURES="" builds the lean set.
-# See docs/DEPLOY.md.
+# The deb/rpm packages are built with the same feature (Cargo.toml's package
+# metadata). Add others with --build-arg FEATURES="pfn-wasm gzip tls zip
+# readline" (all pure Rust; readline only changes gconsole); "rocksdb" also
+# works (the builder then installs clang for bindgen). FEATURES="" builds the
+# lean set. See docs/DEPLOY.md.
+#
+# .github/workflows/packaging.yml builds this image and runs
+# scripts/package-smoke.sh against it (review infra#7).
 
 # ---- builder ------------------------------------------------------------------
-# The toolchain is the crate's MSRV (`rust-version` in Cargo.toml).
+# The toolchain is the crate's MSRV (`rust-version` in Cargo.toml; every
+# workspace member declares the same, tests/packaging_layout.rs checks it), so
+# the image build is also the MSRV build.
 ARG RUST_VERSION=1.89
 FROM rust:${RUST_VERSION}-slim-bookworm AS builder
 
@@ -43,15 +49,14 @@ COPY bench ./bench
 COPY src ./src
 COPY conf ./conf
 
-# Build the release binaries with cached registry and target directories, and
-# copy them out of the cache mount in the same step.
+# Build and install every binary target of the gstore package (whatever
+# [[bin]] targets Cargo.toml has: no list to keep in step, review infra#7)
+# into /out/bin, with cached registry and target directories.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked -p gstore --bins ${FEATURES:+--features "$FEATURES"} \
-    && mkdir -p /out \
-    && for b in gserver gconsole gbuild gquery gadd gsub gdrop gshow gbackup grestore gexport gmonitor gcompact gnode; do \
-         cp "target/release/$b" /out/; \
-       done
+    cargo install --path . --locked --root /out --target-dir /src/target \
+        ${FEATURES:+--features "$FEATURES"} \
+    && rm -f /out/.crates.toml /out/.crates2.json
 
 # ---- runtime ------------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
@@ -61,9 +66,9 @@ LABEL org.opencontainers.image.title="gstore-rust" \
       org.opencontainers.image.source="https://github.com/yangop8/gstore-rust" \
       org.opencontainers.image.licenses="BSD-3-Clause"
 
-# curl for the health check; ca-certificates for https sources (LOAD, gbuild URLs).
+# ca-certificates for https sources (LOAD, gbuild URLs, SERVICE).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # A dedicated unprivileged user owns the data.
@@ -71,7 +76,8 @@ RUN groupadd --system --gid 10001 gstore \
     && useradd --system --uid 10001 --gid gstore --home-dir /var/lib/gstore \
          --no-create-home --shell /usr/sbin/nologin gstore
 
-COPY --from=builder /out/ /usr/local/bin/
+COPY --from=builder /out/bin/ /usr/local/bin/
+COPY --chmod=0755 packaging/docker/gstore-healthcheck /usr/local/bin/gstore-healthcheck
 
 # Configuration in /etc/gstore (conf.ini from the shipped example, the log4cplus
 # properties examples); data in /var/lib/gstore, the working directory: every
@@ -94,10 +100,13 @@ VOLUME ["/var/lib/gstore", "/etc/gstore"]
 # Upstream's default port (conf.ini [server] port).
 EXPOSE 9000
 
-# A cheap, unauthenticated /api operation (upstream's `check`). Adjust the port
-# if conf.ini changes it.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD curl -fsS 'http://127.0.0.1:9000/api?operation=check' | grep -q '"StatusCode":0' || exit 1
+# Healthy while gserver runs and accepts connections on the address it
+# listens on, whatever port or scheme conf.ini and the command line chose
+# (packaging/docker/gstore-healthcheck: `gserver -S` with the server's own
+# arguments). The probe sends no request: it is not logged as client traffic
+# and the IP lists do not apply to it (review infra#17).
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD ["/usr/local/bin/gstore-healthcheck"]
 
 # gserver in the foreground (-s); SIGTERM (docker stop) shuts it down
 # gracefully: in-flight requests finish, open transactions roll back,

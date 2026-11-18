@@ -10,6 +10,8 @@ testdata/
 docs/
 scripts/
 packaging/
+# ... except the container's health check (Dockerfile).
+!packaging/docker/gstore-healthcheck
 # Databases, logs and backups a local run may have left in the tree.
 *.db/
 *.db
