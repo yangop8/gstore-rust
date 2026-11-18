@@ -258,6 +258,21 @@ fn wait_done(addr: &SocketAddr, opt_id: &str) -> Json {
     wait_done_as(addr, "root", opt_id)
 }
 
+/// Join `h`, failing with `what` if it has not finished within a minute —
+/// a hang guard only, never the assertion (review http#20: the tests that
+/// used wall-clock bounds instead make the awaited work endless unless the
+/// behaviour under test stops it).
+fn join_within<T: Send + 'static>(h: thread::JoinHandle<T>, what: &str) -> T {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(h.join());
+    });
+    match rx.recv_timeout(Duration::from_secs(60)) {
+        Ok(r) => r.unwrap_or_else(|e| std::panic::resume_unwind(e)),
+        Err(_) => panic!("{what}"),
+    }
+}
+
 /// `n` triples `:s<i> :p :o<i>`.
 fn chain(n: usize) -> String {
     let mut ttl = String::from("@prefix : <http://ex/> .\n");
@@ -305,8 +320,68 @@ fn async_test_operation_lifecycle() {
     assert_eq!((code(&j), msg(&j)), (0, "test operation done".to_string()));
     assert!(j.get("opt_id").is_none(), "{j}");
 
-    // Asynchronously: an opt_id at once (upstream's answer), the result later.
-    let started = Instant::now();
+    // Asynchronously: an opt_id at once (upstream's answer), the result
+    // later. review gapi#21: "at once" used to be a 2500 ms wall-clock bound
+    // on a 3 s operation. Now the first operation runs until it is
+    // cancelled (it would take ten minutes otherwise): its answer can only
+    // have come while it ran — a synchronous answer would hit the client's
+    // read timeout instead — and the "while it runs" checks below cannot
+    // race its end.
+    let j = api_body(
+        &addr,
+        &Json::obj()
+            .with("operation", "__asyncTest")
+            .with("username", "root")
+            .with("password", "root")
+            .with("async", true)
+            .with("sleep_ms", 600_000),
+    );
+    assert_eq!(
+        (code(&j), msg(&j)),
+        (0, "Operation Success.".to_string()),
+        "{j}"
+    );
+    let held = opt_id_of(&j);
+    // While it runs: state 0 with its progress (or the initial message).
+    let j = api(
+        &addr,
+        &[("operation", "checkOperationState"), ("opt_id", &held)],
+    );
+    assert_eq!((code(&j), int(&j, "state")), (0, 0), "{j}");
+    assert!(
+        ["test operation running", "Operation success"].contains(&msg(&j).as_str()),
+        "{j}"
+    );
+    let listed = running_tasks_as(&addr, "root");
+    let item = listed
+        .iter()
+        .find(|t| t.get("opt_id").and_then(Json::as_str) == Some(held.as_str()))
+        .unwrap_or_else(|| panic!("{held} not in {listed:?}"));
+    assert_eq!(
+        item.get("operation").and_then(Json::as_str),
+        Some("__asyncTest")
+    );
+    assert_eq!(int(item, "async"), 1);
+    assert_eq!(int(item, "status"), 0);
+    assert_eq!(int(item, "endTime"), 0);
+    // REST /tasklist lists it as well.
+    let r = rest(&addr, "GET", "/tasklist", "");
+    assert!(
+        r.body.contains(&format!("\"opt_id\":\"{held}\"")),
+        "{}",
+        r.body
+    );
+    // Cancelled, it ends with upstream's cancellation error.
+    let j = api(
+        &addr,
+        &[("operation", "operationTaskCancel"), ("opt_id", &held)],
+    );
+    assert_eq!(code(&j), 0, "{j}");
+    let j = wait_done(&addr, &held);
+    assert_eq!(int(&j, "state"), -1, "{j}");
+    assert!(msg(&j).to_lowercase().contains("cancel"), "{j}");
+
+    // An operation that runs to its end: the result, later.
     let j = api_body(
         &addr,
         &Json::obj()
@@ -317,10 +392,6 @@ fn async_test_operation_lifecycle() {
             .with("sleep_ms", 3000)
             .with("success_num", 5)
             .with("failed_num", 2),
-    );
-    assert!(
-        started.elapsed() < Duration::from_millis(2500),
-        "answered at once"
     );
     assert_eq!(
         (code(&j), msg(&j)),
@@ -336,36 +407,6 @@ fn async_test_operation_lifecycle() {
         .unwrap()
         .as_millis() as u64;
     assert!(t <= now + 5 && now - t < 60_000, "{t} vs {now}");
-
-    // While it runs: state 0 with its progress (or the initial message).
-    let j = api(
-        &addr,
-        &[("operation", "checkOperationState"), ("opt_id", &opt_id)],
-    );
-    assert_eq!((code(&j), int(&j, "state")), (0, 0), "{j}");
-    assert!(
-        ["test operation running", "Operation success"].contains(&msg(&j).as_str()),
-        "{j}"
-    );
-    let listed = running_tasks_as(&addr, "root");
-    let item = listed
-        .iter()
-        .find(|t| t.get("opt_id").and_then(Json::as_str) == Some(opt_id.as_str()))
-        .unwrap_or_else(|| panic!("{opt_id} not in {listed:?}"));
-    assert_eq!(
-        item.get("operation").and_then(Json::as_str),
-        Some("__asyncTest")
-    );
-    assert_eq!(int(item, "async"), 1);
-    assert_eq!(int(item, "status"), 0);
-    assert_eq!(int(item, "endTime"), 0);
-    // REST /tasklist lists it as well.
-    let r = rest(&addr, "GET", "/tasklist", "");
-    assert!(
-        r.body.contains(&format!("\"opt_id\":\"{opt_id}\"")),
-        "{}",
-        r.body
-    );
 
     // Done: state 1, the final message and the counts.
     let j = wait_done(&addr, &opt_id);
@@ -958,13 +999,13 @@ fn shutdown_cancels_a_running_graph_function_query() {
     let addr_q = addr;
     let query = thread::spawn(move || rest(&addr_q, "POST", "/sparql?db_name=slow", SLOW_GFUN));
     wait_running_query(&addr);
-    let started = Instant::now();
     srv.shutdown();
-    serving.join().unwrap();
-    assert!(
-        started.elapsed() < Duration::from_secs(10),
-        "the shutdown waited {:?}",
-        started.elapsed()
+    // review http#20: no wall-clock bound — the query never ends by itself
+    // (two billion PageRank sweeps), so a shutdown that returns at all
+    // cancelled it; the timeout only guards against a hang.
+    join_within(
+        serving,
+        "the shutdown never finished: it waited for the query",
     );
     let r = query.join().unwrap();
     assert!(
@@ -1057,18 +1098,14 @@ fn an_update_running_a_graph_function_is_cancelled_like_a_query() {
     let addr_q = addr;
     let query = thread::spawn(move || rest(&addr_q, "POST", "/update?db_name=slow", update));
     wait_running_query(&addr);
-    let started = Instant::now();
     srv.shutdown();
-    let (done_tx, done_rx) = mpsc::channel();
-    thread::spawn(move || {
-        serving.join().unwrap();
-        let _ = done_tx.send(());
-    });
-    assert!(
-        done_rx.recv_timeout(Duration::from_secs(30)).is_ok(),
-        "the shutdown never finished: the update kept the database locked"
+    // (The update runs until cancelled: a shutdown that returns at all
+    // cancelled it — review http#20: no wall-clock bound besides the hang
+    // guard.)
+    join_within(
+        serving,
+        "the shutdown never finished: the update kept the database locked",
     );
-    assert!(started.elapsed() < Duration::from_secs(30));
     let r = query.join().unwrap();
     assert!(
         r.body.to_lowercase().contains("cancel"),
@@ -1353,12 +1390,15 @@ fn shutdown_cancels_running_operations_and_waits_bounded() {
             ("sleep_ms", "60000"),
         ],
     ));
+    // review http#20: the stubborn one runs for ten minutes (it used to be
+    // 8 s against a 6 s wall-clock bound on the shutdown): a shutdown that
+    // returns at all did not wait for it.
     let stubborn = opt_id_of(&api(
         &addr,
         &[
             ("operation", "__asyncTest"),
             ("async", "true"),
-            ("sleep_ms", "8000"),
+            ("sleep_ms", "600000"),
             ("ignore_cancel", "true"),
         ],
     ));
@@ -1376,13 +1416,11 @@ fn shutdown_cancels_running_operations_and_waits_bounded() {
             thread::sleep(Duration::from_millis(5));
         }
     }
-    let started = Instant::now();
     srv.shutdown();
-    serving.join().unwrap();
-    let took = started.elapsed();
-    assert!(
-        took < Duration::from_secs(6),
-        "the shutdown waited {took:?} — not bounded by the grace + shutdown_wait"
+    join_within(
+        serving,
+        "the shutdown waited for an operation that ignores cancellation — not bounded \
+         by the grace + shutdown_wait",
     );
     let tm = srv.task_manager();
     let info = tm.get(polite.parse().unwrap()).unwrap();
@@ -1392,7 +1430,7 @@ fn shutdown_cancels_running_operations_and_waits_bounded() {
     assert_eq!(
         info.state,
         TaskState::Running,
-        "still running past the bound: {info:?} after {took:?}"
+        "still running past the bound: {info:?}"
     );
     assert!(info.cancel_requested);
     // No new asynchronous operation once shut down.

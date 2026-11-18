@@ -4578,11 +4578,39 @@ mod tests {
         assert_eq!(c.read().generation, v);
     }
 
-    fn tmp_dir(tag: &str) -> std::path::PathBuf {
-        let d =
-            std::env::temp_dir().join(format!("gstore_server_unit_{tag}_{}", std::process::id()));
+    /// A unique temp path (pid and a counter), removed when dropped — also
+    /// when the test fails (review: no fixed temp paths, nothing left
+    /// behind).
+    struct TmpDir(std::path::PathBuf);
+
+    impl std::ops::Deref for TmpDir {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<std::path::Path> for TmpDir {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tmp_dir(tag: &str) -> TmpDir {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "gstore_server_unit_{tag}_{}_{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
         let _ = std::fs::remove_dir_all(&d);
-        d
+        TmpDir(d)
     }
 
     fn ask(dir: &std::path::Path, q: &str) -> bool {
@@ -4596,7 +4624,7 @@ mod tests {
         let dir = tmp_dir("partial");
         let db = Database::build_from_str("srv", DATA).unwrap();
         db.save(&dir).unwrap();
-        let server = Arc::new(Server::bind(db, "127.0.0.1:0").unwrap().with_db_dir(&dir));
+        let server = Arc::new(Server::bind(db, "127.0.0.1:0").unwrap().with_db_dir(&*dir));
         let addr = server.local_addr().unwrap();
         let s2 = Arc::clone(&server);
         let serving = thread::spawn(move || s2.serve_forever());
@@ -4614,7 +4642,6 @@ mod tests {
         server.shutdown();
         let report = serving.join().unwrap();
         assert!(report.failed.is_empty(), "{report:?}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// With check_point off, an update still in flight when the graceful
@@ -4628,7 +4655,7 @@ mod tests {
         let server = Arc::new(
             Server::bind(db, "127.0.0.1:0")
                 .unwrap()
-                .with_db_dir(&dir)
+                .with_db_dir(&*dir)
                 .with_check_point(false)
                 .with_shutdown_grace(Duration::from_millis(50)),
         );
@@ -4647,7 +4674,13 @@ mod tests {
             .as_bytes(),
         )
         .unwrap();
-        thread::sleep(Duration::from_millis(100));
+        // The connection is in flight before the shutdown begins (review
+        // http#20: a latch on the server's counter instead of a 100 ms sleep).
+        let until = Instant::now() + Duration::from_secs(60);
+        while server.life.in_flight.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < until, "the connection was never accepted");
+            thread::sleep(Duration::from_millis(1));
+        }
         server.shutdown();
         let report = serving.join().unwrap();
         assert!(!report.drained && report.saved.is_empty(), "{report:?}");
@@ -4660,7 +4693,6 @@ mod tests {
             ask(&dir, "ASK { <http://ex/late> <http://ex/p> <http://ex/x> }"),
             "an acknowledged update is durable"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -5227,43 +5259,78 @@ mod tests {
 
     #[test]
     fn an_idle_connection_times_out_and_never_delays_shutdown() {
+        // Idle timeout: the server closes a quiet kept-alive connection.
+        // review http#20: no wall-clock bound — the client's read timeout
+        // (30 s, a hundred times the 300 ms idle timeout) is only a hang
+        // guard: a server that never closed it fails the read instead.
         let opts = HttpOptions {
             keep_alive_timeout: Duration::from_millis(300),
             ..HttpOptions::default()
         };
         let (server, addr, serving) = start_with(opts);
-        // Idle timeout: the server closes a quiet kept-alive connection.
         let s = TcpStream::connect(addr).unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
         let mut w = s.try_clone().unwrap();
         let mut r = BufReader::new(s);
         w.write_all(get_status("").as_bytes()).unwrap();
         let (head, _) = read_one(&mut r);
         assert!(head.contains("Connection: keep-alive"), "{head}");
-        let t0 = Instant::now();
         let mut rest = Vec::new();
-        r.read_to_end(&mut rest).unwrap();
+        r.read_to_end(&mut rest)
+            .expect("the server closes the idle connection");
         assert!(rest.is_empty());
-        assert!(
-            t0.elapsed() < Duration::from_secs(5),
-            "closed after the idle timeout"
-        );
+        server.shutdown();
+        serving.join().unwrap();
 
-        // An idle connection does not hold up a graceful shutdown.
+        // An idle connection does not hold up a graceful shutdown — even one
+        // whose idle timeout (an hour) would outlast every hang guard here:
+        // a shutdown that returns at all, and closes the connection, did
+        // not wait for it.
+        let opts = HttpOptions {
+            keep_alive_timeout: Duration::from_secs(3600),
+            ..HttpOptions::default()
+        };
+        let (server, addr, serving) = start_with(opts);
         let s = TcpStream::connect(addr).unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
         let mut w = s.try_clone().unwrap();
         let mut r = BufReader::new(s);
         w.write_all(get_status("").as_bytes()).unwrap();
-        let _ = read_one(&mut r);
-        let t0 = Instant::now();
+        let (head, _) = read_one(&mut r);
+        assert!(head.contains("Connection: keep-alive"), "{head}");
         server.shutdown();
-        let report = serving.join().unwrap();
+        let report = join_within(serving, "the shutdown waited for the idle connection");
         assert!(report.drained, "{report:?}");
-        assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
         let mut rest = Vec::new();
-        r.read_to_end(&mut rest).unwrap();
+        r.read_to_end(&mut rest)
+            .expect("the shutdown closes the idle connection");
         assert!(rest.is_empty(), "the idle connection was closed");
+    }
+
+    /// Join `h`, failing with `what` if it has not finished within a minute
+    /// (a hang guard, never the assertion).
+    fn join_within<T: Send + 'static>(h: thread::JoinHandle<T>, what: &str) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(h.join());
+        });
+        match rx.recv_timeout(Duration::from_secs(60)) {
+            Ok(r) => r.unwrap_or_else(|e| std::panic::resume_unwind(e)),
+            Err(_) => panic!("{what}"),
+        }
+    }
+
+    /// Wait until `srv` counts at least `n` accepted connections in flight
+    /// (a latch on the server's own counter; the deadline is a hang guard).
+    fn wait_in_flight(srv: &Server, n: usize) {
+        let until = Instant::now() + Duration::from_secs(60);
+        while srv.life.in_flight.load(Ordering::SeqCst) < n {
+            assert!(
+                Instant::now() < until,
+                "{n} connections never got in flight"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 
     #[test]
@@ -5273,7 +5340,7 @@ mod tests {
             queue_len: 8,
             ..HttpOptions::default()
         };
-        let (_srv, addr, _serving) = start_with(opts);
+        let (srv, addr, _serving) = start_with(opts);
         // Two slow clients occupy both workers: they send half a request.
         let mut slow: Vec<TcpStream> = (0..2)
             .map(|_| {
@@ -5282,7 +5349,9 @@ mod tests {
                 s
             })
             .collect();
-        thread::sleep(Duration::from_millis(200));
+        // Both accepted (the workers take connections in accept order) —
+        // review http#20: a latch instead of a 200 ms sleep.
+        wait_in_flight(&srv, 2);
         // The third (N+1-th) connection is accepted but must wait for a worker.
         let mut third = TcpStream::connect(addr).unwrap();
         third
@@ -5317,30 +5386,33 @@ mod tests {
 
     #[test]
     fn an_idle_keep_alive_connection_yields_its_worker() {
+        // review http#20: the idle timeout is an hour, so the second
+        // connection can only be served because the idle one yielded its
+        // worker; the 30 s read timeouts are hang guards, not the assertion
+        // (this used to be "served within 5 s" against a 60 s idle timeout).
         let opts = HttpOptions {
             threads: 1,
+            keep_alive_timeout: Duration::from_secs(3600),
             ..HttpOptions::default()
         };
         let (_srv, addr, _serving) = start_with(opts);
         // A kept-alive connection holds the only worker while idle …
         let a = TcpStream::connect(addr).unwrap();
-        a.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        a.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
         let mut aw = a.try_clone().unwrap();
         let mut ar = BufReader::new(a);
         aw.write_all(get_status("").as_bytes()).unwrap();
         let (head, _) = read_one(&mut ar);
         assert!(head.contains("Connection: keep-alive"), "{head}");
-        // … until another connection needs it: then it closes, far sooner
-        // than its 60 s idle timeout.
-        let t0 = Instant::now();
+        // … until another connection needs it: then it closes.
         let mut b = TcpStream::connect(addr).unwrap();
-        b.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        b.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
         b.write_all(get_status("Connection: close\r\n").as_bytes())
             .unwrap();
         let mut resp = String::new();
-        b.read_to_string(&mut resp).unwrap();
+        b.read_to_string(&mut resp)
+            .expect("the second connection is served while the first idles");
         assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
-        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
         let mut rest = Vec::new();
         ar.read_to_end(&mut rest).unwrap();
         assert!(rest.is_empty(), "the idle connection was closed");
@@ -5353,19 +5425,30 @@ mod tests {
             read_timeout: Duration::from_millis(500),
             ..HttpOptions::default()
         };
-        let (_srv, addr, _serving) = start_with(opts);
-        // One byte of request head every 100 ms: each read is well within the
-        // read timeout, but the head as a whole is not.
+        let (srv, addr, _serving) = start_with(opts);
+        // One byte of request head every 100 ms, for as long as the server
+        // takes it: each read is well within the read timeout, but the head
+        // as a whole is not. review http#20: the drip never ends by itself
+        // (it used to stop after 4 s, with the other request bounded by a
+        // 3 s wall clock), so the other request can only be served once the
+        // server cut the dripping connection off; the read timeouts are
+        // hang guards.
         let mut drip = TcpStream::connect(addr).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = Arc::clone(&stop);
         let dripper = thread::spawn(move || {
-            for b in b"GET /status HTTP/1.1\r\nX-Slow: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
-                if drip.write_all(&[*b]).is_err() {
+            let mut head = b"GET /status HTTP/1.1\r\nX-Slow: "
+                .iter()
+                .chain(std::iter::repeat(&b'a'));
+            while !stop2.load(Ordering::SeqCst) {
+                if drip.write_all(&[*head.next().unwrap()]).is_err() {
                     return true; // the server hung up
                 }
                 thread::sleep(Duration::from_millis(100));
             }
             let mut buf = [0u8; 256];
-            drip.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            drip.set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
             // A response, EOF or a reset all mean the server let go; only a
             // timeout would mean it still holds the connection.
             !matches!(
@@ -5373,16 +5456,17 @@ mod tests {
                 Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
             )
         });
-        thread::sleep(Duration::from_millis(150));
-        let t0 = Instant::now();
+        // The dripping connection holds the only worker first.
+        wait_in_flight(&srv, 1);
         let mut s = TcpStream::connect(addr).unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
         s.write_all(get_status("Connection: close\r\n").as_bytes())
             .unwrap();
         let mut resp = String::new();
-        s.read_to_string(&mut resp).unwrap();
+        s.read_to_string(&mut resp)
+            .expect("served once the dripping connection is cut off");
         assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
-        assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
+        stop.store(true, Ordering::SeqCst);
         assert!(
             dripper.join().unwrap(),
             "the dripping connection was dropped"
@@ -5611,7 +5695,7 @@ ZGtzXQmVjvGBU7z7pWjIgmq28fkDHI++7pR8xkxr79QUsCaT5YJgQoKL
         use std::io::{Read as _, Write as _};
         // Write the embedded cert+key to temp files and load them through the
         // crate's real `load_tls_config` path.
-        let dir = std::env::temp_dir().join(format!("gstore_tls_{}", std::process::id()));
+        let dir = tmp_dir("tls");
         std::fs::create_dir_all(&dir).unwrap();
         let cert = dir.join("cert.pem");
         let key = dir.join("key.pem");
@@ -5661,8 +5745,6 @@ ZGtzXQmVjvGBU7z7pWjIgmq28fkDHI++7pR8xkxr79QUsCaT5YJgQoKL
         let text = String::from_utf8_lossy(&resp);
         assert!(text.contains("200 OK"), "TLS response: {text}");
         assert!(text.contains("http://ex/b"), "TLS response: {text}");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Keep-alive works over TLS too: two requests on one TLS connection.
@@ -5670,7 +5752,7 @@ ZGtzXQmVjvGBU7z7pWjIgmq28fkDHI++7pR8xkxr79QUsCaT5YJgQoKL
     #[test]
     fn tls_keep_alive_serves_two_requests() {
         use std::io::Write as _;
-        let dir = std::env::temp_dir().join(format!("gstore_tls_ka_{}", std::process::id()));
+        let dir = tmp_dir("tls_ka");
         std::fs::create_dir_all(&dir).unwrap();
         let (cert, key) = (dir.join("cert.pem"), dir.join("key.pem"));
         std::fs::write(&cert, CERT_PEM).unwrap();
@@ -5709,7 +5791,6 @@ ZGtzXQmVjvGBU7z7pWjIgmq28fkDHI++7pR8xkxr79QUsCaT5YJgQoKL
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
         assert!(body.contains("\"triples\":2"), "{body}");
         server.shutdown();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A `HEAD` response keeps its headers (`Content-Length` included) but

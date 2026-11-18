@@ -966,29 +966,36 @@ mod tests {
     }
 
     /// A peer that trickles its response (each byte well within a per-read
-    /// timeout) cannot stretch the exchange past the total deadline.
+    /// timeout) cannot stretch the exchange past the total deadline. review
+    /// http#20: the trickle never ends by itself (it stops when the client
+    /// hangs up), so a call that returns at all — with `TimedOut` — was cut
+    /// off by the deadline; the receive timeout is only a hang guard (this
+    /// used to be "within 3 s" against a 10 s trickle).
     #[test]
     fn a_trickling_endpoint_hits_the_total_deadline() {
-        let url = one_shot(|mut s| {
-            for _ in 0..100 {
-                if s.write_all(b"x").is_err() {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(100));
+        let url = one_shot(|mut s| loop {
+            if s.write_all(b"x").is_err() {
+                return;
             }
+            std::thread::sleep(Duration::from_millis(100));
         });
         let limits = Limits {
             total: Duration::from_millis(700),
             ..Limits::default()
         };
-        let started = Instant::now();
-        let err = sparql_post_with(&url, "SELECT * WHERE { ?s ?p ?o }", limits).unwrap_err();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(sparql_post_with(
+                &url,
+                "SELECT * WHERE { ?s ?p ?o }",
+                limits,
+            ));
+        });
+        let err = rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the trickle held the request past its deadline")
+            .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
-        assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "{:?}",
-            started.elapsed()
-        );
     }
 
     /// A response over the size cap is refused instead of buffered whole.
@@ -1294,11 +1301,12 @@ mIjSMKbBFgquUgIhAPHupNklmfNjoKbt7eKBPIKOTzsJbKSpBaMVuL/X4bNv
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         // A handshake record header announcing 16 KiB, then its bytes one
-        // at a time, 50 ms apart (5 s in all), then the connection closes.
+        // at a time, 50 ms apart, until the client hangs up (review http#20:
+        // it used to stop after 5 s, so only that bounded the call).
         let trickler = std::thread::spawn(move || {
             let (mut sock, _) = listener.accept().unwrap();
             let _ = sock.write_all(&[0x16, 0x03, 0x03, 0x40, 0x00]);
-            for _ in 0..100 {
+            loop {
                 std::thread::sleep(Duration::from_millis(50));
                 if sock.write_all(&[0x02]).is_err() {
                     break;
@@ -1364,7 +1372,19 @@ mIjSMKbBFgquUgIhAPHupNklmfNjoKbt7eKBPIKOTzsJbKSpBaMVuL/X4bNv
     #[cfg(feature = "tls")]
     #[test]
     fn post_over_https_verifies_the_server() {
-        let dir = std::env::temp_dir().join(format!("gstore_https_post_{}", std::process::id()));
+        /// Removes the directory, also when the test fails.
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "gstore_https_post_{}_{}",
+            std::process::id(),
+            crate::sysdb::clock::unix_millis()
+        ));
+        let _cleanup = Cleanup(dir.clone());
         std::fs::create_dir_all(&dir).unwrap();
         let (cert, key) = (dir.join("cert.pem"), dir.join("key.pem"));
         std::fs::write(&cert, CERT_PEM).unwrap();
@@ -1426,7 +1446,6 @@ mIjSMKbBFgquUgIhAPHupNklmfNjoKbt7eKBPIKOTzsJbKSpBaMVuL/X4bNv
             seen[1].is_empty(),
             "nothing is sent to an unverified server"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1478,23 +1497,25 @@ mIjSMKbBFgquUgIhAPHupNklmfNjoKbt7eKBPIKOTzsJbKSpBaMVuL/X4bNv
         assert!(listener.accept().is_err(), "nothing connected");
     }
 
-    /// A refused connection is an error, not a hang.
+    /// A refused connection is an error at once, not a wait for the
+    /// deadline. review http#20: told apart by the error's kind — a refusal,
+    /// not the deadline's `TimedOut` — instead of a 3 s wall-clock bound
+    /// against a 2 s deadline.
     #[test]
     fn post_to_a_closed_port_fails_fast() {
         let port = {
             let l = TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap().port()
         };
-        let started = Instant::now();
         let opts = PostOptions {
             limits: Limits {
-                total: Duration::from_secs(2),
+                total: Duration::from_secs(60),
                 ..Limits::default()
             },
             ..PostOptions::default()
         };
         let url = format!("http://127.0.0.1:{port}/");
-        assert!(post_with(&url, "text/plain", b"x", &opts).is_err());
-        assert!(started.elapsed() < Duration::from_secs(3));
+        let err = post_with(&url, "text/plain", b"x", &opts).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused, "{err}");
     }
 }
