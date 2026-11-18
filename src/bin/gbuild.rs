@@ -82,7 +82,10 @@
 //! package's scratch directory — and keeps the claim until it ends: another
 //! process building, loading or dropping the same database meanwhile is
 //! refused, and `gbuild` fails at once (status 1) when another process holds
-//! the directory. A build that fails removes the database directory it
+//! the directory. Without `--force` a directory that was new when `gbuild`
+//! started is checked again once claimed: a database another process
+//! created and finished in between is refused like one that was there
+//! before, and left alone. A build that fails removes the database directory it
 //! created (upstream's `Util::remove_path` of a failed build) — under that
 //! claim, and only while it holds no database — so the same `gbuild` can
 //! simply be run again; a failed `--force` rebuild leaves the directory as
@@ -355,13 +358,17 @@ fn main() -> ExitCode {
     let name = &name;
     let dir = db_dir_for(name);
     let existed = holds_data(Path::new(&dir));
-    if !force && existed {
+    let refuse_existing = || {
         eprintln!(
             "gbuild: the database path '{dir}' already exists. Please check database {name}, \
              or use gdrop to remove it at first (or rebuild it with --force)."
         );
-        return ExitCode::FAILURE;
+        ExitCode::FAILURE
+    };
+    if !force && existed {
+        return refuse_existing();
     }
+    park_before_claim();
     // Claim the directory before anything is written into or beside it —
     // the parse error log, a zip package's scratch directory — and hold the
     // claim through the build (review bulkcli#2, #6): another process
@@ -378,6 +385,15 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // The directory was new when checked above; another process may have
+    // created, built and released it in the moment before the claim (review
+    // of bulkcli#2's fix). Under the claim nothing else can, so look again:
+    // anything there besides the lock file is refused as above, and nothing
+    // is removed (the claim is simply released).
+    if !force && !existed && holds_more_than_its_lock(Path::new(&dir)) {
+        drop(claim);
+        return refuse_existing();
+    }
     // A failed build removes what it created; one over an existing
     // database (`--force`) leaves the directory as it is.
     let mut created = CreatedDir {
@@ -674,6 +690,29 @@ fn holds_data(path: &Path) -> bool {
     match std::fs::read_dir(path) {
         Ok(mut entries) => entries.next().is_some(),
         Err(_) => path.exists(),
+    }
+}
+
+/// [`holds_data`] for a directory this process has claimed: its lock file
+/// (which the claim created) does not count.
+fn holds_more_than_its_lock(path: &Path) -> bool {
+    match std::fs::read_dir(path) {
+        Ok(entries) => entries
+            .flatten()
+            .any(|e| e.file_name() != gstore::db::dirlock::LOCK_FILE),
+        Err(_) => true,
+    }
+}
+
+/// A test hook of debug builds (round-4 review of bulkcli#2's fix): with
+/// `GSTORE_GBUILD_PARK_BEFORE_CLAIM=<path>` set, `gbuild` reads `<path>` to
+/// its end between its "is the directory new?" check and its claim — a
+/// FIFO parks it there until the test closes the FIFO's other end, so the
+/// test can build the same name in that gap deterministically.
+fn park_before_claim() {
+    #[cfg(debug_assertions)]
+    if let Some(p) = std::env::var_os("GSTORE_GBUILD_PARK_BEFORE_CLAIM") {
+        let _ = fs::read(p);
     }
 }
 
