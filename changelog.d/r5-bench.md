@@ -175,10 +175,11 @@ two runs, calibration 74.6 and 79.6 ms against the baseline's 72.1).
   `max_spread` 1.6; the 68 single-query 50× cases all fail; under the old
   rules the baseline against its own slowest processes failed
   `time.geomean` (1.68 > 1.5) and most 50× cases passed.
-- Tests: `cargo test --workspace` (default features) 3099 passed, 0
-  failed, 10 ignored with `GSTORE_DISK_QUERY_MODE=memory` and again with
-  `stream`; `cargo test -p gstore-bench --features rocksdb` (gbuild built
-  with RocksDB first, target-rocks) 91 passed, 0 failed, 1 ignored;
+- Tests at the branch head after review: `cargo test --workspace`
+  (default features) 3101 passed, 0 failed, 10 ignored with
+  `GSTORE_DISK_QUERY_MODE=memory` and again with `stream`; `cargo test -p
+  gstore-bench --features rocksdb` (gbuild built with RocksDB first,
+  target-rocks) 93 passed, 0 failed, 1 ignored;
   `cargo clippy --workspace --all-targets -- -D warnings` and `cargo clippy
   -p gstore-bench --all-targets --features rocksdb -- -D warnings` clean.
 - CI doc check: with one row of a docs/BENCHMARKS.md table changed, the new
