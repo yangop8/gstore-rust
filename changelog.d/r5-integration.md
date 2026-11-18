@@ -69,6 +69,33 @@ r5-packaging edited `scripts/conformance.sh`, which keeps the convention-4
 helper once with round 1's two `compat_switch` lines and the single
 `check_compat_switches || exit 1` after the server-start check.
 
+Final check of the round (after the review follow-ups, from 618401c;
+test fixes and one release-build warning, no behaviour change; each fix
+was shown on the code before it, see the commit messages):
+
+- `gbuild` no longer imports `std::fs` unused in release builds: its only
+  bare `fs::` use is the debug-build park hook, so the bench smoke's, the
+  packages' and the image's release builds warned about it.
+- `tests/api_hygiene.rs`
+  `unloaded_statistics_are_read_again_for_a_look_alike_directory`
+  (gapi#17) takes the read count once its directory swap is done: between
+  the two renames there is no `cold`, and another test's `monitor` of an
+  unloaded database prunes the read counts of directories that are gone,
+  so a stream-mode workspace run failed "read anew" with 0 for 1.
+- The in-process `ApiServer` harnesses wait for the server's shutdown
+  (join the serving thread) before their temp root is removed: a server
+  still shutting down (rolling back, saving) or still answering wrote below
+  the removed root and recreated it. A gzip feature run left
+  `gstore_secrev_deep_api_*` (`tests/dt_security_review.rs`), and a failing
+  run of `http_api::tests::statements_and_batch_payloads_are_parsed_off_the_state_lock`
+  had left `gstore_api_unit_parse_off_lock_*` in `/tmp`. Fixed in that
+  file's harness, twelve more integration-test harnesses (among them the
+  shared `tests/upstream_scripts/harness.rs`) and the unit tests of
+  `src/http_api.rs`, whose servers were never stopped.
+- `gnlqa/tests/linker_cache.rs` (cluster-nlqa#22) takes as "another user"
+  a uid other than its own: run as `nobody` (65534) it gave its own file to
+  itself and failed.
+
 ## GAP_PLAN status line
 
 none
@@ -107,6 +134,13 @@ none
   `changelog.d/r5-test-audit.md` gets the `/api` session-token row above
   (as in `tests/adversarial_coverage.rs`).
 - Every package's Docs notes stand as written in its fragment.
+- docs/REFACTOR_BACKLOG.md (final check, no action needed now): the
+  single-database `Server` harnesses (`tests/http_browser_surface.rs`,
+  `tests/http_request_semantics.rs`,
+  `tests/chunked_framing_counts_against_the_body_cap.rs`) still drop their
+  server without joining it; they serve in-memory databases and write
+  nothing below a temp directory, so no leak follows. A harness that gives
+  one an on-disk database should join it as the `ApiServer` ones now do.
 
 ## Measured numbers
 
@@ -204,6 +238,46 @@ jobs, but the feature, RocksDB and stream-mode runs overlapped each other
   save elsewhere; the probe's digest only while a probe is alive).
   MSRV 1.89 was not rechecked (that toolchain is not installed here); the
   new code uses no API newer than 1.82.
+
+- Final check of the round, at 03ad265 (the commit adding this paragraph
+  changes only this file). Toolchain 1.99.1, `CARGO_PROFILE_{DEV,TEST}_DEBUG=0`,
+  `CARGO_INCREMENTAL=0`, heavy steps through the two-slot limiter (the
+  feature, RocksDB and workspace runs partly overlapped; the bench smoke
+  ran alone). Every commit since 9eb72a2 carries the two trailer lines;
+  no package worktree is left.
+  `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets
+  -- -D warnings` and `RUSTDOCFLAGS='-D warnings' cargo doc -p gstore
+  --no-deps --locked`: clean. `cargo test --workspace`:
+  `GSTORE_DISK_QUERY_MODE=memory` 236 runs, 3316 passed, 0 failed, 10
+  ignored; `stream` the same; `/tmp` listed before and after each run:
+  identical (73 entries, all left by earlier runs). CI's table step
+  (`target/debug/gstore-bench report --check` over CHANGELOG.md,
+  README.md, bench/README.md, docs/BENCHMARKS.md): clean.
+  Feature entries (build `--profile test`, clippy `-D warnings`, test;
+  fresh target directory and TMPDIR each, both removed, TMPDIR empty
+  afterwards), 208 runs each, 0 failed, 9 ignored: gzip 2961 passed, tls
+  2966, zip 2983, readline 2957, pfn-wasm 2986, `zip pfn-wasm readline`
+  3012. RocksDB (target-rocks, sources touched, lock held for the whole
+  sequence, `cargo build --profile test -p gstore --bin gbuild --features
+  rocksdb` before the gstore-bench tests as bench.yml does): clippy clean;
+  `-p gstore` 208 runs, 3055 passed, 0 failed, 10 ignored; `-p
+  gstore-bench` 14 runs, 93 passed, 0 failed, 1 ignored.
+  `scripts/conformance.sh` (TMPDIR in the scratch directory, empty
+  afterwards): all six suites PASS (parser's known cases 15 and 17),
+  round 1's two compat switches reported. Bench smoke: release build
+  without warnings; `report --check README.md CHANGELOG.md` and over every
+  marked doc clean; `gstore-bench ci --baseline bench/baselines/smoke.json`
+  PASS, 460 gates checked, 0 failed, warm-median time geomean LUBM-like
+  snapshot 0.99 (limit 1.56), disk 1.02, WatDiv-like snapshot 1.06, disk
+  1.08 (limit 1.50 each), calibration 67.85 ms; the 2x and 3x canaries
+  each exit 1. MSRV 1.89: `cargo +1.89 check --locked --workspace
+  --all-targets` and `check --release --locked -p gstore --bins --features
+  pfn-wasm` (the image's build) clean, without warnings.
+  Not root, as GitHub's runner: the 230 test binaries of `cargo test
+  --workspace` run as uid 65534 (`setpriv`, a `CARGO_TARGET_TMPDIR` and
+  TMPDIR it owns): all pass, nothing left in TMPDIR; linker_cache also as
+  uid 1001. `systemd-analyze verify` of the unit is silent as root and as
+  uid 65534.
 
 ## Requests/Not yet
 
