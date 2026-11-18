@@ -4,16 +4,19 @@
 //! upstream does (its `Util::configure` re-runs log4cplus' `doConfigure` on
 //! the `log_mode` file).
 
+mod common;
 #[path = "upstream_scripts/harness.rs"]
 mod harness;
 
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::io::{BufRead, BufReader, Write};
+use std::net::{SocketAddr, TcpListener};
+use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 
+use common::globals::LoggerReset;
+use common::server::Running;
 use gstore::config::GStoreConfig;
 use gstore::http_api::ApiServer;
 use gstore::json::{self, Json};
@@ -24,16 +27,21 @@ use harness::*;
 const DATA: &str = "<http://ex/a> <http://ex/p> <http://ex/b> .\n";
 const DIV: &str = "SELECT ((7/2) AS ?x) WHERE {}";
 
+/// A server and its root. The fields drop in order: the server is stopped
+/// and joined (review tests-b#11: it used to be asked to stop and left
+/// running), then its root removed.
 struct Srv {
-    server: Arc<ApiServer>,
+    _server: Running<ApiServer>,
     addr: SocketAddr,
-    root: PathBuf,
+    _root: RemoveOnDrop,
 }
 
-impl Drop for Srv {
+/// A directory removed when dropped — also when the test fails.
+struct RemoveOnDrop(std::path::PathBuf);
+
+impl Drop for RemoveOnDrop {
     fn drop(&mut self) {
-        self.server.shutdown();
-        let _ = fs::remove_dir_all(&self.root);
+        let _ = fs::remove_dir_all(&self.0);
     }
 }
 
@@ -53,11 +61,13 @@ fn start(tag: &str, conf: &Path, data: &Path, log_refresh: bool) -> Srv {
     if log_refresh {
         server = server.with_log_refresh();
     }
-    let server = Arc::new(server);
-    let addr = server.local_addr().unwrap();
-    let s2 = Arc::clone(&server);
-    thread::spawn(move || s2.serve_forever());
-    Srv { server, addr, root }
+    let server = Running::start(server);
+    let addr = server.addr();
+    Srv {
+        _server: server,
+        addr,
+        _root: RemoveOnDrop(root),
+    }
 }
 
 impl Srv {
@@ -105,20 +115,18 @@ impl Srv {
         );
         body.extend_from_slice(data);
         body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
-        let mut s = TcpStream::connect(self.addr).unwrap();
-        let mut req = format!(
-            "POST /file/upload HTTP/1.1\r\nHost: 127.0.0.1\r\n\
-             Content-Type: multipart/form-data; boundary={boundary}\r\n\
-             Content-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        )
-        .into_bytes();
-        req.extend_from_slice(&body);
-        s.write_all(&req).unwrap();
-        let mut resp = String::new();
-        s.read_to_string(&mut resp).unwrap();
-        let (_, text) = resp.split_once("\r\n\r\n").unwrap();
-        let j = json::parse(text).unwrap();
+        // review tests-b#11: the shared client (an overall deadline; a hung
+        // server fails the test naming the request) instead of a read
+        // without a timeout.
+        let content_type = format!("multipart/form-data; boundary={boundary}");
+        let r = common::http::request(
+            &self.addr,
+            "POST",
+            "/file/upload",
+            &[("Content-Type", &content_type)],
+            &body,
+        );
+        let j = r.json();
         ok(&j);
         string(&j, "filepath")
     }
@@ -179,6 +187,8 @@ fn decimal(cell: &str) -> bool {
 #[test]
 fn query_settings_reach_every_database_phase5_opens_and_refreshconf_updates_them() {
     let data = scratch("set5_data");
+    // Removed also when the test fails (it used to be removed on success only).
+    common::tmp::remove_at_thread_exit(&data);
     let conf = data.join("conf.ini");
     write_conf(&conf, "truncate");
     let p1 = data.join("p1.nt");
@@ -273,7 +283,13 @@ fn query_settings_reach_every_database_phase5_opens_and_refreshconf_updates_them
 
 #[test]
 fn refreshconf_reconfigures_the_diagnostic_log_like_upstream() {
+    // review tests-b#16: the process-wide logger this test installs is reset
+    // however the test ends (it used to be reset on its last line only, so a
+    // failed assertion left the binary's other tests logging into this
+    // test's removed scratch directory).
+    let _log = LoggerReset;
     let data = scratch("set5_log");
+    common::tmp::remove_at_thread_exit(&data);
     let conf = data.join("conf.ini");
     let a = data.join("a.log");
     let b = data.join("b.log");
