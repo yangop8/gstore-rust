@@ -2695,16 +2695,28 @@ fn the_console_talks_to_a_tls_gserver() {
             .with_config(config)
             .with_load_policy(policy),
     );
-    struct Stop(Arc<gstore::http_api::ApiServer>);
+    // Stops the server and waits for its serving thread (its shutdown
+    // writes below `root`, which `_root` removes afterwards).
+    struct Stop(
+        Arc<gstore::http_api::ApiServer>,
+        Option<thread::JoinHandle<()>>,
+    );
     impl Drop for Stop {
         fn drop(&mut self) {
             self.0.shutdown();
+            if let Some(h) = self.1.take() {
+                let _ = h.join();
+            }
         }
     }
-    let _stop = Stop(Arc::clone(&server));
     let tls = gstore::server::load_tls_config(&cert, &key).unwrap();
     let serving = Arc::clone(&server);
-    thread::spawn(move || serving.serve_forever_tls(tls));
+    let _stop = Stop(
+        Arc::clone(&server),
+        Some(thread::spawn(move || {
+            serving.serve_forever_tls(tls);
+        })),
+    );
     let relay = Relay::start(server.local_addr().unwrap());
     let cwd = scratch("gc_tls_cwd");
     let _cwd = DirGuard(cwd.clone());

@@ -61,6 +61,7 @@ struct Srv {
     server: Arc<ApiServer>,
     addr: SocketAddr,
     root: PathBuf,
+    serving: Option<thread::JoinHandle<()>>,
 }
 
 impl Srv {
@@ -95,6 +96,13 @@ impl Srv {
 impl Drop for Srv {
     fn drop(&mut self) {
         self.server.shutdown();
+        // `shutdown` only asks: the serving thread then rolls back open
+        // transactions and saves the databases, writing below the root.
+        // Wait for it, so the temp directory is removed after its last
+        // write (a server still shutting down could recreate it).
+        if let Some(h) = self.serving.take() {
+            let _ = h.join();
+        }
         let _ = fs::remove_dir_all(&self.root);
     }
 }
@@ -114,10 +122,15 @@ fn start_with(
     let server = Arc::new(build(server));
     let addr = server.local_addr().unwrap();
     let s2 = Arc::clone(&server);
-    thread::spawn(move || {
+    let serving = Some(thread::spawn(move || {
         s2.serve_forever();
-    });
-    Srv { server, addr, root }
+    }));
+    Srv {
+        server,
+        addr,
+        root,
+        serving,
+    }
 }
 
 fn start(tag: &str) -> Srv {

@@ -59,12 +59,20 @@ impl Drop for TmpDir {
 struct Api {
     server: Arc<ApiServer>,
     addr: SocketAddr,
+    serving: Option<thread::JoinHandle<()>>,
     _root: TmpDir,
 }
 
 impl Drop for Api {
     fn drop(&mut self) {
         self.server.shutdown();
+        // `shutdown` only asks: the serving thread then rolls back open
+        // transactions and saves the databases, writing below the root.
+        // Wait for it, so the temp directory is removed after its last
+        // write (a server still shutting down could recreate it).
+        if let Some(h) = self.serving.take() {
+            let _ = h.join();
+        }
     }
 }
 
@@ -79,10 +87,13 @@ fn start_api() -> Api {
     let server = Arc::new(server);
     let addr = server.local_addr().unwrap();
     let s2 = Arc::clone(&server);
-    thread::spawn(move || s2.serve_forever());
+    let serving = Some(thread::spawn(move || {
+        s2.serve_forever();
+    }));
     Api {
         server,
         addr,
+        serving,
         _root: root,
     }
 }

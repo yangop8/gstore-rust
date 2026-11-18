@@ -84,6 +84,7 @@ struct Api {
     server: Arc<ApiServer>,
     addr: SocketAddr,
     root: PathBuf,
+    serving: Option<thread::JoinHandle<()>>,
 }
 
 impl Api {
@@ -96,8 +97,15 @@ impl Api {
         let server = Arc::new(server);
         let addr = server.local_addr().unwrap();
         let s2 = Arc::clone(&server);
-        thread::spawn(move || s2.serve_forever());
-        Api { server, addr, root }
+        let serving = Some(thread::spawn(move || {
+            s2.serve_forever();
+        }));
+        Api {
+            server,
+            addr,
+            root,
+            serving,
+        }
     }
 
     fn root(&self, method: &str, target: &str, body: &str) -> (u16, String) {
@@ -112,7 +120,15 @@ impl Api {
 
 impl Drop for Api {
     fn drop(&mut self) {
+        // `shutdown` only asks: the serving thread then rolls back open
+        // transactions and saves the databases, writing below `root`. Wait
+        // for it, so the test's temp directory is removed after the last
+        // write — a server still shutting down recreated it (txn.log,
+        // logs/transaction.json) after the removal and left it behind.
         self.server.shutdown();
+        if let Some(h) = self.serving.take() {
+            let _ = h.join();
+        }
     }
 }
 

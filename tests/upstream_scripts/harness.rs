@@ -89,11 +89,19 @@ pub struct Server {
     server: Arc<ApiServer>,
     pub addr: SocketAddr,
     pub root: PathBuf,
+    serving: Option<thread::JoinHandle<()>>,
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
         self.server.shutdown();
+        // `shutdown` only asks: the serving thread then rolls back open
+        // transactions and saves the databases, writing below the root.
+        // Wait for it, so the temp directory is removed after its last
+        // write (a server still shutting down could recreate it).
+        if let Some(h) = self.serving.take() {
+            let _ = h.join();
+        }
         let _ = fs::remove_dir_all(&self.root);
     }
 }
@@ -126,10 +134,15 @@ impl Server {
         let server = Arc::new(server);
         let addr = server.local_addr().unwrap();
         let s2 = Arc::clone(&server);
-        thread::spawn(move || {
+        let serving = Some(thread::spawn(move || {
             s2.serve_forever();
-        });
-        Server { server, addr, root }
+        }));
+        Server {
+            server,
+            addr,
+            root,
+            serving,
+        }
     }
 
     /// `POST /api` with `body` as upstream's scripts send it (`Content-Type:

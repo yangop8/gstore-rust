@@ -201,11 +201,19 @@ fn a_session_login_leaves_the_failed_login_lockout_alone() {
     use gstore::http_api::ApiServer;
     use std::sync::Arc;
 
-    /// Stops the server and removes its root, also when the test fails.
-    struct Running(Arc<ApiServer>, std::path::PathBuf);
+    /// Stops the server, waits for its serving thread (its shutdown writes
+    /// below the root) and removes its root, also when the test fails.
+    struct Running(
+        Arc<ApiServer>,
+        std::path::PathBuf,
+        Option<std::thread::JoinHandle<()>>,
+    );
     impl Drop for Running {
         fn drop(&mut self) {
             self.0.shutdown();
+            if let Some(h) = self.2.take() {
+                let _ = h.join();
+            }
             let _ = std::fs::remove_dir_all(&self.1);
         }
     }
@@ -224,9 +232,15 @@ fn a_session_login_leaves_the_failed_login_lockout_alone() {
                 ..LockoutPolicy::default()
             }),
     );
-    let running = Running(Arc::clone(&server), root);
     let addr = server.local_addr().unwrap();
-    std::thread::spawn(move || server.serve_forever());
+    let serving = Arc::clone(&server);
+    let running = Running(
+        server,
+        root,
+        Some(std::thread::spawn(move || {
+            serving.serve_forever();
+        })),
+    );
 
     let api = |headers: &[(&str, &str)], body: Json| {
         let (status, j) = exchange(
