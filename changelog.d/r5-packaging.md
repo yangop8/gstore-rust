@@ -223,6 +223,24 @@ Machine shared with three other implementers' builds.
   so the list never matched (reproduced with a `dpkg-deb -b` package).
   Full `scripts/conformance.sh --no-build` again: six suites PASS, port
   picked by the kernel.
+- Second package review: gserver (debug build) traced with `strace -f`
+  through a smoke session (`/api` check, login, build, load, INSERT DATA,
+  SELECT, backup, monitor, checkpoint, REST `/status`, SIGTERM stop): its
+  62 distinct syscalls are all in the unit's `@system-service` and none
+  in the removed `@privileged` / `@resources` sets (expanded with
+  `systemd-analyze syscall-filter`, systemd 255); `prlimit64` only reads
+  limits; its sockets are `AF_INET` plus one `AF_UNIX` socketpair (inside
+  `RestrictAddressFamilies`); its only executable mappings are the
+  file-backed library mappings `MemoryDenyWriteExecute` allows.
+  `systemd-analyze verify` of the unit as an unprivileged user (as CI runs
+  the tests): clean. The health check's bare connections leave no line in
+  the diagnostic log either. The old conformance.sh reproduced the port
+  race with a held probe port ("failed to start API server … Address
+  already in use", exit 1). The deb's extended-description is now checked
+  to name every binary target (tests/packaging_layout.rs). Workspace
+  tests: 3093 passed, 0 failed in each of the memory and stream disk
+  modes; workspace clippy `-D warnings` clean; the package's six test
+  files also pass with `--features "zip pfn-wasm readline gzip tls"`.
 
 ## Requests/Not yet
 
