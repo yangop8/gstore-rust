@@ -303,9 +303,25 @@ done
 if command -v systemd-analyze >/dev/null 2>&1; then
     # ExecStart's binary must exist where verify looks: in the staged root.
     sed "s#^ExecStart=/#ExecStart=$ROOT/#" "$UNIT" >"$WORK/gserver.service"
-    out=$(systemd-analyze verify "$WORK/gserver.service" 2>&1) || fail "systemd-analyze verify: $out"
-    [ -z "$out" ] || fail "systemd-analyze verify: $out"
-    say "systemd-analyze verify: clean"
+    # Only this unit's own problems count. verify also loads the units the
+    # host's targets pull in, and on a newer systemd some of those warn about
+    # options of their own (ubuntu-latest: "xfs_scrub_all.service: Support
+    # for option CPUAccounting= has been removed"); those are not ours.
+    # --recursive-errors=no (systemd >= 250) keeps them out of the exit
+    # status, and only lines naming gserver.service fail the check.
+    rec=()
+    case "$(systemd-analyze --help 2>/dev/null || true)" in
+        *--recursive-errors*) rec=(--recursive-errors=no) ;;
+    esac
+    out=$(systemd-analyze verify ${rec[@]+"${rec[@]}"} --man=no "$WORK/gserver.service" 2>&1) \
+        || fail "systemd-analyze verify: $out"
+    own=$(printf '%s\n' "$out" | grep -F 'gserver.service' || true)
+    [ -z "$own" ] || fail "systemd-analyze verify: $own"
+    if [ -n "$out" ]; then
+        say "systemd-analyze verify: clean (other units' messages ignored: $(printf '%s\n' "$out" | wc -l) lines)"
+    else
+        say "systemd-analyze verify: clean"
+    fi
 else
     say "systemd-analyze verify: skipped (not installed)"
 fi
