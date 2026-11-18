@@ -1092,6 +1092,137 @@ fn the_api_server_syncs_a_backup_before_it_acknowledges() {
     serving.join().unwrap();
 }
 
+/// What an `/api` `build` writes beside the database, not part of it:
+/// upstream's build-cost file and the parse error log (both written once the
+/// database is complete, neither read back as data).
+const BUILD_NOTES: [Exempt; 4] = [
+    Exempt {
+        prefix: "root/apisnap.db/success",
+        how: How::Unaudited,
+        why: "the build's cost in milliseconds (shown by monitor, 0 when missing)",
+    },
+    Exempt {
+        prefix: "root/apisnap.db/parse_error.log",
+        how: How::Unaudited,
+        why: "the build's parse error log: diagnostics, not data",
+    },
+    Exempt {
+        prefix: "root/apidisk.db/success",
+        how: How::Unaudited,
+        why: "the build's cost in milliseconds (shown by monitor, 0 when missing)",
+    },
+    Exempt {
+        prefix: "root/apidisk.db/parse_error.log",
+        how: How::Unaudited,
+        why: "the build's parse error log: diagnostics, not data",
+    },
+];
+
+/// A database the `/api` server creates — REST `/build` (both layouts),
+/// REST `/upload` into a new name, the `/api` `build` operation (both
+/// layouts) — or restores from a backup (REST `/restore` over a database
+/// and into a new name, the `/api` `restore` operation) is durable, its
+/// directory's entry included, before the server answers success. (review
+/// tests-b#3: `/upload` into a new name created the directory without
+/// syncing its parent.)
+#[test]
+fn databases_the_api_server_creates_or_restores_are_durable_before_it_answers() {
+    let tmp = TmpDir::new("api_create");
+    let root = tmp.path().join("root");
+    let mut cfg = gstore::config::GStoreConfig::default();
+    cfg.ip_deny_path = None;
+    let server = Arc::new(
+        gstore::http_api::ApiServer::bind(&root, "pw", "127.0.0.1:0")
+            .unwrap()
+            .with_config(cfg),
+    );
+    let addr = server.local_addr().unwrap();
+    let s2 = Arc::clone(&server);
+    let serving = thread::spawn(move || s2.serve_forever());
+    // The `/api` build reads its source from the upload directory.
+    fs::create_dir_all(root.join("upload")).unwrap();
+    let rdf = root.join("upload").join("base.nt");
+    fs::write(&rdf, BASE).unwrap();
+    let api_build = |db: &str, layout: &str| {
+        format!(
+            r#"{{"operation":"build","db_name":"{db}","db_path":"{}","layout":"{layout}","username":"root","password":"pw"}}"#,
+            rdf.display()
+        )
+    };
+    let backup = root.join("backups").join("restdisk.backup");
+    let steps: [(&str, String, Option<&str>, String); 8] = [
+        (
+            "REST /build, snapshot layout",
+            "/build?db_name=restsnap&layout=snapshot".into(),
+            Some(ROOT),
+            BASE.into(),
+        ),
+        (
+            "REST /build, disk layout",
+            "/build?db_name=restdisk&layout=disk".into(),
+            Some(ROOT),
+            BASE.into(),
+        ),
+        (
+            "REST /upload into a new name",
+            "/upload?db_name=uploaded&format=ntriples".into(),
+            Some(ROOT),
+            BASE.into(),
+        ),
+        (
+            "/api build, snapshot layout",
+            "/api".into(),
+            None,
+            api_build("apisnap", "snapshot"),
+        ),
+        (
+            "/api build, disk layout",
+            "/api".into(),
+            None,
+            api_build("apidisk", "disk"),
+        ),
+        (
+            "REST /restore over the database",
+            format!("/restore?db_name=restdisk&path={}", backup.display()),
+            Some(ROOT),
+            String::new(),
+        ),
+        (
+            "REST /restore into a new name",
+            format!("/restore?db_name=restored&path={}", backup.display()),
+            Some(ROOT),
+            String::new(),
+        ),
+        (
+            "/api restore over the database",
+            "/api".into(),
+            None,
+            format!(
+                r#"{{"operation":"restore","db_name":"restdisk","backup_path":"{}","username":"root","password":"pw"}}"#,
+                backup.display()
+            ),
+        ),
+    ];
+    let exempt: Vec<Exempt> = SERVER_LOGS.into_iter().chain(BUILD_NOTES).collect();
+    for (what, target, auth, body) in steps {
+        if what == "REST /restore over the database" {
+            let (s, b) = request(addr, "POST", "/backup?db_name=restdisk", Some(ROOT), "");
+            assert_eq!(s, 200, "REST /backup: {b}");
+            assert!(backup.is_dir(), "the backup is at {}", backup.display());
+        }
+        let audit = Audit::begin(tmp.path());
+        let (s, b) = request(addr, "POST", &target, auth, &body);
+        assert_eq!(s, 200, "{what}: {b}");
+        assert!(
+            target != "/api" || b.contains("\"StatusCode\":0"),
+            "{what}: {b}"
+        );
+        audit.finish(what, &exempt);
+    }
+    server.shutdown();
+    serving.join().unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // restore swap, bulk install
 // ---------------------------------------------------------------------------

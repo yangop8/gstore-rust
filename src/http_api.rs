@@ -2288,7 +2288,11 @@ impl DbSlot {
         // a database created in memory (`/upload` into a new name) takes the
         // lock before its first save, and keeps it while it is served.
         if !db.holds_dir_lock() {
-            fs::create_dir_all(dir)?;
+            // Created durably: the save below finds the directory there and
+            // syncs only what is inside it (review tests-b#3: the fsync
+            // audit found that a database `/upload` created could lose its
+            // directory entry to a power cut after the success answer).
+            crate::db::fsutil::create_dir_durable(dir)?;
             db.hold_dir_lock(dir)?;
         }
         db.save(dir)
