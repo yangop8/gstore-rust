@@ -1236,6 +1236,21 @@ mod with_zip {
     // CLI: gexport / gbackup / grestore
     // -----------------------------------------------------------------------
 
+    /// The zip scratch directories of the database `db` (`<db>.db`) left in
+    /// `dir`. The tools name them `<db>.db.unzip-tmp-<pid>-<random>` (review
+    /// bulkcli#6), so only a scan by prefix can tell whether one was left.
+    fn unzip_scratch(dir: &Path, db: &str) -> Vec<String> {
+        let prefix = format!("{db}.db.unzip-tmp");
+        let mut left: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(&prefix))
+            .collect();
+        left.sort();
+        left
+    }
+
     fn run(bin: &str, args: &[&str], cwd: &Path) -> std::process::Output {
         let out = Command::new(bin)
             .args(args)
@@ -1359,10 +1374,15 @@ mod with_zip {
         let text = String::from_utf8_lossy(&out.stdout);
         assert!(text.contains("Added 2 new triple(s)"), "{text}");
         assert!(!text.contains("Skipped"), "{text}");
-        assert!(!dir.join("zdb.db.unzip-tmp-0").exists());
+        // review tests-compat (round 4): the scratch directory is
+        // `zdb.db.unzip-tmp-<pid>-<random>` since bulkcli#6, so the check
+        // of the fixed name `zdb.db.unzip-tmp-0` could no longer fail; a
+        // scan by prefix checks gadd's (and below gsub's) cleanup again.
+        assert_eq!(unzip_scratch(&dir, "zdb"), Vec::<String>::new(), "gadd");
         let out = run(env!("CARGO_BIN_EXE_gsub"), &["zdb", "pkg.zip"], &dir);
         let text = String::from_utf8_lossy(&out.stdout);
         assert!(text.contains("Removed 2 triple(s)"), "{text}");
+        assert_eq!(unzip_scratch(&dir, "zdb"), Vec::<String>::new(), "gsub");
         assert_eq!(
             gstore::Database::open(dir.join("zdb.db"))
                 .unwrap()
@@ -1397,6 +1417,9 @@ mod with_zip {
             assert!(err.contains("--unzip-max-size"), "{err}");
         }
         assert!(!dir.join("z9.db").exists());
+        // A refused package leaves no scratch directory either.
+        assert_eq!(unzip_scratch(&dir, "zdb"), Vec::<String>::new(), "gadd");
+        assert_eq!(unzip_scratch(&dir, "z9"), Vec::<String>::new(), "gbuild");
         let out = Command::new(env!("CARGO_BIN_EXE_gbuild"))
             .args(["--unzip-max-size", "lots", "z9", "pkg.zip"])
             .current_dir(&dir)
@@ -1452,7 +1475,9 @@ mod with_zip {
         );
         let text = String::from_utf8_lossy(&out.stdout);
         assert!(text.contains("from 2 source(s)"), "{text}");
-        assert!(!dir.join("z.db.unzip-tmp-0").exists());
+        // review tests-compat (round 4): `z.db.unzip-tmp-0` is a name the
+        // tools no longer use (bulkcli#6); scan by prefix instead.
+        assert_eq!(unzip_scratch(&dir, "z"), Vec::<String>::new());
         assert_eq!(
             gstore::Database::open(dir.join("z.db"))
                 .unwrap()
