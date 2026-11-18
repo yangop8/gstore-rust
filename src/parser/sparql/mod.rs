@@ -178,6 +178,44 @@ pub fn parse(input: &str) -> Result<Query> {
     Parser::new(input, tokens, spans).parse_request()
 }
 
+/// Parse an UPDATE request recorded in an `update.log`, for
+/// [`Database::replay_update_log`](crate::Database::replay_update_log).
+///
+/// A record is a request that succeeded when it was logged — possibly by an
+/// earlier gstore-rust version, whose parser and graph-management rules
+/// accepted requests [`parse`] now refuses (round-4 review of parser#13 /
+/// sparqlconf#16: a replay stopped at the first such record and lost every
+/// statement after it). So a record is read as those versions read it
+/// where this version refuses it:
+///
+/// * a labelled blank node `_:b` in `DELETE DATA`, `DELETE WHERE` or a
+///   DELETE template names the stored node `_:b` (as in a WHERE pattern);
+///   `reason_retract`'s own records hold such labels too. `[]` stays an
+///   error there, as it always was;
+/// * `CREATE GRAPH`, `DROP GRAPH` and `CLEAR GRAPH` are `SILENT`: such a
+///   record of a graph that did not (or, for CREATE, did) exist was a
+///   successful no-op when logged, and is one again; one of a graph that
+///   did (did not) exist does what it did;
+/// * `PREFIX p:x <…>` declares `p:`, two triple statements need no `.`
+///   between them, and a repeated `ORDER BY` / `LIMIT` / `OFFSET` (or an
+///   `ORDER BY` after `LIMIT` / `OFFSET`) is accepted, the last one winning.
+///
+/// Each of these accepts a superset of what [`parse`] accepts and reads
+/// every request [`parse`] accepts the same way, so records this version
+/// logged replay as they ran. Anything else is read as [`parse`] reads it.
+pub(crate) fn parse_logged_update(input: &str) -> Result<Query> {
+    lexer::check_request_size(input)?;
+    let (tokens, spans) = tokenize_with_spans(input)?;
+    let mut parser = Parser::new(input, tokens, spans);
+    parser.logged = true;
+    match parser.parse_request()? {
+        q @ Query::Update(_) => Ok(q),
+        _ => Err(GStoreError::Query(
+            "an update.log record holds a request that is not an UPDATE".into(),
+        )),
+    }
+}
+
 /// A parsed predicate position: a plain term, or a property path.
 enum VerbKind {
     Simple(PatternTerm),
@@ -230,6 +268,10 @@ struct Parser<'s> {
     anon: usize,
     /// How anonymous blank nodes are represented where the parser is now.
     bnode_mode: BnodeMode,
+    /// Reading a request recorded in an `update.log`
+    /// ([`parse_logged_update`]): the readings of earlier gstore-rust
+    /// versions apply where this version refuses what they accepted.
+    logged: bool,
 }
 
 /// A left-deep chain being parsed (see [`Parser::chain_begin`]).
@@ -256,6 +298,7 @@ impl<'s> Parser<'s> {
             peak: 0,
             anon: 0,
             bnode_mode: BnodeMode::Var,
+            logged: false,
         }
     }
 
@@ -415,6 +458,8 @@ impl<'s> Parser<'s> {
                     // parser#13): a typo must not silently rebind a prefix.
                     let pfx = match self.bump() {
                         Token::PName(p, l) if l.is_empty() => p,
+                        // An update.log record: as earlier versions read it.
+                        Token::PName(p, _) if self.logged => p,
                         Token::PName(p, l) => {
                             return Err(self.err(format!(
                                 "PREFIX declares a prefix name ending in ':' (e.g. PREFIX {p}: \
@@ -886,7 +931,9 @@ impl<'s> Parser<'s> {
     /// parser#13). A `.` stays optional after the last statement and around
     /// the other elements of a group (`FILTER`, `OPTIONAL`, `{ … }`, …).
     fn require_triples_separator(&self, follows_triples: bool) -> Result<()> {
-        if follows_triples {
+        // An update.log record is read as earlier versions read it (see
+        // `parse_logged_update`).
+        if follows_triples && !self.logged {
             return Err(self.err(format!(
                 "expected '.' between two triple patterns, found {} directly after one",
                 describe_token(self.peek())
@@ -2514,7 +2561,9 @@ impl<'s> Parser<'s> {
                 Some("OFFSET") if offset.is_some() => Some("OFFSET may appear only once"),
                 _ => None,
             };
-            if let Some(why) = misplaced {
+            // An update.log record: the last one wins, as earlier versions
+            // read it (see `parse_logged_update`).
+            if let Some(why) = misplaced.filter(|_| !self.logged) {
                 return Err(self.err(format!("misplaced solution modifier: {why}")));
             }
             match kw.as_deref() {
@@ -2740,21 +2789,23 @@ impl<'s> Parser<'s> {
                     into,
                 })
             }
+            // In an update.log record CLEAR, DROP and CREATE are SILENT (see
+            // `parse_logged_update`).
             Some("CLEAR") => {
                 self.bump();
-                let silent = self.eat_keyword("SILENT");
+                let silent = self.eat_keyword("SILENT") || self.logged;
                 let target = self.parse_graph_target()?;
                 Ok(UpdateOp::Clear { target, silent })
             }
             Some("DROP") => {
                 self.bump();
-                let silent = self.eat_keyword("SILENT");
+                let silent = self.eat_keyword("SILENT") || self.logged;
                 let target = self.parse_graph_target()?;
                 Ok(UpdateOp::Drop { target, silent })
             }
             Some("CREATE") => {
                 self.bump();
-                let silent = self.eat_keyword("SILENT");
+                let silent = self.eat_keyword("SILENT") || self.logged;
                 self.expect_keyword("GRAPH")?;
                 let name = self.expect_graph_iri()?;
                 Ok(UpdateOp::Create { name, silent })
@@ -3106,7 +3157,10 @@ impl<'s> Parser<'s> {
             // A labelled blank node is as forbidden as `[]` where SPARQL 1.1
             // Update forbids blank nodes (DELETE DATA, DELETE WHERE, DELETE
             // templates; review parser#13 / sparqlconf#16).
+            // An update.log record reads it as the stored node, as earlier
+            // versions did (see `parse_logged_update`).
             Token::Blank(l) => match self.bnode_mode {
+                BnodeMode::Forbidden(_) if self.logged => Ok(Term::Blank(l.clone())),
                 BnodeMode::Forbidden(ctx) => Err(self.err(format!(
                     "blank nodes are not allowed in {ctx} (SPARQL 1.1 Update), but _:{l} \
                      denotes one"

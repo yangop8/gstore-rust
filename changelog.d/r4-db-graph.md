@@ -22,13 +22,34 @@
   labelled ones (`_:b`) too, as SPARQL 1.1 Update requires (only `[]` was
   refused before). `INSERT DATA`, INSERT templates and WHERE patterns keep
   them; a labelled blank node in a WHERE pattern still names the stored
-  node (the documented upstream reading). A triple whose subject or object
-  is a stored blank node is deleted with `DELETE WHERE`/`DELETE … WHERE`
-  and a variable instead (`DELETE { ?b :p "x" } WHERE { ?b :p "x" FILTER
-  isBlank(?b) }`). A reasoning rule's retraction is unaffected (it builds
-  its `DELETE DATA` operation directly); its `update.log` record holds the
-  stored label and does not replay, as `reason_retract`'s docs already
-  said.
+  node (the documented upstream reading). The triples of one stored blank
+  node — what `DELETE DATA { <a> <p> _:x }` deleted before — are deleted
+  with a variable in the template bound to that node in the WHERE clause:
+  `DELETE { <a> <p> ?o } WHERE { <a> <p> ?o FILTER(sameTerm(?o, _:x)) }`
+  (`_:x` is the label a query result shows; a loader may relabel the blank
+  nodes of a file). Note that `FILTER isBlank(?b)` is not a replacement:
+  `DELETE { ?b :p "x" } WHERE { ?b :p "x" FILTER isBlank(?b) }` deletes
+  the triples of every blank node that matches (round-4 review: this
+  changelog first gave that form). A reasoning rule's retraction is
+  unaffected (it builds its `DELETE DATA` operation directly).
+- **`update.log` files written by earlier versions replay** (round-4
+  review: `Database::replay_update_log` parsed each record as a request
+  and stopped at the first one the rules above refuse, losing every
+  statement after it). A record is a request that succeeded when it was
+  logged, so replay reads it as the version that logged it did, where this
+  version refuses what earlier ones accepted: a labelled blank node in
+  `DELETE DATA` / `DELETE WHERE` / a DELETE template names the stored node
+  (`reason_retract`'s own records, which hold stored labels, replay too
+  now), `CREATE` / `DROP` / `CLEAR GRAPH` are `SILENT` (such a record of a
+  missing — for CREATE: existing — graph was a no-op when logged), and the
+  grammar leniencies of earlier parsers (`PREFIX p:x <…>`, two triple
+  statements without a `.`, a repeated `ORDER BY` / `LIMIT` / `OFFSET`, the
+  last one winning) are accepted. Each reading accepts a superset of the
+  current rules and reads what they accept the same way, so records this
+  version logs replay as they ran. Records are evaluated by this version
+  (a `SECONDS` in one gives an `xsd:decimal` now); the first record that
+  still fails stops the replay with its error, the records before it
+  applied.
 - **Behaviour change (sparqlconf#16): `SECONDS` returns an exact
   `xsd:decimal`** (§17.4.5.7): `SECONDS("…T14:45:13.815-05:00"^^xsd:dateTime)`
   is `"13.815"^^xsd:decimal`, whole seconds `"7"^^xsd:decimal` (it returned
@@ -101,6 +122,16 @@
   asserted that a labelled blank node in `DELETE WHERE` / a DELETE template
   named the stored node (now: refused, the triple stays, a variable
   deletes it; the INSERT template's label is still a fresh node).
+- Round-4 review fixes: `tests/delete_one_stored_blank_node.rs` pins the
+  exact `sameTerm` delete on every layout (and that `isBlank` deletes every
+  matching node) — a guard of existing behaviour, not a fix;
+  `tests/update_log_replays_what_earlier_versions_logged.rs` replays a log
+  of twelve records an earlier version accepted (in the record framing
+  before checksums and with them; before the fix the replay stopped at the
+  second record, `DROP GRAPH <http://ex/missing>`, with one statement
+  applied) and a log this version wrote, which replays to the same
+  dataset. New `parser::sparql::parse_logged_update` (crate-internal) and
+  `Statement::parse_logged` (crate-internal) are the replay's parse.
 - Tests and tools: `tests/graph_management.rs` (every layout: the existence
   rule, refused blank nodes, SECONDS, the grammar rules, the VS-tree after
   clears / copies / moves / transactions / reasoning, `try_*` on a Stream
@@ -140,6 +171,21 @@ none
 - docs/DEPLOY.md: no compat switch and no secure default from this package;
   the behaviour changes above are SPARQL 1.1 conformance fixes that no
   upstream script relies on (scripts/conformance.sh passes unchanged).
+  Upgrade note (round-4 review): clients that delete blank-node triples
+  the upstream way (`DELETE DATA { <a> <p> _:x }`, `DELETE WHERE { <a> <p>
+  _:x }`) get a parse error now; the exact replacement is `DELETE { <a> <p>
+  ?o } WHERE { <a> <p> ?o FILTER(sameTerm(?o, _:x)) }`. No `[query]`
+  switch restores the upstream reading: D1's switches restore upstream
+  behaviour that a *secure default* turned off, and this is a
+  specification-conformance change with no security side (SPARQL 1.1
+  Update §3.1.2 / §3.1.3 forbid blank nodes there), no upstream script or
+  SDK test relies on it, the exact replacement exists and is pinned
+  (`tests/delete_one_stored_blank_node.rs`, every layout), and the one
+  place where old requests must keep their old reading — replaying an
+  `update.log` written by an earlier version — reads them so.
+- README.md (library API, `replay_update_log`): records written by earlier
+  versions replay with the readings those versions had (see the Changelog
+  bullet).
 - docs/REFACTOR_BACKLOG.md (D3/D8 remainders, with ids):
   - review db#4 (remainder; PHASE6_PLAN §8 D6): the Stream-mode `vstree.kv`
     is not rebuilt in-session after a clear, an insert or reasoning, and an

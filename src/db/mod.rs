@@ -4357,6 +4357,19 @@ impl Database {
     /// recursion occurs. A torn tail a crash left (see
     /// [`replay_redo_log`](Self::replay_redo_log)) is skipped; a damaged
     /// record anywhere else is an error.
+    ///
+    /// A record is a request that succeeded when it was logged, possibly by
+    /// an earlier version whose rules were more lenient. Where this version
+    /// refuses what those accepted, the record is read as they read it: a
+    /// labelled blank node in `DELETE DATA` / `DELETE WHERE` / a DELETE
+    /// template names the stored node, `CREATE` / `DROP` / `CLEAR GRAPH`
+    /// are `SILENT` (a record of a missing graph was a no-op when logged),
+    /// and the grammar leniencies of earlier parsers (a missing `.` between
+    /// triple statements, `PREFIX p:x <…>`, a repeated `LIMIT`) are
+    /// accepted. Requests are evaluated by this version: a function whose
+    /// result changed (`SECONDS` returns an `xsd:decimal`) gives its new
+    /// result. The first record that still fails stops the replay with its
+    /// error; the records before it stay applied.
     pub fn replay_update_log<P: AsRef<Path>>(&mut self, path: P) -> Result<usize> {
         let data = fs::read(path)?;
         let saved = self.update_log.take();
@@ -4380,7 +4393,11 @@ impl Database {
                 })?);
             }
             for sparql in statements {
-                self.query(sparql)?;
+                // Read as the version that logged it read it (round-4
+                // review: records earlier versions accepted — a DROP GRAPH
+                // of a missing graph, a labelled blank node in DELETE DATA
+                // — stopped the replay at the first one).
+                self.execute_as(Statement::parse_logged(sparql)?, None, None)?;
                 applied += 1;
             }
             Ok(())
@@ -5053,8 +5070,8 @@ impl Database {
     /// line cannot be read back. The opt-in statement log
     /// (`update.log`) records that `DELETE DATA` text; a blank node in it is
     /// written as its stored label, which SPARQL does not accept in `DELETE
-    /// DATA`, so replaying such a record fails (the triple-level redo log is
-    /// unaffected).
+    /// DATA` but [`replay_update_log`](Self::replay_update_log) reads as the
+    /// stored node again.
     pub(crate) fn reason_retract(
         &mut self,
         lines: &[String],

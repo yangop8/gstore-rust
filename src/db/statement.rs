@@ -29,6 +29,19 @@ impl Statement {
         })
     }
 
+    /// Parse `text`, an UPDATE request recorded in an `update.log`, as
+    /// [`Database::replay_update_log`](super::Database::replay_update_log)
+    /// reads it: where this version's parser and graph-management rules
+    /// refuse what earlier versions accepted and logged, as those versions
+    /// read it (see [`sparql::parse_logged_update`]).
+    pub(crate) fn parse_logged(text: &str) -> Result<Statement> {
+        let query = sparql::parse_logged_update(text)?;
+        Ok(Statement {
+            text: Arc::from(text),
+            query,
+        })
+    }
+
     /// Whether this is an UPDATE request (it needs exclusive access to the
     /// database); `false` for SELECT, ASK, CONSTRUCT and DESCRIBE.
     pub fn is_update(&self) -> bool {
