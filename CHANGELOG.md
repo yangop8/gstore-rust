@@ -2059,8 +2059,9 @@ Documentation:
   working on the default graph only (ext#15); stale parser docs fixed
   (parser#17). `docs/CPP_PARITY.md`'s three status tables are rewritten from
   the code, marking library-only and experimental items and correcting
-  earlier claims inline (gap-doc-claims#3, #4, #5); `kvstore::vlist`
-  describes the overflow page chain (disk#14) and `eval_describe` DESCRIBE's
+  earlier claims inline (gap-doc-claims#3, gap-doc-claims#4,
+  gap-doc-claims#5); `kvstore::vlist` describes the overflow page chain
+  (disk#14) and `eval_describe` DESCRIBE's
   description and the syntax-tree cap (sparqlconf#19); `src/concurrent.rs`
   documents `ConcurrentDb` as a library-only second concurrency model
   (design#14). `docs/PFN.md` documents fuel, `pfn_fuel_per_query`, eager
