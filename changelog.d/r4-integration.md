@@ -254,6 +254,62 @@ toolchain 1.99.1, `CARGO_PROFILE_{DEV,TEST}_DEBUG=0`,
   directories of another worktree's test process (pid 27764, r5-gnlqa's
   `bench/tests/cli.rs` binary, running then), removed when it finished.
 
+Round-4 review fixes (commits eb1da2f..HEAD on fix-r4; same toolchain and
+settings, the machine shared with the round-5 implementers, load average
+5-7):
+
+- Failing-before checks, each test run against the source without its
+  fix (the fix reverted or emulated in place, restored afterwards):
+  `gbuild_rechecks_a_new_name_under_its_claim` (re-check disabled: the
+  parked gbuild exited 0 over the other process's database);
+  `cli_output_files_are_private_until_complete` (old creation mode: "the
+  temporary file for a 644 file was created with mode 644"; with `--features
+  zip` and the old `gexport.rs` / `zipio.rs`: the link replaced by a
+  regular file, the planted `out.zip.part` target overwritten); `zipio`'s
+  `archives_never_write_through_a_planted_part_and_keep_a_link` (old
+  `write_archive`: the victim file overwritten); `tests/dt_zip_io.rs`'
+  prefix scans (scratch directory leaked on purpose: gadd and gbuild
+  checks fail); `update_log_replays_what_earlier_versions_logged` (old
+  replay: stopped at `DROP GRAPH <http://ex/missing>`);
+  `concurrent_base_string_index_stays_cached` (old cell use: 3 builds for 3
+  base-state queries, expected 1); `pfn_fuel_is_counted_per_request` (old
+  `with_settings`: the two-operation update ran); and, re-checked from the
+  earlier commits, `detached_save_keeps_data_and_rules_together` (old
+  order: 2 triples beside the old rule) and
+  `unloaded_statistics_follow_the_files`'s snapshot case (statistics
+  cached unconditionally: monitor answered 2 triples, the files held 3).
+  `delete_one_stored_blank_node` guards existing behaviour (no fix).
+- `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --
+  -D warnings`, `cargo clippy -p gstore --all-targets --features "zip
+  pfn-wasm" -- -D warnings`, `RUSTDOCFLAGS='-D warnings' cargo doc -p
+  gstore --no-deps --locked`: clean.
+- `cargo test --workspace --no-fail-fast`: `GSTORE_DISK_QUERY_MODE=memory`
+  3091 passed, 0 failed, 10 ignored; `=stream` 3091 passed, 0 failed, 10
+  ignored.
+- `cargo test -p gstore --features zip`: 2889 passed, 0 failed, 9 ignored;
+  `--features pfn-wasm`: 2892 passed, 0 failed, 9 ignored (each in a
+  scratch target directory, deleted afterwards).
+- `--features rocksdb` (shared target-rocks, touched and under the lock):
+  `delete_one_stored_blank_node`, `update_log_replays_what_earlier_versions_logged`,
+  `graph_management`, `detached_save_keeps_data_and_rules_together`,
+  `unloaded_statistics_follow_the_files`,
+  `gbuild_rechecks_a_new_name_under_its_claim`, `dt_rocksdb`: 36 passed,
+  0 failed.
+- `scripts/conformance.sh --no-build`: all six suites pass (parser: the
+  known cases 15 and 17; python sdk_check 49 passed); no compat switch
+  added.
+- Bench smoke gate (`cargo build --release --locked -p gstore -p
+  gstore-bench --bin gbuild --bin gstore-bench`, then `gstore-bench ci
+  --baseline bench/baselines/smoke.json` under `/tmp/gstore-bench.lock`,
+  load average 6.25 at its start): PASS, 456 gates checked, 0 failed;
+  warm-query geomean vs the committed baseline: snapshot 0.93, disk 0.93,
+  WatDiv-like snapshot 1.01, disk 1.25 (bound 1.50); calibration 76.24 ms.
+  The hot-path changes are per request or per index build (a bool test in
+  the parser's DELETE / grammar checks, one `match` in
+  `Evaluator::with_settings`, one thread-local increment per substring-index
+  build, one generation compare per version-view query), not per row.
+  `gstore-bench report --check README.md CHANGELOG.md`: clean.
+
 ## Requests/Not yet
 
 - (Done in the round-4 review fixes, nothing left for r5-test-hygiene:)
