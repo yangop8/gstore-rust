@@ -10714,6 +10714,22 @@ mod tests {
     }
 
     /// The served handle of database `name`.
+    /// Wait until a writer queues for `h` behind the reader the caller
+    /// holds. The standard library's lock refuses new readers while a
+    /// writer waits (`try_read` fails then, which is also why monitoring
+    /// must not take a read guard), so that is the latch (review http#20:
+    /// it used to be a 100 ms sleep); the deadline is a hang guard.
+    fn wait_writer_queued(h: &DbCell) {
+        let until = Instant::now() + Duration::from_secs(60);
+        while h.slot.try_read().is_ok() {
+            assert!(
+                Instant::now() < until,
+                "the writer never queued for the database"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     fn served(server: &ApiServer, name: &str) -> DbHandle {
         Arc::clone(
             locked(&server.inner.state)
@@ -10911,7 +10927,7 @@ mod tests {
             let writer = std::thread::spawn(move || {
                 let _w = h2.write().unwrap();
             });
-            std::thread::sleep(Duration::from_millis(100));
+            wait_writer_queued(&h);
             check("a reader holds it and a writer waits");
             drop(shared);
             writer.join().unwrap();
@@ -10965,7 +10981,7 @@ mod tests {
             let writer = std::thread::spawn(move || {
                 let _w = h2.write().unwrap();
             });
-            std::thread::sleep(Duration::from_millis(100));
+            wait_writer_queued(&h);
             check("a reader holds it and a writer waits");
             drop(shared);
             writer.join().unwrap();
@@ -11022,7 +11038,7 @@ mod tests {
         let reader = h.read().unwrap();
         let h2 = Arc::clone(&h);
         let writer = std::thread::spawn(move || drop(h2.write().unwrap()));
-        std::thread::sleep(Duration::from_millis(100));
+        wait_writer_queued(&h);
         for _ in 0..5 {
             let t0 = Instant::now();
             let got = request_within(
