@@ -9,6 +9,8 @@
 //! (review durability#17: the default policy never reads an out-of-core
 //! tree, so a stale `vstree.kv` beside a new store went unnoticed).
 
+mod common;
+
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -70,30 +72,11 @@ fn assert_vstree_agrees(db: &mut Database, ctx: &str) {
     }
 }
 
-/// The temp directories the current test thread made, removed when the
-/// thread ends — also when the test fails (a thread-local's destructor runs
-/// after the unwinding).
-struct TmpDirs(std::cell::RefCell<Vec<std::path::PathBuf>>);
-
-impl Drop for TmpDirs {
-    fn drop(&mut self) {
-        for p in self.0.borrow().iter() {
-            // A directory, or a file (a store path).
-            let _ = std::fs::remove_dir_all(p).or_else(|_| std::fs::remove_file(p));
-        }
-    }
-}
-
-thread_local! {
-    static TMP_DIRS: TmpDirs = const { TmpDirs(std::cell::RefCell::new(Vec::new())) };
-}
-
+/// A fresh, empty directory for the test, removed when its thread ends —
+/// also when it fails (review tests-a#16: the shared helper of
+/// `tests/common` instead of this file's own copy of `TmpDirs`).
 fn tmp(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("gstore_dt_bulkcrash_{tag}_{}", std::process::id()));
-    TMP_DIRS.with(|t| t.0.borrow_mut().push(d.clone()));
-    let _ = fs::remove_dir_all(&d);
-    fs::create_dir_all(&d).unwrap();
-    d
+    common::tmp::thread_dir(&format!("dt_bulkcrash_{tag}"))
 }
 
 fn lubm_nt() -> PathBuf {
