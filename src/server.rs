@@ -4538,12 +4538,14 @@ mod tests {
     fn counters_are_read_whole() {
         let c = Arc::new(DbCounters::default());
         let stop = Arc::new(AtomicBool::new(false));
+        let reading = Arc::new(AtomicUsize::new(0));
         let readers: Vec<_> = (0..3)
             .map(|_| {
                 let (c, stop) = (Arc::clone(&c), Arc::clone(&stop));
+                let reading = Arc::clone(&reading);
                 thread::spawn(move || {
                     let mut n = 0u64;
-                    while !stop.load(Ordering::SeqCst) {
+                    loop {
                         let s = c.read();
                         // Every publish stores the same value everywhere.
                         assert_eq!(s.triples, s.entities);
@@ -4551,15 +4553,26 @@ mod tests {
                         assert_eq!(s.triples, s.predicates);
                         assert_eq!(s.triples, s.generation);
                         n += 1;
+                        if n == 1 {
+                            reading.fetch_add(1, Ordering::SeqCst);
+                        }
+                        if stop.load(Ordering::SeqCst) {
+                            return n;
+                        }
                     }
-                    n
                 })
             })
             .collect();
-        // Publish for a while, with every reader running meanwhile.
-        let t0 = Instant::now();
+        // Every reader is reading before the publishes start (a latch, not a
+        // time slice — review http#20); then a fixed number of publishes,
+        // with every reader running meanwhile.
+        let until = Instant::now() + Duration::from_secs(60);
+        while reading.load(Ordering::SeqCst) < 3 {
+            assert!(Instant::now() < until, "the readers never started");
+            thread::yield_now();
+        }
         let mut v = 0u64;
-        while t0.elapsed() < Duration::from_millis(150) {
+        while v < 200_000 {
             v += 1;
             c.store(CounterSnapshot {
                 triples: v,

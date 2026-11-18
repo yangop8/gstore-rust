@@ -9397,97 +9397,84 @@ mod tests {
     /// for an unknown user). That hash must run with the state lock released:
     /// otherwise every client sending bad credentials — no account needed —
     /// holds the server-wide lock for the whole hash, and every other request
-    /// (`/cancel`, `/tasklist`, …) queues behind it. Sampled directly: while
-    /// clients hammer bad credentials through Basic auth, `/login`, `/shutdown`
-    /// and the `/api` protocol, the state lock must be free nearly always.
+    /// (`/cancel`, `/tasklist`, …) queues behind it. Checked on every path
+    /// that takes credentials — Basic auth, `/login`, `/shutdown` and the
+    /// `/api` protocol: the hash is parked (a test hook) while the test
+    /// looks at the lock. review http#20: this used to sample the lock
+    /// while clients hammered it ("held in under a quarter of the samples").
     #[test]
     fn bad_credentials_never_hash_under_the_state_lock() {
+        use crate::http_users::test_hooks::park_verifications_of;
         let (server, addr) = start("pbkdf2_lock");
-        let stop = Arc::new(AtomicBool::new(false));
-        let bad = basic("nobody", "x");
-        let wrong = basic("root", "wrong");
-        let mut attackers = Vec::new();
-        for i in 0..3 {
-            let stop = Arc::clone(&stop);
-            let (bad, wrong) = (bad.clone(), wrong.clone());
-            attackers.push(std::thread::spawn(move || {
-                let mut n = 0usize;
-                while !stop.load(Ordering::Relaxed) {
-                    let (s, _) = match (i + n) % 5 {
-                        0 => {
-                            split_status_body(&raw_request(&addr, "GET", "/status", Some(&bad), ""))
-                        }
-                        1 => split_status_body(&raw_request(
-                            &addr,
-                            "GET",
-                            "/tasklist",
-                            Some(&wrong),
-                            "",
-                        )),
-                        2 => split_status_body(&raw_request(
-                            &addr,
-                            "POST",
-                            "/login",
-                            None,
-                            "username=root&password=wrong",
-                        )),
-                        3 => split_status_body(&raw_request(
-                            &addr,
-                            "POST",
-                            "/shutdown",
-                            None,
-                            "username=root&password=wrong",
-                        )),
-                        _ => split_status_body(&raw_request(
-                            &addr,
-                            "POST",
-                            "/api",
-                            None,
-                            r#"{"operation":"testConnect","username":"nobody","password":"x"}"#,
-                        )),
-                    };
-                    // 429: the account got locked out at this address
-                    // (failed logins; review http#6: the lockout covers
-                    // `/login` and Basic credentials, and answers 429 with
-                    // Retry-After — upstream's per-address 403 is the
-                    // upstream_login_lockout switch).
-                    assert!(
-                        s == 401 || s == 200 || s == 403 || s == 429,
-                        "unexpected status {s}"
-                    );
-                    n += 1;
-                }
-                n
-            }));
+        type Send = fn(&SocketAddr, &str) -> String;
+        let paths: [(&str, Send); 4] = [
+            ("Basic auth", |addr, name| {
+                raw_request(addr, "GET", "/tasklist", Some(&basic(name, "x")), "")
+            }),
+            ("/login", |addr, name| {
+                raw_request(
+                    addr,
+                    "POST",
+                    "/login",
+                    None,
+                    &format!("username={name}&password=x"),
+                )
+            }),
+            ("/shutdown", |addr, name| {
+                raw_request(
+                    addr,
+                    "POST",
+                    "/shutdown",
+                    None,
+                    &format!("username={name}&password=x"),
+                )
+            }),
+            ("/api", |addr, name| {
+                raw_request(
+                    addr,
+                    "POST",
+                    "/api",
+                    None,
+                    &format!(r#"{{"operation":"testConnect","username":"{name}","password":"x"}}"#),
+                )
+            }),
+        ];
+        for (i, (path, send)) in paths.into_iter().enumerate() {
+            // An unknown user each (one failure apiece: no lockout) — but
+            // `/shutdown` verifies only root's credentials (one wrong
+            // password does not lock root out either).
+            let name = if path == "/shutdown" {
+                "root".to_string()
+            } else {
+                format!("hash_lock_probe_{i}")
+            };
+            let park = park_verifications_of(&name);
+            let request = {
+                let name = name.clone();
+                std::thread::spawn(move || split_status_body(&send(&addr, &name)))
+            };
+            assert!(
+                park.wait_parked(Duration::from_secs(60)),
+                "{path}: the bad credentials were never verified"
+            );
+            assert!(
+                server.inner.state.try_lock().is_ok(),
+                "{path}: the state lock is held while bad credentials are hashed"
+            );
+            park.release();
+            let (s, b) = request.join().unwrap();
+            assert!(
+                [200, 401, 403].contains(&s) && !b.contains("\"StatusCode\":0"),
+                "{path}: refused: {s} {b}"
+            );
         }
-        // Let the attackers get going, then sample the lock for a while.
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let (mut samples, mut busy) = (0u32, 0u32);
-        let until = Instant::now() + std::time::Duration::from_millis(1500);
-        while Instant::now() < until {
-            samples += 1;
-            if server.inner.state.try_lock().is_err() {
-                busy += 1;
-            }
-            std::thread::sleep(std::time::Duration::from_micros(500));
-        }
-        // Authenticated requests are still served meanwhile (refused, 429,
-        // once the failed logins from this same address locked root out —
-        // review http#6).
+        // Authenticated requests are still served.
         let root = basic("root", "root");
-        let (s, _) = split_status_body(&raw_request(&addr, "GET", "/tasklist", Some(&root), ""));
-        assert!(s == 200 || s == 429, "{s}");
-        stop.store(true, Ordering::Relaxed);
-        let attempts: usize = attackers.into_iter().map(|h| h.join().unwrap()).sum();
-        assert!(attempts > 0);
-        assert!(
-            busy * 4 < samples,
-            "the state lock was held in {busy} of {samples} samples while bad credentials \
-             were being checked"
-        );
+        let (s, b) = split_status_body(&raw_request(&addr, "GET", "/tasklist", Some(&root), ""));
+        assert_eq!(s, 200, "{b}");
         assert!(
             server.inner.state.try_lock().is_ok(),
-            "the lock is free once the attackers stop"
+            "the lock is free once the requests are done"
         );
         server.shutdown();
     }
@@ -10796,8 +10783,12 @@ mod tests {
         ));
         assert!(warm.contains("\"tripleNum\":\"2\""), "{warm}");
         let h = served(&server, "mon");
+        // review http#20: the test holds the database for the whole check,
+        // so a request that waited for it would never be answered — the
+        // 30 s read timeout is a hang guard, not the assertion (this used
+        // to be "within a second").
         let check = |what: &str| {
-            let second = Duration::from_secs(1);
+            let guard = Duration::from_secs(30);
             for (method, target, body, expect) in [
                 ("GET", "/status", String::new(), "\"total_triples\":2"),
                 ("GET", "/monitor", String::new(), "\"triples\":2"),
@@ -10821,17 +10812,11 @@ mod tests {
                     "\"StatusCode\":0",
                 ),
             ] {
-                let t0 = Instant::now();
-                let got = request_within(&addr, method, target, Some(&auth), &body, second);
+                let got = request_within(&addr, method, target, Some(&auth), &body, guard);
                 let (s, b) =
                     got.unwrap_or_else(|| panic!("{method} {target} {body} waited ({what})"));
                 assert_eq!(s, 200, "{target}: {b}");
                 assert!(b.contains(expect), "{target} ({what}): {b}");
-                assert!(
-                    t0.elapsed() < second,
-                    "{target} took {:?} ({what})",
-                    t0.elapsed()
-                );
             }
         };
         {
@@ -10875,8 +10860,10 @@ mod tests {
             .db
             .query("INSERT DATA { <http://ex/c> <http://ex/p> <http://ex/d> }")
             .unwrap();
+        // (As above, review http#20: the database is held throughout, the
+        // timeout is a hang guard.)
         let check = |what: &str| {
-            let second = Duration::from_secs(1);
+            let guard = Duration::from_secs(30);
             for (body, expect) in [
                 (monitor.clone(), "\"tripleNum\":\"3\""),
                 (
@@ -10884,12 +10871,10 @@ mod tests {
                     "\"StatusCode\":0",
                 ),
             ] {
-                let t0 = Instant::now();
-                let got = request_within(&addr, "POST", "/api", Some(&auth), &body, second);
+                let got = request_within(&addr, "POST", "/api", Some(&auth), &body, guard);
                 let (s, b) = got.unwrap_or_else(|| panic!("{body} waited ({what})"));
                 assert_eq!(s, 200, "{b}");
                 assert!(b.contains(expect), "{what}: {b}");
-                assert!(t0.elapsed() < second, "{what}: took {:?}", t0.elapsed());
             }
         };
         {
@@ -11116,21 +11101,22 @@ mod tests {
         let long_read = std::thread::spawn(move || {
             let _r = h2.read().unwrap();
             held_tx.send(()).unwrap();
-            // Bounded: a read that waits for this one fails the test below
-            // instead of hanging it.
-            rx.recv_timeout(Duration::from_secs(5)).ok();
+            // Held until the read below is done. Bounded: a read that waits
+            // for this one would find the settings synced once it gets the
+            // database, and fail the test below instead of hanging it
+            // (review http#20: that, not a one-second bound, is the
+            // assertion).
+            rx.recv_timeout(Duration::from_secs(60)).ok();
         });
         held_rx.recv().unwrap();
         server.inner.apply_query_settings(new);
-        let t0 = Instant::now();
         {
             let slot = server.inner.read_synced(&h).unwrap();
-            assert!(
-                t0.elapsed() < Duration::from_secs(1),
-                "the read waited {:?} for the other read",
-                t0.elapsed()
+            assert_eq!(
+                slot.db.query_settings(),
+                old,
+                "busy: not synced yet (a read that waited for the other read would have synced)"
             );
-            assert_eq!(slot.db.query_settings(), old, "busy: not synced yet");
         }
         tx.send(()).unwrap();
         long_read.join().unwrap();
@@ -11485,13 +11471,12 @@ mod tests {
             integer_division: IntegerDivision::Truncate,
             ..old
         };
-        let t0 = Instant::now();
+        // The readers are parked in the gate until it opens below: installing
+        // settings that waited for them would only return once the gate's
+        // hang guard let them go, and they would then be applied — so "not
+        // yet" is the assertion (review http#20: it used to be a one-second
+        // bound).
         server.inner.apply_query_settings(new);
-        assert!(
-            t0.elapsed() < Duration::from_secs(1),
-            "installing settings waited for the readers ({:?})",
-            t0.elapsed()
-        );
         assert_eq!(h.read().unwrap().db.query_settings(), old, "not yet: busy");
         gate.open();
         for r in readers {
