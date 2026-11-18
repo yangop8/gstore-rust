@@ -268,3 +268,51 @@ fn a_cache_file_readable_by_others_is_not_trusted() {
         "a cache file other users can read or write was reused"
     );
 }
+
+/// Round-5 review follow-up (cluster-nlqa#22): only the mode bits were
+/// checked, through `metadata` (which follows links). A symbolic link to a
+/// private file elsewhere was followed and trusted, and so was a `0600` file
+/// owned by another user whenever the process could read it (as root). Both
+/// are rebuilt now, not reused.
+#[cfg(unix)]
+#[test]
+fn a_planted_link_or_a_file_of_another_user_is_not_trusted() {
+    let dir = TempDir::new("linker-cache-owner");
+    let cache = LinkerCache::new(dir.path().join("cache"));
+    build(&PagedKb::new(10), &cache);
+    let file = std::fs::read_dir(dir.path().join("cache"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|x| x == "json"))
+        .expect("the cache file");
+
+    // A symlink in its place, to a well-formed private file of this user.
+    let target = dir.path().join("elsewhere.json");
+    std::fs::rename(&file, &target).unwrap();
+    std::os::unix::fs::symlink(&target, &file).unwrap();
+    let kb = PagedKb::new(10);
+    build(&kb, &cache);
+    assert_eq!(
+        kb.label_queries().len(),
+        3,
+        "a planted symlink was followed"
+    );
+
+    // A 0600 file owned by another user: only root can make one, and only a
+    // process that can read another user's private file is at risk.
+    let probe = std::fs::File::create(dir.path().join("probe")).unwrap();
+    let as_root = std::os::unix::fs::fchown(&probe, Some(65534), None).is_ok();
+    drop(probe);
+    if as_root {
+        std::os::unix::fs::chown(&file, Some(65534), None).unwrap();
+        let kb = PagedKb::new(10);
+        build(&kb, &cache);
+        assert_eq!(
+            kb.label_queries().len(),
+            3,
+            "a 0600 cache file owned by another user was trusted"
+        );
+    } else {
+        eprintln!("not root: the foreign-owner case needs chown and is skipped");
+    }
+}

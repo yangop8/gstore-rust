@@ -475,21 +475,51 @@ impl LinkerCache {
     /// The cached labels for `fingerprint`, if present, readable, current
     /// (younger than the maximum age), private and well-formed.
     ///
-    /// On Unix a file that grants group or other users any access is not
-    /// trusted: [`store`](Self::store) only writes `0600` files, so such a
-    /// file was not written by this user's gnlqa (for example, it was
-    /// planted in a shared cache directory) and its labels would steer
-    /// entity linking.
+    /// On Unix only a file this user's gnlqa can have written is trusted:
+    /// [`store`](Self::store) writes regular `0600` files owned by the
+    /// process's effective user. A symbolic link, a file owned by another
+    /// user (even with mode `0600`: a process running as root can read it)
+    /// or one that grants group or other users any access was not written
+    /// by it — for example, it was planted in a shared cache directory — and
+    /// its labels would steer entity linking. The checks are made on the
+    /// opened file, so a file swapped in between is refused too.
     pub fn load(&self, fingerprint: &str) -> Option<LinkerLabels> {
+        use std::io::Read as _;
         let path = self.path(fingerprint);
-        let meta = std::fs::metadata(&path).ok()?;
+        // The directory entry itself (not followed): a regular file, so
+        // opening it neither follows a link nor blocks on a planted FIFO.
+        let entry = std::fs::symlink_metadata(&path).ok()?;
+        if !entry.file_type().is_file() {
+            eprintln!(
+                "gnlqa: warning: ignoring the linker cache file {}: it is not a regular file",
+                path.display()
+            );
+            return None;
+        }
+        let mut file = std::fs::File::open(&path).ok()?;
+        let meta = file.metadata().ok()?;
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            if meta.permissions().mode() & 0o077 != 0 {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let why = if (meta.dev(), meta.ino()) != (entry.dev(), entry.ino()) {
+                Some("it was replaced while it was opened".to_string())
+            } else if meta.uid() != effective_uid() {
+                Some(format!(
+                    "it is owned by user {}, not by this process's user {}",
+                    meta.uid(),
+                    effective_uid()
+                ))
+            } else if meta.permissions().mode() & 0o077 != 0 {
+                Some(
+                    "it is accessible to other users (gnlqa writes these files with mode 0600)"
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+            if let Some(why) = why {
                 eprintln!(
-                    "gnlqa: warning: ignoring the linker cache file {}: it is accessible to \
-                     other users (gnlqa writes these files with mode 0600)",
+                    "gnlqa: warning: ignoring the linker cache file {}: {why}",
                     path.display()
                 );
                 return None;
@@ -499,7 +529,8 @@ impl LinkerCache {
         if age >= self.max_age {
             return None;
         }
-        let bytes = std::fs::read(&path).ok()?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).ok()?;
         let c: CachedLabels = serde_json::from_slice(&bytes).ok()?;
         let sane =
             |v: &[(String, String)]| v.iter().all(|(u, _)| crate::schema::checked_iri(u).is_ok());
@@ -558,6 +589,17 @@ impl LinkerCache {
         }
         Ok(())
     }
+}
+
+/// The process's effective user id (what owns the files it creates).
+#[cfg(unix)]
+fn effective_uid() -> u32 {
+    extern "C" {
+        fn geteuid() -> u32;
+    }
+    // SAFETY: geteuid takes no arguments, cannot fail and touches no memory
+    // of the caller.
+    unsafe { geteuid() }
 }
 
 /// Build a `FILTER` disjunction over language tags: always allows no-language
