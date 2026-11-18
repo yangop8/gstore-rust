@@ -110,6 +110,22 @@ format change, no API removed):
   `#[cfg(test)]` parse hook in `http_api.rs` (no code in release builds).
 - Test temp directories in the `server.rs`, `http_client.rs` and
   `gapi/tasks.rs` test modules are unique and removed on drop.
+- Round-5 review follow-ups of the rewritten tests (test-only):
+  `bad_credentials_never_hash_under_the_state_lock` parked every
+  verification of `root` for its `/shutdown` case, so another test
+  server's uncached root login could satisfy `wait_parked` while this
+  request had not reached its hash; the new doc-hidden hook
+  `http_users::test_hooks::park_verification_attempt(name, secret)` parks
+  only one presented secret's verification and the `/shutdown` case sends
+  a wrong password no other test sends
+  (`http_users::tests::an_attempt_park_holds_only_its_own_secret`, which
+  fails with a park keyed by the name alone). `post_to_a_closed_port_fails_fast`
+  and `callbacks_report_delivery_failures`' transport-error case connect to
+  port 0 (refused at once; nothing can listen on it) instead of a port
+  bound and released, which a server of a parallel test could take
+  (tests-a#7); the callback case also checks the failure is not an address
+  error. The doc line of the `served` test helper in `http_api.rs` is back
+  above it (the http#20 hunk had split it from its function).
 
 ## GAP_PLAN status line
 
