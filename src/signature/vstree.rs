@@ -1060,8 +1060,16 @@ mod tests {
 
     // ---- out-of-core VS-tree (task 1) -------------------------------------
 
+    /// A store path unique to this process and call (review disk#13: the
+    /// fixed `gstore_vstree_disk_<tag>.kv` was shared by concurrent test
+    /// processes).
     fn diskvs_tmp(tag: &str) -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("gstore_vstree_disk_{tag}.kv"));
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!(
+            "gstore_vstree_disk_{tag}_{}_{n}.kv",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&p);
         let mut wal = p.clone().into_os_string();
         wal.push(".wal");
