@@ -31,8 +31,12 @@ thread_local! {
     static TMP_DIRS: TmpDirs = const { TmpDirs(std::cell::RefCell::new(Vec::new())) };
 }
 
+/// review tests-b#9: unique to the process and call (the fixed
+/// `gstore_persist_<tag>` was shared by concurrent runs).
 fn tmp(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("gstore_persist_{tag}"));
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let d = std::env::temp_dir().join(format!("gstore_persist_{tag}_{}_{n}", std::process::id()));
     TMP_DIRS.with(|t| t.0.borrow_mut().push(d.clone()));
     let _ = fs::remove_dir_all(&d);
     d

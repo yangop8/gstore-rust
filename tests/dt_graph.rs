@@ -171,7 +171,9 @@ fn clear_named_graph_and_clear_all() {
 
 #[test]
 fn named_graphs_persist_across_save_load() {
-    let dir = std::env::temp_dir().join("gstore_graph_test.db");
+    // review tests-a#6: unique to the process (the fixed name was shared by
+    // concurrent runs).
+    let dir = std::env::temp_dir().join(format!("gstore_graph_test_{}.db", std::process::id()));
     remove_when_done(dir.clone());
     let _ = std::fs::remove_dir_all(&dir);
     {
