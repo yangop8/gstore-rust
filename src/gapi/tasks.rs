@@ -2122,15 +2122,15 @@ mod tests {
         );
         drop(listener);
 
-        // Allowed, a transport error (nothing listens) is retried, then
-        // reported.
-        let port = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap().port()
-        };
-        let status = deliver(config(true), format!("http://127.0.0.1:{port}/cb"));
+        // Allowed, a transport error (nothing listens: port 0, which nothing
+        // can listen on — a port bound and released here could be taken by
+        // a server another test binds meanwhile, round-5 review follow-up of
+        // tests-a#7) is retried, then reported.
+        let status = deliver(config(true), "http://127.0.0.1:0/cb".to_string());
         assert!(
-            status.starts_with("failed:") && !status.contains("host-local"),
+            status.starts_with("failed:")
+                && !status.contains("host-local")
+                && !status.contains("invalid"),
             "{status}"
         );
 

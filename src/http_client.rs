@@ -1521,10 +1521,11 @@ mIjSMKbBFgquUgIhAPHupNklmfNjoKbt7eKBPIKOTzsJbKSpBaMVuL/X4bNv
     /// against a 2 s deadline.
     #[test]
     fn post_to_a_closed_port_fails_fast() {
-        let port = {
-            let l = TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap().port()
-        };
+        // Port 0, which nothing can listen on (round-5 review follow-up of
+        // tests-a#7): a port bound and released here could be handed to a
+        // server another test of this binary binds meanwhile, which would
+        // then answer instead of refusing.
+        let port = 0;
         let opts = PostOptions {
             limits: Limits {
                 total: Duration::from_secs(60),
