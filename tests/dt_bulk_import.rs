@@ -276,14 +276,40 @@ fn blank_nodes_and_graph_labels_follow_the_memory_build() {
         Database::build_from_sources("m", &srcs, &ImportOptions::strict(), &mut ()).unwrap();
     let mut db = Database::open(&dir).unwrap();
     let mut mem = mem;
-    for q in [
-        "SELECT (COUNT(DISTINCT ?s) AS ?n) WHERE { ?s <http://e/p> ?o }",
-        "SELECT ?o WHERE { ?s <http://e/p> ?o } ORDER BY ?o",
-        "SELECT ?o WHERE { GRAPH ?g { ?s <http://e/p> ?o } . ?g <http://e/r> ?about }",
+    // review tests-a#4: the answers were compared by row count only — a
+    // COUNT has one row whatever it counts — so a scoping regression shared
+    // by both builds passed. The answers are pinned now, and the bulk build
+    // must give exactly the memory build's rows: two distinct subjects in
+    // the default graph (a.nt's `_:b` and b.nt's `_:b`; one if the two
+    // documents' labels were merged — g.nq's `_:x` is in graph `_:g`), and
+    // the blank graph label `_:g` is the subject of the graph's description.
+    let cells = |rows: Vec<Vec<Option<String>>>| -> Vec<String> {
+        rows.into_iter()
+            .map(|r| {
+                r.into_iter()
+                    .map(Option::unwrap_or_default)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect()
+    };
+    for (q, want) in [
+        (
+            "SELECT (COUNT(DISTINCT ?s) AS ?n) WHERE { ?s <http://e/p> ?o }",
+            vec!["\"2\"^^<http://www.w3.org/2001/XMLSchema#integer>"],
+        ),
+        (
+            "SELECT ?o WHERE { ?s <http://e/p> ?o } ORDER BY ?o",
+            vec!["\"one\"", "\"two\""],
+        ),
+        (
+            "SELECT ?o WHERE { GRAPH ?g { ?s <http://e/p> ?o } . ?g <http://e/r> ?about }",
+            vec!["\"three\""],
+        ),
     ] {
-        let x = db.select(q).unwrap().rows;
-        assert_eq!(x.len(), mem.select(q).unwrap().rows.len(), "{q}");
-        assert!(!x.is_empty(), "{q}");
+        let x = cells(db.select(q).unwrap().rows);
+        assert_eq!(x, cells(mem.select(q).unwrap().rows), "bulk vs memory: {q}");
+        assert_eq!(x, want, "{q}");
     }
     assert_eq!(db.entity_num(), mem.entity_num());
     assert_eq!(db.triple_num(), 4);
