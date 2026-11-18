@@ -8607,6 +8607,22 @@ pub fn dictionary_string_index(dict: &Dictionary) -> Option<Arc<StringIndex>> {
 /// between two cancellation checks.
 const STRING_INDEX_POLL: usize = 1024;
 
+std::thread_local! {
+    /// See [`string_index_builds`].
+    static STRING_INDEX_BUILDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many dictionary substring indexes
+/// [`dictionary_string_index_cancellable`] started to build on this thread
+/// so far (a dictionary too small or out of core for one does not count). A
+/// work counter for tests (round-4 review of design#9's fix: a
+/// [`ConcurrentDb`](crate::ConcurrentDb) base snapshot's cached index), not
+/// an API.
+#[doc(hidden)]
+pub fn string_index_builds() -> u64 {
+    STRING_INDEX_BUILDS.with(std::cell::Cell::get)
+}
+
 /// [`dictionary_string_index`] for a request with a cancel flag: a raised
 /// `cancel` stops the build — checked every 1,024 terms —
 /// with [`GStoreError::Cancelled`] (review conc#5). `Ok(None)` when no index
@@ -8618,6 +8634,7 @@ pub fn dictionary_string_index_cancellable(
     if dict.is_disk_backed() || dict.entity_num() + dict.literal_num() < STRING_INDEX_MIN_ENTRIES {
         return Ok(None);
     }
+    STRING_INDEX_BUILDS.with(|c| c.set(c.get().saturating_add(1)));
     string_index::poll(cancel)?;
     // A candidates-only index (the FILTER checks every candidate): each form
     // is posted as it is computed, and no copy of it is kept.

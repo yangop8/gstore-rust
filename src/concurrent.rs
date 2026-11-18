@@ -1476,8 +1476,19 @@ impl VersionView<'_> {
         let base = &self.db.base;
         let csr = || base.csr.get_or_build(0, || CsrGraph::build(&base.store));
         // The base's index when the dictionary is the base's (same
-        // generation), else one built for this query.
-        let string_index = || base.string_index.get(&dict, None);
+        // generation), else one built for this query — and never put into
+        // the base's cell, which keeps the first index it is asked for: a
+        // view over another state asking first left base-state views and
+        // reads rebuilding the index on every substring query (round-4
+        // review of design#9's fix).
+        let own_dict = dict.generation() == base.dict.generation();
+        let string_index = || {
+            if own_dict {
+                base.string_index.get(&dict, None)
+            } else {
+                crate::query::engine::dictionary_string_index(&dict)
+            }
+        };
         let mut eval = Evaluator::new(&dict, &store).with_settings(
             latest.settings.clone(),
             EvalProviders {

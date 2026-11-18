@@ -71,7 +71,14 @@ Behaviour changes first:
   index across queries (seeded from the database's cached one) instead of
   rebuilding it per CONTAINS/REGEX query; `WITH` / `USING` updates use the
   database's substring index; a `ConcurrentDb` version view whose state is
-  the base snapshot's uses its cached CSR. `Evaluator::with_vstree` reuses
+  the base snapshot's uses its cached CSR. Round-4 review fix: a version
+  view over another state (one that interned new terms) builds its own
+  index and no longer fills the base snapshot's cell, which keeps the first
+  index it is asked for — a view over a newer state asking first left
+  every base-state read rebuilding the index per substring query
+  (`tests/concurrent_base_string_index_stays_cached.rs`, counted with the
+  doc-hidden per-thread work counter
+  `query::engine::string_index_builds()`). `Evaluator::with_vstree` reuses
   `new`'s struct literal.
 - New `tests/executor_differential.rs` (review query#17 / design#10): the
   materializing and the streaming executors (with and without `LIMIT`,
