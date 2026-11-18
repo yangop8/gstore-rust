@@ -52,7 +52,16 @@ Behaviour changes first.
   anew). Before, every
   request opened the database (or read its whole snapshot), made a pass over
   its data and held its name busy meanwhile, refusing a concurrent `load`
-  by root and a second `monitor` (1007).
+  by root and a second `monitor` (1007). Round-4 review fix: the
+  statistics are cached only under the files they were read from — a
+  snapshot's files are fingerprinted before the read too and the result
+  is cached only when both prints agree, and for the locked layouts this
+  process's share of the directory lock is held from the open to the
+  fingerprint — so a writer between the read and the fingerprint (a save
+  of the snapshot by another process, a `gadd` the moment the lock was
+  free) no longer leaves the old statistics cached under the new files'
+  print (`tests/unloaded_statistics_follow_the_files.rs`, through the
+  doc-hidden test hook `gapi::set_unloaded_stats_hook`).
 - **Creating a database handle no longer holds the server-wide state lock
   during the directory walk** (review http#13, conc#7): REST `/load`,
   `/build`, `/upload` (into an unloaded or a new name), `/restore`, the

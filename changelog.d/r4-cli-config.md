@@ -30,7 +30,12 @@
   it), and removes a directory it created only under that claim and only
   while it holds no database. Another process holding the directory makes
   `gbuild` fail at once with status 1 ("cannot build '…': … locked by
-  another process"), touching nothing.
+  another process"), touching nothing. Without `--force`, a directory that
+  was new when `gbuild` checked it is checked again once claimed (round-4
+  review: a database another process created, built and released between
+  the check and the claim was rebuilt instead of refused): anything there
+  besides the claim's lock file is refused with the usual "already exists"
+  message and left alone.
 - **`gbuild` keeps a database it built when its summary cannot be
   printed** (review bulkcli#3). The database is marked as kept as soon as
   the build (or save, or install) succeeded, before any output; the
@@ -87,7 +92,19 @@
   the output is ready (a writable file in a directory where no file can be
   created too). The first version of this change renamed its temporary
   file over the link, the FIFO and — run as root — the device, and gave
-  the result the default mode; fixed before hand-over.
+  the result the default mode; fixed before hand-over. Round-4 review
+  fixes: the temporary file is created private (`0600`) and given the
+  replaced file's owner and mode only once its content is complete (it was
+  created `0644` under the usual umask, so output meant for a private
+  `0600` file could be opened by another user until the mode was copied);
+  and `gexport -z` writes its archive the same way (it went through a
+  fixed `<archive>.part`, opened truncating and following a symbolic link
+  — a link planted there had its target overwritten — and renamed over the
+  unresolved path, turning a link to the archive into a regular file).
+  `zipio::pack_file` / `pack_dir` (the library's and `/api`'s archives)
+  write `<dest>.part-<pid>-<n>`, created exclusively, and replace the file
+  a symbolic-link destination names; new `zipio::pack_file_to` packs into
+  a writer the caller commits.
 - **`gserver` answers invalid arguments with exit status 2** (review
   bulkcli#18), as every other tool does (it was `1`, which a script or a
   service manager could not tell from a failed start). `0` success and `1`
@@ -108,9 +125,26 @@
   the root password`) used to read `s3cret` and now reads the whole text,
   as upstream reads it — it only seeds a new user store, and such a value
   is now a startup warning that does not quote the password ("the value
-  of 'root_password' holds a '#' or ';' standing as a word of its own; all
-  of it is the value …"). Upstream files, which have no inline comments,
-  parse as before. New `Ini::inline_comments()`. The shipped example's header
+  of 'root_password' holds a '#' or ';' after whitespace; all of it is the
+  value …"). **Behaviour change for existing gstore-rust files, every
+  key** (round-4 review): the old rule also cut at a marker glued to the
+  next word, the new one keeps it — `db_home=/srv/gstore #primary` read
+  `/srv/gstore` and now reads `/srv/gstore #primary`, `backup_path=./backups
+  ;nightly` likewise, and `ip_deny_path=./conf/ipDeny.config #blocked`
+  names a file that does not exist. Each such value is now a startup
+  warning naming the line, the key and the kept text ("'#primary' after
+  the value of 'db_home' is part of the value, as upstream gStore reads it
+  (earlier gstore-rust versions read it as a comment; …)"); for
+  `root_password` the warning does not quote it. Put whitespace after the
+  marker (or the comment on a line of its own) to keep a comment, or quote
+  the value to keep the text. `gserver` also warns at startup about a
+  configured `ip_allow_path` / `ip_deny_path` it cannot read (missing, a
+  directory, unreadable), with the effect — an empty allow list lets no
+  address in, an empty deny list keeps none out (new
+  `IpFilter::list_file_warnings`); a deny list missing at its built-in
+  place (`./conf/ipDeny.config`, the out-of-the-box state) is not
+  reported. Upstream files, which have no inline comments, parse as
+  before. New `Ini::inline_comments()`. The shipped example's header
   illustrates the rule with a `thread_num` line: upstream's test scripts
   take the port from the first line containing `port=`, so no comment may
   contain `port=` above `[server] port` (a first draft did, and broke every
@@ -165,7 +199,23 @@
   zipped `gexport`, output destinations that are links, FIFOs, private or
   read-only files, `gserver`'s usage status, the failpoint report) and
   `tests/zip_central_directory_bound.rs` (peak resident set before a
-  400,000-entry package is refused; its own binary); unit tests in
+  400,000-entry package is refused; its own binary). Round-4 review fixes,
+  each failing before its fix: `tests/conf_ini_upgrade_warnings.rs` and
+  `config::tests::a_value_earlier_versions_cut_at_a_glued_marker_is_kept_and_reported`
+  (glued-marker warnings, unreadable IP lists in `gserver`'s startup
+  output); `tests/gbuild_rechecks_a_new_name_under_its_claim.rs` (a
+  debug-build hook, `GSTORE_GBUILD_PARK_BEFORE_CLAIM=<fifo>`, parks
+  `gbuild` between its check and its claim while the test builds the same
+  name); `tests/cli_output_files_are_private_until_complete.rs` (the
+  temporary file's mode; with `--features zip`, `gexport -z` through a
+  link and past a planted `out.zip.part`); `zipio`'s
+  `archives_never_write_through_a_planted_part_and_keep_a_link`.
+  `cli_failure_paths::conf_ini_inline_comments_follow_the_documented_rule`
+  asserted that the glued `root_password = Tr0ub4dor #3` and `db_home =
+  /srv/a ;b` give no warning — corrected (comment `review` in the test,
+  convention 13b). The `unzip-tmp-0` checks of `tests/dt_zip_io.rs`, vacuous
+  since bulkcli#6, scan by prefix again (gadd, gsub, gbuild and refused
+  packages); unit tests in
   `src/config.rs` (the shipped example keeps `port=9000` the first
   `port=` line), `src/zipio.rs` (end-record parsing; a zip64 record the
   reader would skip is not counted; short entry names) and
@@ -187,7 +237,17 @@ none
     ` # ` or ` ; ` as a word. Upgrade note: a `root_password` line with a
     note after the value (`root_password="pw"  # …`) now sets the whole
     text, as upstream does (it seeds a new user store only; a startup
-    warning says so without quoting it) — remove such notes.
+    warning says so without quoting it) — remove such notes. Upgrade
+    note, every key (round-4 review): a note glued to its marker after a
+    value (`db_home=/srv/gstore #primary`, `backup_path=./backups
+    ;nightly`, `ip_deny_path=./conf/ipDeny.config #blocked`) was cut by
+    earlier gstore-rust versions and is part of the value now, as
+    upstream reads it — a database home, backup directory or IP list
+    path can move on upgrade; each such line is a startup warning. Put a
+    space after the marker, or the note on its own line. `gserver` also
+    warns about a configured `ip_allow_path` / `ip_deny_path` it cannot
+    read (an empty allow list admits nobody, an empty deny list denies
+    nobody).
   - Precedence: command-line flag > `conf.ini` > built-in default — except
     that the environment variables `GSTORE_DISK_QUERY_MODE`,
     `GSTORE_DISK_CACHE_MB`, `GSTORE_VSTREE_ON_OPEN`, `GSTORE_ID_RECLAIM` and
@@ -217,7 +277,8 @@ none
   - Exit statuses: `gserver` now uses `2` for invalid arguments, like the
     other tools (`0` success, `1` failure, `2` invalid arguments; `gbuild`
     `3` built with skipped statements).
-  - `gquery -f FILE` and `gexport` write `<dest>.part-<pid>-<n>` and rename
+  - `gquery -f FILE` and `gexport` (also with `-z`) write
+    `<dest>.part-<pid>-<n>` — private (`0600`) until complete — and rename
     it over the destination once complete: a failure leaves the previous
     file. A crash may leave such a `.part-*` file behind (safe to delete).
     A symbolic link keeps pointing at its file (which is replaced, keeping
@@ -306,17 +367,11 @@ none
   "bulkcli#1"); this package added the concurrent-gbuild, failed-print,
   conf.ini-warning and `gquery -f` failure tests and made the kill test
   load-independent.
-- Residual window of bulkcli#2, recorded for docs/REFACTOR_BACKLOG.md
-  (not changed: no deterministic test is possible, D6): `gbuild` decides
-  "the directory is new" (`holds_data`) just before it claims the
-  directory, two adjacent statements. If another process created, built
-  and released the same new name entirely between them (microseconds; a
-  real build takes far longer, and while it runs its lock file makes the
-  directory non-empty, so the second `gbuild` is refused), a second
-  `gbuild` without `--force` would rebuild that database instead of
-  refusing; it never deletes it (the cleanup removes only a directory that
-  holds no database, under the claim). A fix would re-check
-  `Database::storage_kind` under the claim and refuse without `--force`.
+- Residual window of bulkcli#2 (`gbuild` decided "the directory is new"
+  just before it claimed it): closed in the round-4 review fixes — the
+  check is repeated under the claim, with a deterministic test through a
+  debug-build park hook (see Changelog). Nothing for
+  docs/REFACTOR_BACKLOG.md.
 - Observed, not this package's: `tests/rdf_parser_conformance.rs`
   `jsonld_node_contexts_and_context_arrays_add_layers_not_copies` (review
   parser#7, r3-parser) is a wall-clock ratio test that fails under load —
@@ -330,7 +385,6 @@ none
   filter it; a work counter (context layers created) would be
   load-independent.
 - The `tests/dt_zip_io.rs` assertions `!dir.join("z.db.unzip-tmp-0").exists()`
-  (and the `-0` variants) became vacuous with the new scratch names; the
-  new `gbuild_unpacks_into_a_fresh_scratch_directory_after_taking_the_lock`
-  checks that no `*.unzip-tmp*` is left. r5-test-hygiene may update them to
-  a prefix scan.
+  (and the `-0` variants), vacuous with the new scratch names, were
+  replaced by a prefix scan in the round-4 review fixes (gadd, gsub,
+  gbuild, refused packages); nothing left for r5-test-hygiene here.

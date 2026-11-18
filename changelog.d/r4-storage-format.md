@@ -36,7 +36,12 @@
   appended the new tree after the old one (three builds of 5,000 entities
   grew the file to 671,744, 1,339,392 and 2,007,040 bytes) and replayed a
   stale `<path>.wal` into it. Production paths already built under a fresh
-  temporary name; library callers are affected.
+  temporary name; library callers are affected. Round-4 review fix: the
+  public streaming writer `VsTree::write_disk_sorted` replaces the file
+  with its write-ahead log too (it truncated the file in place and left
+  the log, whose stale batch the next open replayed into the new file — a
+  streamed write of 10 entities opened as an empty tree);
+  `building_drops_a_stale_write_ahead_log` covers it.
 - **Behaviour change (review robust#11): a corrupt VList is a read error.**
   `DiskStore::try_o_by_sp` reports a compacted `sp2o_vlist` record that does
   not decode, or one with an unknown tag, as `io::ErrorKind::InvalidData`

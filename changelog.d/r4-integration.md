@@ -97,6 +97,35 @@ refuses blank nodes there now (r4-db-graph's request); `src/bulk/commit.rs`'
 docs link `DirLock` by its path (the `-D warnings` rustdoc job failed on
 the merged tree and on r4-cli-config's branch).
 
+**Round-4 review fixes** (the confirmed findings of the review of the
+merged round; each is described in the fragment of the package whose
+change it corrects, with its test, which fails before the fix):
+
+- conf.ini values earlier gstore-rust versions cut at a glued comment
+  (`db_home=/srv/gstore #primary`, `ip_deny_path=… #blocked`) are kept as
+  upstream reads them and now reported at startup, `root_password`
+  included; `gserver` reports an unreadable `ip_allow_path` /
+  `ip_deny_path` (r4-cli-config).
+- `gbuild` without `--force` checks a new name again under its claim;
+  temporary outputs of `gquery -f` / `gexport` are `0600` until complete;
+  `gexport -z` writes its archive like a plain export, and
+  `zipio::pack_file` / `pack_dir` use an exclusive temporary name and keep
+  a symbolic-link destination; `tests/dt_zip_io.rs` checks the zip scratch
+  cleanup of gadd / gsub / gbuild again (r4-cli-config).
+- `VsTree::write_disk_sorted` replaces a file together with its WAL
+  (r4-storage-format).
+- A detached database's `save` decides on its rules before it writes its
+  snapshot; one budget of `pfn_fuel_per_query` per request, shared by the
+  operations of an UPDATE (r4-ext-docs).
+- `monitor` / `schema` cache an unloaded database's statistics only under
+  the files they were read from (r4-api-hygiene).
+- A `ConcurrentDb` version view over another state no longer takes over
+  the base snapshot's substring-index cell (r4-sparql-guard).
+- `update.log` records written by earlier versions replay with the
+  readings those versions had; the exact single-blank-node delete
+  (`FILTER(sameTerm(?o, _:x))`) is documented and pinned, the `isBlank`
+  example corrected (r4-db-graph).
+
 No standalone `upstream-compat` startup line and no `scripts/conformance.sh`
 change came with round 4: no package added a compat switch, so there was
 nothing to fold into `GStoreConfig::upstream_compat_warnings` (convention
@@ -227,12 +256,9 @@ toolchain 1.99.1, `CARGO_PROFILE_{DEV,TEST}_DEBUG=0`,
 
 ## Requests/Not yet
 
-- For r5-test-hygiene (r4-cli-config's note, not changed here):
-  `tests/dt_zip_io.rs`' assertions `!dir.join("z.db.unzip-tmp-0").exists()`
-  became vacuous with the unpredictable scratch names; r4-cli-config's
-  `gbuild_unpacks_into_a_fresh_scratch_directory_after_taking_the_lock`
-  checks that no `*.unzip-tmp*` is left, but the old assertions want a
-  prefix scan.
+- (Done in the round-4 review fixes, nothing left for r5-test-hygiene:)
+  `tests/dt_zip_io.rs`' vacuous `unzip-tmp-0` assertions scan by prefix
+  now.
 - For r5-console (r4-ext-docs' note): ext#14's local-console cases
   (`gconsole --local` snapshot updates lost on quit, statements split at
   `;`) belong with ext#5 / ext#9.
