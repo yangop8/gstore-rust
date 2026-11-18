@@ -322,7 +322,11 @@ fn commit_does_not_wait_for_a_long_snapshot_query() {
         &tid,
         "INSERT DATA { <http://ex/n> <http://ex/p> <http://ex/m> }",
     );
-    let expired_before = gstore::http_api::expired_snapshot_reads();
+    // review tests-b#10: this server's count. The process-wide
+    // `gstore::http_api::expired_snapshot_reads()` also counts the reads the
+    // other tests of this binary expire at their own commits, concurrently:
+    // it could move while this read never expired.
+    let expired_before = srv.server.expired_snapshot_reads();
     let reader = {
         let srv = Arc::clone(&srv);
         thread::spawn(move || srv.req("POST", "/sparql?db_name=l", LONG_ASK))
@@ -349,7 +353,7 @@ fn commit_does_not_wait_for_a_long_snapshot_query() {
     );
     // The read expired (and re-runs on the live database): cancel it.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while gstore::http_api::expired_snapshot_reads() == expired_before {
+    while srv.server.expired_snapshot_reads() == expired_before {
         assert!(Instant::now() < deadline, "the snapshot read never expired");
         thread::sleep(Duration::from_millis(10));
     }
