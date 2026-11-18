@@ -1385,6 +1385,11 @@ impl ReadSnapshot {
                 "updates cannot run against a transaction's read snapshot".into(),
             )));
         }
+        // The caller's PFN fuel count starts from zero for this read (a
+        // retried read gets a new one); the evaluator keeps it (see
+        // `Evaluator::with_settings`).
+        let request_pfn = pfn.map(crate::pfn::PfnCaller::for_query);
+        let pfn = request_pfn.as_ref();
         let q = stmt.query();
         match &self.store {
             SnapStore::Mem(store) => {

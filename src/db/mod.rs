@@ -2867,6 +2867,11 @@ impl Database {
             ));
         }
         self.check_store_readable()?;
+        // The request's PFN caller counts this query's fuel from zero (the
+        // caller a library passes may serve many queries); every evaluator
+        // of the query shares the count (see `with_settings`).
+        let request_pfn = pfn.map(crate::pfn::PfnCaller::for_query);
+        let pfn = request_pfn.as_ref();
         let (sparql, q) = (stmt.text(), stmt.query());
         // Serve from the query cache when the same request was already
         // answered against the current (unchanged) store. Only
@@ -2956,6 +2961,16 @@ impl Database {
     ) -> Result<QueryResult> {
         // A broken on-disk store refuses every statement until reopened.
         self.check_store_readable()?;
+        // One PFN fuel count for the whole request (round-4 review of
+        // ext#1: each DELETE / INSERT … WHERE operation started a count of
+        // its own, so a request of N operations had N budgets): the
+        // request's caller, else the installed one, counted from zero here
+        // and shared by the evaluators of every operation (see
+        // `with_settings`).
+        let request_pfn = pfn
+            .or(self.pfn.as_ref())
+            .map(crate::pfn::PfnCaller::for_query);
+        let pfn = request_pfn.as_ref();
         // Reject a statically invalid request (an unknown IRI
         // function, a graph function in FILTER/BIND, …) before any of
         // its operations is applied.

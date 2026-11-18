@@ -24,8 +24,20 @@
   Option<&AtomicU64>` (`None`: the call is a query of its own). Every query
   path installs its caller through `with_limits` or `for_query`
   (`ConcurrentDb` snapshots and version views included), so repeated
-  queries never share a budget; in an update every `DELETE` / `INSERT …
-  WHERE` operation has its own.
+  queries never share a budget. **Round-4 review fix: one budget per
+  request**, also for an UPDATE: every evaluator installed its caller with
+  a fresh count and an UPDATE builds one per `DELETE` / `INSERT … WHERE`
+  operation, so a request of N operations could use N budgets. The
+  request's entry (`Database::run_update`, `Database::read_as`, a
+  transaction snapshot's read) now starts one count (`for_query` on the
+  request's caller, else the installed one), and `Evaluator::with_settings`
+  keeps a request caller's count (new `PfnCaller::limited(limits)`: same
+  caller and count under other limits); the installed caller of a
+  snapshot read still gets a count of its own per query. A library caller
+  passed to many `query_as` calls still gives each request its own budget.
+  `tests/pfn_fuel_is_counted_per_request.rs` (feature `pfn-wasm`) fails
+  before the fix: an update of two operations whose PFN calls together
+  pass the budget ran.
 - **PFN functions of any size run (review ext#2).** The wasmi runtime
   translates modules eagerly, when they are compiled and loaded. With
   wasmi's default lazy translation a function's translation (7 fuel units
@@ -82,7 +94,12 @@
   contract C8 orders after the rule lock, and `reasonManage`'s disable
   saves while it holds the rule lock): while another operation of the
   process holds it, the write is refused with an error and nothing is
-  changed.
+  changed. Round-4 review fix: a detached database's `save` (in-memory
+  rules, `into_memory()`) takes that lock — still without waiting —
+  before it writes its snapshot and holds it through both writes, so a
+  refused save leaves the destination as it was; it used to install the
+  new snapshot first and then have the rules refused, pairing the new data
+  with the directory's old rules and ledgers.
 - **Documentation (review ext#15, design#16, parser#17).** Every reasoner
   (RDFS, textual rules, `reasonManage`) reads and writes the default graph
   only — now said in `src/reason` and `docs/DESIGN.md`. `docs/DESIGN.md`
@@ -122,6 +139,11 @@ none
   the PFN calls of one query may use together. Say that fuel counts
   instructions, host bytes and each call's instantiation (initial memory
   and data section, one unit per 8 bytes). docs/PFN.md already says it.
+- docs/PFN.md (owned here, edited in the round-4 review fix): the
+  `pfn_fuel_per_query` row says every request starts from zero and the
+  operations of one UPDATE share one budget. README.md / DEPLOY.md: the
+  same wording wherever `pfn_fuel_per_query` is described ("per request",
+  not "per query or operation").
 - docs/DEPLOY.md, the limits paragraph: `pfn_fuel_per_query` is a limit
   key, not an upstream-compat switch (upstream runs PFN as native code
   without limits; the runtime is a Rust extension behind `pfn-wasm`), so it

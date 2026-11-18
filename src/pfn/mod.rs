@@ -189,8 +189,9 @@ pub struct PfnLimits {
     /// of the query, its sub-queries and `GRAPH` blocks); `0` = unlimited.
     /// Without it a query could run [`call::MAX_COMBINATIONS`] calls of a
     /// full `fuel_per_call` each (review ext#1). The count belongs to the
-    /// [`PfnCaller`] a query runs with: every query starts from zero (in an
-    /// update, every `DELETE` / `INSERT … WHERE` operation).
+    /// [`PfnCaller`] a request runs with: every request starts from zero,
+    /// and an UPDATE request's operations share one count (round-4 review:
+    /// each `DELETE` / `INSERT … WHERE` operation had a budget of its own).
     pub fuel_per_query: u64,
 }
 
@@ -230,11 +231,13 @@ impl Default for PfnLimits {
 ///
 /// A caller also counts the fuel its calls used, for
 /// [`PfnLimits::fuel_per_query`]: clones share the count (the evaluators
-/// of one query — sub-queries, `GRAPH` blocks — hold clones), while
+/// of one request — sub-queries, `GRAPH` blocks, every operation of an
+/// UPDATE — hold clones, or [`limited`](Self::limited) ones), while
 /// [`new`](Self::new), [`with_limits`](Self::with_limits),
 /// [`as_user`](Self::as_user) and [`for_query`](Self::for_query) start a
-/// new one. Every database query path installs its caller through
-/// `with_limits` (or `for_query`), so each query has its own budget.
+/// new one. Every database request starts the count of the caller it runs
+/// with (`for_query` on the request's caller at its entry, or `with_limits`
+/// on the database's installed one), so each request has one budget.
 #[derive(Debug, Clone)]
 pub struct PfnCaller {
     registry: Arc<PfnRegistry>,
@@ -265,6 +268,20 @@ impl PfnCaller {
             limits,
             spent: Arc::default(),
             ..self
+        }
+    }
+
+    /// The same caller and the same [fuel count](PfnLimits::fuel_per_query)
+    /// under `limits`: for another evaluator of the same request, which
+    /// shares the request's budget (round-4 review of ext#1: every
+    /// `DELETE` / `INSERT … WHERE` operation of an UPDATE started a count
+    /// of its own, so one request could use the budget once per operation).
+    pub fn limited(&self, limits: PfnLimits) -> PfnCaller {
+        PfnCaller {
+            registry: Arc::clone(&self.registry),
+            user: self.user.clone(),
+            limits,
+            spent: Arc::clone(&self.spent),
         }
     }
 

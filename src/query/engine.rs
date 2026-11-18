@@ -1180,7 +1180,10 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
     /// Top-K options, graph-function budget, path budget, user-defined
     /// functions, VS-tree policy and the PFN caller — `request_pfn` (the
     /// requesting user's) if given, else the settings' own, under the
-    /// settings' PFN limits either way — plus the CSR and substring-index
+    /// settings' PFN limits either way; `request_pfn` keeps its
+    /// [fuel count](crate::pfn::PfnLimits::fuel_per_query), which the
+    /// request's evaluators share, while the settings' own caller starts a
+    /// new one — plus the CSR and substring-index
     /// caches of `providers`. Every database read and UPDATE path and
     /// every read snapshot builds its evaluator with this (review
     /// design#9); the per-request cancel flag and named graphs are set
@@ -1207,10 +1210,15 @@ impl<'a, S: TripleSource> Evaluator<'a, S> {
         self.topk = topk;
         self.gfun_max_output = gfun_max_output_bytes;
         self.path_max_duplicates = path_max_duplicates;
-        self.pfn = request_pfn
-            .cloned()
-            .or(pfn)
-            .map(|caller| caller.with_limits(pfn_limits));
+        // The request's caller keeps its fuel count, the request's, which
+        // every evaluator of the request shares — each operation of an
+        // UPDATE included (round-4 review of ext#1: each started from
+        // zero); the request's entry started it. The database's installed
+        // caller gets a count of its own for this evaluation.
+        self.pfn = match request_pfn {
+            Some(caller) => Some(caller.limited(pfn_limits)),
+            None => pfn.map(|caller| caller.with_limits(pfn_limits)),
+        };
         self.functions = Rc::new(functions);
         if vs_policy.is_some() {
             self.vs_policy = vs_policy;
