@@ -179,7 +179,7 @@ fn same_term_deletes_exactly_the_named_blank_node_on_every_layout() {
                 &mut db,
                 "SELECT ?o WHERE { <http://ex/a> <http://ex/p> ?o }"
             ),
-            [y.clone()],
+            std::slice::from_ref(y),
             "{layout:?}"
         );
         assert_eq!(db.triple_num(), 4, "{layout:?}");

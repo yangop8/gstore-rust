@@ -16,7 +16,7 @@
 #![cfg(unix)]
 
 #[path = "../src/bin/common/cli.rs"]
-#[allow(dead_code, unused_imports)]
+#[allow(unused_imports)]
 mod cli;
 
 use std::fs;
