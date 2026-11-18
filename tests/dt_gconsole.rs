@@ -111,7 +111,12 @@ fn wait(child: &mut Child) -> i32 {
 
 /// Run a stdin script as root.
 fn script(srv: &Server, cwd: &Path, stdin: &str) -> Run {
-    let mut cmd = gconsole(&srv.addr, cwd);
+    script_at(&srv.addr, cwd, stdin)
+}
+
+/// Run a stdin script as root against the server at `addr`.
+fn script_at(addr: &SocketAddr, cwd: &Path, stdin: &str) -> Run {
+    let mut cmd = gconsole(addr, cwd);
     cmd.args(["-u", "root", "-p", PASSWORD]);
     run(cmd, stdin)
 }
@@ -641,12 +646,11 @@ fn wrong_password_and_unreachable_server() {
     let r = run(cmd, "");
     assert_eq!(r.code, 1, "{r:?}");
     assert!(r.out.starts_with("login failed: "), "{r:?}");
-    // Nothing listening.
-    let free = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap();
-    let mut cmd = gconsole(&free, &cwd);
+    // Nothing listening: port 0, which nothing can listen on (review
+    // tests-a#7: a port bound and freed again could be taken meanwhile by
+    // another test's server, which gconsole would then talk to).
+    let nothing: SocketAddr = ([127, 0, 0, 1], 0).into();
+    let mut cmd = gconsole(&nothing, &cwd);
     cmd.args(["-u", "root", "-p", PASSWORD]);
     let r = run(cmd, "showdbs;\n");
     assert_eq!(r.code, 1, "{r:?}");
@@ -654,7 +658,7 @@ fn wrong_password_and_unreachable_server() {
         r.out, "Could not connect to server. Please check server status\n",
         "{r:?}"
     );
-    assert!(r.err.contains(&format!("{}", free.port())), "{r:?}");
+    assert!(r.err.contains("cannot connect to 127.0.0.1:0"), "{r:?}");
     // Bad options.
     let mut cmd = gconsole(&srv.addr, &cwd);
     cmd.arg("--bogus");
@@ -777,6 +781,98 @@ fn users_and_privileges() {
     assert_eq!(run(cmd, "").code, 1, "bob is gone");
 }
 
+/// `user`'s privileges on `db` by the server's `showuser`: the names of the
+/// `*_privilege` fields listing `db`, sorted.
+fn privileges_of(srv: &Server, user: &str, db: &str) -> Vec<String> {
+    let users = srv.op("showuser", &[]);
+    ok(&users);
+    let entry = users
+        .get("ResponseBody")
+        .and_then(Json::as_array)
+        .unwrap()
+        .iter()
+        .find(|u| u.get("username").and_then(Json::as_str) == Some(user))
+        .cloned()
+        .unwrap();
+    let mut privs: Vec<String> = entry
+        .as_object()
+        .unwrap()
+        .iter()
+        .filter(|(k, v)| {
+            k.ends_with("_privilege")
+                && v.as_str()
+                    .is_some_and(|l| l.split(',').any(|d| d.trim() == db))
+        })
+        .map(|(k, _)| k.trim_end_matches("_privilege").to_string())
+        .collect();
+    privs.sort();
+    privs
+}
+
+/// review ext#11: `setpriv` refuses an answer that is not a list of
+/// privilege numbers — a typo, an out-of-range number, an empty line —
+/// and changes nothing; a valid one moves the user's privileges on the
+/// database to exactly the given set (granting what is missing, then
+/// revoking the rest), and a lone `0` sets none.
+#[test]
+fn setpriv_refuses_invalid_numbers_and_sets_exactly_the_given_ones() {
+    let srv = Server::start("gc_setpriv");
+    ok(&srv.build("small", &data("small/small.nt")));
+    let cwd = scratch("gc_setpriv_cwd");
+    let _cwd = DirGuard(cwd.clone());
+    let setpriv = |answer: &str| {
+        script(
+            &srv,
+            &cwd,
+            &format!("setpriv bob small;\n{PASSWORD}\n{answer}\n"),
+        )
+    };
+    let r = script(&srv, &cwd, &format!("addusr bob;\n{PASSWORD}\nbobpw\n"));
+    assert_eq!(r.code, 0, "{r:?}");
+    let r = setpriv("1 2 3");
+    assert_eq!(r.code, 0, "{r:?}");
+    let granted = ["load", "query", "unload"];
+    assert_eq!(privileges_of(&srv, "bob", "small"), granted);
+    for (answer, why) in [
+        ("q", "not a privilege number (1-8, or 0 for none): q"),
+        ("", "no privilege number given"),
+        ("2 9", "not a privilege number (1-8, or 0 for none): 9"),
+        ("1 x 3", "not a privilege number (1-8, or 0 for none): x"),
+        (
+            "0 1",
+            "0 (no privilege) cannot be combined with other numbers",
+        ),
+    ] {
+        let r = setpriv(answer);
+        assert_eq!(r.code, 1, "{answer:?}: {r:?}");
+        assert!(
+            r.out.contains(&format!("{why}\nPrivilege set failed.\n")),
+            "{answer:?}: {r:?}"
+        );
+        assert!(!r.out.contains("successfully"), "{answer:?}: {r:?}");
+        assert_eq!(
+            privileges_of(&srv, "bob", "small"),
+            granted,
+            "{answer:?} changed nothing"
+        );
+    }
+    let r = setpriv("4 1");
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(
+        r.out
+            .contains("[will set priv:]00010010\nPrivilege set successfully.\n"),
+        "{r:?}"
+    );
+    assert_eq!(privileges_of(&srv, "bob", "small"), ["query", "update"]);
+    let r = setpriv("8");
+    assert_eq!(r.code, 0, "{r:?}");
+    assert_eq!(privileges_of(&srv, "bob", "small").len(), 7);
+    let r = setpriv("0");
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.out.contains("[will set priv:]00000000\n"), "{r:?}");
+    assert!(privileges_of(&srv, "bob", "small").is_empty());
+}
+
 #[test]
 fn help_version_and_unknown_commands() {
     let srv = Server::start("gc_help");
@@ -851,36 +947,24 @@ impl Drop for Gserver {
 }
 
 impl Gserver {
+    /// review tests-a#7: gserver binds a port of its own choosing (`-p 0`)
+    /// and the test learns it from gserver's own announcement — no port
+    /// picked and freed beforehand (another test's server could take it
+    /// meanwhile), and no readiness check that any listener would pass.
     fn start(dir: &Path, conf_extra: &str) -> Gserver {
-        let port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
         fs::create_dir_all(dir.join("conf")).unwrap();
         fs::write(
             dir.join("conf/conf.ini"),
             format!(
-                "[server]\nport={port}\nthread_num=4\n[system]\ndb_home=./dbhome/\n\
+                "[server]\nthread_num=4\n[system]\ndb_home=./dbhome/\n\
                  root_password={GSERVER_PASSWORD}\n{conf_extra}"
             ),
         )
         .unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_gserver"))
-            .current_dir(dir)
-            .args(["--load-dir", &path_str(&data("small"))])
-            .env_remove("GSTORE_GSERVER_BACKGROUND")
-            .env_remove("GSTORE_GSERVER_SUPERVISOR")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let srv = Gserver { child, port };
-        wait_for("gserver", || {
-            TcpStream::connect(("127.0.0.1", port)).is_ok()
-        });
-        srv
+        let data_dir = path_str(&data("small"));
+        let (child, port) =
+            spawn_gserver(dir, &["--load-dir", &data_dir, "-p", "0"]).expect("gserver started");
+        Gserver { child, port }
     }
 
     /// Run a gconsole stdin script as root, from `cwd`.
@@ -890,6 +974,77 @@ impl Gserver {
         cmd.args(["-u", "root", "-p", GSERVER_PASSWORD]);
         run(cmd, stdin)
     }
+}
+
+/// Start `gserver` in `dir` with `args` and wait until it announces the
+/// address it serves on (its own stdout, so whatever answers there is this
+/// server): the child and its port. `None` when it exited first — e.g.
+/// because its port was taken. Its output keeps being drained until it
+/// exits.
+fn spawn_gserver(dir: &Path, args: &[&str]) -> Option<(Child, u16)> {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_gserver"))
+        .current_dir(dir)
+        .args(args)
+        .env_remove("GSTORE_GSERVER_BACKGROUND")
+        .env_remove("GSTORE_GSERVER_SUPERVISOR")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let out = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(out).lines() {
+            let Ok(line) = line else { break };
+            if let Some(port) = announced_port(&line) {
+                let _ = tx.send(port);
+            }
+        }
+    });
+    // The timeout is only a hang guard; an exit ends the wait at once.
+    match rx.recv_timeout(Duration::from_secs(120)) {
+        Ok(port) => Some((child, port)),
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            None
+        }
+    }
+}
+
+/// review tests-a#7: the readiness check of the gserver binaries started
+/// here is gserver's own announcement, not a connection to the port: a
+/// port another listener holds is not taken for a ready gserver (gserver
+/// exits, and the caller learns it at once).
+#[test]
+fn a_gserver_is_ready_when_it_says_so_not_when_its_port_answers() {
+    let dir = scratch("gc_ready");
+    let _dir = DirGuard(dir.clone());
+    let taken = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = taken.local_addr().unwrap().port();
+    fs::create_dir_all(dir.join("conf")).unwrap();
+    fs::write(
+        dir.join("conf/conf.ini"),
+        format!(
+            "[server]\nport={port}\nthread_num=4\n[system]\ndb_home=./dbhome/\n\
+             root_password={GSERVER_PASSWORD}\n"
+        ),
+    )
+    .unwrap();
+    assert!(
+        TcpStream::connect(("127.0.0.1", port)).is_ok(),
+        "the old check would have taken this for gserver"
+    );
+    assert!(spawn_gserver(&dir, &[]).is_none());
+    drop(taken);
+}
+
+/// The port of gserver's startup line `… on http://127.0.0.1:PORT …`.
+fn announced_port(line: &str) -> Option<u16> {
+    let (_, rest) = line.split_once(" on http://")?;
+    let addr = rest.split_whitespace().next()?;
+    addr.parse::<SocketAddr>().ok().map(|a| a.port())
 }
 
 /// Whether `hay` holds `lines` in this order (each found after the end of
@@ -1288,6 +1443,174 @@ fn the_local_mode_runs_a_lowercase_sparql_load_and_reports_failures() {
         let r = run(cmd, script);
         assert_eq!(r.code, 1, "{script}: {r:?}");
     }
+}
+
+/// A snapshot-layout database `<dir>/<name>.db` holding `triples` (N-Triples).
+fn snapshot_db(dir: &Path, name: &str, triples: &str) -> PathBuf {
+    let path = dir.join(format!("{name}.db"));
+    let db = gstore::Database::build_from_str(name, triples).unwrap();
+    db.save(&path).unwrap();
+    assert_eq!(
+        gstore::Database::storage_kind(&path),
+        Some(gstore::StorageKind::Snapshot)
+    );
+    path
+}
+
+fn triples_in(dir: &Path) -> u64 {
+    gstore::Database::open(dir).unwrap().triple_num()
+}
+
+/// review ext#5: `gconsole --local` keeps the updates it acknowledged
+/// (`[updated N triple(s)]`) to a snapshot-layout database — persisted only
+/// by a save — when it leaves the database: at `quit`, at the end of the
+/// input and on `load <other>`. A new in-memory database is saved to
+/// `<name>.db`, as `save` does.
+#[test]
+fn the_local_mode_saves_acknowledged_updates_when_it_leaves_a_database() {
+    let cwd = scratch("gc_local_save");
+    let _cwd = DirGuard(cwd.clone());
+    let one = "<http://a> <http://p> <http://b> .\n";
+    let insert = "insert data { <http://a> <http://p> <http://c> };\n";
+    snapshot_db(&cwd, "other", one);
+    for (how, tail) in [
+        ("quit", "quit;\n"),
+        ("the end of the input", ""),
+        ("load <other>", "load other\nquit;\n"),
+    ] {
+        let kept = snapshot_db(&cwd, "kept", one);
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_gconsole"));
+        cmd.current_dir(&cwd).args(["--local", "kept"]);
+        let r = run(cmd, &format!("{insert}{tail}"));
+        assert_eq!(r.code, 0, "{how}: {r:?}");
+        assert!(r.out.contains("[updated 1 triple(s)]"), "{how}: {r:?}");
+        assert_eq!(triples_in(&kept), 2, "{how}: the insert is kept: {r:?}");
+        assert!(
+            r.out.contains("saved to "),
+            "{how}: the save is reported: {r:?}"
+        );
+        fs::remove_dir_all(&kept).unwrap();
+    }
+    // Nothing changed: nothing is written.
+    snapshot_db(&cwd, "kept", one);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_gconsole"));
+    cmd.current_dir(&cwd).args(["--local", "kept"]);
+    let r = run(cmd, "select * where { ?s ?p ?o };\nquit;\n");
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(!r.out.contains("saved to"), "{r:?}");
+    // A new in-memory database: saved where `save` saves it.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_gconsole"));
+    cmd.current_dir(&cwd).args(["--local", "fresh"]);
+    let r = run(cmd, insert);
+    assert_eq!(r.code, 0, "{r:?}");
+    assert_eq!(triples_in(&cwd.join("fresh.db")), 1, "{r:?}");
+}
+
+/// review ext#5, the rest of the rule: an `import` is kept like an update;
+/// an on-disk database writes each update through and is never saved by
+/// the console (in whichever `GSTORE_DISK_QUERY_MODE` it is opened); and a
+/// save the console cannot make is never passed over: it fails the script,
+/// and `load <other>` keeps the database whose updates it could not save.
+#[test]
+fn the_local_mode_keeps_imports_writes_disk_databases_through_and_reports_a_failed_save() {
+    let cwd = scratch("gc_local_save_rest");
+    let _cwd = DirGuard(cwd.clone());
+    let one = "<http://a> <http://p> <http://b> .\n";
+    let insert = "insert data { <http://a> <http://p> <http://c> };\n";
+    let nt = cwd.join("more.nt");
+    fs::write(&nt, "<http://x> <http://p> <http://y> .\n").unwrap();
+    let local = |db: &str, stdin: &str| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_gconsole"));
+        cmd.current_dir(&cwd).args(["--local", db]);
+        run(cmd, stdin)
+    };
+
+    // An import into a snapshot database, then the end of the input.
+    let kept = snapshot_db(&cwd, "kept", one);
+    let r = local("kept", &format!("import {}\n", path_str(&nt)));
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.out.contains("imported 1 new triple(s)"), "{r:?}");
+    assert!(r.out.contains("saved to "), "{r:?}");
+    assert_eq!(triples_in(&kept), 2, "the import is kept: {r:?}");
+
+    // An on-disk database: written through, not saved.
+    let disk = cwd.join("ondisk.db");
+    let base = cwd.join("one.nt");
+    fs::write(&base, one).unwrap();
+    gstore::Database::build_disk(&disk, &[&base]).unwrap();
+    assert_eq!(
+        gstore::Database::storage_kind(&disk),
+        Some(gstore::StorageKind::Disk)
+    );
+    let r = local("ondisk", &format!("{insert}quit;\n"));
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.out.contains("[updated 1 triple(s)]"), "{r:?}");
+    assert!(!r.out.contains("saved to"), "written through: {r:?}");
+    assert_eq!(triples_in(&disk), 2, "the insert is kept: {r:?}");
+
+    // A new in-memory database whose `<name>.db` cannot be written (a file
+    // is in its way).
+    fs::write(cwd.join("blocked.db"), "not a database").unwrap();
+    for (how, tail) in [
+        ("the end of the input", ""),
+        ("quit", "quit;\n"),
+        ("load <other>", "load kept\nstats\n"),
+    ] {
+        let r = local("blocked", &format!("{insert}{tail}"));
+        assert_eq!(r.code, 1, "{how}: the failed save fails the script: {r:?}");
+        assert!(r.err.contains("save failed"), "{how}: {r:?}");
+        assert!(!r.out.contains("saved to"), "{how}: {r:?}");
+        if how == "load <other>" {
+            assert!(r.err.contains("'blocked' stays loaded"), "{how}: {r:?}");
+            assert!(!r.out.contains("loaded 'kept'"), "{how}: {r:?}");
+            assert!(r.out.contains("name=blocked triples=1"), "{how}: {r:?}");
+        }
+    }
+    assert_eq!(
+        fs::read_to_string(cwd.join("blocked.db")).unwrap(),
+        "not a database"
+    );
+}
+
+/// review ext#9: `gconsole --local` ends a statement by the remote
+/// console's rule — at a `;` outside `{…}` groups, string literals and
+/// `<IRI>`s — not at any line ending in `;`: a multi-line SELECT with a
+/// predicate-object list, a long literal whose first line ends in `;`, two
+/// statements on one line and a multi-operation update sharing its prologue
+/// all run, and a script's final statement may lack its `;`.
+#[test]
+fn the_local_mode_ends_statements_like_the_remote_console() {
+    let cwd = scratch("gc_local_statements");
+    let _cwd = DirGuard(cwd.clone());
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_gconsole"));
+    cmd.current_dir(&cwd).args(["--local", "memdb"]);
+    let r = run(
+        cmd,
+        "insert data { <http://s> <http://p> \"a\" . <http://s> <http://q> \"b\" };\n\
+         select ?s ?z where { ?s <http://p> ?o ;\n\
+         <http://q> ?z };\n\
+         insert data { <http://s> <http://r> \"\"\"line one;\n\
+         line two\"\"\" };\n\
+         ask { <http://s> <http://r> \"line one;\\nline two\" };\n\
+         select (1 as ?first) {}; select (2 as ?second) {};\n\
+         prefix ex: <http://ex/> insert data { ex:a ex:p ex:b } ; insert data { ex:c ex:p ex:d };\n\
+         select (count(*) as ?n) where { ?x <http://ex/p> ?y }",
+    );
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.err.is_empty(), "no statement failed: {r:?}");
+    assert!(r.out.contains("\"b\""), "the multi-line SELECT ran: {r:?}");
+    assert!(
+        r.out.contains("true"),
+        "the long literal kept its ';': {r:?}"
+    );
+    assert!(
+        r.out.contains("?first") && r.out.contains("?second"),
+        "{r:?}"
+    );
+    assert!(
+        r.out.contains("\"2\"^^"),
+        "both operations of the update, and the final statement without ';': {r:?}"
+    );
 }
 
 /// `create` / `batchinsert` / `batchremove` against a real server whose
@@ -1716,6 +2039,164 @@ fn requests_carry_upstreams_operations_and_parameters() {
     assert_eq!(r.code, 0, "{r:?}");
 }
 
+/// Whether `text` holds a character a terminal acts on rather than shows
+/// (C0 controls but line breaks and tabs, DEL, C1 controls).
+fn drives_the_terminal(text: &str) -> bool {
+    text.chars().any(|c| {
+        let u = c as u32;
+        (u < 0x20 && c != '\n' && c != '\t') || (0x7f..0xa0).contains(&u)
+    })
+}
+
+/// review ext#10: what a server answers is printed with its control
+/// characters escaped — the paths `backup` and `export` print, the counts
+/// and times of a query, an update and an import, the failure message of a
+/// login and the text of an answer that is not an `/api` envelope — so a
+/// spoofed or compromised server cannot drive the operator's terminal
+/// (retitle it, clear it, write the clipboard).
+#[test]
+fn server_fields_cannot_drive_the_terminal() {
+    const ESC: &str = "\u{1b}]0;PWNED\u{7}\u{1b}[2J";
+    let respond: Arc<Responder> = Arc::new(|req: &Json| {
+        Some(match field(req, "operation").as_str() {
+            "backup" => success().with("backupfilepath", format!("{ESC}./backups/x").as_str()),
+            "export" => success().with("filepath", "\u{1b}]52;c;SGVsbG8=\u{7}f.nt"),
+            "query" => success()
+                .with("AnsNum", "\u{1b}[2J5")
+                .with("QueryTime", "\u{1b}]0;T\u{7}1"),
+            "batchInsert" => success()
+                .with("success_num", format!("{ESC}3").as_str())
+                .with("failed_num", format!("{ESC}1").as_str()),
+            "build" => success().with("failed_num", format!("{ESC}2").as_str()),
+            _ => success(),
+        })
+    });
+    let fake = Fake::start(respond);
+    let cwd = scratch("gc_control_chars");
+    let _cwd = DirGuard(cwd.clone());
+    let nt = cwd.join("x.nt");
+    fs::write(&nt, "<a> <b> <c> .\n").unwrap();
+    let mut cmd = gconsole(&fake.addr, &cwd);
+    cmd.args(["-u", "root", "-p", PASSWORD]);
+    let r = run(
+        cmd,
+        &format!(
+            "create db1 {nt};\nuse db1;\nbackup;\nexport;\ninsert data {{ <a> <b> <c> }};\n\
+             batchinsert {nt};\n",
+            nt = path_str(&nt)
+        ),
+    );
+    assert!(!drives_the_terminal(&r.out), "{r:?}");
+    for shown in [
+        "Backup path: \\u001B]0;PWNED\\u0007\\u001B[2J./backups/x",
+        "Export file: \\u001B]52;c;SGVsbG8=\\u0007f.nt",
+        "Update ans num \\u001B[2J5, use \\u001B]0;T\\u00071 ms.",
+        "RDF parse error num \\u001B]0;PWNED",
+        "After inserted triples num \\u001B]0;PWNED",
+    ] {
+        assert!(r.out.contains(shown), "{shown:?}: {r:?}");
+    }
+    assert_eq!(r.code, 0, "{r:?}");
+
+    // A login refused with such a message, and an answer that is not an
+    // `/api` envelope.
+    let respond: Arc<Responder> = Arc::new(|req: &Json| {
+        Some(match field(req, "operation").as_str() {
+            "login" => Json::obj()
+                .with("StatusCode", 1001)
+                .with("StatusMsg", format!("{ESC}no").as_str()),
+            _ => success(),
+        })
+    });
+    let fake = Fake::start(respond);
+    let mut cmd = gconsole(&fake.addr, &cwd);
+    cmd.args(["-u", "root", "-p", PASSWORD]);
+    let r = run(cmd, "showdbs;\n");
+    assert_eq!(r.code, 1, "{r:?}");
+    assert!(r.out.contains("login failed: \\u001B]0;PWNED"), "{r:?}");
+    assert!(!drives_the_terminal(&r.out), "{r:?}");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let not_json = thread::spawn(move || {
+        // The login, then one more request: each answered with text.
+        for _ in 0..2 {
+            let Ok((mut s, _)) = listener.accept() else {
+                return;
+            };
+            let _ = read_request(&mut s);
+            let body = format!("{ESC}<html>");
+            let _ = write!(
+                s,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    let mut cmd = gconsole(&addr, &cwd);
+    cmd.args(["-u", "root", "-p", PASSWORD]);
+    let r = run(cmd, "showdbs;\n");
+    // Unblock the fake's last accept, if the console made fewer requests.
+    let _ = TcpStream::connect(addr);
+    not_json.join().unwrap();
+    assert_eq!(r.code, 1, "{r:?}");
+    assert!(!drives_the_terminal(&r.out), "{r:?}");
+    assert!(!drives_the_terminal(&r.err), "{r:?}");
+    assert!(r.err.contains("\\u001B]0;PWNED"), "{r:?}");
+}
+
+/// review ext#11: `setpriv` grants what is missing first and then revokes
+/// the rest; when the revoke fails it takes the grant back, so the user is
+/// left with the privileges they had, and says so.
+#[test]
+fn setpriv_rolls_back_its_grant_when_the_revoke_fails() {
+    let respond: Arc<Responder> = Arc::new(|req: &Json| {
+        Some(match field(req, "operation").as_str() {
+            "showuser" => success().with(
+                "ResponseBody",
+                Json::Arr(vec![Json::obj()
+                    .with("username", "bob")
+                    .with("query_privilege", "small,")
+                    .with("load_privilege", "small,")
+                    .with("unload_privilege", "small,")
+                    .with("update_privilege", "")]),
+            ),
+            "userprivilegemanage"
+                if field(req, "type") == "2" && field(req, "privileges") == "1,2,3" =>
+            {
+                Json::obj()
+                    .with("StatusCode", 1005)
+                    .with("StatusMsg", "delete privilege query,load,unload failed.")
+            }
+            _ => success(),
+        })
+    });
+    let fake = Fake::start(respond);
+    let cwd = scratch("gc_setpriv_rollback");
+    let _cwd = DirGuard(cwd.clone());
+    let mut cmd = gconsole(&fake.addr, &cwd);
+    cmd.args(["-u", "root", "-p", PASSWORD]);
+    let r = run(cmd, &format!("setpriv bob small;\n{PASSWORD}\n4\n"));
+    assert_eq!(r.code, 1, "{r:?}");
+    let steps: Vec<(String, String)> = fake
+        .ops("userprivilegemanage")
+        .iter()
+        .map(|q| (field(q, "type"), field(q, "privileges")))
+        .collect();
+    let step = |t: &str, p: &str| (t.to_string(), p.to_string());
+    assert_eq!(
+        steps,
+        [step("1", "4"), step("2", "1,2,3"), step("2", "4")],
+        "grant, the failed revoke, the grant taken back: {r:?}"
+    );
+    assert!(
+        r.out.contains(
+            "Privilege set failed delete privilege query,load,unload failed.\n\
+             The privileges of bob on small are unchanged.\n"
+        ),
+        "{r:?}"
+    );
+}
+
 fn sigint(child: &Child) {
     let ok = Command::new("kill")
         .args(["-INT", &child.id().to_string()])
@@ -1758,8 +2239,13 @@ fn ctrl_c_cancels_the_running_query_and_the_statement_being_typed() {
     let fake = Fake::start(respond);
     let cwd = scratch("gc_ctrl_c");
     let _cwd = DirGuard(cwd.clone());
+    // review ext#13 / tests-a#14: `-i` shows the prompts, and the test
+    // sends each Ctrl-C only once the prompt it is meant for is visible —
+    // the console reads with a Ctrl-C mark taken before showing its prompt
+    // (see `term::LineReader::read_line_since`) — and goes on only once
+    // the console has answered it, instead of ordering them with sleeps.
     let mut cmd = gconsole(&fake.addr, &cwd);
-    cmd.args(["-u", "root", "-p", PASSWORD]);
+    cmd.args(["-u", "root", "-p", PASSWORD, "-i"]);
     let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1767,28 +2253,36 @@ fn ctrl_c_cancels_the_running_query_and_the_statement_being_typed() {
         .spawn()
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
-    let (out, err) = collect(&mut child);
+    let out = Live::start(child.stdout.take().unwrap());
+    let mut stderr = child.stderr.take().unwrap();
+    let err = thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stderr.read_to_string(&mut s);
+        s
+    });
+    let at = out.wait_for("the first prompt", "gStore[no database]> ", 0);
     stdin.write_all(b"use slow;\n").unwrap();
-    wait_for("load", || !fake.ops("load").is_empty());
+    let at = out.wait_for("the database's prompt", "gStore[slow]> ", at);
     // Ctrl-C while a statement is being typed drops it.
     stdin.write_all(b"select * where {\n").unwrap();
-    thread::sleep(Duration::from_millis(400));
+    let at = out.wait_for("the continuation prompt", "     -> ", at);
     sigint(&child);
-    thread::sleep(Duration::from_millis(400));
+    let at = out.wait_for("a fresh prompt", "gStore[slow]> ", at);
     // Ctrl-C while the server works on a query: the connection is dropped
-    // and the server's task cancelled.
+    // and the server's task cancelled. (The console takes its Ctrl-C mark
+    // before it sends the request.)
     stdin.write_all(b"select ?x where { ?x ?p ?o };\n").unwrap();
     wait_for("the query", || !fake.ops("query").is_empty());
-    thread::sleep(Duration::from_millis(200));
     sigint(&child);
     wait_for("the cancellation", || {
         !fake.ops("operationTaskCancel").is_empty()
     });
+    let at = out.wait_for("the cancel's report", "Query cancelled.\n", at);
     // The console is still there.
     stdin.write_all(b"pdb;\n").unwrap();
     drop(stdin);
     let code = wait(&mut child);
-    let (out, err) = (out.join().unwrap(), err.join().unwrap());
+    let (out, err) = (out.finish(), err.join().unwrap());
     let queries: Vec<String> = fake
         .ops("query")
         .iter()
@@ -1808,13 +2302,63 @@ fn ctrl_c_cancels_the_running_query_and_the_statement_being_typed() {
     wait_for("the dropped connection", || {
         !fake.dropped.lock().unwrap().is_empty()
     });
-    assert!(out.contains("Query cancelled.\n"), "{out}\n{err}");
     assert!(
-        out.ends_with("slow\n\n"),
+        out[at..].starts_with("\ngStore[slow]> slow\n\n"),
         "pdb ran after the cancel: {out}\n{err}"
     );
-    // A cancelled command counts as a failure of the script.
-    assert_eq!(code, 1, "{out}\n{err}");
+    // review ext#13: `-i` makes the run interactive, whose exit status is 0
+    // whatever failed; that a cancelled command fails a script (exit 1) is
+    // asserted by `ctrl_c_cancels_the_servers_query_task`.
+    assert_eq!(code, 0, "{out}\n{err}");
+}
+
+/// A child's output as it arrives, to wait for what it printed.
+struct Live {
+    text: Arc<Mutex<Vec<u8>>>,
+    reader: thread::JoinHandle<()>,
+}
+
+impl Live {
+    fn start(mut pipe: impl Read + Send + 'static) -> Live {
+        let text = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&text);
+        let reader = thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n @ 1..) = pipe.read(&mut buf) {
+                sink.lock().unwrap().extend_from_slice(&buf[..n]);
+            }
+        });
+        Live { text, reader }
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.text.lock().unwrap()).into_owned()
+    }
+
+    /// Wait until `marker` has been printed at or after byte `from`; the
+    /// offset just past it (the timeout is only a hang guard).
+    fn wait_for(&self, what: &str, marker: &str, from: usize) -> usize {
+        let t0 = Instant::now();
+        loop {
+            let text = self.text();
+            if let Some(i) = text.get(from..).and_then(|t| t.find(marker)) {
+                return from + i + marker.len();
+            }
+            assert!(
+                t0.elapsed() < Duration::from_secs(60),
+                "timed out waiting for {what}: {text}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Everything, once the child closed its end.
+    fn finish(self) -> String {
+        let Live { text, reader } = self;
+        reader.join().unwrap();
+        let text = text.lock().unwrap();
+        String::from_utf8_lossy(&text).into_owned()
+    }
 }
 
 /// A query that runs for a long time unless cancelled (a REGEX FILTER over
@@ -1878,6 +2422,364 @@ fn ctrl_c_cancels_the_servers_query_task() {
     assert!(tasks("0").is_empty(), "nothing left running");
 }
 
+// ---- what crosses the network: sessions and TLS (review ext#12) ------------------
+
+/// A TCP relay to `upstream` that records, per connection, the bytes the
+/// client sent (each recorded before it is forwarded, so a request the
+/// server answered is recorded whole).
+struct Relay {
+    addr: SocketAddr,
+    sent: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+impl Relay {
+    fn start(upstream: SocketAddr) -> Relay {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sent: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&sent);
+        thread::spawn(move || {
+            for client in listener.incoming() {
+                let Ok(client) = client else { continue };
+                let Ok(server) = TcpStream::connect(upstream) else {
+                    continue;
+                };
+                let index = {
+                    let mut log = log.lock().unwrap();
+                    log.push(Vec::new());
+                    log.len() - 1
+                };
+                let log = Arc::clone(&log);
+                let (mut from_client, mut to_server) =
+                    (client.try_clone().unwrap(), server.try_clone().unwrap());
+                thread::spawn(move || {
+                    let mut buf = [0u8; 8192];
+                    while let Ok(n @ 1..) = from_client.read(&mut buf) {
+                        log.lock().unwrap()[index].extend_from_slice(&buf[..n]);
+                        if to_server.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                    let _ = to_server.shutdown(std::net::Shutdown::Write);
+                });
+                let (mut from_server, mut to_client) = (server, client);
+                thread::spawn(move || {
+                    let _ = std::io::copy(&mut from_server, &mut to_client);
+                    let _ = to_client.shutdown(std::net::Shutdown::Write);
+                });
+            }
+        });
+        Relay { addr, sent }
+    }
+
+    /// What the client sent on each connection, as (lossy) text.
+    fn requests(&self) -> Vec<String> {
+        self.sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(r).into_owned())
+            .collect()
+    }
+}
+
+/// review ext#12: gconsole logs in once (`POST /login`) and sends the
+/// session, not the password, with every request; when the session ends —
+/// here because the user changed their password — it logs in again and
+/// repeats the request; at the end it logs out.
+#[test]
+fn the_password_crosses_the_network_once_per_login() {
+    let srv = Server::start("gc_session");
+    ok(&srv.build("small", &data("small/small.nt")));
+    let relay = Relay::start(srv.addr);
+    let cwd = scratch("gc_session_cwd");
+    let _cwd = DirGuard(cwd.clone());
+    let r = script_at(
+        &relay.addr,
+        &cwd,
+        "showdbs;\nuse small;\nselect (count(*) as ?n) where { ?s ?p ?o };\n",
+    );
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.out.contains("\"25\"^^"), "{r:?}");
+    let requests = relay.requests();
+    let with_password: Vec<&String> = requests.iter().filter(|r| r.contains(PASSWORD)).collect();
+    assert_eq!(with_password.len(), 1, "{requests:#?}");
+    assert!(
+        with_password[0].starts_with("POST /login HTTP/1.1\r\n"),
+        "{requests:#?}"
+    );
+    let api: Vec<&String> = requests
+        .iter()
+        .filter(|r| r.starts_with("POST /api "))
+        .collect();
+    // The session's check (`login`), then the three commands.
+    assert_eq!(api.len(), 4, "{requests:#?}");
+    assert!(api[0].contains("\"operation\":\"login\""), "{requests:#?}");
+    for request in api {
+        assert!(request.contains("\r\nAuthorization: Bearer "), "{request}");
+        assert!(!request.contains("\"password\""), "{request}");
+    }
+    assert!(
+        requests.last().unwrap().starts_with("POST /logout "),
+        "{requests:#?}"
+    );
+
+    // The password changes: the server ends the session, the console logs
+    // in again with the new password, and the next command still runs.
+    let r = script_at(
+        &relay.addr,
+        &cwd,
+        &format!("setpswd;\n{PASSWORD}\nnew-pw\nnew-pw\nshowdbs;\n"),
+    );
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(
+        printed_in_order(&r.out, &["Password set successfully.\n", "| small    |"]).is_ok(),
+        "{r:?}"
+    );
+    let logins = relay
+        .requests()
+        .iter()
+        .filter(|r| r.starts_with("POST /login ") && r.contains("new-pw"))
+        .count();
+    assert_eq!(logins, 1, "one login again, with the new password");
+}
+
+/// A gstore-rust gserver older than the `/api` sessions: `POST /login`
+/// gives a session (its REST API), but `/api` wants the password (`1003`
+/// without one). Every request is recorded as (path, body).
+struct PreSessionServer {
+    addr: SocketAddr,
+    requests: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+impl PreSessionServer {
+    fn start() -> PreSessionServer {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&requests);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let Some((path, body)) = read_raw_request(&mut stream) else {
+                    continue;
+                };
+                log.lock().unwrap().push((path.clone(), body.clone()));
+                let answer = match path.as_str() {
+                    "/login" => success().with("session", "rest-only-token"),
+                    "/api" => match json::parse(&body) {
+                        Ok(j) if j.get("password").is_none() => Json::obj()
+                            .with("StatusCode", 1003)
+                            .with("StatusMsg", "username or password is empty"),
+                        Ok(j) if field(&j, "password") != PASSWORD => Json::obj()
+                            .with("StatusCode", 1001)
+                            .with("StatusMsg", "Username or password is wrong."),
+                        Ok(_) => success().with(
+                            "ResponseBody",
+                            Json::Arr(vec![Json::obj().with("database", "small")]),
+                        ),
+                        Err(_) => Json::obj().with("StatusCode", 1003),
+                    },
+                    _ => success(),
+                };
+                reply(&mut stream, &answer);
+            }
+        });
+        PreSessionServer { addr, requests }
+    }
+}
+
+/// One HTTP request: its path and its body as text.
+fn read_raw_request(stream: &mut TcpStream) -> Option<(String, String)> {
+    let mut reader = BufReader::new(stream.try_clone().ok()?);
+    let mut first = String::new();
+    reader.read_line(&mut first).ok()?;
+    let path = first.split_whitespace().nth(1)?.to_string();
+    let mut len = 0usize;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).ok()? == 0 {
+            return None;
+        }
+        let line = line.trim_end();
+        if line.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            if k.eq_ignore_ascii_case("content-length") {
+                len = v.trim().parse().ok()?;
+            }
+        }
+    }
+    let mut body = vec![0u8; len];
+    reader.read_exact(&mut body).ok()?;
+    Some((path, String::from_utf8_lossy(&body).into_owned()))
+}
+
+/// review ext#12 (compatibility): a gserver whose `POST /login` gives a
+/// session its `/api` does not take — a gstore-rust release older than the
+/// `/api` sessions — is still served, with upstream's protocol (the
+/// password in every body); the session it did not take is ended.
+#[test]
+fn a_server_whose_api_takes_no_session_gets_the_password() {
+    let srv = PreSessionServer::start();
+    let cwd = scratch("gc_pre_session");
+    let _cwd = DirGuard(cwd.clone());
+    let r = script_at(&srv.addr, &cwd, "showdbs;\n");
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.out.contains("| small "), "{r:?}");
+    let requests = srv.requests.lock().unwrap().clone();
+    let paths: Vec<&str> = requests.iter().map(|(p, _)| p.as_str()).collect();
+    assert_eq!(
+        paths,
+        ["/login", "/api", "/logout", "/api", "/api"],
+        "the session tried, refused and ended; upstream's login; showdbs: {requests:#?}"
+    );
+    for (_, body) in &requests[3..] {
+        assert!(
+            body.contains(&format!("\"password\":\"{PASSWORD}\"")),
+            "{requests:#?}"
+        );
+    }
+}
+
+/// A self-signed certificate for `localhost` / `127.0.0.1` (the one
+/// `src/http_client.rs`'s HTTPS test uses) and its key.
+#[cfg(feature = "tls")]
+const CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBvTCCAWOgAwIBAgIUKHclqAxNOvVOQ3kWyfFT+rCJUHwwCgYIKoZIzj0EAwIw
+FDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDcwMjIwMjkyMFoXDTM2MDYyOTIw
+MjkyMFowFDESMBAGA1UEAwwJbG9jYWxob3N0MFkwEwYHKoZIzj0CAQYIKoZIzj0D
+AQcDQgAEYHEfrA2tZnM3sdpdua9aH0oSv8G2EmRrc10JlY7xgVO8+6VoyIJqtvH5
+AxyPvu6UfMZMa+/UFLAmk+WCYEKCi6OBkjCBjzAdBgNVHQ4EFgQUJOZ8AYKC5S5i
+QJhbdtMpHgmjlaowHwYDVR0jBBgwFoAUJOZ8AYKC5S5iQJhbdtMpHgmjlaowGgYD
+VR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAwGA1UdEwEB/wQCMAAwDgYDVR0PAQH/
+BAQDAgeAMBMGA1UdJQQMMAoGCCsGAQUFBwMBMAoGCCqGSM49BAMCA0gAMEUCIQCo
+ndoh3KosHMemvMMbjxtaNbbXmxGjfsgme3rBkLuziQIgFeUx/cU+Fpw/Dl5McuKP
+cCWfronEM/ASghi4/9ldMUI=
+-----END CERTIFICATE-----
+";
+
+#[cfg(feature = "tls")]
+const KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgUBOdoa9/azwl851s
+NPlNYkOXVnBaUKf3fk8J38AOaYehRANCAARgcR+sDa1mczex2l25r1ofShK/wbYS
+ZGtzXQmVjvGBU7z7pWjIgmq28fkDHI++7pR8xkxr79QUsCaT5YJgQoKL
+-----END PRIVATE KEY-----
+";
+
+/// review ext#12: gconsole talks to a gserver serving TLS (`--tls`),
+/// verifying its certificate (`--ca-file`, else `$SSL_CERT_FILE`): nothing
+/// of the session — not the password, not a statement — crosses the
+/// network in clear text, and a server whose certificate the CA bundle
+/// does not vouch for gets nothing.
+#[cfg(feature = "tls")]
+#[test]
+fn the_console_talks_to_a_tls_gserver() {
+    let root = scratch("gc_tls");
+    let _root = DirGuard(root.clone());
+    let certs = scratch("gc_tls_certs");
+    let _certs = DirGuard(certs.clone());
+    let (cert, key) = (certs.join("cert.pem"), certs.join("key.pem"));
+    fs::write(&cert, CERT_PEM).unwrap();
+    fs::write(&key, KEY_PEM).unwrap();
+    let empty = certs.join("empty.pem");
+    fs::write(&empty, "").unwrap();
+    let mut config = gstore::config::GStoreConfig::default();
+    config.ip_deny_path = None;
+    config.thread_num = 4;
+    let policy = gstore::LoadPolicy::restricted().with_allowed_dir(data("small"));
+    let server = Arc::new(
+        gstore::http_api::ApiServer::bind(&root, PASSWORD, "127.0.0.1:0")
+            .unwrap()
+            .with_config(config)
+            .with_load_policy(policy),
+    );
+    struct Stop(Arc<gstore::http_api::ApiServer>);
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            self.0.shutdown();
+        }
+    }
+    let _stop = Stop(Arc::clone(&server));
+    let tls = gstore::server::load_tls_config(&cert, &key).unwrap();
+    let serving = Arc::clone(&server);
+    thread::spawn(move || serving.serve_forever_tls(tls));
+    let relay = Relay::start(server.local_addr().unwrap());
+    let cwd = scratch("gc_tls_cwd");
+    let _cwd = DirGuard(cwd.clone());
+    let console = |extra: &[&str]| {
+        let mut cmd = gconsole(&relay.addr, &cwd);
+        cmd.args(["-u", "root", "-p", PASSWORD]).args(extra);
+        cmd
+    };
+    let r = run(
+        console(&["--tls", "--ca-file", &path_str(&cert)]),
+        &format!(
+            "create small {nt};\nuse small;\nselect (count(*) as ?n) where {{ ?s ?p ?o }};\n",
+            nt = small_nt()
+        ),
+    );
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(
+        r.out.contains("Build RDF database small successfully!"),
+        "{r:?}"
+    );
+    assert!(r.out.contains("\"25\"^^"), "{r:?}");
+    let sent = relay.requests().concat();
+    assert!(!sent.is_empty());
+    for clear in [PASSWORD, "POST ", "select", "Bearer"] {
+        assert!(
+            !sent.contains(clear),
+            "{clear:?} crossed the network in clear text"
+        );
+    }
+    // `$SSL_CERT_FILE` names the bundle when --ca-file does not.
+    let mut cmd = console(&["--tls", "-e", "showdbs;"]);
+    cmd.env("SSL_CERT_FILE", &cert);
+    let r = run(cmd, "");
+    assert_eq!(r.code, 0, "{r:?}");
+    assert!(r.out.contains("| small    |"), "{r:?}");
+    // A bundle that does not vouch for the server: refused before anything
+    // is sent.
+    let before = relay.requests().len();
+    let r = run(
+        console(&["--tls", "--ca-file", &path_str(&empty), "-e", "showdbs;"]),
+        "",
+    );
+    assert_eq!(r.code, 1, "{r:?}");
+    assert_eq!(
+        r.out, "Could not connect to server. Please check server status\n",
+        "{r:?}"
+    );
+    assert!(r.err.contains("TLS with 127.0.0.1"), "{r:?}");
+    assert!(
+        relay.requests()[before..]
+            .iter()
+            .all(|c| !c.contains(PASSWORD)),
+        "nothing is sent to an unverified server"
+    );
+}
+
+/// Without the `tls` feature, `--tls` is refused up front.
+#[cfg(not(feature = "tls"))]
+#[test]
+fn tls_needs_the_tls_feature() {
+    let cwd = scratch("gc_no_tls");
+    let _cwd = DirGuard(cwd.clone());
+    let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
+    let mut cmd = gconsole(&addr, &cwd);
+    cmd.args(["-u", "root", "-p", PASSWORD, "--tls", "-e", "showdbs;"]);
+    let r = run(cmd, "");
+    assert_eq!(r.code, 2, "{r:?}");
+    assert!(r.err.contains("`tls` cargo feature"), "{r:?}");
+    let mut cmd = gconsole(&addr, &cwd);
+    cmd.args(["--ca-file", "x.pem", "-e", "showdbs;"]);
+    let r = run(cmd, "");
+    assert_eq!(r.code, 2, "{r:?}");
+    assert!(r.err.contains("--ca-file needs --tls"), "{r:?}");
+}
+
 // ---- the README flow: gserver + conf.ini + gconsole -u root ---------------------
 
 #[cfg(unix)]
@@ -1885,22 +2787,6 @@ fn ctrl_c_cancels_the_servers_query_task() {
 fn gconsole_finds_gserver_through_conf_ini() {
     let dir = scratch("gc_readme");
     let _dir = DirGuard(dir.clone());
-    let port = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    fs::create_dir_all(dir.join("conf")).unwrap();
-    fs::write(
-        dir.join("conf/conf.ini"),
-        // review sec#8 / infra#3: an explicit root password (gserver refuses
-        // the default one).
-        format!(
-            "[server]\nport={port}\nthread_num=4\n[system]\ndb_home=./dbhome/\n\
-             root_password={GSERVER_PASSWORD}\n"
-        ),
-    )
-    .unwrap();
     let data_dir = path_str(&data("small"));
     struct Kill(Child);
     impl Drop for Kill {
@@ -1909,21 +2795,36 @@ fn gconsole_finds_gserver_through_conf_ini() {
             let _ = self.0.wait();
         }
     }
-    let server = Kill(
-        Command::new(env!("CARGO_BIN_EXE_gserver"))
-            .current_dir(&dir)
-            .args(["--load-dir", &data_dir])
-            .env_remove("GSTORE_GSERVER_BACKGROUND")
-            .env_remove("GSTORE_GSERVER_SUPERVISOR")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
-    wait_for("gserver", || {
-        TcpStream::connect(("127.0.0.1", port)).is_ok()
-    });
+    // review tests-a#7: both read the port from conf.ini, so it is chosen
+    // beforehand; gserver must then say it serves on it (its own stdout —
+    // not merely some listener on that port), and when the port was taken
+    // meanwhile gserver exits and another one is tried.
+    let mut server = None;
+    for _ in 0..10 {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        fs::create_dir_all(dir.join("conf")).unwrap();
+        fs::write(
+            dir.join("conf/conf.ini"),
+            // review sec#8 / infra#3: an explicit root password (gserver
+            // refuses the default one).
+            format!(
+                "[server]\nport={port}\nthread_num=4\n[system]\ndb_home=./dbhome/\n\
+                 root_password={GSERVER_PASSWORD}\n"
+            ),
+        )
+        .unwrap();
+        if let Some((child, announced)) = spawn_gserver(&dir, &["--load-dir", &data_dir]) {
+            let child = Kill(child);
+            assert_eq!(announced, port, "gserver serves conf.ini's port");
+            server = Some(child);
+            break;
+        }
+    }
+    let server = server.expect("gserver started on a free port");
     // No --port: gconsole reads it from ./conf/conf.ini, like upstream.
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_gconsole"));
     cmd.current_dir(&dir)

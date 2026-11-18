@@ -51,6 +51,20 @@ pub enum Next {
 /// The next statement of `buf`. With `at_eof` (no more input will come) a
 /// final statement without `;` is complete too.
 pub fn next_statement(buf: &str, at_eof: bool) -> Next {
+    scan_statement(buf, at_eof, false)
+}
+
+/// [`next_statement`] for input that is SPARQL whatever its first word —
+/// the statements of the local console (`gconsole --local`), which ends
+/// them by the same rule as this one: at a `;` outside `{…}` groups, string
+/// literals, `<IRI>`s and `#` comments (review ext#9).
+pub fn next_sparql_statement(buf: &str, at_eof: bool) -> Next {
+    scan_statement(buf, at_eof, true)
+}
+
+/// [`next_statement`], the statement read as SPARQL when `sparql` (else as
+/// [`is_sparql`] decides).
+fn scan_statement(buf: &str, at_eof: bool, sparql: bool) -> Next {
     let start = skip_blank(buf);
     if start >= buf.len() {
         return Next::Blank {
@@ -58,7 +72,7 @@ pub fn next_statement(buf: &str, at_eof: bool) -> Next {
         };
     }
     let body = &buf[start..];
-    let end = if is_sparql(body) {
+    let end = if sparql || is_sparql(body) {
         find_sparql_end(body)
     } else {
         find_command_end(body)
@@ -538,6 +552,40 @@ mod tests {
         assert_eq!(
             stmt("insert data { <a> <b> <c> } ; delete data { <a> <b> <c> };").as_deref(),
             Some("insert data { <a> <b> <c> }")
+        );
+    }
+
+    /// review ext#9: the local console's statements are SPARQL whatever
+    /// their first word, and end by the same rule.
+    #[test]
+    fn sparql_statements_end_by_the_same_rule_whatever_their_first_word() {
+        let sparql = |buf: &str| match next_sparql_statement(buf, false) {
+            Next::Statement { text, .. } => Some(text),
+            _ => None,
+        };
+        // Read as a console command, `myfn …` would end at its first `;`.
+        assert_eq!(
+            sparql("myfn { ?s ?p ?o ; <q> ?z };").as_deref(),
+            Some("myfn { ?s ?p ?o ; <q> ?z }")
+        );
+        assert_eq!(
+            stmt("myfn { ?s ?p ?o ; <q> ?z };").as_deref(),
+            Some("myfn { ?s ?p ?o")
+        );
+        assert_eq!(
+            next_sparql_statement("select * where {\n ?s ?p ?o ;\n", false),
+            Next::Incomplete
+        );
+        assert_eq!(
+            next_sparql_statement("select * where { ?s ?p ?o }", true),
+            Next::Statement {
+                text: "select * where { ?s ?p ?o }".to_string(),
+                consumed: 27
+            }
+        );
+        assert_eq!(
+            next_sparql_statement("  # only a comment;\n", false),
+            Next::Blank { consumed: 20 }
         );
     }
 

@@ -5,13 +5,21 @@
 //!
 //! ```text
 //! gconsole [-u <user>] [-p <password>] [--host H] [--port N] [-c conf.ini]
-//!          [-e "<commands>"] [-i]
+//!          [--tls [--ca-file FILE]] [-e "<commands>"] [-i]
 //! gconsole --local <db>          # the embedded REPL (gstore-rust extension)
 //! ```
 //!
 //! * **Login** (upstream): the user name is asked for unless `-u` gives it,
 //!   the password (echo off) unless `-p` or the `GSTORE_PASSWORD`
-//!   environment variable gives it; a person typing gets seven tries.
+//!   environment variable gives it; a person typing gets seven tries. The
+//!   console logs in once (`POST /login`) and sends the session, not the
+//!   password, with every request — upstream's per-request password only
+//!   against a server without sessions (see [`client`]).
+//! * **HTTPS**: `--tls` (the `tls` cargo feature) talks to a gserver
+//!   serving TLS (`--tls-cert` / `--tls-key`), verifying its certificate
+//!   against `--ca-file` (else `$SSL_CERT_FILE` or the system CA bundle).
+//!   Without it, a server that is not on this machine gets a warning: the
+//!   password (at login) and every statement cross the network in clear.
 //! * **Statements** end with `;` and may span lines (`     -> ` prompts the
 //!   continuation); `#` starts a comment; `<statement> > file` / `>> file`
 //!   redirect its output. The prompt is `gStore[no database]> ` or
@@ -46,7 +54,7 @@ pub mod term;
 
 use std::path::PathBuf;
 
-use client::{ApiClient, CallError};
+use client::{ApiClient, CallError, LoginError};
 use commands::{
     Console, History, CROSS_LINE_PROMPT, MAX_WRONG_PSWD_TIMES, PRODUCT_NAME, PRODUCT_VERSION,
 };
@@ -68,6 +76,10 @@ pub struct Options {
     pub config: Option<PathBuf>,
     pub exec: Option<String>,
     pub interactive: bool,
+    /// `--tls`: HTTPS.
+    pub tls: bool,
+    /// `--ca-file`: the CA certificates to verify the server with.
+    pub ca_file: Option<PathBuf>,
     /// `--local <db>` (or the legacy `gconsole <db>`).
     pub local: Option<String>,
     /// The database was given the legacy way (a bare argument).
@@ -115,6 +127,8 @@ pub fn parse_args(args: &[String]) -> Result<Invocation, String> {
             "-c" | "--config" => o.config = Some(PathBuf::from(value(flag)?)),
             "-e" | "--exec" => o.exec = Some(value(flag)?),
             "-i" | "--interactive" => o.interactive = true,
+            "--tls" => o.tls = true,
+            "--ca-file" => o.ca_file = Some(PathBuf::from(value(flag)?)),
             "--local" => o.local = Some(value(flag)?),
             _ if !arg.starts_with('-') && o.local.is_none() => {
                 o.local = Some(arg.to_string());
@@ -150,6 +164,9 @@ pub fn help_text() -> String {
          \x20 -c, --config FILE   the conf.ini to read the port from (default ./{DEFAULT_CONF}).\n\
          \x20 -e, --exec CMDS     run the ;-separated commands, then exit.\n\
          \x20 -i, --interactive   banner, prompts and history even when stdin is not a terminal.\n\
+         \x20 --tls               HTTPS: gserver serves TLS (needs the `tls` feature).\n\
+         \x20 --ca-file FILE      with --tls: the CA certificates (PEM) to verify gserver with\n\
+         \x20                     (default $SSL_CERT_FILE, else the system bundle).\n\
          \x20 --local DB          gstore-rust extension: the embedded console on database DB\n\
          \x20                     (a directory or <name>.db), without a server.\n\
          \x20 \n\
@@ -237,11 +254,29 @@ pub fn main(args: &[String]) -> i32 {
             return 2;
         }
     };
+    if opts.ca_file.is_some() && !opts.tls {
+        eprintln!("gconsole: --ca-file needs --tls");
+        return 2;
+    }
+    if opts.tls && !cfg!(feature = "tls") {
+        eprintln!("gconsole: --tls needs a gconsole built with the `tls` cargo feature");
+        return 2;
+    }
     let host = opts
         .host
         .clone()
         .unwrap_or_else(|| DEFAULT_HOST.to_string());
-    run_client(&opts, ApiClient::new(&host, port))
+    let mut client = ApiClient::new(&host, port);
+    client.tls = opts.tls;
+    client.ca_file = opts.ca_file.clone();
+    if !client.tls && !client.is_local() {
+        eprintln!(
+            "gconsole: warning: the connection to {host} is not encrypted: the password (at \
+             login) and every statement cross the network in clear text (use --tls with a \
+             gserver serving TLS, or an SSH tunnel)"
+        );
+    }
+    run_client(&opts, client)
 }
 
 /// Log in (upstream `login`), retrying while a person types the password.
@@ -270,21 +305,15 @@ fn login(console: &mut Console, opts: &Options) -> Result<(), i32> {
         };
         console.client.username = name;
         console.client.password = pw;
-        let body = console.client.body("login", vec![]);
-        match console.client.call_interruptible(&body) {
-            Ok(j) => {
-                let code = j.get("StatusCode").and_then(crate::json::Json::as_i64);
-                if code == Some(0) {
-                    return Ok(());
-                }
-                let msg = j
-                    .get("StatusMsg")
-                    .and_then(crate::json::Json::as_str)
-                    .unwrap_or_default();
+        match console.client.log_in() {
+            Ok(()) => return Ok(()),
+            Err(LoginError::Refused(msg)) => {
+                // The server's text must not drive the terminal (ext#10).
+                let msg = table::printable(&msg, true);
                 term::show(&format!("login failed: {msg}\n"));
             }
-            Err(CallError::Interrupted) => return Err(1),
-            Err(e) => {
+            Err(LoginError::Call(CallError::Interrupted)) => return Err(1),
+            Err(LoginError::Call(e)) => {
                 term::show("Could not connect to server. Please check server status\n");
                 eprintln!("gconsole: {e} ({})", console.client.url());
                 return Err(1);
@@ -318,10 +347,13 @@ impl Source {
     fn read(&mut self, console: &mut Console, prompt: &str) -> ReadOutcome {
         match self {
             Source::Plain { prompts } => {
+                // The mark before the prompt: a Ctrl-C typed once it shows
+                // is never lost (review ext#13).
+                let mark = term::interrupts();
                 if *prompts {
                     term::show(prompt);
                 }
-                let line = console.reader.read_line();
+                let line = console.reader.read_line_since(mark);
                 if *prompts && line == ReadOutcome::Interrupted {
                     term::show("\n");
                 }
@@ -366,6 +398,7 @@ fn run_client(opts: &Options, client: ApiClient) -> i32 {
         }
     }
     repl(&mut console, &mut source, interactive);
+    console.client.close_session();
     if !interactive && console.failures > 0 {
         1
     } else {
