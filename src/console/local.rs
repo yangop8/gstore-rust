@@ -13,10 +13,15 @@
 //! and the console saves it by itself when it leaves a database holding
 //! updates no save has persisted yet — at `quit` / `exit`, at the end of the
 //! input and on `load <other>` — so an update it acknowledged
-//! (`[updated N triple(s)]`) is never dropped (review ext#5). When that save
-//! fails, `load <other>` keeps the current database, and an interactive
-//! `quit` stays in the console (a second `quit` leaves without saving); at
-//! the end of the input the failure is reported (exit code 1).
+//! (`[updated N triple(s)]`) is not dropped when the console is left (review
+//! ext#5). Ctrl-C does not end the console: as in the remote one it discards
+//! the statement being typed, and the console goes on (round-5 review
+//! follow-up: it used to kill the process, unsaved updates and all). A
+//! console killed by another signal (`SIGTERM`, `SIGHUP`, `SIGKILL`) does not
+//! get to save. When that save fails, `load <other>` keeps the current
+//! database, and an interactive `quit` stays in the console (a second `quit`
+//! leaves without saving); at the end of the input the failure is reported
+//! (exit code 1).
 //!
 //! Type a SPARQL statement terminated by `;` to run it; it may span lines,
 //! and a `;` inside a `{…}` group, a string literal, an `<IRI>` or a `#`
@@ -33,10 +38,11 @@
 //! Run non-interactively (stdin not a terminal), the exit code is 1 when a
 //! statement or command failed.
 
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use super::syntax::{self, Next};
+use super::term::{self, ReadOutcome};
 use crate::parser::import::{self, ImportOptions};
 use crate::{db_dir_for, Database, QueryResult, StorageKind};
 
@@ -77,14 +83,31 @@ pub fn run(target: &str) -> i32 {
     let mut quit_discards = false;
 
     crate::outln!("gStore-rust local console. End a query with ';'. Type 'help' for commands.");
-    let stdin = io::stdin();
-    let interactive = stdin.is_terminal();
+    // Ctrl-C discards the statement being typed instead of ending the process
+    // with its unsaved updates (as in the remote console): leaving goes
+    // through `quit` / `exit` or the end of the input, which save.
+    term::install_sigint();
+    let interactive = io::stdin().is_terminal();
+    let mut reader = term::LineReader::new();
     let mut failures = 0usize;
     let mut buffer = String::new();
-    print_prompt(&buffer);
 
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
+    loop {
+        // The mark before the prompt: a Ctrl-C typed once it shows is never
+        // lost (review ext#13).
+        let mark = term::interrupts();
+        print_prompt(&buffer);
+        let line = match reader.read_line_since(mark) {
+            ReadOutcome::Line(line) => line,
+            ReadOutcome::Interrupted => {
+                if interactive {
+                    crate::outln!();
+                }
+                buffer.clear();
+                continue;
+            }
+            ReadOutcome::Eof => break,
+        };
         let trimmed = line.trim();
         let discard_armed = std::mem::take(&mut quit_discards);
 
@@ -94,7 +117,6 @@ pub fn run(target: &str) -> i32 {
             match cmd {
                 "" if trimmed.is_empty() => {
                     quit_discards = discard_armed;
-                    print_prompt(&buffer);
                     continue;
                 }
                 "quit" | "exit" => {
@@ -115,12 +137,10 @@ pub fn run(target: &str) -> i32 {
                         db.name()
                     );
                     quit_discards = true;
-                    print_prompt(&buffer);
                     continue;
                 }
                 "help" => {
                     print_help();
-                    print_prompt(&buffer);
                     continue;
                 }
                 "stats" => {
@@ -132,14 +152,12 @@ pub fn run(target: &str) -> i32 {
                         db.literal_num(),
                         db.predicate_num()
                     );
-                    print_prompt(&buffer);
                     continue;
                 }
                 "save" => {
                     if !save(&db, &mut saved_at) {
                         failures += 1;
                     }
-                    print_prompt(&buffer);
                     continue;
                 }
                 cmd if cmd.starts_with("import ") => {
@@ -147,7 +165,6 @@ pub fn run(target: &str) -> i32 {
                     if !import_file(&mut db, path) {
                         failures += 1;
                     }
-                    print_prompt(&buffer);
                     continue;
                 }
                 cmd if cmd.starts_with("load ") && !is_sparql_load(&cmd["load ".len()..]) => {
@@ -159,7 +176,6 @@ pub fn run(target: &str) -> i32 {
                             "load failed: '{}' stays loaded (its updates are not saved)",
                             db.name()
                         );
-                        print_prompt(&buffer);
                         continue;
                     }
                     match Database::open(db_dir_for(other)) {
@@ -173,7 +189,6 @@ pub fn run(target: &str) -> i32 {
                             eprintln!("load failed: {e}");
                         }
                     }
-                    print_prompt(&buffer);
                     continue;
                 }
                 _ => {}
@@ -183,7 +198,6 @@ pub fn run(target: &str) -> i32 {
         buffer.push_str(&line);
         buffer.push('\n');
         failures += run_statements(&mut db, &mut buffer, false);
-        print_prompt(&buffer);
     }
     // A script's final statement may lack its `;` (a person's unfinished
     // one is dropped), as in the remote console.
@@ -342,7 +356,7 @@ fn print_help() {
          \x20                 (LOAD <iri> … is SPARQL's LOAD)\n  \
          import <path>     import an RDF file (format by extension), a directory or a URL\n  \
          quit | exit       leave the console (saving unsaved updates first)\n\
-         otherwise: type a SPARQL query ending in ';'"
+         otherwise: type a SPARQL query ending in ';' (Ctrl-C discards the one being typed)"
     );
 }
 

@@ -16,7 +16,17 @@ Behaviour changes first:
   `quit` stays in the console (a second `quit` leaves without saving), and
   at the end of the input the failure is reported (exit code 1). On-disk
   (`kvstore.kv`) and RocksDB databases write each update through and are
-  not saved. The banner of a new database and `help` say so.
+  not saved. The banner of a new database and `help` say so. Ctrl-C no
+  longer ends the local console (round-5 review follow-up: `SIGINT` kept
+  its default action there, so it killed the process with every
+  acknowledged but unsaved update): as in the remote console it discards
+  the statement being typed (the console reads through
+  `term::LineReader` with the Ctrl-C mark taken before each prompt), and
+  the updates are saved when the console is left. A console killed by
+  another signal (`SIGTERM`, `SIGHUP`, `SIGKILL`) still does not save;
+  the module docs say so instead of "never dropped"
+  (`dt_gconsole::ctrl_c_in_the_local_mode_keeps_the_acknowledged_updates`,
+  which failed before the fix with the console ended by `SIGINT`).
 - **`gconsole --local` ends statements like the remote console (review
   ext#9).** A statement used to end at any line ending in `;`, so a
   multi-line SELECT with a `;` predicate-object list, a long (`"""…"""`)
@@ -53,9 +63,15 @@ Behaviour changes first:
   invalid or has expired: log in again."`. A request that carries a
   password is checked exactly as before (the token is then ignored), so
   nothing changes for upstream clients. No password is checked on this
-  path, so it adds nothing to the failed-login lockout — the `/login` that
-  issued the token is under it — and the IP allow/deny lists and
-  upstream-lockout check run before it as for every operation.
+  path, so it neither adds to the failed-login lockout — the `/login` that
+  issued the token is under it — nor clears it: an `/api` `login` made with
+  a session token leaves the account's failed-login count (and an active
+  lock) at the caller's address alone (round-5 review follow-up: it cleared
+  them, so anyone holding a user's token could guess that user's password
+  without limit, with a token `login` after every four wrong guesses;
+  `Ctx::session_auth`, `api_session_tokens::a_session_login_leaves_the_failed_login_lockout_alone`).
+  The IP allow/deny lists and upstream-lockout check run before it as for
+  every operation.
 - **`gconsole --tls [--ca-file FILE]` (review ext#12; the `tls` cargo
   feature).** The console can talk to a gserver serving HTTPS
   (`--tls-cert` / `--tls-key`): each exchange runs over rustls, the server's
@@ -210,6 +226,13 @@ none
   are not in this package's files; as the verifier noted they fail loudly
   (gserver `-b` exits non-zero and the port is read back from the pid file),
   so only the `dt_gconsole.rs` sites could run against the wrong server.
+- Round-5 review follow-up, not done: `gconsole --local` does not catch
+  `SIGHUP` / `SIGTERM` to save before it exits (a closed terminal or a
+  `kill` still drops unsaved snapshot updates). Reason: it needs a second
+  signal path through `term::LineReader` (a termination outcome next to
+  `Interrupted`, which the remote console would have to handle as well);
+  `save` and the on-disk layouts are the remedies meanwhile. For
+  docs/REFACTOR_BACKLOG.md with ext#5.
 - Not in this package's ids, seen while here: two unit tests in
   `src/console` (`commands::tests::history_is_kept_and_capped`,
   `tests::ports_come_from_the_configuration`) use per-process names under

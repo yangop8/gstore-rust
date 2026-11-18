@@ -2849,3 +2849,79 @@ fn gconsole_finds_gserver_through_conf_ini() {
     );
     assert!(dir.join("dbhome/small.db").is_dir());
 }
+
+/// Round-5 review follow-up (ext#5): Ctrl-C in `gconsole --local` left
+/// `SIGINT` at its default action, so it killed the process — and with it
+/// every update the console had acknowledged (`[updated N triple(s)]`) to
+/// a snapshot-layout database but not yet saved. As in the remote console,
+/// it now discards the statement being typed; the acknowledged update is
+/// saved when the console is left.
+#[cfg(unix)]
+#[test]
+fn ctrl_c_in_the_local_mode_keeps_the_acknowledged_updates() {
+    let cwd = scratch("gc_local_ctrl_c");
+    let _cwd = DirGuard(cwd.clone());
+    let kept = snapshot_db(&cwd, "kept", "<http://a> <http://p> <http://b> .\n");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_gconsole"))
+        .current_dir(&cwd)
+        .args(["--local", "kept"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let out = Live::start(child.stdout.take().unwrap());
+    let err = Live::start(child.stderr.take().unwrap());
+    // Wait for `marker`, failing at once if the console is gone (the
+    // timeout is only a hang guard).
+    let shown = |child: &mut Child, what: &str, marker: &str, from: usize| {
+        let t0 = Instant::now();
+        loop {
+            let text = out.text();
+            if let Some(i) = text.get(from..).and_then(|t| t.find(marker)) {
+                return from + i + marker.len();
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("gconsole ended ({status}) before {what}: {text}");
+            }
+            assert!(
+                t0.elapsed() < Duration::from_secs(60),
+                "timed out waiting for {what}: {text}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    };
+    stdin
+        .write_all(b"insert data { <http://a> <http://p> <http://c> };\n")
+        .unwrap();
+    let at = shown(
+        &mut child,
+        "the acknowledgement",
+        "[updated 1 triple(s)]",
+        0,
+    );
+    let at = shown(&mut child, "the next prompt", "gsql> ", at);
+    // A statement being typed; Ctrl-C once its continuation prompt shows.
+    stdin
+        .write_all(b"insert data { <http://a> <http://p> <http://d> }\n")
+        .unwrap();
+    let at = shown(&mut child, "the continuation prompt", "  ..> ", at);
+    sigint(&child);
+    let at = shown(&mut child, "a fresh prompt after Ctrl-C", "gsql> ", at);
+    stdin.write_all(b"stats;\n").unwrap();
+    drop(stdin);
+    let code = wait(&mut child);
+    let (out, err) = (out.finish(), err.finish());
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(
+        out[at..].contains("name=kept triples=2"),
+        "the interrupted statement was discarded: {out}\n{err}"
+    );
+    assert!(out[at..].contains("saved to "), "{out}\n{err}");
+    assert_eq!(
+        triples_in(&kept),
+        2,
+        "the acknowledged insert survived the Ctrl-C: {out}\n{err}"
+    );
+}

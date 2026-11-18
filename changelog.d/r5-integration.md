@@ -35,8 +35,10 @@ Wiring (integration commits):
   (sec#20); the map in `tests/adversarial_coverage.rs`' module docs gets
   that path's row, pointing at
   `api_session_tokens::the_upstream_api_takes_a_login_session_in_place_of_the_password`
-  (no password is checked there, so the failed-login lockout does not
-  apply; an unknown, logged-out or revoked token is refused). The copy of
+  (no password is checked there, so the path neither counts towards the
+  failed-login lockout nor — since the round-5 review follow-up, with
+  `a_session_login_leaves_the_failed_login_lockout_alone` added to the
+  row — clears it; an unknown, logged-out or revoked token is refused). The copy of
   the table in `changelog.d/r5-test-audit.md` is left as that package
   wrote it (fragments are folded by the closing step).
 
