@@ -4,9 +4,10 @@
 //! macros — and the query / access records of the REST endpoints of
 //! [`gstore::http_api::ApiServer`] (client IP, answer count, latency).
 
+mod common;
+
 use std::fs;
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -466,6 +467,9 @@ fn the_macros_write_through_the_installed_logger() {
             threshold: Level::Trace,
         }),
     };
+    // review tests-b#16: reset however the test ends (it used to be reset
+    // on its last line only).
+    let _log = common::globals::LoggerReset;
     let installed = logging::init(&cfg).expect("install");
     assert_eq!(installed.file_path(), Some(path.as_path()));
     assert_eq!(logging::max_level(), Some(Level::Debug));
@@ -562,24 +566,19 @@ fn basic_root() -> String {
     "Basic cm9vdDpyb290".to_string()
 }
 
+/// One request as root (`(status, body)`), through the shared client
+/// (review tests-b#11: a hung server fails the test naming the request,
+/// where this read had no timeout).
 fn request(addr: &SocketAddr, method: &str, target: &str, body: &str) -> (u16, String) {
-    let mut s = TcpStream::connect(addr).unwrap();
-    let raw = format!(
-        "{method} {target} HTTP/1.1\r\nHost: x\r\nAuthorization: {}\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        basic_root(),
-        body.len()
+    let auth = basic_root();
+    let r = common::http::request(
+        addr,
+        method,
+        target,
+        &[("Host", "x"), ("Authorization", &auth)],
+        body.as_bytes(),
     );
-    s.write_all(raw.as_bytes()).unwrap();
-    let mut resp = String::new();
-    s.read_to_string(&mut resp).unwrap();
-    let status = resp
-        .split_whitespace()
-        .nth(1)
-        .and_then(|c| c.parse().ok())
-        .unwrap();
-    let body = resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
-    (status, body.to_string())
+    (r.status, r.text())
 }
 
 fn start(root: &Path, cfg: Option<GStoreConfig>) -> (Arc<ApiServer>, SocketAddr) {

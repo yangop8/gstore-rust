@@ -10,14 +10,16 @@
 //! * the IP allow / deny lists and the failed-login lockout refuse an
 //!   asynchronous submission before any task exists.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use common::server::Running;
 use gstore::config::GStoreConfig;
 use gstore::gapi::tasks::TaskState;
 use gstore::http_api::ApiServer;
@@ -61,20 +63,20 @@ fn tmp_root(tag: &str) -> PathBuf {
     p
 }
 
-/// A served `ApiServer` (root password `root`) in `root` with `config`.
-fn start_with(root: &Path, config: GStoreConfig) -> (Arc<ApiServer>, SocketAddr) {
-    let server = Arc::new(
+/// A served `ApiServer` (root password `root`) in `root` with `config`;
+/// stopped and joined when the guard is dropped (review tests-a#8: it was
+/// never shut down).
+fn start_with(root: &Path, config: GStoreConfig) -> (Running<ApiServer>, SocketAddr) {
+    let server = Running::start(
         ApiServer::bind(root, "root", "127.0.0.1:0")
             .unwrap()
             .with_config(config),
     );
-    let addr = server.local_addr().unwrap();
-    let s2 = Arc::clone(&server);
-    thread::spawn(move || s2.serve_forever());
+    let addr = server.addr();
     (server, addr)
 }
 
-fn start(tag: &str) -> (Arc<ApiServer>, SocketAddr, PathBuf) {
+fn start(tag: &str) -> (Running<ApiServer>, SocketAddr, PathBuf) {
     let root = tmp_root(tag);
     let (srv, addr) = start_with(&root, GStoreConfig::default());
     (srv, addr, root)
