@@ -23,7 +23,8 @@ if [ ! -r "/proc/$pid/cmdline" ]; then
     echo "gstore-healthcheck: no process $pid"
     exit 1
 fi
-cd "/proc/$pid/cwd" 2>/dev/null || :
+cd "/proc/$pid/cwd" 2>/dev/null \
+    || echo "gstore-healthcheck: cannot enter the working directory of process $pid (run the check as the server's user)" >&2
 status=$(GSTORE_GSERVER=${GSTORE_GSERVER:-gserver} xargs -0 sh -c '
     case "${1##*/}" in
         gserver) shift ;;

@@ -400,8 +400,14 @@ say "gserver listens on $API"
 # The container image's health check (packaging/docker/gstore-healthcheck)
 # against this server, on its non-default port: healthy, and no request
 # recorded (the access log is only created by a request).
-GSTORE_HEALTHCHECK_PID=$(sed -n 1p "$PIDFILE") GSTORE_GSERVER=$GSERVER \
-    "$REPO/packaging/docker/gstore-healthcheck" >"$WORK/health.log" 2>&1 \
+# It runs as the server's user, as the image's HEALTHCHECK does: it enters
+# /proc/PID/cwd, which root may not do for another user's process without
+# CAP_SYS_PTRACE (a container's root, as in the Fedora smoke). The script
+# text is passed as an argument, so the unit's user needs no access to the
+# checkout.
+as_user env GSTORE_HEALTHCHECK_PID="$(sed -n 1p "$PIDFILE")" GSTORE_GSERVER="$GSERVER" \
+    sh -c "$(cat "$REPO/packaging/docker/gstore-healthcheck")" gstore-healthcheck \
+    >"$WORK/health.log" 2>&1 \
     || { cat "$WORK/health.log" >&2; fail "the health check reports the running server unhealthy"; }
 [ ! -s "$WORKDIR/dbhome/access.log" ] || fail "the health check is logged as client traffic"
 say "health check: healthy, no access-log record"
