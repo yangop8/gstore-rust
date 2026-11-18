@@ -671,11 +671,18 @@ fn unloaded_statistics_are_read_again_for_a_look_alike_directory() {
             .unwrap_or_default()
     };
     assert!(classes().contains("K1"), "cold's own classes");
-    let reads = gstore::gapi::unloaded_stats_reads(&cold);
     // `twin`'s directory takes `cold`'s place, timestamps and all.
     fs::rename(&cold, srv.root.0.join("cold.moved")).unwrap();
     fs::rename(&twin, &cold).unwrap();
     set_mtimes(&cold, t);
+    // The read count is taken once `cold` exists again: between the two
+    // renames there is no directory `cold`, and a `monitor` / `schema` of
+    // any unloaded database in this process (another test's server, run in
+    // parallel) drops the counts of directories that are gone, so a count
+    // taken before the swap could be reset under the test (a full workspace
+    // run saw "read anew" fail with 0 for 1). No read of `cold` happens in
+    // between, so the count says the same as before.
+    let reads = gstore::gapi::unloaded_stats_reads(&cold);
     let after = classes();
     assert!(
         after.contains("K2") && !after.contains("K1"),
