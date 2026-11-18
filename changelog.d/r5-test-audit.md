@@ -9,14 +9,15 @@ format change, no API removed):
   point** (review tests-b#3). A database directory created by the disk
   bulk build (`Database::build_disk`, `gstore::bulk::build`, `gbuild`), the
   RocksDB bulk build, `Database::build_rocksdb_from_str` /
-  `build_rocksdb_from_files`, `Database::backup_dir`, the servers' backups
-  (REST `/backup`, `/api` `backup`: the backups directory and the backup's
-  own directory) and a user's PFN source / module directories were made
-  with `create_dir_all`: their files were synced, but the new directory's
-  entry in its parent was not, so a power cut after the success answer
-  could lose the whole database, backup or function. All of them now use
-  `fsutil::create_dir_durable` (the parent of every created directory is
-  fsynced).
+  `build_rocksdb_from_files`, `Database::backup_dir`, REST `/upload` into
+  a new database name, the servers' backups (REST `/backup`, `/api`
+  `backup`: the backups directory and the backup's own directory; `/api`
+  exports share the helper that creates the directory) and a user's PFN
+  source / module directories were made with `create_dir_all`: their files
+  were synced, but the new directory's entry in its parent was not, so a
+  power cut after the success answer could lose the whole database, backup
+  or function. All of them now use `fsutil::create_dir_durable` (the parent
+  of every created directory is fsynced).
 - **Reasoning-rule directories are created durably** (tests-b#3).
   `reason_rule_files/` (created by the first `reasonManage add`) and its
   `inferred/` ledger directory are fsynced into their parents when they are
@@ -30,7 +31,7 @@ format change, no API removed):
   each sync is recorded (file identity, length, mtime, a directory's
   entries, call site) for every live `Probe`. With no probe alive the
   record costs one atomic load per fsync. Not a supported API.
-- New `tests/fsync_audit.rs` (20 tests, 3 more with `--features rocksdb`):
+- New `tests/fsync_audit.rs` (21 tests, 3 more with `--features rocksdb`):
   around one commit point, every changed file must have been synced after
   its last write, every changed directory after its last entry change and a
   RocksDB store's log after its last write; and every intermediate state a
@@ -43,10 +44,14 @@ format change, no API removed):
   Materialize, RocksDB), `commit()` and `/commit`, both servers' `/update`,
   snapshot saves and checkpoints (also over a disk database), disk and
   RocksDB saves elsewhere, backups (library, REST, `/api`), the restore
-  swap, bulk installs (disk and RocksDB, into new / disk / ruled / snapshot
-  directories), `build_rocksdb_from_str`, WAL create/rename/delete and its
-  replay at open, a VS-tree rebuilt at open, redo/update-log appends, rule
-  directory and PFN writes (review tests-b#3, tests-a#13).
+  swap (library, REST `/restore` over a database and into a new name,
+  `/api` `restore`), databases the `/api` server creates (REST `/build` of
+  both layouts, `/upload` into a new name, the `/api` `build` operation of
+  both layouts), bulk installs (disk and RocksDB, into new / disk / ruled /
+  snapshot directories), `build_rocksdb_from_str`, WAL create/rename/delete
+  and its replay at open, a VS-tree rebuilt at open, redo/update-log
+  appends, rule directory and PFN writes (a compile's module directory with
+  `--features pfn-wasm`) (review tests-b#3, tests-a#13).
 - New `tests/adversarial_coverage.rs`: the map from every DoS /
   hostile-input category of review sec#20, http#20, robust#17 and gapi#21
   to its regression test (table below), plus the two that were missing:
@@ -64,9 +69,13 @@ format change, no API removed):
   dripping client, worker hand-over, counters), `http_client` tests
   (trickling endpoint and TLS handshake, closed port), `http_api` tests
   (`bad_credentials_never_hash_under_the_state_lock` now parks the hash
-  and checks the state lock; the monitoring and query-settings tests' one
-  second bounds). New doc-hidden test hook
-  `http_users::test_hooks::park_verifications_of`.
+  and `statements_and_batch_payloads_are_parsed_off_the_state_lock` parks
+  the statement / batch-payload parse, each checking the state lock while
+  parked, where they sampled it; the monitoring and query-settings tests'
+  one-second bounds; the monitoring tests' 100 ms "a writer queued" sleeps
+  became a latch on the lock refusing new readers). New doc-hidden test
+  hook `http_users::test_hooks::park_verifications_of`, and a
+  `#[cfg(test)]` parse hook in `http_api.rs` (no code in release builds).
 - Test temp directories in the `server.rs`, `http_client.rs` and
   `gapi/tasks.rs` test modules are unique and removed on drop.
 
@@ -101,15 +110,25 @@ none
     `rocks_sink`'s `sync_wal` right after a memtable flush (the log is
     empty) and its `sync_dir(staging)` (the staged store is renamed away and
     any later build discards the staging area). Kept as belt and braces.
-  - http#20: `http_api::tests::statements_and_batch_payloads_are_parsed_off_the_state_lock`
-    still samples the state lock (`busy * 8 < samples`); a deterministic
-    version needs park points in the statement classifier and the
-    batch-payload parser (production code in `http_api.rs`). The verifier
-    measured it 10/10 green pinned to one CPU.
-  - http#20: `monitoring_answers_while_the_database_is_held` still orders
-    its "writer queued behind a reader" case with a 100 ms sleep (the
-    RwLock's waiter is not observable); a slow start only weakens that
-    case, it cannot fail it.
+  - tests-b#3 (audit model): the audit keys files and directories by
+    their path below the audited root, so a commit point that renames a
+    whole database directory (`/api` `rename`, `drop` with
+    `is_backup=true`) reads as new, never-synced files under the new name
+    although they were synced before and only the parent's entry changed
+    (which the audit does check). Those two operations are therefore not
+    audited; following identities across renamed directories would let
+    the audit cover them.
+  - tests-b#3: the `/api` `build` operation writes upstream's build-cost
+    file (`success`) and the parse error log into the new database
+    without syncing them; both are informational (a missing cost reads as
+    0), so the audit test exempts them, with that reason, rather than
+    syncing them.
+  - http#20 (outside the audited list, found by the grep):
+    `http_api::tests::monitor_after_a_change_answers_at_once_and_settles`
+    (round 4, gapi#17) asserts that `/api monitor` waits at most 250 ms
+    for the background statistics refresh. That bound is the property it
+    measures (a 40 ms wait); a deterministic version needs a hook in the
+    refresh. Its "a writer queued" ordering is now a latch.
 
 ## Measured numbers
 
@@ -146,7 +165,7 @@ none
   | `src/server.rs` (tests) | 5 (+1 150 ms work loop) | 0 | the 2 hits are production log rate limits |
   | `src/http_client.rs` (tests) | 2 | 0 | — |
   | `src/gapi/tasks.rs` (tests) | 0 (1 unguarded busy wait) | 0 | — |
-  | `src/http_api.rs` (the http#20 tests) | 6 | 1 | `statements_and_batch_payloads_are_parsed_off_the_state_lock` (backlog) |
+  | `src/http_api.rs` (the http#20 tests) | 6 | 0 | the one hit in the file is `monitor_after_a_change_answers_at_once_and_settles` (round 4, not an http#20 test; backlog) |
   | `tests/dt_rw_crash.rs`, `tests/fsync_audit.rs`, `tests/adversarial_coverage.rs` | 0 | 0 | — |
 
 - Adversarial-coverage table (sec#20, http#20, robust#17, gapi#21; also in
@@ -168,6 +187,7 @@ none
   | GET update, CORS, DNS rebinding | `http_browser_surface::get_never_runs_an_update_unless_the_compat_switch_is_on`, `cors_headers_go_only_to_listed_origins`, `a_loopback_request_must_name_a_local_host` |
   | lockout on every authentication path | `login_lockout::api_login_and_test_connect_are_refused_for_a_locked_account_without_hashing`, `rest_login_and_basic_credentials_are_refused_for_a_locked_account`, `the_pre_body_check_refuses_a_locked_account_before_hashing` |
   | hashing off the state lock | `http_api::tests::bad_credentials_never_hash_under_the_state_lock` (now deterministic) |
+  | parsing off the state lock | `http_api::tests::statements_and_batch_payloads_are_parsed_off_the_state_lock` (now deterministic) |
   | session growth / expiry | `user_store_consistency::a_user_flooding_logins_ends_only_their_own_oldest_sessions`, `expired_sessions_are_swept_on_login` |
   | deeply nested `SERVICE` reply | `service_hardening::a_deeply_nested_reply_is_a_parse_error`, `a_service_endpoint_replying_100k_nested_brackets_does_not_abort` |
   | surrogate pairs | `service_hardening::surrogate_pair_escapes_in_service_results_decode`, `a_surrogate_pair_from_a_service_endpoint_joins_with_local_data` |
@@ -223,10 +243,14 @@ none
   - `src/db/persist.rs` (R5: nobody): `Database::backup_dir` and
     `Database::create_rocksdb` create their directory with
     `create_dir_durable`.
-  - `src/http_api.rs` (R5: nobody): `handle_backup` and `backup_target`
-    use `create_dir_durable`; test module: the five http#20 tests above.
+  - `src/http_api.rs` (R5: nobody): `handle_backup`, `backup_target` and
+    `DbSlot::save_db` use `create_dir_durable`; a `#[cfg(test)]`
+    `parse_test_hook` module with one `#[cfg(test)]` call line each in
+    `handle_query`'s and `handle_update`'s deferred closures and at the
+    start of `parse_batch_payload`; test module: the http#20 tests above.
   - `src/gapi/ops_db.rs` (R5: nobody): the `backup` operation's target and
-    both destination paths use `create_dir_durable`.
+    both destination paths, and `output_dir` (the backups / export
+    directory), use `create_dir_durable`.
   - `src/http_users.rs`: `test_hooks::note_verification` also serves the
     new `park_verifications_of` (doc-hidden test hook).
   - `src/db/logs.rs` `LogWriter::write_out`, `src/reason/store.rs`
@@ -241,7 +265,8 @@ none
     `newer_than_snapshots`, `install`), `src/backend/rocks.rs`
     (`RocksStore::sync_wal`); `src/lib.rs` one `pub mod sync_probe` line.
 - Not done (backlog, reasons in Docs notes): the nightly power-loss job;
-  the remaining sampling test in `http_api.rs`.
+  auditing whole-directory renames; the 250 ms bound of a round-4
+  monitoring test.
 - `--test-threads=1`: run for the touched test targets and lib modules
   (not the whole workspace, which the default-parallelism runs cover in
   both disk query modes).
