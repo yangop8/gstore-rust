@@ -2348,7 +2348,15 @@ fn output_dir(
             format!("cannot create '{}': {e}", root.display()),
         )
     };
-    fs::create_dir_all(root).map_err(io)?;
+    // Durably: a backup's success answer must not outlive its directory
+    // (review tests-b#3: the fsync audit found that a backups directory
+    // created here was never synced into its parent).
+    crate::db::fsutil::create_dir_durable(root).map_err(|e| {
+        GResp::error(
+            Status::OperationFailed,
+            format!("cannot create '{}': {e}", root.display()),
+        )
+    })?;
     let requested = requested.filter(|r| {
         let r = lexical(r);
         !aliases.iter().any(|a| lexical(a) == r) && lexical(&root.to_string_lossy()) != r

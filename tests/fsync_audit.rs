@@ -1077,6 +1077,10 @@ fn the_api_server_syncs_a_backup_before_it_acknowledges() {
     let (s, b) = request(addr, "POST", "/backup?db_name=bak", Some(ROOT), "");
     assert_eq!(s, 200, "REST /backup: {b}");
     audit.finish("REST /backup", &SERVER_LOGS);
+    // The `/api` operation creates the backups directory itself (both
+    // protocols back up into `<root>/backups`): each path's directory
+    // creation is checked on its own.
+    fs::remove_dir_all(root.join("backups")).unwrap();
     let audit = Audit::begin(tmp.path());
     let (s, b) = request(
         addr,
