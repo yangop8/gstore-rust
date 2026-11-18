@@ -4847,6 +4847,8 @@ impl ApiInner {
             // Parsed once, with no lock held: the parse classifies the
             // statement (privilege, shared or exclusive guard) and is what
             // the job runs.
+            #[cfg(test)]
+            parse_test_hook::parsing(&sparql);
             let stmt = Statement::parse(&sparql).ok();
             let is_update = stmt.as_ref().is_some_and(Statement::is_update);
             let op = if is_update { "update" } else { "query" };
@@ -4897,6 +4899,8 @@ impl ApiInner {
         let fmt = ResultFormat::negotiate(req.param("format").as_deref(), req.header("accept"));
         let user = user.to_string();
         Dispatch::Deferred(Box::new(move |inner| {
+            #[cfg(test)]
+            parse_test_hook::parsing(&sparql);
             let stmt = Statement::parse(&sparql).ok();
             log_query(&inner.config(), &inner.root, &name, &user, &sparql);
             let qlog = RestQueryLog::start(inner, &name, &sparql, fmt);
@@ -8564,6 +8568,8 @@ fn parse_batch_payload(
     format: Option<&str>,
     payload: &str,
 ) -> Result<(&'static str, Vec<Triple>), String> {
+    #[cfg(test)]
+    parse_test_hook::parsing(payload);
     let explicit = format
         .map(|f| f.trim().to_ascii_lowercase())
         .filter(|f| !f.is_empty() && f != "json");
@@ -8789,6 +8795,71 @@ pub(crate) mod backup_test_hook {
         for hook in hooks {
             hook();
         }
+    }
+}
+
+/// Test hook (review http#20): parks the parse of a statement or a batch
+/// payload whose text holds a marker, so that a test can look at the state
+/// lock while the parse is under way — deterministically, where it used to
+/// sample the lock while big requests were parsed.
+#[cfg(test)]
+pub(crate) mod parse_test_hook {
+    use std::sync::{Condvar, Mutex, PoisonError};
+
+    struct Parks {
+        /// Marker → whether a parse holding it is parked.
+        marked: Vec<(String, bool)>,
+    }
+
+    static PARKS: Mutex<Parks> = Mutex::new(Parks { marked: Vec::new() });
+    static CHANGED: Condvar = Condvar::new();
+
+    /// Parks every parse of a text holding `marker` until dropped.
+    pub(crate) struct Park(String);
+
+    impl Park {
+        /// Park the parses of texts holding `marker` (use a marker no other
+        /// test sends).
+        pub(crate) fn new(marker: &str) -> Park {
+            let mut p = PARKS.lock().unwrap_or_else(PoisonError::into_inner);
+            p.marked.push((marker.to_string(), false));
+            Park(marker.to_string())
+        }
+
+        /// Wait until a parse is parked; `false` after `timeout` (a hang
+        /// guard).
+        pub(crate) fn wait_parked(&self, timeout: std::time::Duration) -> bool {
+            let p = PARKS.lock().unwrap_or_else(PoisonError::into_inner);
+            let (p, _) = CHANGED
+                .wait_timeout_while(p, timeout, |p| {
+                    !p.marked.iter().any(|(m, parked)| *m == self.0 && *parked)
+                })
+                .unwrap_or_else(PoisonError::into_inner);
+            p.marked.iter().any(|(m, parked)| *m == self.0 && *parked)
+        }
+    }
+
+    impl Drop for Park {
+        fn drop(&mut self) {
+            let mut p = PARKS.lock().unwrap_or_else(PoisonError::into_inner);
+            p.marked.retain(|(m, _)| *m != self.0);
+            CHANGED.notify_all();
+        }
+    }
+
+    /// Called right before a statement or a batch payload is parsed.
+    pub(super) fn parsing(text: &str) {
+        let mut p = PARKS.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(i) = p.marked.iter().position(|(m, _)| text.contains(m.as_str())) else {
+            return;
+        };
+        let marker = p.marked[i].0.clone();
+        p.marked[i].1 = true;
+        CHANGED.notify_all();
+        // Released when the park is dropped.
+        let _released = CHANGED
+            .wait_while(p, |p| p.marked.iter().any(|(m, _)| *m == marker))
+            .unwrap_or_else(PoisonError::into_inner);
     }
 }
 
@@ -9940,9 +10011,12 @@ mod tests {
     /// Classifying a SPARQL statement (a full parse) and parsing a batch
     /// payload — up to the request body cap — run with the state lock
     /// released, so a big request cannot stall `/cancel` and every other
-    /// client behind it. Sampled directly while such requests are processed.
+    /// client behind it. Each parse is parked (a test hook) while the test
+    /// looks at the lock. review http#20: this used to sample the lock while
+    /// such requests were parsed ("held in under an eighth of the samples").
     #[test]
     fn statements_and_batch_payloads_are_parsed_off_the_state_lock() {
+        use super::parse_test_hook::Park;
         let (server, addr) = start("parse_off_lock");
         let root = basic("root", "root");
         assert_eq!(
@@ -9957,52 +10031,48 @@ mod tests {
             200
         );
         let mut nt = String::new();
-        for i in 0..150_000 {
+        for i in 0..1_000 {
             nt.push_str(&format!(
                 "<http://ex/s{i}> <http://ex/p> \"value number {i}\" .\n"
             ));
         }
         let mut values = String::from("SELECT * WHERE { VALUES ?x { ");
-        for i in 0..150_000 {
+        for i in 0..1_000 {
             values.push_str(&format!("<http://ex/s{i}> "));
         }
         values.push_str("} }");
-        let requests: Vec<(&str, String)> = vec![
-            ("/batchRemove?db_name=b", nt.clone()),
-            ("/batchRemove?db_name=b&format=ttl", nt),
-            ("/sparql?db_name=b", values.clone()),
-            ("/update?db_name=b", values),
+        let requests: [(&str, &String); 4] = [
+            ("/batchRemove?db_name=b", &nt),
+            ("/batchRemove?db_name=b&format=ttl", &nt),
+            ("/sparql?db_name=b", &values),
+            ("/update?db_name=b", &values),
         ];
-        let stop = Arc::new(AtomicBool::new(false));
-        let worker = {
-            let (stop, root) = (Arc::clone(&stop), root.clone());
-            std::thread::spawn(move || {
-                for (target, body) in requests {
-                    let (s, b) =
-                        split_status_body(&raw_request(&addr, "POST", target, Some(&root), &body));
-                    assert!(s == 200 || s == 400, "{target}: {s} {b}");
-                }
-                stop.store(true, Ordering::Relaxed);
-            })
-        };
-        let (mut samples, mut busy) = (0u32, 0u32);
-        while !stop.load(Ordering::Relaxed) {
-            samples += 1;
-            if server.inner.state.try_lock().is_err() {
-                busy += 1;
-            }
-            std::thread::sleep(std::time::Duration::from_micros(200));
+        for (i, (target, body)) in requests.into_iter().enumerate() {
+            // A comment only this request carries marks its parse.
+            let marker = format!("parse-off-lock-{i}");
+            let body = format!("{body}\n# {marker}\n");
+            let park = Park::new(&marker);
+            let request = {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    split_status_body(&raw_request(&addr, "POST", target, Some(&root), &body))
+                })
+            };
+            assert!(
+                park.wait_parked(Duration::from_secs(60)),
+                "{target}: the request was never parsed"
+            );
+            assert!(
+                server.inner.state.try_lock().is_ok(),
+                "{target}: the state lock is held while the request is parsed"
+            );
+            drop(park);
+            let (s, b) = request.join().unwrap();
+            assert!(s == 200 || s == 400, "{target}: {s} {b}");
         }
-        worker.join().unwrap();
         assert!(
-            samples > 20,
-            "the requests took too little time to sample: {samples}"
-        );
-        // Parsing under the lock shows up as ~35% here; what remains without
-        // it (copying the body out of the request) is ~5%.
-        assert!(
-            busy * 8 < samples,
-            "the state lock was held in {busy} of {samples} samples while requests were parsed"
+            server.inner.state.try_lock().is_ok(),
+            "the lock is free once the requests are done"
         );
         server.shutdown();
     }
