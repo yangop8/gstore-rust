@@ -4,18 +4,18 @@
 //! coordinator (see [`gstore::cluster::ShardNode`] / [`gstore::rpc`]).
 //!
 //! **Experimental.** `gnode` exercises the experimental [`gstore::cluster`]
-//! layer: nothing written to it is persisted (a restarted node starts from its
-//! optional `data_file` only, a cluster replica from nothing), the RPC
-//! protocol is unauthenticated and may change between releases, and it is
-//! not connected to `gserver` or the HTTP API. It has no counterpart in
-//! upstream gStore 1.4. Do not use it for data you need to keep.
+//! layer: a shard node persists nothing (a restarted node starts from its
+//! optional `data_file` only), the RPC protocol is unauthenticated and may
+//! change between releases, and it is not connected to `gserver` or the HTTP
+//! API. It has no counterpart in upstream gStore 1.4. Do not use it for data
+//! you need to keep.
 //!
 //! Usage:
 //!
 //! - `gnode [bind_addr] [data_file]` — run a single **shard** node (the default).
-//! - `gnode cluster <id> <bind_addr> [peer_id@addr ...]` — run a **replicated
-//!   cluster** node (a Raft-like leader/follower replica; see
-//!   [`gstore::cluster::ClusterNode`]).
+//! - `gnode cluster <id> <bind_addr> [peer_id@addr ...] (--state-dir DIR |
+//!   --ephemeral)` — run a **replicated cluster** node (a Raft-like
+//!   leader/follower replica; see [`gstore::cluster::ClusterNode`]).
 //!
 //! For the shard mode:
 //!
@@ -31,12 +31,24 @@
 //! listen address, and each `peer_id@addr` names another replica (e.g.
 //! `1@127.0.0.1:7101`). One node wins leadership by majority vote; clients send
 //! writes to the leader, which replicates them to a quorum before they apply.
+//! One of two state choices is required:
+//!
+//! - `--state-dir DIR`: the replica's Raft term, vote and log are journaled
+//!   in `DIR` (one directory per node id) and `fsync`ed before it answers, so
+//!   it can be restarted — it keeps the vote it gave in its term and its log,
+//!   and rebuilds its triples as the leader re-confirms the log;
+//! - `--ephemeral`: everything stays in memory (the earlier behaviour). Such a
+//!   replica must never be restarted under the same id: it would forget its
+//!   vote and could vote a second time in one term (two leaders of one term),
+//!   or help elect a leader that lacks committed writes (review
+//!   cluster-nlqa#11).
 //!
 //! The wire protocol is the hand-rolled, `std`-only length-prefixed binary codec
 //! in [`gstore::rpc`] — the zero-dependency stand-in for gRPC; swapping in gRPC
 //! would be a serialization-codec swap, not an architectural change.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use gstore::cluster::{ClusterNode, RaftConfig, ShardNode};
@@ -49,9 +61,7 @@ fn main() -> ExitCode {
     let mut positionals: Vec<&str> = Vec::new();
     for arg in &args[1..] {
         if arg == "-h" || arg == "--help" {
-            eprintln!(
-                "usage (experimental, in-memory only):\n  gnode [bind_addr] [data_file]\n  gnode cluster <id> <bind_addr> [peer_id@addr ...]"
-            );
+            eprintln!("usage (experimental):\n  gnode [bind_addr] [data_file]\n  {CLUSTER_USAGE}");
             return ExitCode::SUCCESS;
         }
         positionals.push(arg);
@@ -94,13 +104,74 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Run a replicated **cluster** node: `cluster <id> <bind_addr> [peer_id@addr ...]`.
+/// The cluster-mode command line.
+const CLUSTER_USAGE: &str =
+    "gnode cluster <id> <bind_addr> [peer_id@addr ...] (--state-dir DIR | --ephemeral)";
+
+/// Where a cluster replica keeps its Raft term, vote and log.
+enum StateChoice {
+    /// Journaled in this directory (durable across restarts).
+    Dir(PathBuf),
+    /// In memory only: the replica must never restart under the same id.
+    Ephemeral,
+}
+
+/// Split the cluster-mode arguments into the positional ones and the state
+/// choice (`--state-dir DIR`, `--state-dir=DIR` or `--ephemeral`, anywhere).
+fn parse_state_choice<'a>(args: &[&'a str]) -> Result<(Vec<&'a str>, StateChoice), String> {
+    let mut positionals = Vec::new();
+    let mut dir: Option<PathBuf> = None;
+    let mut ephemeral = false;
+    let mut it = args.iter();
+    while let Some(&arg) = it.next() {
+        if arg == "--ephemeral" {
+            ephemeral = true;
+        } else if arg == "--state-dir" {
+            match it.next() {
+                Some(d) if !d.is_empty() => dir = Some(PathBuf::from(d)),
+                _ => return Err("--state-dir needs a directory".to_string()),
+            }
+        } else if let Some(d) = arg.strip_prefix("--state-dir=") {
+            if d.is_empty() {
+                return Err("--state-dir needs a directory".to_string());
+            }
+            dir = Some(PathBuf::from(d));
+        } else if arg.starts_with("--") {
+            return Err(format!("unknown option '{arg}'"));
+        } else {
+            positionals.push(arg);
+        }
+    }
+    match (dir, ephemeral) {
+        (Some(d), false) => Ok((positionals, StateChoice::Dir(d))),
+        (None, true) => Ok((positionals, StateChoice::Ephemeral)),
+        (Some(_), true) => Err("--state-dir and --ephemeral exclude each other".to_string()),
+        (None, false) => Err(
+            "choose where the replica keeps its Raft term, vote and log: --state-dir DIR \
+             (durable; required to restart it safely) or --ephemeral (in memory; it must \
+             then never be restarted under the same id)"
+                .to_string(),
+        ),
+    }
+}
+
+/// Run a replicated **cluster** node:
+/// `cluster <id> <bind_addr> [peer_id@addr ...] (--state-dir DIR | --ephemeral)`.
 fn run_cluster(args: &[&str]) -> ExitCode {
+    let (args, state) = match parse_state_choice(args) {
+        Ok(parsed) => parsed,
+        Err(msg) => {
+            eprintln!("gnode cluster: {msg}");
+            eprintln!("usage: {CLUSTER_USAGE}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let args = &args[..];
     let id: NodeId = match args.first().and_then(|s| s.parse().ok()) {
         Some(id) => id,
         None => {
             eprintln!("gnode cluster: expected a numeric node <id>");
-            eprintln!("usage: gnode cluster <id> <bind_addr> [peer_id@addr ...]");
+            eprintln!("usage: {CLUSTER_USAGE}");
             return ExitCode::FAILURE;
         }
     };
@@ -140,16 +211,37 @@ fn run_cluster(args: &[&str]) -> ExitCode {
     }
 
     let peer_ids: Vec<NodeId> = peers.iter().map(|(p, _)| *p).collect();
-    let node = match ClusterNode::bind(
-        id,
-        peer_ids,
-        TripleStore::new(),
-        bind_addr,
-        RaftConfig::default(),
-    ) {
+    let bound = match &state {
+        StateChoice::Dir(dir) => {
+            ClusterNode::bind_persistent(id, peer_ids, dir, bind_addr, RaftConfig::default())
+        }
+        StateChoice::Ephemeral => {
+            eprintln!(
+                "gnode cluster: --ephemeral: node {id} keeps its Raft state in memory only; \
+                 never restart it under the same id"
+            );
+            ClusterNode::bind(
+                id,
+                peer_ids,
+                TripleStore::new(),
+                bind_addr,
+                RaftConfig::default(),
+            )
+        }
+    };
+    let node = match bound {
         Ok(n) => n,
         Err(e) => {
-            eprintln!("gnode cluster: failed to bind '{bind_addr}': {e}");
+            match &state {
+                StateChoice::Dir(dir) => eprintln!(
+                    "gnode cluster: failed to start node {id} on '{bind_addr}' with state \
+                     directory '{}': {e}",
+                    dir.display()
+                ),
+                StateChoice::Ephemeral => {
+                    eprintln!("gnode cluster: failed to bind '{bind_addr}': {e}")
+                }
+            }
             return ExitCode::FAILURE;
         }
     };

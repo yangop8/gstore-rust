@@ -172,9 +172,19 @@ pub fn tune_stream(
     Ok(())
 }
 
+/// The payload buffer [`read_message`] starts with; it grows (doubling) only
+/// as payload bytes actually arrive.
+const FIRST_READ_CAPACITY: usize = 64 * 1024;
+
 /// Read one length-prefixed message: a 4-byte big-endian length, then exactly
 /// that many payload bytes. Errors if the length exceeds [`MAX_FRAME`]. An EOF
-/// before the length prefix surfaces as [`io::ErrorKind::UnexpectedEof`].
+/// before the length prefix — or before the announced payload is complete —
+/// surfaces as [`io::ErrorKind::UnexpectedEof`].
+///
+/// The length prefix is unauthenticated, so it never sizes an allocation: the
+/// buffer grows with the bytes received (review robust#15 / sec#19, merged
+/// into cluster-nlqa#9). A peer announcing a 256 MiB frame and sending three
+/// bytes costs a few KiB, not 256 MiB.
 pub fn read_message<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf)?;
@@ -185,20 +195,49 @@ pub fn read_message<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
             "rpc frame exceeds MAX_FRAME",
         ));
     }
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf)?;
+    let mut buf = Vec::with_capacity(len.min(FIRST_READ_CAPACITY));
+    r.by_ref().take(len as u64).read_to_end(&mut buf)?;
+    if buf.len() != len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "rpc frame truncated: the peer closed before the announced payload arrived",
+        ));
+    }
     Ok(buf)
+}
+
+/// Encode `resp` as a reply payload — or, when the encoding is larger than
+/// [`MAX_FRAME`] (which [`write_message`] refuses to send), an encoded
+/// [`Response::Error`] saying so. Without this a server built the oversized
+/// answer, failed to send it and dropped the connection, so the client saw a
+/// reset (and retried the whole request) instead of the reason (review
+/// cluster-nlqa#9).
+pub fn encode_reply(resp: &Response) -> Vec<u8> {
+    encode_reply_within(resp, MAX_FRAME)
+}
+
+/// [`encode_reply`] against an explicit frame limit (tests use a small one).
+pub(crate) fn encode_reply_within(resp: &Response, limit: usize) -> Vec<u8> {
+    let bytes = resp.encode();
+    if bytes.len() <= limit {
+        return bytes;
+    }
+    Response::Error(format!(
+        "response of {} bytes exceeds the {limit}-byte rpc frame limit",
+        bytes.len()
+    ))
+    .encode()
 }
 
 // ---------------------------------------------------------------------------
 // Primitive byte (de)serialization helpers — std only, big-endian.
 // ---------------------------------------------------------------------------
 
-fn put_u32(buf: &mut Vec<u8>, v: u32) {
+pub(crate) fn put_u32(buf: &mut Vec<u8>, v: u32) {
     buf.extend_from_slice(&v.to_be_bytes());
 }
 
-fn put_u64(buf: &mut Vec<u8>, v: u64) {
+pub(crate) fn put_u64(buf: &mut Vec<u8>, v: u64) {
     buf.extend_from_slice(&v.to_be_bytes());
 }
 
@@ -262,8 +301,9 @@ fn put_op(buf: &mut Vec<u8>, op: &LogOp) {
     }
 }
 
-/// Encode a slice of [`LogEntry`] as a `u32` count then each `term` + op.
-fn put_entries(buf: &mut Vec<u8>, entries: &[LogEntry]) {
+/// Encode a slice of [`LogEntry`] as a `u32` count then each `term` + op
+/// (also the entry encoding of a durable `ClusterNode`'s Raft journal).
+pub(crate) fn put_entries(buf: &mut Vec<u8>, entries: &[LogEntry]) {
     put_u32(buf, entries.len() as u32);
     for e in entries {
         put_u64(buf, e.term);
@@ -273,7 +313,7 @@ fn put_entries(buf: &mut Vec<u8>, entries: &[LogEntry]) {
 
 /// Encode a slice of [`IdTriple`] (snapshot payload) as a `u32` count then each
 /// `(sub, pred, obj)`.
-fn put_triples(buf: &mut Vec<u8>, triples: &[IdTriple]) {
+pub(crate) fn put_triples(buf: &mut Vec<u8>, triples: &[IdTriple]) {
     put_u32(buf, triples.len() as u32);
     for t in triples {
         put_u32(buf, t.sub);
@@ -284,15 +324,21 @@ fn put_triples(buf: &mut Vec<u8>, triples: &[IdTriple]) {
 
 /// A forward cursor over a byte buffer, returning [`io::Error`] of kind
 /// [`io::ErrorKind::InvalidData`] on truncation — so a malformed frame is a
-/// clean error rather than a panic.
-struct Reader<'a> {
+/// clean error rather than a panic. Also reads a durable `ClusterNode`'s Raft
+/// journal records, which reuse these encodings.
+pub(crate) struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
 }
 
 impl<'a> Reader<'a> {
-    fn new(buf: &'a [u8]) -> Reader<'a> {
+    pub(crate) fn new(buf: &'a [u8]) -> Reader<'a> {
         Reader { buf, pos: 0 }
+    }
+
+    /// Bytes not consumed yet.
+    pub(crate) fn remaining(&self) -> usize {
+        self.buf.len() - self.pos
     }
 
     fn take(&mut self, n: usize) -> io::Result<&'a [u8]> {
@@ -307,16 +353,16 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn u8(&mut self) -> io::Result<u8> {
+    pub(crate) fn u8(&mut self) -> io::Result<u8> {
         Ok(self.take(1)?[0])
     }
 
-    fn u32(&mut self) -> io::Result<u32> {
+    pub(crate) fn u32(&mut self) -> io::Result<u32> {
         let b = self.take(4)?;
         Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
     }
 
-    fn u64(&mut self) -> io::Result<u64> {
+    pub(crate) fn u64(&mut self) -> io::Result<u64> {
         let b = self.take(8)?;
         Ok(u64::from_be_bytes([
             b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
@@ -378,7 +424,7 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn entries(&mut self) -> io::Result<Vec<LogEntry>> {
+    pub(crate) fn entries(&mut self) -> io::Result<Vec<LogEntry>> {
         let n = self.u32()? as usize;
         let mut out = Vec::with_capacity(n.min(1024));
         for _ in 0..n {
@@ -389,7 +435,7 @@ impl<'a> Reader<'a> {
         Ok(out)
     }
 
-    fn triples(&mut self) -> io::Result<Vec<IdTriple>> {
+    pub(crate) fn triples(&mut self) -> io::Result<Vec<IdTriple>> {
         let n = self.u32()? as usize;
         let mut out = Vec::with_capacity(n.min(1024));
         for _ in 0..n {
@@ -449,7 +495,10 @@ pub enum Request {
     TripleCount,
     /// Number of triples with a predicate.
     PredCard { pred: PredId },
-    /// Insert a routed triple; the response reports whether it was new.
+    /// Insert a routed triple; the response reports whether it was new
+    /// (`Bool`). A replicated cluster node commits it through its Raft log
+    /// first, and answers `Error` when it is not the leader or cannot confirm
+    /// the commit.
     Insert {
         sub: EntityLiteralId,
         pred: PredId,
@@ -500,7 +549,9 @@ pub enum Request {
     ScanShard { shard: u32, num_shards: u32 },
     /// Migration cut-over: delete every triple in bucket `shard` of `num_shards`
     /// from this node (after its data has been streamed to the new owner);
-    /// replies with the number removed.
+    /// replies with the number removed. Served by a shard node only: a
+    /// replicated cluster node refuses it with `Error`, since it would change
+    /// one replica outside the Raft log.
     PurgeShard { shard: u32, num_shards: u32 },
 }
 
@@ -1093,6 +1144,26 @@ mod tests {
         assert!(
             took < std::time::Duration::from_millis(1500),
             "40 loopback round trips took {took:?}; frames are being delayed"
+        );
+    }
+
+    /// review cluster-nlqa#9: an answer too large for one frame becomes an
+    /// encoded `Error` naming its size (the client learns why) instead of a
+    /// frame `write_message` refuses, which used to drop the connection.
+    #[test]
+    fn an_oversized_reply_is_encoded_as_an_error() {
+        let big = Response::Ids((0..100).collect());
+        let encoded = encode_reply_within(&big, 64);
+        match Response::decode(&encoded).unwrap() {
+            Response::Error(msg) => assert!(msg.contains("405 bytes exceeds"), "{msg}"),
+            other => panic!("expected an Error reply, got {other:?}"),
+        }
+        let small = Response::Count(7);
+        assert_eq!(encode_reply_within(&small, 64), small.encode());
+        assert_eq!(
+            encode_reply(&big),
+            big.encode(),
+            "within MAX_FRAME: unchanged"
         );
     }
 

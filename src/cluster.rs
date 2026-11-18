@@ -7,9 +7,11 @@
 //!
 //! Everything in this module except the in-process [`ShardedStore`] is an
 //! **experimental library feature**: it is not wired into `gserver` or the HTTP
-//! API, its wire protocol ([`crate::rpc`]) and APIs may change without notice,
-//! and it has no persistence (a [`ClusterNode`]'s Raft log and store live in
-//! memory only). It is **not** a port of upstream gStore: upstream 1.4's
+//! API, its wire protocol ([`crate::rpc`]) is unauthenticated, and its APIs may
+//! change without notice. Stores live in memory only; the one durable piece is
+//! a [`ClusterNode`]'s Raft term, vote and log when it is bound with
+//! [`ClusterNode::bind_persistent`] (its triple store is rebuilt from that log
+//! after a restart). It is **not** a port of upstream gStore: upstream 1.4's
 //! `src/Cluster` (leader/follower replication) is not compiled into its
 //! release, and the distributed gStore edition is not open source. Use it for
 //! experiments and tests, not production data.
@@ -151,9 +153,11 @@
 //!   them from the triple-only snapshot. The transport never auto-compacts, so
 //!   config entries reach rejoining nodes by normal log backfill; a
 //!   config-carrying snapshot is the remaining fix.
-//! * **Persistence and server integration.** Nothing here is durable, and the
-//!   cluster is not reachable from `gserver` / the HTTP API (see *Experimental*
-//!   above).
+//! * **Persistence and server integration.** Only a persistent
+//!   [`ClusterNode`]'s Raft term, vote and log are durable (enough for a
+//!   replica to restart without breaking Raft's safety); shard nodes and the
+//!   coordinators keep everything in memory, and the cluster is not reachable
+//!   from `gserver` / the HTTP API (see *Experimental* above).
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashSet};
@@ -432,13 +436,29 @@ impl TripleSource for ShardedStore {
 /// carry **many** requests (the [`RemoteShard`] client keeps one connection per
 /// shard and reuses it across a scatter-gather). The store is shared behind a
 /// [`Mutex`] so reads and routed inserts are serialized per node.
+///
+/// Every connection's reads and writes are bounded by an I/O timeout
+/// ([`ShardNode::DEFAULT_IO_TIMEOUT`], see [`ShardNode::with_io_timeout`]): a
+/// client that goes idle, stalls mid-frame or stops reading its replies is
+/// disconnected instead of pinning a thread forever (review cluster-nlqa#9).
+/// A [`RemoteShard`] whose idle connection was closed reconnects on its next
+/// call. The node is still unauthenticated and still spends one thread per
+/// open connection — trusted networks only (see [`crate::rpc`]).
 #[derive(Debug)]
 pub struct ShardNode {
     store: Arc<Mutex<TripleStore>>,
     listener: TcpListener,
+    io_timeout: Duration,
+    /// Largest reply payload sent; a bigger answer is replaced by a
+    /// [`Response::Error`] ([`rpc::MAX_FRAME`]; tests lower it).
+    reply_limit: usize,
 }
 
 impl ShardNode {
+    /// Default bound on each read from / write to a client connection — how
+    /// long a connection may sit idle between requests, or stall inside one.
+    pub const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(60);
+
     /// Bind to `addr` (e.g. `"127.0.0.1:0"` for an ephemeral port), taking
     /// ownership of this node's local shard.
     pub fn bind<A: ToSocketAddrs>(store: TripleStore, addr: A) -> io::Result<ShardNode> {
@@ -446,7 +466,17 @@ impl ShardNode {
         Ok(ShardNode {
             store: Arc::new(Mutex::new(store)),
             listener,
+            io_timeout: Self::DEFAULT_IO_TIMEOUT,
+            reply_limit: rpc::MAX_FRAME,
         })
+    }
+
+    /// Use `timeout` (clamped to at least 1 ms) instead of
+    /// [`ShardNode::DEFAULT_IO_TIMEOUT`] for every read and write on the
+    /// connections this node accepts.
+    pub fn with_io_timeout(mut self, timeout: Duration) -> ShardNode {
+        self.io_timeout = timeout.max(Duration::from_millis(1));
+        self
     }
 
     /// The actual bound address (useful after binding to port 0).
@@ -458,27 +488,35 @@ impl ShardNode {
     pub fn serve_forever(&self) {
         for stream in self.listener.incoming().flatten() {
             // Request/response traffic: push each small reply frame out at once
-            // rather than letting Nagle hold it for the client's delayed ACK.
-            let _ = stream.set_nodelay(true);
+            // rather than letting Nagle hold it for the client's delayed ACK;
+            // and bound every read/write so an idle or stalled client cannot
+            // hold its connection thread forever.
+            if rpc::tune_stream(&stream, Some(self.io_timeout)).is_err() {
+                continue;
+            }
             let store = Arc::clone(&self.store);
-            thread::spawn(move || serve_connection(store, stream));
+            let limit = self.reply_limit;
+            thread::spawn(move || serve_connection(store, stream, limit));
         }
     }
 }
 
 /// Serve one client connection: decode framed [`Request`]s and reply with framed
-/// [`Response`]s until the peer closes or an I/O error occurs.
-fn serve_connection(store: Arc<Mutex<TripleStore>>, mut stream: TcpStream) {
+/// [`Response`]s until the peer closes, a read or write times out, or an I/O
+/// error occurs. A reply larger than `reply_limit` is answered with a
+/// [`Response::Error`] naming its size, and the connection stays usable.
+fn serve_connection(store: Arc<Mutex<TripleStore>>, mut stream: TcpStream, reply_limit: usize) {
     loop {
         let bytes = match rpc::read_message(&mut stream) {
             Ok(b) => b,
-            Err(_) => return, // peer closed or framing error
+            Err(_) => return, // peer closed, timed out, or framing error
         };
         let resp = match Request::decode(&bytes) {
             Ok(req) => dispatch(&store, &req),
             Err(e) => Response::Error(e.to_string()),
         };
-        if rpc::write_message(&mut stream, &resp.encode()).is_err() {
+        let reply = rpc::encode_reply_within(&resp, reply_limit);
+        if rpc::write_message(&mut stream, &reply).is_err() {
             return;
         }
     }
@@ -869,19 +907,57 @@ impl Shard {
 /// module's distributed stores construct one.
 pub struct Scatter<'a> {
     shards: Vec<&'a dyn ShardRead>,
+    /// Whether one triple may sit on more than one shard right now (a
+    /// [`ShardCluster`] bucket whose migration is unfinished). Lists are
+    /// de-duplicated anyway; counts then cannot simply be summed.
+    overlapping: bool,
 }
 
 impl std::fmt::Debug for Scatter<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Scatter")
             .field("shards", &self.shards.len())
+            .field("overlapping", &self.overlapping)
             .finish()
     }
 }
 
 impl<'a> Scatter<'a> {
     fn new(shards: Vec<&'a dyn ShardRead>) -> Scatter<'a> {
-        Scatter { shards }
+        Scatter {
+            shards,
+            overlapping: false,
+        }
+    }
+
+    /// Mark the shards as possibly holding copies of the same triples.
+    fn overlapping(mut self, overlapping: bool) -> Scatter<'a> {
+        self.overlapping = overlapping;
+        self
+    }
+
+    /// The number of distinct triples with predicate `pred`: the per-shard
+    /// counts summed, or — while shards may overlap — the size of the merged,
+    /// de-duplicated `(sub, obj)` list.
+    fn pred_card(&self, pred: PredId) -> io::Result<u64> {
+        if self.overlapping {
+            return Ok(self.gather(|s| s.read_so_by_p(pred))?.len() as u64);
+        }
+        self.sum(|s| s.read_pred_card(pred))
+    }
+
+    /// The number of distinct triples: the per-shard counts summed, or — while
+    /// shards may overlap, when a sum would count a copied triple twice
+    /// (review cluster-nlqa#1) — the distinct triples counted per predicate.
+    fn triple_count(&self) -> io::Result<u64> {
+        if !self.overlapping {
+            return self.sum(|s| s.read_triple_count());
+        }
+        let mut total = 0;
+        for pred in self.gather(|s| s.read_predicates())? {
+            total += self.pred_card(pred)?;
+        }
+        Ok(total)
     }
 
     /// `true` as soon as any shard holds the triple (a found triple is found no
@@ -996,9 +1072,10 @@ pub trait TryTripleSource {
         self.scatter()?.gather(|s| s.read_object_keys())
     }
     /// Fallible [`TripleSource::triple_count`]. Each triple lives on exactly one
-    /// shard, so the per-shard sum is the global count.
+    /// shard, so the per-shard sum is the global count — except while a
+    /// [`ShardCluster`] migration is unfinished, when the count de-duplicates.
     fn try_triple_count(&self) -> io::Result<u64> {
-        self.scatter()?.sum(|s| s.read_triple_count())
+        self.scatter()?.triple_count()
     }
     /// Fallible [`TripleSource::distinct_subjects`] (global-distinct, not a sum).
     fn try_distinct_subjects(&self) -> io::Result<usize> {
@@ -1013,9 +1090,10 @@ pub trait TryTripleSource {
     fn try_num_predicates(&self) -> io::Result<usize> {
         Ok(self.scatter()?.gather(|s| s.read_predicates())?.len())
     }
-    /// Fallible [`TripleSource::pred_card`] (triple counts partition cleanly).
+    /// Fallible [`TripleSource::pred_card`] (triple counts partition cleanly,
+    /// except while a [`ShardCluster`] migration is unfinished).
     fn try_pred_card(&self, pred: PredId) -> io::Result<usize> {
-        Ok(self.scatter()?.sum(|s| s.read_pred_card(pred))? as usize)
+        Ok(self.scatter()?.pred_card(pred)? as usize)
     }
     /// Fallible [`TripleSource::pred_distinct_subj`].
     fn try_pred_distinct_subj(&self, pred: PredId) -> io::Result<usize> {
@@ -1448,10 +1526,45 @@ impl ClusterConfig {
 /// is [`ClusterNode`]'s Raft-replicated [`ClusterConfig`]. A deployment feeds each
 /// committed config-change into [`ShardCluster::add_node`]/`remove_node` to enact
 /// the migration; the two share the [`ClusterConfig`] type.
+///
+/// ## Interrupted migrations
+///
+/// A migration copies a bucket triple by triple over RPC, so it can fail part
+/// way (a node dies, a link resets). The routing change is recorded first and
+/// every re-homed bucket stays a *pending move* until both its copy and the
+/// purge of the source succeed; a failure leaves the bucket **stranded** — its
+/// triples may sit on both nodes, which reads de-duplicate, counts included —
+/// and returns the error. Moves are idempotent, so they simply run again
+/// (review cluster-nlqa#1; before, a retry was a silent no-op and a later
+/// leave dropped the stranded triples while every call returned `Ok`):
+///
+/// * repeating the failed [`ShardCluster::add_node`] / `remove_node`, or
+///   [`ShardCluster::resume_migrations`], finishes the stranded buckets
+///   ([`ShardCluster::stranded_buckets`] lists them);
+/// * any *other* membership change first resumes them, and is refused —
+///   changing nothing — while a bucket stays stranded, so a node is never
+///   dropped while it may hold the only copy of some triples;
+/// * a leaving node is drained of *every* bucket (not only those it owned, so
+///   stray copies are not left behind), and its endpoint is dropped only once
+///   all of them moved.
+///
+/// Re-adding an existing member never replaces its endpoint — that silently
+/// dropped a `Local` member's data (review cluster-nlqa#10): the same address
+/// is a retry, a different one is refused.
 #[derive(Debug)]
 pub struct ShardCluster {
     config: ClusterConfig,
     endpoints: HashMap<NodeId, Shard>,
+    /// Buckets whose re-homing `config` already records but the data plane has
+    /// not finished, bucket → move (at most one per bucket).
+    pending: BTreeMap<usize, BucketMove>,
+}
+
+/// One unfinished bucket migration of a [`ShardCluster`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BucketMove {
+    from: NodeId,
+    to: NodeId,
 }
 
 impl ShardCluster {
@@ -1460,6 +1573,7 @@ impl ShardCluster {
         ShardCluster {
             config: ClusterConfig::new(num_shards),
             endpoints: HashMap::new(),
+            pending: BTreeMap::new(),
         }
     }
 
@@ -1479,63 +1593,161 @@ impl ShardCluster {
     pub fn owner_of_subject(&self, sub: EntityLiteralId) -> Option<NodeId> {
         self.config.owner_of_subject(sub)
     }
-    /// Borrow a member's shard endpoint (for inspection / tests).
+    /// Borrow a node's shard endpoint (for inspection / tests): a member's, or
+    /// a departed node's that is still being drained.
     pub fn endpoint(&self, id: NodeId) -> Option<&Shard> {
         self.endpoints.get(&id)
+    }
+
+    /// The buckets whose migration is unfinished, as `(bucket, from, to)`,
+    /// ascending by bucket — empty unless a membership change failed part way.
+    /// While any remain their triples may sit on two nodes (reads stay complete
+    /// and exact), and other membership changes are refused until
+    /// [`ShardCluster::resume_migrations`] (or a retry of the failed change)
+    /// finishes them.
+    pub fn stranded_buckets(&self) -> Vec<(usize, NodeId, NodeId)> {
+        self.pending
+            .iter()
+            .map(|(&bucket, m)| (bucket, m.from, m.to))
+            .collect()
+    }
+
+    /// Finish every stranded bucket migration (see
+    /// [`ShardCluster::stranded_buckets`]), then drop the endpoints of departed
+    /// nodes that hold nothing more. Stops at the first failure and returns it;
+    /// the buckets not yet moved stay stranded for a later call. `Ok` at once
+    /// when nothing is stranded.
+    pub fn resume_migrations(&mut self) -> io::Result<()> {
+        let moves: Vec<(usize, BucketMove)> = self.pending.iter().map(|(&b, &m)| (b, m)).collect();
+        for (bucket, mv) in moves {
+            if let Err(e) = self.migrate_shard(bucket, mv.from, mv.to) {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!(
+                        "migrating bucket {bucket} from node {} to node {} failed; {} bucket(s) \
+                         stay stranded until the membership change is retried or \
+                         resume_migrations succeeds: {e}",
+                        mv.from,
+                        mv.to,
+                        self.pending.len()
+                    ),
+                ));
+            }
+            self.pending.remove(&bucket);
+        }
+        self.retire_departed();
+        Ok(())
+    }
+
+    /// Drop the endpoint of every node that is no longer a member and that no
+    /// pending move still involves.
+    fn retire_departed(&mut self) {
+        let (config, pending) = (&self.config, &self.pending);
+        self.endpoints.retain(|&id, _| {
+            config.contains(id) || pending.values().any(|m| m.from == id || m.to == id)
+        });
     }
 
     /// Admit node `id` (at `addr`) with a freshly bound, empty (or pre-seeded)
     /// shard `endpoint`, then migrate the buckets that rendezvous now assigns to
     /// it from their previous owners — so the new node *receives its shards*. The
     /// first node admitted simply owns every bucket (nothing to migrate yet).
+    ///
+    /// If a migration fails the error is returned and the unfinished buckets
+    /// stay stranded (see the type docs); calling `add_node` again with the same
+    /// `id` and `addr` resumes them. For an existing member that retry is all
+    /// it does: the registered endpoint is kept and the `endpoint` passed is
+    /// dropped (refused if it is a `Local` shard holding triples, which would
+    /// be lost); an existing member at a different `addr` is refused with
+    /// [`io::ErrorKind::InvalidInput`]. A new member is refused while buckets
+    /// of an earlier change stay stranded.
     pub fn add_node(&mut self, id: NodeId, addr: SocketAddr, endpoint: Shard) -> io::Result<()> {
+        if self.config.contains(id) {
+            let known = self.config.addr(id);
+            if known != Some(addr) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "node {id} is already a member at {}; remove it before adding it at {addr}",
+                        known.map_or_else(|| "an unknown address".to_string(), |a| a.to_string())
+                    ),
+                ));
+            }
+            if let Shard::Local(store) = &endpoint {
+                if store.triple_count() > 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "node {id} is already a member; re-adding it with a pre-seeded \
+                             local shard would discard that shard's triples"
+                        ),
+                    ));
+                }
+            }
+            drop(endpoint); // a retry: the member keeps its registered endpoint
+            return self.resume_migrations();
+        }
+        // A different change: finish an earlier one first, or change nothing.
+        self.resume_migrations()?;
         let old = self.config.clone();
         self.endpoints.insert(id, endpoint);
-        if !self.config.add_node(id, addr) {
-            return Ok(()); // already a member: no rebalance
+        self.config.add_node(id, addr);
+        for bucket in 0..self.config.num_shards() {
+            if let (Some(from), Some(to)) = (old.owner(bucket), self.config.owner(bucket)) {
+                if from != to {
+                    self.pending.insert(bucket, BucketMove { from, to });
+                }
+            }
         }
-        self.rebalance(&old)
+        self.resume_migrations()
     }
 
-    /// Evict node `id`: migrate every bucket it owned to that bucket's new
+    /// Evict node `id`: migrate every bucket it may hold to that bucket's new
     /// (survivor) owner — no data loss — then drop its endpoint. A no-op if `id`
-    /// is not a member.
+    /// is neither a member nor a departed node still being drained.
+    ///
+    /// Refused, changing nothing, while buckets of an earlier change stay
+    /// stranded, or when `id` is the last member and still holds triples
+    /// (they would have nowhere to go). If a migration fails the error is
+    /// returned: `id` has left the membership (writes no longer route to it)
+    /// but keeps its endpoint — reads still see its triples — until a retry
+    /// of `remove_node(id)` or [`ShardCluster::resume_migrations`] has moved
+    /// every bucket.
     pub fn remove_node(&mut self, id: NodeId) -> io::Result<()> {
-        let old = self.config.clone();
-        if !self.config.remove_node(id) {
+        if self.config.contains(id) {
+            self.resume_migrations()?;
+            if self.config.members() == [id] {
+                let held = match self.endpoints.get(&id) {
+                    Some(ep) => ep.reader().read_triple_count()?,
+                    None => 0,
+                };
+                if held > 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "node {id} is the last member and holds {held} triple(s), which \
+                             would have nowhere to go; add another node first"
+                        ),
+                    ));
+                }
+            }
+            self.config.remove_node(id);
+            for bucket in 0..self.config.num_shards() {
+                if let Some(to) = self.config.owner(bucket) {
+                    self.pending.insert(bucket, BucketMove { from: id, to });
+                }
+            }
+        } else if !self.endpoints.contains_key(&id) {
             return Ok(());
         }
-        for shard in 0..self.config.num_shards() {
-            if old.owner(shard) == Some(id) {
-                if let Some(new_owner) = self.config.owner(shard) {
-                    self.migrate_shard(shard, id, new_owner)?;
-                }
-            }
-        }
-        self.endpoints.remove(&id);
-        Ok(())
+        self.resume_migrations()
     }
 
-    /// Migrate every bucket whose owner changed between `old` and the current
-    /// config (used after admitting a node).
-    fn rebalance(&mut self, old: &ClusterConfig) -> io::Result<()> {
-        for shard in 0..self.config.num_shards() {
-            let new_owner = match self.config.owner(shard) {
-                Some(o) => o,
-                None => continue,
-            };
-            if let Some(old_owner) = old.owner(shard) {
-                if old_owner != new_owner {
-                    self.migrate_shard(shard, old_owner, new_owner)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Stream bucket `shard` from `from`'s endpoint to `to`'s, then purge it from
-    /// `from` (cut-over). If the source endpoint is gone (e.g. a failed node) the
-    /// migration is skipped rather than erroring.
+    /// Copy bucket `shard` from `from`'s endpoint to `to`'s, then purge it from
+    /// `from` (cut-over). Idempotent: run again after a failure at any step it
+    /// copies what is left (a triple already on `to` is a no-op insert) and
+    /// purges again — which is how a stranded bucket is finished. Nothing is
+    /// purged before every scanned triple reached `to`.
     fn migrate_shard(&mut self, shard: usize, from: NodeId, to: NodeId) -> io::Result<()> {
         if from == to {
             return Ok(());
@@ -1543,12 +1755,16 @@ impl ShardCluster {
         let n = self.config.num_shards() as u32;
         let triples = match self.endpoints.get(&from) {
             Some(ep) => ep.scan_shard(shard as u32, n)?,
-            None => return Ok(()),
+            None => return Ok(()), // the source holds nothing any more
         };
-        if let Some(dst) = self.endpoints.get_mut(&to) {
-            for t in &triples {
-                dst.insert(*t)?;
-            }
+        let dst = self.endpoints.get_mut(&to).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("migration target node {to} has no registered endpoint"),
+            )
+        })?;
+        for t in &triples {
+            dst.insert(*t)?;
         }
         if let Some(src) = self.endpoints.get_mut(&from) {
             src.purge_shard(shard as u32, n)?;
@@ -1594,10 +1810,14 @@ impl ShardCluster {
 }
 
 impl TryTripleSource for ShardCluster {
+    /// Every registered endpoint — the members', plus a departed node's that is
+    /// still being drained — marked as overlapping while a bucket is stranded
+    /// (its triples may then sit on two nodes).
     fn scatter(&self) -> io::Result<Scatter<'_>> {
-        Ok(Scatter::new(
-            self.endpoints.values().map(Shard::reader).collect(),
-        ))
+        Ok(
+            Scatter::new(self.endpoints.values().map(Shard::reader).collect())
+                .overlapping(!self.pending.is_empty()),
+        )
     }
 }
 
@@ -1841,6 +2061,21 @@ impl Default for RaftConfig {
     }
 }
 
+/// The furthest one message may move a node's term forward. Raft terms grow
+/// by one per election round, so a real peer is never billions of terms
+/// ahead; a larger jump can only be forged (the protocol is unauthenticated),
+/// and adopting it let one message push every node to the last representable
+/// term, after which the next election overflowed — a panic that poisoned the
+/// node's state in debug builds, a wrap to 0 in release, and in either case a
+/// cluster that never elected a leader again (review cluster-nlqa#2). With
+/// this bound reaching `u64::MAX` would take billions of forged messages.
+const MAX_TERM_STEP: u64 = 1 << 32;
+
+/// The largest log index a peer may claim (snapshot base, match index): far
+/// beyond any real log, and far enough from `u64::MAX` that index arithmetic
+/// (`index + 1`, `base + len`) cannot overflow (review cluster-nlqa#2).
+const MAX_LOG_INDEX: u64 = 1 << 62;
+
 /// The pure Raft state machine for one node. It owns the replicated log and all
 /// election/replication bookkeeping but **not** the [`TripleStore`]: committed
 /// mutations are handed out via [`RaftState::drain_apply`]. Every input is an
@@ -1885,6 +2120,38 @@ pub struct RaftState {
 
     /// Pending store-reset from a freshly installed snapshot.
     pending_reset: Option<Vec<IdTriple>>,
+
+    // Durability bookkeeping for a persistent transport (review
+    // cluster-nlqa#11): what changed since the last `take_durable_delta`.
+    /// `(current_term, voted_for)` as last handed out for persisting.
+    durable_hard: (u64, Option<NodeId>),
+    /// Lowest log index appended or overwritten since then.
+    log_dirty_from: Option<u64>,
+    /// The snapshot base moved (install or compaction) since then.
+    snapshot_dirty: bool,
+}
+
+/// What a durable transport must write before anything a [`RaftState`] step
+/// produced — a reply, an outgoing message, a commit — may be seen: the hard
+/// state if it changed, and the log suffix that changed (after the snapshot
+/// when a snapshot replaced the log prefix). See
+/// [`ClusterNode::bind_persistent`].
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DurableDelta {
+    /// New `(current_term, voted_for)`.
+    hard: Option<(u64, Option<NodeId>)>,
+    /// New snapshot `(base_index, base_term, triples)`; the log restarts after
+    /// `base_index`.
+    snapshot: Option<(u64, u64, Vec<IdTriple>)>,
+    /// `(from, entries)`: the log from index `from` on is now exactly
+    /// `entries` (everything at or after `from` before is replaced).
+    entries: Option<(u64, Vec<LogEntry>)>,
+}
+
+impl DurableDelta {
+    fn is_empty(&self) -> bool {
+        self.hard.is_none() && self.snapshot.is_none() && self.entries.is_none()
+    }
 }
 
 impl RaftState {
@@ -1918,9 +2185,58 @@ impl RaftState {
             cfg_heartbeat: cfg.heartbeat_timeout.max(1),
             rng: seed,
             pending_reset: None,
+            durable_hard: (0, None),
+            log_dirty_from: None,
+            snapshot_dirty: false,
         };
         s.reset_election_timeout();
         s
+    }
+
+    /// Reload the durable state a persistent transport recovered (its term,
+    /// vote, snapshot and log). The commit index is volatile in Raft, so it
+    /// restarts at the snapshot base; the entries after it are applied again
+    /// once a leader re-confirms them.
+    fn restore(&mut self, rec: RecoveredState) {
+        self.current_term = rec.term;
+        self.voted_for = rec.voted_for;
+        self.durable_hard = (rec.term, rec.voted_for);
+        self.base_index = rec.base_index;
+        self.base_term = rec.base_term;
+        self.log = rec.log;
+        if rec.base_index > 0 {
+            self.snapshot = rec.snapshot.clone();
+            self.pending_reset = Some(rec.snapshot);
+            self.commit_index = rec.base_index;
+            self.last_applied = rec.base_index;
+        }
+    }
+
+    /// Note that the log changed from `index` on.
+    fn log_changed_from(&mut self, index: u64) {
+        self.log_dirty_from = Some(self.log_dirty_from.map_or(index, |d| d.min(index)));
+    }
+
+    /// Hand out — and forget — what changed in the durable state since the
+    /// last call (see [`DurableDelta`]).
+    fn take_durable_delta(&mut self) -> DurableDelta {
+        let mut d = DurableDelta::default();
+        let hard = (self.current_term, self.voted_for);
+        if hard != self.durable_hard {
+            d.hard = Some(hard);
+            self.durable_hard = hard;
+        }
+        if self.snapshot_dirty {
+            d.snapshot = Some((self.base_index, self.base_term, self.snapshot.clone()));
+            d.entries = Some((self.base_index + 1, self.log.clone()));
+        } else if let Some(from) = self.log_dirty_from {
+            let from = from.max(self.base_index + 1);
+            let start = ((from - self.base_index - 1) as usize).min(self.log.len());
+            d.entries = Some((from, self.log[start..].to_vec()));
+        }
+        self.snapshot_dirty = false;
+        self.log_dirty_from = None;
+        d
     }
 
     // --- read-only accessors -------------------------------------------------
@@ -2026,6 +2342,13 @@ impl RaftState {
         }
     }
 
+    /// Whether `term`, carried by a message from a peer, is one a real peer
+    /// could hold: at most [`MAX_TERM_STEP`] ahead of ours. A message with a
+    /// larger term is forged and is answered without being adopted.
+    fn plausible_term(&self, term: u64) -> bool {
+        term <= self.current_term.saturating_add(MAX_TERM_STEP)
+    }
+
     // --- driver input: a logical clock tick ---------------------------------
 
     /// Advance one logical tick. A follower/candidate that exceeds its election
@@ -2051,7 +2374,15 @@ impl RaftState {
     }
 
     fn start_election(&mut self) -> Vec<Outgoing> {
-        self.current_term += 1;
+        let Some(next_term) = self.current_term.checked_add(1) else {
+            // The term space is used up — only forged terms get here. Never
+            // wrap to 0 (every peer would then refuse us forever): stay a
+            // follower that can still vote and follow (review cluster-nlqa#2).
+            self.role = Role::Follower;
+            self.reset_election_timeout();
+            return Vec::new();
+        };
+        self.current_term = next_term;
         self.role = Role::Candidate;
         self.voted_for = Some(self.id);
         self.votes_granted.clear();
@@ -2093,6 +2424,7 @@ impl RaftState {
         // leader's log byte-identical to its followers' in the common case.
         if self.last_log_index() > self.commit_index {
             self.log.push(LogEntry::new(self.current_term, LogOp::Noop));
+            self.log_changed_from(self.last_log_index());
         }
         let nli = self.last_log_index() + 1;
         self.next_index.clear();
@@ -2103,6 +2435,12 @@ impl RaftState {
             self.match_index.insert(p, 0);
         }
         self.heartbeat_elapsed = 0;
+        if self.peers.is_empty() {
+            // A single node is its own quorum: the no-op above commits at
+            // once, and with it the log a restarted durable node recovered
+            // (review cluster-nlqa#11) — not only at the next client write.
+            self.advance_commit();
+        }
         self.replicate()
     }
 
@@ -2156,7 +2494,7 @@ impl RaftState {
         last_log_index: u64,
         last_log_term: u64,
     ) -> RaftReply {
-        if term < self.current_term {
+        if term < self.current_term || !self.plausible_term(term) {
             return RaftReply::Vote {
                 term: self.current_term,
                 granted: false,
@@ -2190,9 +2528,10 @@ impl RaftState {
         leader_commit: u64,
         entries: Vec<LogEntry>,
     ) -> RaftReply {
-        if term < self.current_term {
+        if term < self.current_term || !self.plausible_term(term) {
             // Stale leader: reject and advertise our (higher) term so it steps
-            // down. This is the split-brain guard.
+            // down. This is the split-brain guard. A forged far-future term is
+            // refused the same way, without adopting it.
             return RaftReply::Append {
                 term: self.current_term,
                 success: false,
@@ -2232,9 +2571,11 @@ impl RaftState {
                     let pos = (index - self.base_index - 1) as usize;
                     self.log.truncate(pos);
                     self.log.push(*entry);
+                    self.log_changed_from(index);
                 }
             } else {
                 self.log.push(*entry);
+                self.log_changed_from(index);
             }
         }
 
@@ -2262,7 +2603,12 @@ impl RaftState {
         last_included_term: u64,
         triples: Vec<IdTriple>,
     ) -> RaftReply {
-        if term < self.current_term {
+        if term < self.current_term
+            || !self.plausible_term(term)
+            || last_included_index > MAX_LOG_INDEX
+        {
+            // Stale, or forged (a far-future term, or an index no real log
+            // reaches — installing it overflowed the node's next election).
             return RaftReply::Snapshot {
                 term: self.current_term,
             };
@@ -2282,6 +2628,7 @@ impl RaftState {
             self.base_index = last_included_index;
             self.base_term = last_included_term;
             self.log.clear();
+            self.snapshot_dirty = true;
             self.snapshot = triples.clone();
             self.pending_reset = Some(triples);
             self.commit_index = last_included_index;
@@ -2300,7 +2647,9 @@ impl RaftState {
         match reply {
             RaftReply::Vote { term, granted } => {
                 if term > self.current_term {
-                    self.observe_term(term);
+                    if self.plausible_term(term) {
+                        self.observe_term(term);
+                    }
                     return Vec::new();
                 }
                 if self.role != Role::Candidate || term < self.current_term {
@@ -2320,12 +2669,18 @@ impl RaftState {
                 match_index,
             } => {
                 if term > self.current_term {
-                    self.observe_term(term);
+                    if self.plausible_term(term) {
+                        self.observe_term(term);
+                    }
                     return Vec::new();
                 }
                 if self.role != Role::Leader || term < self.current_term {
                     return Vec::new();
                 }
+                // A follower cannot hold more of our log than we do: a larger
+                // claim is a lie that would wrap `next_index` (review
+                // cluster-nlqa#2).
+                let match_index = match_index.min(self.last_log_index());
                 if success {
                     // Within one term a follower's agreed prefix only grows, so
                     // a late reply to an older AppendEntries must not move
@@ -2352,14 +2707,18 @@ impl RaftState {
                 } else {
                     // Log mismatch: back up next_index and retry.
                     let cur = *self.next_index.get(&from).unwrap_or(&1);
-                    let next = (match_index + 1).min(cur.saturating_sub(1)).max(1);
+                    let next = (match_index.saturating_add(1))
+                        .min(cur.saturating_sub(1))
+                        .max(1);
                     self.next_index.insert(from, next);
                     self.replicate_to(from).into_iter().collect()
                 }
             }
             RaftReply::Snapshot { term } => {
                 if term > self.current_term {
-                    self.observe_term(term);
+                    if self.plausible_term(term) {
+                        self.observe_term(term);
+                    }
                     return Vec::new();
                 }
                 if self.role != Role::Leader {
@@ -2409,6 +2768,7 @@ impl RaftState {
         }
         self.log.push(LogEntry::new(self.current_term, op));
         let idx = self.last_log_index();
+        self.log_changed_from(idx);
         if self.peers.is_empty() {
             self.advance_commit();
         }
@@ -2506,6 +2866,7 @@ impl RaftState {
         self.base_index = up_to_index;
         self.base_term = new_base_term;
         self.snapshot = triples;
+        self.snapshot_dirty = true;
     }
 
     /// The fate of the entry this node appended at `index` during `term`:
@@ -2571,6 +2932,265 @@ impl std::fmt::Display for ProposeError {
 
 impl std::error::Error for ProposeError {}
 
+/// The durable Raft state a [`RaftJournal`] recovered: what
+/// [`RaftState::restore`] reloads.
+#[derive(Debug, Default)]
+struct RecoveredState {
+    term: u64,
+    voted_for: Option<NodeId>,
+    base_index: u64,
+    base_term: u64,
+    snapshot: Vec<IdTriple>,
+    log: Vec<LogEntry>,
+}
+
+/// The durable Raft state of one persistent [`ClusterNode`] (review
+/// cluster-nlqa#11): an append-only journal, `raft.journal` in the node's state
+/// directory, of the changes [`RaftState::take_durable_delta`] hands out —
+/// term and vote, log suffixes, snapshots. Every batch is written and
+/// `fsync`ed before the node answers or sends anything that depends on it, so
+/// a restarted replica remembers the vote it gave in its term and the entries
+/// it acknowledged; without that it could vote a second time in one term (two
+/// leaders of one term) or help elect a leader that lacks committed entries.
+///
+/// Layout: an 8-byte magic and the owning node id, then records of `u32` BE
+/// payload length, `u32` BE CRC-32 of the payload, payload. Payload tag 1 is
+/// the hard state (`u64` term, `u8` has-vote, `u64` vote), 2 a snapshot
+/// (`u64` base index, `u64` base term, triples), 3 a log suffix (`u64` first
+/// index, entries; it replaces everything from that index on). Entries and
+/// triples use the [`crate::rpc`] encodings. A torn record at the tail (a
+/// crash mid-append, never acknowledged) is cut off on open; an intact record
+/// that does not decode (a newer format, a damaged file) makes the open fail
+/// instead, so acknowledged state is never dropped silently.
+#[derive(Debug)]
+struct RaftJournal {
+    file: std::fs::File,
+}
+
+impl RaftJournal {
+    /// The journal's file name inside the state directory.
+    const FILE: &'static str = "raft.journal";
+    const MAGIC: &'static [u8; 8] = b"GSRAFTJ1";
+    const HEADER_LEN: usize = 16;
+
+    /// Open (creating it if needed) the journal of node `id` in `dir` and
+    /// replay it. Refuses a journal written by another node id, and one that
+    /// another open journal (another process, or another node in this one)
+    /// holds: two copies of one replica writing one journal could again vote
+    /// twice in a term. The exclusive advisory lock lasts as long as the
+    /// journal is open; a file system without advisory locks opens unlocked.
+    fn open(dir: &std::path::Path, id: NodeId) -> io::Result<(RaftJournal, RecoveredState)> {
+        use std::io::{Read as _, Write as _};
+        // A new state directory's own entry (and any new ancestor's) is
+        // synced too: a journal that vanished with its directory after a power
+        // loss would restart the node at term 0 with no vote.
+        crate::db::fsutil::create_dir_durable(dir).map_err(|e| match e {
+            GStoreError::Io(e) => e,
+            other => io::Error::other(other.to_string()),
+        })?;
+        let path = dir.join(Self::FILE);
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(&path)?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "{} is in use: another running node holds this state directory",
+                        path.display()
+                    ),
+                ))
+            }
+            Err(std::fs::TryLockError::Error(e)) if e.kind() == io::ErrorKind::Unsupported => {}
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        if bytes.len() < Self::HEADER_LEN {
+            // New (or created but never completed): start a fresh journal.
+            file.set_len(0)?;
+            let mut header = Self::MAGIC.to_vec();
+            rpc::put_u64(&mut header, id);
+            file.write_all(&header)?;
+            file.sync_all()?;
+            sync_parent_dir(dir)?;
+            return Ok((RaftJournal { file }, RecoveredState::default()));
+        }
+        let mut r = rpc::Reader::new(&bytes[8..Self::HEADER_LEN]);
+        if &bytes[..8] != Self::MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} is not a raft journal", path.display()),
+            ));
+        }
+        let owner = r.u64()?;
+        if owner != id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "{} belongs to node {owner}, not node {id}: a state directory serves one node",
+                    path.display()
+                ),
+            ));
+        }
+        let mut state = RecoveredState::default();
+        let mut at = Self::HEADER_LEN;
+        while let Some((payload, next)) = Self::record_at(&bytes, at) {
+            if let Err(e) = Self::replay(&mut state, payload) {
+                // A whole record (its CRC matches) that does not decode was
+                // not torn by a crash: it comes from a newer journal format or
+                // a damaged file. Cutting it off — with every record after it —
+                // would silently forget acknowledged state such as a vote, the
+                // very thing the journal exists to keep, so refuse to start.
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{}: the record at byte {at} is intact but cannot be read ({e}); \
+                         refusing to start from a raft journal this build does not understand",
+                        path.display()
+                    ),
+                ));
+            }
+            at = next;
+        }
+        if at < bytes.len() {
+            // A torn (or damaged) tail: it was never acknowledged — every
+            // record is synced before the node acts on it — so drop it.
+            file.set_len(at as u64)?;
+            file.sync_all()?;
+        }
+        Ok((RaftJournal { file }, state))
+    }
+
+    /// The well-formed record starting at `at`: its payload and the offset of
+    /// the next record. `None` at the end, or at a torn or corrupt record —
+    /// including a zero-length one, which [`RaftJournal::append`] never
+    /// writes but a crash can leave behind (a file grown, its new bytes still
+    /// zero), and whose CRC would otherwise match.
+    fn record_at(bytes: &[u8], at: usize) -> Option<(&[u8], usize)> {
+        let head = bytes.get(at..at.checked_add(8)?)?;
+        let len = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
+        if len == 0 {
+            return None;
+        }
+        let crc = u32::from_be_bytes([head[4], head[5], head[6], head[7]]);
+        let end = (at + 8).checked_add(len)?;
+        let payload = bytes.get(at + 8..end)?;
+        (crc32(payload) == crc).then_some((payload, end))
+    }
+
+    /// Apply one record to the recovered state.
+    fn replay(state: &mut RecoveredState, payload: &[u8]) -> io::Result<()> {
+        let mut r = rpc::Reader::new(payload);
+        match r.u8()? {
+            1 => {
+                state.term = r.u64()?;
+                let has_vote = r.u8()? != 0;
+                let vote = r.u64()?;
+                state.voted_for = has_vote.then_some(vote);
+            }
+            2 => {
+                state.base_index = r.u64()?;
+                state.base_term = r.u64()?;
+                state.snapshot = r.triples()?;
+                state.log.clear();
+            }
+            3 => {
+                let from = r.u64()?;
+                let entries = r.entries()?;
+                let keep = from.saturating_sub(state.base_index + 1);
+                if keep > state.log.len() as u64 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "raft journal: a log suffix starts past the end of the log",
+                    ));
+                }
+                state.log.truncate(keep as usize);
+                for (i, e) in entries.into_iter().enumerate() {
+                    if from + i as u64 > state.base_index {
+                        state.log.push(e);
+                    }
+                }
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "raft journal: unknown record",
+                ))
+            }
+        }
+        if r.remaining() != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "raft journal: trailing bytes in a record",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Append `delta` as one batch of records and `fsync` it.
+    fn append(&mut self, delta: &DurableDelta) -> io::Result<()> {
+        use std::io::Write as _;
+        let mut batch = Vec::new();
+        let mut record = |payload: Vec<u8>| {
+            batch.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            batch.extend_from_slice(&crc32(&payload).to_be_bytes());
+            batch.extend_from_slice(&payload);
+        };
+        if let Some((term, vote)) = delta.hard {
+            let mut p = vec![1u8];
+            rpc::put_u64(&mut p, term);
+            p.push(u8::from(vote.is_some()));
+            rpc::put_u64(&mut p, vote.unwrap_or(0));
+            record(p);
+        }
+        if let Some((base_index, base_term, triples)) = &delta.snapshot {
+            let mut p = vec![2u8];
+            rpc::put_u64(&mut p, *base_index);
+            rpc::put_u64(&mut p, *base_term);
+            rpc::put_triples(&mut p, triples);
+            record(p);
+        }
+        if let Some((from, entries)) = &delta.entries {
+            let mut p = vec![3u8];
+            rpc::put_u64(&mut p, *from);
+            rpc::put_entries(&mut p, entries);
+            record(p);
+        }
+        if batch.is_empty() {
+            return Ok(());
+        }
+        self.file.write_all(&batch)?;
+        self.file.sync_data()
+    }
+}
+
+/// `fsync` directory `dir`, so a file just created in it survives a crash. A
+/// no-op off unix, where a directory cannot be opened for syncing.
+fn sync_parent_dir(dir: &std::path::Path) -> io::Result<()> {
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
+/// The CRC-32 (IEEE, reflected) of `data` — the raft journal's record check.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &b in data {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg());
+        }
+    }
+    !crc
+}
+
 /// The outbound replication channel to one peer: a single-slot mailbox holding
 /// the **newest** Raft message for that peer, drained by that peer's dedicated
 /// sender thread.
@@ -2623,6 +3243,12 @@ pub struct ClusterNode {
     /// How long a [`Request::ClientWrite`] waits for its entry to commit before
     /// answering "not confirmed".
     commit_timeout: Mutex<Duration>,
+    /// The durable Raft state of a node bound with
+    /// [`ClusterNode::bind_persistent`]; `None` keeps it in memory only.
+    journal: Option<Mutex<RaftJournal>>,
+    /// Set once the journal could not be written: the node has stopped for
+    /// good (fail-stop) and [`ClusterNode::revive`] does not restart it.
+    durable_failed: AtomicBool,
 }
 
 impl ClusterNode {
@@ -2640,12 +3266,64 @@ impl ClusterNode {
 
     /// Bind node `id` with cluster peers `peer_ids` (their addresses are set
     /// later via [`ClusterNode::set_peer_addr`]) and a starting `store`.
+    ///
+    /// The node keeps its Raft term, vote and log **in memory only**: it must
+    /// never be restarted under the same id, or it could vote a second time in
+    /// a term it already voted in (two leaders of one term) and help elect a
+    /// leader that lacks committed entries. Use
+    /// [`ClusterNode::bind_persistent`] for a replica that may restart.
     pub fn bind<A: ToSocketAddrs>(
         id: NodeId,
         peer_ids: Vec<NodeId>,
         store: TripleStore,
         addr: A,
         cfg: RaftConfig,
+    ) -> io::Result<Arc<ClusterNode>> {
+        let state = RaftState::new(id, peer_ids.clone(), &cfg);
+        Self::bind_with(id, &peer_ids, state, store, addr, cfg, None)
+    }
+
+    /// Bind a node whose Raft term, vote and log are **durable** in
+    /// `state_dir` (created if missing; one directory per node id): every
+    /// change is appended to the directory's journal and `fsync`ed before the
+    /// node answers a vote or append, sends a message, or counts its own entry
+    /// toward a commit (review cluster-nlqa#11). On a restart from the same
+    /// directory the node resumes with the term and vote it had — so it cannot
+    /// vote twice in one term — and with its log; the triple store starts empty
+    /// and is rebuilt as a leader re-confirms the log's entries.
+    ///
+    /// A state directory written by a different node id is refused. If the
+    /// journal cannot be written the node stops for good (fail-stop): it never
+    /// answers from state that a restart would forget.
+    pub fn bind_persistent<A: ToSocketAddrs>(
+        id: NodeId,
+        peer_ids: Vec<NodeId>,
+        state_dir: &std::path::Path,
+        addr: A,
+        cfg: RaftConfig,
+    ) -> io::Result<Arc<ClusterNode>> {
+        let (journal, recovered) = RaftJournal::open(state_dir, id)?;
+        let mut state = RaftState::new(id, peer_ids.clone(), &cfg);
+        state.restore(recovered);
+        Self::bind_with(
+            id,
+            &peer_ids,
+            state,
+            TripleStore::new(),
+            addr,
+            cfg,
+            Some(journal),
+        )
+    }
+
+    fn bind_with<A: ToSocketAddrs>(
+        id: NodeId,
+        peer_ids: &[NodeId],
+        state: RaftState,
+        store: TripleStore,
+        addr: A,
+        cfg: RaftConfig,
+        journal: Option<RaftJournal>,
     ) -> io::Result<Arc<ClusterNode>> {
         let listener = TcpListener::bind(addr)?;
         let tick_interval = cfg.tick_interval;
@@ -2654,7 +3332,6 @@ impl ClusterNode {
             .filter(|&&p| p != id)
             .map(|&p| (p, Arc::new(PeerLink::default())))
             .collect();
-        let state = RaftState::new(id, peer_ids, &cfg);
         Ok(Arc::new(ClusterNode {
             id,
             state: Arc::new(Mutex::new(state)),
@@ -2669,7 +3346,63 @@ impl ClusterNode {
             tick_interval,
             io_timeout: Duration::from_millis(300),
             commit_timeout: Mutex::new(Self::DEFAULT_COMMIT_TIMEOUT),
+            journal: journal.map(Mutex::new),
+            durable_failed: AtomicBool::new(false),
         }))
+    }
+
+    /// Make the Raft state machine's latest step durable before anything it
+    /// produced — a reply, an outgoing message, a commit counting this node —
+    /// can be seen; the caller holds the state lock, so journal order is state
+    /// order. A no-op for an in-memory node. If the journal cannot be written
+    /// the node stops for good and the error is returned — then, and on every
+    /// later call: the failed batch is gone from `st`'s durability bookkeeping
+    /// (its delta was handed out), so a later step that changes nothing new
+    /// would otherwise look durable and could, say, grant again a vote that
+    /// never reached the disk.
+    fn persist(&self, st: &mut RaftState) -> io::Result<()> {
+        let Some(journal) = &self.journal else {
+            return Ok(());
+        };
+        if self.durable_failed.load(Ordering::SeqCst) {
+            return Err(io::Error::other(
+                "the raft journal could not be written earlier; this node has stopped",
+            ));
+        }
+        let delta = st.take_durable_delta();
+        if delta.is_empty() {
+            return Ok(());
+        }
+        let written = journal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .append(&delta);
+        if let Err(e) = &written {
+            self.durable_failed.store(true, Ordering::SeqCst);
+            self.alive.store(false, Ordering::SeqCst);
+            crate::gs_error!(
+                "cluster node {}: the raft journal could not be written ({e}); the node stops",
+                self.id
+            );
+        }
+        written
+    }
+
+    /// Feed an inbound Raft RPC to the state machine and answer it — only
+    /// once the state it answers from is durable.
+    fn handle_raft(&self, msg: RaftMsg) -> Response {
+        let reply = {
+            let mut st = self.state.lock().unwrap();
+            let reply = st.handle(msg);
+            self.persist(&mut st).map(|()| reply)
+        };
+        match reply {
+            Ok(reply) => {
+                self.apply_actions();
+                reply_to_response(reply)
+            }
+            Err(e) => Response::Error(format!("raft state could not be made durable: {e}")),
+        }
     }
 
     /// Bound how long a [`Request::ClientWrite`] served by this node waits for
@@ -2796,10 +3529,14 @@ impl ClusterNode {
     fn submit(&self, op: LogOp) -> std::result::Result<(u64, u64), ProposeError> {
         let (idx, term) = {
             let mut st = self.state.lock().unwrap();
-            match st.propose(op) {
-                Some(i) => (i, st.current_term()),
-                None => return Err(ProposeError::NotLeader(st.leader_id())),
+            let Some(i) = st.propose(op) else {
+                return Err(ProposeError::NotLeader(st.leader_id()));
+            };
+            // Durable before it is replicated or counted toward a commit.
+            if self.persist(&mut st).is_err() {
+                return Err(ProposeError::NotCommitted(None));
             }
+            (i, st.current_term())
         };
         let outs = { self.state.lock().unwrap().replicate_now() };
         self.route(outs);
@@ -2824,6 +3561,9 @@ impl ClusterNode {
     /// Bring a killed node back: resume ticking/serving and reset its election
     /// timer.
     pub fn revive(&self) {
+        if self.durable_failed.load(Ordering::SeqCst) {
+            return; // stopped because its journal failed: stays down
+        }
         self.state.lock().unwrap().note_revived();
         self.alive.store(true, Ordering::SeqCst);
     }
@@ -2898,7 +3638,9 @@ impl ClusterNode {
                 return;
             }
             let resp = self.handle_request(req);
-            if rpc::write_message(&mut stream, &resp.encode()).is_err() {
+            // An answer too large for one frame is reported, not dropped with
+            // the connection (review cluster-nlqa#9).
+            if rpc::write_message(&mut stream, &rpc::encode_reply(&resp)).is_err() {
                 return;
             }
         }
@@ -2911,16 +3653,12 @@ impl ClusterNode {
                 candidate_id,
                 last_log_index,
                 last_log_term,
-            } => {
-                let reply = self.state.lock().unwrap().handle(RaftMsg::RequestVote {
-                    term,
-                    candidate_id,
-                    last_log_index,
-                    last_log_term,
-                });
-                self.apply_actions();
-                reply_to_response(reply)
-            }
+            } => self.handle_raft(RaftMsg::RequestVote {
+                term,
+                candidate_id,
+                last_log_index,
+                last_log_term,
+            }),
             Request::AppendEntries {
                 term,
                 leader_id,
@@ -2928,40 +3666,42 @@ impl ClusterNode {
                 prev_log_term,
                 leader_commit,
                 entries,
-            } => {
-                let reply = self.state.lock().unwrap().handle(RaftMsg::AppendEntries {
-                    term,
-                    leader_id,
-                    prev_log_index,
-                    prev_log_term,
-                    leader_commit,
-                    entries,
-                });
-                self.apply_actions();
-                reply_to_response(reply)
-            }
+            } => self.handle_raft(RaftMsg::AppendEntries {
+                term,
+                leader_id,
+                prev_log_index,
+                prev_log_term,
+                leader_commit,
+                entries,
+            }),
             Request::InstallSnapshot {
                 term,
                 leader_id,
                 last_included_index,
                 last_included_term,
                 triples,
-            } => {
-                let reply = self.state.lock().unwrap().handle(RaftMsg::InstallSnapshot {
-                    term,
-                    leader_id,
-                    last_included_index,
-                    last_included_term,
-                    triples,
-                });
-                self.apply_actions();
-                reply_to_response(reply)
-            }
+            } => self.handle_raft(RaftMsg::InstallSnapshot {
+                term,
+                leader_id,
+                last_included_index,
+                last_included_term,
+                triples,
+            }),
             Request::ClientWrite { op } => self.client_write_response(op),
-            // On a cluster node, a routed insert goes through the replicated log.
-            Request::Insert { sub, pred, obj } => {
-                self.client_write_response(LogOp::Insert(IdTriple::new(sub, pred, obj)))
-            }
+            // On a cluster node, a routed insert goes through the replicated
+            // log, and answers as [`RemoteShard::insert`] expects: `Bool` (was
+            // it new?) once committed, `Error` otherwise. It used to answer a
+            // `WriteAck`, so a [`RemoteShard`] reported an error for a write
+            // that had committed (review cluster-nlqa#3).
+            Request::Insert { sub, pred, obj } => self.routed_insert(IdTriple::new(sub, pred, obj)),
+            // Deleting a bucket on this replica alone, outside the log, made
+            // the replicas diverge for good (review cluster-nlqa#3). Every
+            // mutation of a replicated store goes through `ClientWrite`.
+            Request::PurgeShard { .. } => Response::Error(
+                "PurgeShard is not served by a replicated cluster node: it would change \
+                 this replica outside the Raft log; send ClientWrite Delete operations"
+                    .to_string(),
+            ),
             Request::ClusterStatus => {
                 let st = self.state.lock().unwrap();
                 Response::Status {
@@ -2983,7 +3723,36 @@ impl ClusterNode {
                 }
             }
             // Read-only shard queries are served from the replicated store.
-            other => dispatch(&self.store, &other),
+            // (Listed one by one, so a new request kind has to be classified
+            // as read-only or log-routed before it compiles.)
+            read @ (Request::Exists { .. }
+            | Request::PoByS { .. }
+            | Request::OBySp { .. }
+            | Request::PBySo { .. }
+            | Request::PsByO { .. }
+            | Request::SByPo { .. }
+            | Request::SoByP { .. }
+            | Request::SubsByP { .. }
+            | Request::ObjsByP { .. }
+            | Request::SubjectKeys
+            | Request::ObjectKeys
+            | Request::Predicates
+            | Request::TripleCount
+            | Request::PredCard { .. }
+            | Request::ScanShard { .. }) => dispatch(&self.store, &read),
+        }
+    }
+
+    /// Serve a routed [`Request::Insert`] (the [`RemoteShard`] surface) through
+    /// the replicated log: `Bool(true)` once a new triple is committed and
+    /// applied here, `Bool(false)` if it was already present, and an `Error`
+    /// (naming the leader, when known) when this node is not the leader or the
+    /// write is not confirmed committed within the commit timeout.
+    fn routed_insert(&self, t: IdTriple) -> Response {
+        let present = self.store_contains(t);
+        match self.propose_and_wait(LogOp::Insert(t), self.commit_timeout()) {
+            Ok(_) => Response::Bool(!present),
+            Err(e) => Response::Error(e.to_string()),
         }
     }
 
@@ -3018,7 +3787,15 @@ impl ClusterNode {
             if !self.alive.load(Ordering::SeqCst) {
                 continue;
             }
-            let outs = { self.state.lock().unwrap().tick() };
+            let outs = {
+                let mut st = self.state.lock().unwrap();
+                let outs = st.tick();
+                // A new term and our own vote are durable before we campaign.
+                match self.persist(&mut st) {
+                    Ok(()) => outs,
+                    Err(_) => continue,
+                }
+            };
             self.route(outs);
             self.apply_actions();
         }
@@ -3070,7 +3847,14 @@ impl ClusterNode {
             if !self.alive.load(Ordering::SeqCst) {
                 continue; // crashed while waiting for the reply
             }
-            let more = self.state.lock().unwrap().handle_reply(peer, reply);
+            let more = {
+                let mut st = self.state.lock().unwrap();
+                let more = st.handle_reply(peer, reply);
+                match self.persist(&mut st) {
+                    Ok(()) => more,
+                    Err(_) => continue,
+                }
+            };
             self.apply_actions();
             self.route(more);
         }
@@ -3122,8 +3906,18 @@ impl ClusterNode {
     }
 
     /// Drain and apply committed entries; the caller must hold `apply_lock`.
+    /// Nothing once the node's journal has failed: a single-node leader counts
+    /// an entry committed as it appends it, before the journal write that then
+    /// failed, and such an entry must never reach the store. (Checked under
+    /// the state lock, which the failing write holds while it sets the flag.)
     fn apply_actions_locked(&self) {
-        let actions = { self.state.lock().unwrap().drain_apply() };
+        let actions = {
+            let mut st = self.state.lock().unwrap();
+            if self.durable_failed.load(Ordering::SeqCst) {
+                return;
+            }
+            st.drain_apply()
+        };
         if actions.is_empty() {
             return;
         }
@@ -3477,6 +4271,26 @@ impl ReplicaGroup {
         Some((leader, idx))
     }
 
+    /// Propose a mutation and report whether it **committed**: `Ok(index)` once
+    /// a quorum stored it (delivery is synchronous, so this is decided before
+    /// returning) and the leader applied it; [`ProposeError::NotLeader`] when
+    /// the group has no leader; [`ProposeError::NotCommitted`] when the leader
+    /// appended it but no quorum acknowledged it. The entry then stays in the
+    /// leader's log and may still commit once a quorum is back (or be dropped
+    /// by a later leader), so the outcome is unknown and a retry is safe —
+    /// every [`LogOp`] is idempotent (review cluster-nlqa#4; the
+    /// [`ClusterNode::propose_and_wait`] contract).
+    pub fn commit(&mut self, op: LogOp) -> std::result::Result<u64, ProposeError> {
+        let leader = self.leader().ok_or(ProposeError::NotLeader(None))?;
+        let term = self.state(leader).current_term();
+        let (leader, idx) = self.propose(op).ok_or(ProposeError::NotLeader(None))?;
+        let st = self.state(leader);
+        match st.entry_outcome(idx, term) {
+            Some(true) if st.last_applied() >= idx => Ok(idx),
+            _ => Err(ProposeError::NotCommitted(self.leader())),
+        }
+    }
+
     /// Tick the current leader `rounds` times so pending work — heartbeats,
     /// backfill to a rejoined follower, an [`Request::InstallSnapshot`] to a
     /// replica behind the compaction point — flushes through. A no-op once the
@@ -3597,10 +4411,14 @@ impl ShardedRaftCluster {
     }
 
     /// Route a triple to its bucket's group and commit it through that group's
-    /// Raft log. Returns `Some(true)` if newly added, `Some(false)` if already
-    /// present, or `None` if the owning group currently has no leader to accept
-    /// it. The check against the leader's committed store keeps the op idempotent
-    /// (a duplicate is not re-logged).
+    /// Raft log. Returns `Some(true)` once it is **committed** (newly added),
+    /// `Some(false)` if already present, or `None` if it could not be
+    /// committed now: the owning group has no leader, or its leader has no
+    /// quorum (the entry may stay appended and commit once a quorum returns —
+    /// the outcome is unknown, retry; see [`ReplicaGroup::commit`]). Before
+    /// review cluster-nlqa#4 an appended-but-uncommitted write was reported
+    /// `Some(true)`. The check against the leader's committed store keeps the op
+    /// idempotent (a duplicate is not re-logged).
     pub fn insert(&mut self, t: IdTriple) -> Option<bool> {
         let g = shard_of(t.sub, self.num_shards);
         if let Some(store) = self.groups[g].readable_store() {
@@ -3608,10 +4426,12 @@ impl ShardedRaftCluster {
                 return Some(false);
             }
         }
-        self.groups[g].propose(LogOp::Insert(t)).map(|_| true)
+        self.groups[g].commit(LogOp::Insert(t)).ok().map(|_| true)
     }
 
-    /// Routed bulk insert; returns the number of triples newly committed.
+    /// Routed bulk insert; returns the number of triples newly committed (a
+    /// triple that could not be committed — no leader, no quorum — is not
+    /// counted; see [`ShardedRaftCluster::insert`]).
     pub fn insert_all(&mut self, triples: impl IntoIterator<Item = IdTriple>) -> u64 {
         let mut added = 0;
         for t in triples {
@@ -3623,8 +4443,9 @@ impl ShardedRaftCluster {
     }
 
     /// Route a delete to its bucket's group and commit it. Returns `Some(true)`
-    /// if the triple was present (and is now removed), `Some(false)` if it was
-    /// absent, or `None` if the group has no leader.
+    /// once the delete of a present triple is **committed**, `Some(false)` if it
+    /// was absent, or `None` if the delete could not be committed now (no
+    /// leader, or no quorum — outcome unknown, retry; review cluster-nlqa#4).
     pub fn remove(&mut self, t: IdTriple) -> Option<bool> {
         let g = shard_of(t.sub, self.num_shards);
         // Decide presence only against the leader. With no leader, a probe would
@@ -3639,7 +4460,7 @@ impl ShardedRaftCluster {
         if !present {
             return Some(false);
         }
-        self.groups[g].propose(LogOp::Delete(t)).map(|_| true)
+        self.groups[g].commit(LogOp::Delete(t)).ok().map(|_| true)
     }
 
     /// Tick every bucket's leader `rounds` times so any pending catch-up /
@@ -3944,6 +4765,7 @@ mod tests {
 #[cfg(test)]
 mod test_support {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     /// A TCP front for a shard node that can be **cut** and **restored** —
     /// modelling a shard host that goes down and comes back while coordinators
@@ -3955,6 +4777,9 @@ mod test_support {
     pub(super) struct Link {
         addr: SocketAddr,
         up: Arc<AtomicBool>,
+        /// Requests the link still forwards before it cuts itself
+        /// ([`Link::fail_after`]); `usize::MAX` means unlimited.
+        budget: Arc<AtomicUsize>,
     }
 
     impl Link {
@@ -3963,7 +4788,9 @@ mod test_support {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind link");
             let addr = listener.local_addr().expect("link addr");
             let up = Arc::new(AtomicBool::new(true));
+            let budget = Arc::new(AtomicUsize::new(usize::MAX));
             let flag = Arc::clone(&up);
+            let left = Arc::clone(&budget);
             thread::spawn(move || {
                 for client in listener.incoming().flatten() {
                     if !flag.load(Ordering::SeqCst) {
@@ -3971,10 +4798,18 @@ mod test_support {
                         continue;
                     }
                     let flag = Arc::clone(&flag);
-                    thread::spawn(move || relay(client, backend, &flag));
+                    let left = Arc::clone(&left);
+                    thread::spawn(move || relay(client, backend, &flag, &left));
                 }
             });
-            Link { addr, up }
+            Link { addr, up, budget }
+        }
+
+        /// Forward `n` more requests, then cut the link at the next one (which
+        /// is not forwarded) — a deterministic mid-operation failure: the host
+        /// dies after exactly `n` RPCs, whatever the timing.
+        pub(super) fn fail_after(&self, n: usize) {
+            self.budget.store(n, Ordering::SeqCst);
         }
 
         /// The address coordinators should use for this shard.
@@ -3987,15 +4822,33 @@ mod test_support {
             self.up.store(false, Ordering::SeqCst);
         }
 
-        /// Bring the shard back.
+        /// Bring the shard back (and lift any [`Link::fail_after`] budget).
         pub(super) fn restore(&self) {
+            self.budget.store(usize::MAX, Ordering::SeqCst);
             self.up.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Spend one request of a [`Link::fail_after`] budget; `false` once it is
+    /// exhausted (`usize::MAX` is unlimited).
+    fn take_one(budget: &AtomicUsize) -> bool {
+        let mut cur = budget.load(Ordering::SeqCst);
+        loop {
+            let next = match cur {
+                usize::MAX => return true,
+                0 => return false,
+                n => n - 1,
+            };
+            match budget.compare_exchange(cur, next, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return true,
+                Err(seen) => cur = seen,
+            }
         }
     }
 
     /// Relay framed request/response pairs between `client` and the node at
     /// `backend` until either side closes or the link is cut.
-    fn relay(mut client: TcpStream, backend: SocketAddr, up: &AtomicBool) {
+    fn relay(mut client: TcpStream, backend: SocketAddr, up: &AtomicBool, budget: &AtomicUsize) {
         let Ok(mut server) = TcpStream::connect(backend) else {
             return;
         };
@@ -4004,6 +4857,10 @@ mod test_support {
         while let Ok(req) = rpc::read_message(&mut client) {
             if !up.load(Ordering::SeqCst) {
                 return; // cut mid-session: sever both sockets
+            }
+            if !take_one(budget) {
+                up.store(false, Ordering::SeqCst); // budget exhausted: the host dies now
+                return;
             }
             if rpc::write_message(&mut server, &req).is_err() {
                 return;
@@ -6021,9 +6878,19 @@ mod replicated_shard_tests {
         // commit, so nothing new is applied.
         cluster.set_replica_down(0, followers[2], true);
         let before = cluster.group(0).state(leader).commit_index();
+        let appended = cluster.group(0).state(leader).log_len();
+        // review cluster-nlqa#12: this asserted `Some(true)` — "committed",
+        // per insert's docs — for exactly this uncommitted write (the bug of
+        // cluster-nlqa#4). An uncommitted write reports `None` (outcome
+        // unknown); that the leader still appends it is checked directly.
         assert_eq!(
             cluster.insert(t(7, 8, 9)),
-            Some(true),
+            None,
+            "an uncommitted write is not reported committed"
+        );
+        assert_eq!(
+            cluster.group(0).state(leader).log_len(),
+            appended + 1,
             "leader still appends"
         );
         let after = cluster.group(0).state(leader).commit_index();
@@ -6342,5 +7209,1152 @@ mod replicated_shard_tests {
             );
         }
         assert_eq!(cluster.remove(a), Some(false), "removing an absent triple");
+    }
+}
+
+/// Regression tests for the review findings fixed in this module (review
+/// cluster-nlqa#1-#4, #9-#12): each one reproduces the reported failure
+/// through the public API and checks the fixed behaviour. Failures are
+/// injected deterministically — a [`test_support::Link`] that dies after an
+/// exact number of RPCs, a replica marked down, a forged message — and wall
+/// clocks only bound the waits (hang guards), never decide an assertion.
+#[cfg(test)]
+mod review_fix_tests {
+    use super::test_support::Link;
+    use super::*;
+    use std::time::Instant;
+
+    /// Upper bound on any wait in this module: a hang guard, not an assertion.
+    const HANG_GUARD: Duration = Duration::from_secs(30);
+
+    fn t(s: u32, p: u32, o: u32) -> IdTriple {
+        IdTriple::new(s, p, o)
+    }
+
+    /// A placeholder member address for an in-process (`Shard::Local`)
+    /// endpoint: the config needs one, nothing ever connects to it.
+    fn local_addr(host: u8) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, host], 0))
+    }
+
+    fn local_shard(triples: &[IdTriple]) -> Shard {
+        let mut s = TripleStore::new();
+        s.bulk_load(triples.iter().copied());
+        Shard::Local(s)
+    }
+
+    /// A [`ShardNode`] holding `initial` on an ephemeral port, served from a
+    /// background thread; returns its address.
+    fn start_shard(initial: &[IdTriple]) -> SocketAddr {
+        let mut store = TripleStore::new();
+        store.bulk_load(initial.iter().copied());
+        let node = ShardNode::bind(store, "127.0.0.1:0").expect("bind shard node");
+        let addr = node.local_addr().expect("shard addr");
+        thread::spawn(move || node.serve_forever());
+        addr
+    }
+
+    fn remote(addr: SocketAddr) -> Shard {
+        Shard::Remote(RemoteShard::connect(addr).expect("resolve shard addr"))
+    }
+
+    /// Whether member `id`'s own endpoint holds `tr`.
+    fn holds(cluster: &ShardCluster, id: NodeId, tr: IdTriple) -> bool {
+        cluster
+            .endpoint(id)
+            .expect("member endpoint")
+            .reader()
+            .read_exists(tr.sub, tr.pred, tr.obj)
+            .expect("endpoint answers")
+    }
+
+    // ----- review cluster-nlqa#1: retry-safe migrations -----------------------
+
+    /// The reviewer's experiment: node 0 holds 400 triples, node 1 joins over
+    /// a link that dies after 30 RPCs. The retry of the join must finish the
+    /// stranded buckets, and a later leave of node 0 must lose nothing (before
+    /// the fix the retry was a silent no-op, the count read 430 and the leave
+    /// dropped ~65 triples, every call returning `Ok`).
+    #[test]
+    fn a_failed_join_is_resumed_by_its_retry_and_a_later_leave_loses_nothing() {
+        let triples: Vec<IdTriple> = (1..=400).map(|s| t(s, 7, s + 1000)).collect();
+        let mut cluster = ShardCluster::new(16);
+        cluster
+            .add_node(0, local_addr(1), local_shard(&triples))
+            .unwrap();
+
+        let link = Link::to(start_shard(&[]));
+        link.fail_after(30);
+        let joined = cluster.add_node(1, link.addr(), remote(link.addr()));
+        assert!(joined.is_err(), "the link dies mid-migration: {joined:?}");
+
+        link.restore();
+        cluster
+            .add_node(1, link.addr(), remote(link.addr()))
+            .expect("the retry resumes the stranded buckets");
+        assert_eq!(
+            cluster.try_triple_count().unwrap(),
+            400,
+            "no triple lost or counted twice after the retried join"
+        );
+        for &tr in &triples {
+            let owner = cluster.owner_of_subject(tr.sub).unwrap();
+            for id in cluster.members() {
+                assert_eq!(
+                    holds(&cluster, id, tr),
+                    id == owner,
+                    "{tr:?} must live on its owner {owner} only (checked node {id})"
+                );
+            }
+        }
+
+        cluster.remove_node(0).expect("node 0 leaves");
+        assert_eq!(cluster.members(), vec![1]);
+        assert_eq!(cluster.try_triple_count().unwrap(), 400);
+        for &tr in &triples {
+            assert!(
+                cluster.try_exists(tr.sub, tr.pred, tr.obj).unwrap(),
+                "{tr:?} lost by the leave"
+            );
+        }
+    }
+
+    /// While a failed join leaves buckets stranded, reads stay exact (the
+    /// copied triples sit on both nodes but are counted once), and every other
+    /// membership change is refused without changing anything — before the
+    /// fix `remove_node(0)` went ahead and dropped the stranded triples.
+    #[test]
+    fn stranded_buckets_block_other_membership_changes_until_resumed() {
+        let triples: Vec<IdTriple> = (1..=400).map(|s| t(s, 7, s + 1000)).collect();
+        let mut cluster = ShardCluster::new(16);
+        cluster
+            .add_node(0, local_addr(1), local_shard(&triples))
+            .unwrap();
+        let link = Link::to(start_shard(&[]));
+        link.fail_after(30);
+        assert!(cluster
+            .add_node(1, link.addr(), remote(link.addr()))
+            .is_err());
+        let stranded = cluster.stranded_buckets();
+        assert!(!stranded.is_empty());
+        assert!(stranded.iter().all(|&(_, from, to)| (from, to) == (0, 1)));
+
+        // The link is still down: nothing else may change.
+        assert!(
+            cluster.remove_node(0).is_err(),
+            "node 0 may hold the only copy"
+        );
+        assert!(cluster
+            .add_node(2, local_addr(2), Shard::Local(TripleStore::new()))
+            .is_err());
+        assert_eq!(cluster.members(), vec![0, 1]);
+        assert_eq!(cluster.stranded_buckets(), stranded);
+
+        link.restore();
+        assert_eq!(
+            cluster.try_triple_count().unwrap(),
+            400,
+            "copies counted once"
+        );
+        assert_eq!(cluster.try_pred_card(7).unwrap(), 400);
+        assert_eq!(cluster.try_iter_all().unwrap().len(), 400);
+
+        cluster.resume_migrations().expect("the link is back");
+        assert!(cluster.stranded_buckets().is_empty());
+        assert_eq!(cluster.try_triple_count().unwrap(), 400);
+        cluster.remove_node(0).expect("nothing stranded any more");
+        assert_eq!(cluster.try_triple_count().unwrap(), 400);
+    }
+
+    /// A leave interrupted mid-migration keeps the leaving node's endpoint —
+    /// reads still see everything — until a retry has drained it.
+    #[test]
+    fn an_interrupted_leave_keeps_the_leaving_endpoint_until_it_is_drained() {
+        let triples: Vec<IdTriple> = (1..=200).map(|s| t(s, 3, s)).collect();
+        let link = Link::to(start_shard(&[]));
+        let mut cluster = ShardCluster::new(8);
+        cluster
+            .add_node(0, link.addr(), remote(link.addr()))
+            .unwrap();
+        cluster
+            .add_node(1, local_addr(1), Shard::Local(TripleStore::new()))
+            .unwrap();
+        cluster.insert_all(triples.iter().copied()).unwrap();
+        let held_by_0 = triples.iter().filter(|tr| holds(&cluster, 0, **tr)).count();
+        assert!(
+            held_by_0 > 10,
+            "node 0 owns some buckets ({held_by_0} triples)"
+        );
+
+        link.fail_after(5);
+        assert!(cluster.remove_node(0).is_err());
+        assert_eq!(
+            cluster.members(),
+            vec![1],
+            "writes no longer route to node 0"
+        );
+        assert!(cluster.endpoint(0).is_some(), "but its endpoint is kept");
+        assert!(!cluster.stranded_buckets().is_empty());
+
+        link.restore();
+        assert_eq!(cluster.try_triple_count().unwrap(), 200);
+        cluster.remove_node(0).expect("the retry drains node 0");
+        assert!(cluster.endpoint(0).is_none(), "drained, then dropped");
+        assert!(cluster.stranded_buckets().is_empty());
+        assert_eq!(cluster.try_triple_count().unwrap(), 200);
+        for &tr in &triples {
+            assert!(holds(&cluster, 1, tr), "{tr:?} reached the survivor");
+        }
+    }
+
+    /// The last member cannot leave while it holds triples: they would have
+    /// nowhere to go (before, its endpoint was dropped with them).
+    #[test]
+    fn the_last_member_holding_data_cannot_leave() {
+        let mut cluster = ShardCluster::new(4);
+        cluster
+            .add_node(0, local_addr(1), local_shard(&[t(1, 2, 3)]))
+            .unwrap();
+        let err = cluster.remove_node(0).expect_err("it holds a triple");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert_eq!(cluster.members(), vec![0]);
+        assert_eq!(cluster.try_triple_count().unwrap(), 1);
+
+        let mut empty = ShardCluster::new(4);
+        empty
+            .add_node(0, local_addr(1), Shard::Local(TripleStore::new()))
+            .unwrap();
+        empty
+            .remove_node(0)
+            .expect("an empty last member may leave");
+        assert!(empty.members().is_empty());
+    }
+
+    // ----- review cluster-nlqa#10: re-adding a member -------------------------
+
+    /// Re-adding an existing member must not replace (and drop) its endpoint:
+    /// before the fix a second `add_node(1, .., Local(empty))` silently dropped
+    /// the member's 10 triples. A re-add naming a different address is not a
+    /// retry and is refused instead of leaving config and endpoint disagreeing.
+    #[test]
+    fn re_adding_a_member_keeps_its_endpoint_and_its_data() {
+        let mut cluster = ShardCluster::new(4);
+        cluster
+            .add_node(1, local_addr(1), Shard::Local(TripleStore::new()))
+            .unwrap();
+        for i in 0..10 {
+            assert!(cluster.insert(t(i, 100, i + 1)).unwrap());
+        }
+        cluster
+            .add_node(1, local_addr(1), Shard::Local(TripleStore::new()))
+            .expect("re-adding with the same address is an idempotent retry");
+        assert_eq!(cluster.try_triple_count().unwrap(), 10, "member data kept");
+
+        let err = cluster
+            .add_node(1, local_addr(2), Shard::Local(TripleStore::new()))
+            .expect_err("a different address is not a retry");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert_eq!(cluster.config().addr(1), Some(local_addr(1)));
+        assert_eq!(cluster.try_triple_count().unwrap(), 10);
+    }
+
+    /// A re-add whose `Local` endpoint holds triples is refused rather than
+    /// silently discarding them.
+    #[test]
+    fn re_adding_a_member_with_a_seeded_local_shard_is_refused() {
+        let mut cluster = ShardCluster::new(4);
+        cluster
+            .add_node(1, local_addr(1), Shard::Local(TripleStore::new()))
+            .unwrap();
+        let err = cluster
+            .add_node(1, local_addr(1), local_shard(&[t(5, 6, 7)]))
+            .expect_err("the seeded triples would be discarded");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        assert_eq!(cluster.try_triple_count().unwrap(), 0);
+    }
+
+    // ----- review cluster-nlqa#9 (+ sec#19, conc#11, robust#15) ---------------
+
+    /// A [`ShardNode`] disconnects a client that stays idle, or stalls inside
+    /// a frame, past its I/O timeout; before, such a connection held its
+    /// thread forever.
+    #[test]
+    fn a_shard_node_disconnects_idle_and_stalled_clients() {
+        use std::io::{Read, Write};
+        let node = ShardNode::bind(TripleStore::new(), "127.0.0.1:0")
+            .unwrap()
+            .with_io_timeout(Duration::from_millis(100));
+        let addr = node.local_addr().unwrap();
+        thread::spawn(move || node.serve_forever());
+
+        let mut idle = TcpStream::connect(addr).unwrap();
+        idle.set_read_timeout(Some(HANG_GUARD)).unwrap();
+        assert_eq!(
+            idle.read(&mut [0u8; 1])
+                .expect("closed by the node, not timed out here"),
+            0
+        );
+
+        // Half a frame: the length prefix announces 10 bytes, one arrives.
+        let mut stalled = TcpStream::connect(addr).unwrap();
+        stalled.set_read_timeout(Some(HANG_GUARD)).unwrap();
+        stalled.write_all(&[0, 0, 0, 10, 1]).unwrap();
+        assert_eq!(stalled.read(&mut [0u8; 1]).expect("closed by the node"), 0);
+
+        // An active client is served as before.
+        let rs = RemoteShard::connect(addr).unwrap();
+        assert_eq!(rs.triple_count().unwrap(), 0);
+    }
+
+    /// A reply larger than the frame limit is answered with an error that
+    /// says so, and the connection stays usable; before, the node built the
+    /// reply, failed to send it and dropped the connection, so the client saw
+    /// a reset, retried, and reported a generic I/O error.
+    #[test]
+    fn an_oversized_shard_reply_is_reported_not_dropped() {
+        let triples: Vec<IdTriple> = (1..=100).map(|s| t(s, 1, s)).collect();
+        let mut store = TripleStore::new();
+        store.bulk_load(triples.iter().copied());
+        let mut node = ShardNode::bind(store, "127.0.0.1:0").unwrap();
+        node.reply_limit = 64; // 100 subject ids need 405 bytes
+        let addr = node.local_addr().unwrap();
+        thread::spawn(move || node.serve_forever());
+
+        let rs = RemoteShard::connect(addr).unwrap();
+        let err = rs.read_subject_keys().expect_err("the reply is too large");
+        assert!(err.to_string().contains("exceeds"), "{err}");
+        assert_eq!(
+            rs.triple_count().unwrap(),
+            100,
+            "the connection still serves"
+        );
+    }
+
+    // ----- review cluster-nlqa#2: forged and overflowing terms ----------------
+
+    /// A forged `RequestVote` at `u64::MAX` must not be adopted: before the fix
+    /// the node granted it, jumped to the last representable term, and the next
+    /// election overflowed (`attempt to add with overflow` in debug builds, a
+    /// wrap to 0 in release).
+    #[test]
+    fn a_forged_max_term_vote_is_refused_and_elections_continue() {
+        let cfg = RaftConfig::default();
+        let mut a = RaftState::new(0, vec![1, 2], &cfg);
+        let reply = a.handle(RaftMsg::RequestVote {
+            term: u64::MAX,
+            candidate_id: 99,
+            last_log_index: u64::MAX,
+            last_log_term: u64::MAX,
+        });
+        assert_eq!(
+            reply,
+            RaftReply::Vote {
+                term: 0,
+                granted: false
+            }
+        );
+        assert_eq!(a.current_term(), 0, "the forged term is not adopted");
+
+        let mut outs = Vec::new();
+        for _ in 0..1000 {
+            outs = a.tick();
+            if !outs.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(a.current_term(), 1, "the node still campaigns normally");
+        assert!(matches!(outs[0].msg, RaftMsg::RequestVote { term: 1, .. }));
+
+        // Forged AppendEntries / InstallSnapshot at the maximum are refused too.
+        let reply = a.handle(RaftMsg::AppendEntries {
+            term: u64::MAX,
+            leader_id: 99,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            leader_commit: 0,
+            entries: vec![],
+        });
+        assert!(
+            matches!(
+                reply,
+                RaftReply::Append {
+                    term: 1,
+                    success: false,
+                    ..
+                }
+            ),
+            "{reply:?}"
+        );
+        let reply = a.handle(RaftMsg::InstallSnapshot {
+            term: u64::MAX,
+            leader_id: 99,
+            last_included_index: 5,
+            last_included_term: u64::MAX,
+            triples: vec![t(1, 2, 3)],
+        });
+        assert_eq!(reply, RaftReply::Snapshot { term: 1 });
+        assert_eq!(a.current_term(), 1);
+        assert_eq!(a.base_index(), 0, "the forged snapshot was not installed");
+    }
+
+    /// Term arithmetic is checked: a node already at the largest term stops
+    /// campaigning instead of panicking (debug) or wrapping to 0 (release).
+    #[test]
+    fn a_node_at_the_largest_term_does_not_overflow() {
+        let cfg = RaftConfig::default();
+        let mut a = RaftState::new(0, vec![1, 2], &cfg);
+        a.current_term = u64::MAX;
+        for _ in 0..1000 {
+            assert!(a.tick().is_empty(), "no election past the last term");
+        }
+        assert_eq!(a.current_term(), u64::MAX, "never wraps");
+        assert_ne!(a.role(), Role::Leader);
+    }
+
+    /// A lying `AppendAck` (match index `u64::MAX`) must not wrap the leader's
+    /// `next_index` or commit beyond its own log.
+    #[test]
+    fn a_lying_append_ack_cannot_wrap_next_index() {
+        let cfg = RaftConfig::default();
+        let mut a = RaftState::new(0, vec![1, 2], &cfg);
+        while a.role() != Role::Candidate {
+            a.tick();
+        }
+        let term = a.current_term();
+        let _ = a.handle_reply(
+            1,
+            RaftReply::Vote {
+                term,
+                granted: true,
+            },
+        );
+        assert!(a.is_leader());
+        a.propose(LogOp::Insert(t(1, 2, 3))).unwrap();
+        for success in [true, false] {
+            let _ = a.handle_reply(
+                1,
+                RaftReply::Append {
+                    term,
+                    success,
+                    match_index: u64::MAX,
+                },
+            );
+            assert!(a.commit_index() <= a.log_len(), "commit past the log");
+            assert!(a.next_index.values().all(|&n| n <= a.log_len() + 1));
+        }
+    }
+
+    /// A forged snapshot claiming the last representable index is refused;
+    /// before the fix it was installed and the node's next election overflowed
+    /// computing `last_log_index + 1`.
+    #[test]
+    fn a_forged_snapshot_index_is_refused() {
+        let cfg = RaftConfig::default();
+        let mut a = RaftState::new(0, vec![], &cfg);
+        let _ = a.handle(RaftMsg::InstallSnapshot {
+            term: 1,
+            leader_id: 9,
+            last_included_index: u64::MAX,
+            last_included_term: 1,
+            triples: vec![t(1, 2, 3)],
+        });
+        assert_eq!(a.base_index(), 0, "the forged snapshot was not installed");
+        for _ in 0..1000 {
+            a.tick();
+            if a.is_leader() {
+                break;
+            }
+        }
+        assert!(a.is_leader(), "the single node still elects itself");
+        assert!(a.propose(LogOp::Insert(t(4, 5, 6))).is_some());
+    }
+
+    /// A single-node [`ClusterNode`] on an ephemeral port with fast ticks,
+    /// shut down when dropped (also when the test fails).
+    struct LiveNode(Arc<ClusterNode>);
+
+    impl LiveNode {
+        fn start(store: TripleStore) -> LiveNode {
+            let cfg = RaftConfig {
+                election_timeout_min: 3,
+                election_timeout_max: 6,
+                heartbeat_timeout: 1,
+                tick_interval: Duration::from_millis(5),
+            };
+            let node = ClusterNode::bind(0, vec![], store, "127.0.0.1:0", cfg).expect("bind");
+            let _ = node.start();
+            LiveNode(node)
+        }
+
+        fn addr(&self) -> SocketAddr {
+            self.0.local_addr().unwrap()
+        }
+
+        /// Wait (bounded by the hang guard) until the node leads.
+        fn wait_leader(&self) {
+            let start = Instant::now();
+            while !self.0.is_leader() {
+                assert!(start.elapsed() < HANG_GUARD, "no leader");
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+
+    impl Drop for LiveNode {
+        fn drop(&mut self) {
+            self.0.shutdown();
+        }
+    }
+
+    /// The reviewer's wire experiment on a live node: one forged max-term
+    /// `RequestVote` used to panic the tick driver and poison the state mutex
+    /// (every later call panicked) — the node must keep serving writes.
+    #[test]
+    fn a_forged_max_term_vote_does_not_wedge_a_live_cluster_node() {
+        let node = LiveNode::start(TripleStore::new());
+        node.wait_leader();
+        let mut s = TcpStream::connect(node.addr()).unwrap();
+        s.set_read_timeout(Some(HANG_GUARD)).unwrap();
+        let reply = rpc::round_trip(
+            &mut s,
+            &Request::RequestVote {
+                term: u64::MAX,
+                candidate_id: 99,
+                last_log_index: 0,
+                last_log_term: 0,
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(reply, Response::Vote { granted: false, term } if term < u64::MAX),
+            "{reply:?}"
+        );
+        let start = Instant::now();
+        loop {
+            match node
+                .0
+                .propose_and_wait(LogOp::Insert(t(1, 2, 3)), Duration::from_secs(2))
+            {
+                Ok(_) => break,
+                Err(e) => assert!(start.elapsed() < HANG_GUARD, "never committed: {e}"),
+            }
+        }
+        assert!(node.0.current_term() < u64::MAX);
+        assert!(node.0.store_contains(t(1, 2, 3)));
+    }
+
+    // ----- review cluster-nlqa#3: shard RPCs sent to a ClusterNode ------------
+
+    /// A [`RemoteShard`] pointed at a [`ClusterNode`]: its routed insert goes
+    /// through the Raft log and answers `Bool` as the [`RemoteShard`] contract
+    /// says (before the fix: `Err("expected a Bool response")` for a committed
+    /// write), and a `PurgeShard` — which would delete data on this replica
+    /// only, outside the log — is refused.
+    #[test]
+    fn a_cluster_node_honours_the_shard_insert_contract_and_refuses_purges() {
+        let node = LiveNode::start(TripleStore::new());
+        node.wait_leader();
+        let rs = RemoteShard::connect(node.addr()).unwrap();
+        let tr = t(11, 22, 33);
+        assert!(rs.insert(tr).unwrap(), "a new triple is reported new");
+        assert!(
+            !rs.insert(tr).unwrap(),
+            "a present triple is reported present"
+        );
+        assert!(node.0.store_contains(tr));
+
+        let commit = node.0.commit_index();
+        for s in 0..4 {
+            assert!(
+                rs.purge_shard(s, 4).is_err(),
+                "PurgeShard bypasses the replicated log and must be refused"
+            );
+        }
+        assert!(node.0.store_contains(tr), "the committed triple survives");
+        assert_eq!(node.0.commit_index(), commit);
+        assert!(
+            rs.read_exists(11, 22, 33).unwrap(),
+            "reads are still served"
+        );
+    }
+
+    /// Every request kind sent to a [`ClusterNode`] is either served from the
+    /// replicated store (reads), routed through the Raft log (writes), or
+    /// refused — none changes the store outside the log.
+    #[test]
+    fn every_request_sent_to_a_cluster_node_reads_goes_through_the_log_or_is_refused() {
+        let mut seed = TripleStore::new();
+        seed.bulk_load([t(1, 2, 3), t(4, 2, 6)]);
+        let node = LiveNode::start(seed);
+        node.wait_leader();
+        let mut s = TcpStream::connect(node.addr()).unwrap();
+        s.set_read_timeout(Some(HANG_GUARD)).unwrap();
+        let mut ask = |req: Request| rpc::round_trip(&mut s, &req).expect("round trip");
+
+        // Reads.
+        assert_eq!(
+            ask(Request::Exists {
+                sub: 1,
+                pred: 2,
+                obj: 3
+            }),
+            Response::Bool(true)
+        );
+        assert_eq!(
+            ask(Request::PoByS { sub: 1 }),
+            Response::Pairs(vec![(2, 3)])
+        );
+        assert_eq!(
+            ask(Request::OBySp { sub: 1, pred: 2 }),
+            Response::Ids(vec![3])
+        );
+        assert_eq!(
+            ask(Request::PBySo { sub: 1, obj: 3 }),
+            Response::Ids(vec![2])
+        );
+        assert_eq!(
+            ask(Request::PsByO { obj: 3 }),
+            Response::Pairs(vec![(2, 1)])
+        );
+        assert_eq!(
+            ask(Request::SByPo { pred: 2, obj: 3 }),
+            Response::Ids(vec![1])
+        );
+        assert_eq!(
+            ask(Request::SoByP { pred: 2 }),
+            Response::Pairs(vec![(1, 3), (4, 6)])
+        );
+        assert_eq!(ask(Request::SubsByP { pred: 2 }), Response::Ids(vec![1, 4]));
+        assert_eq!(ask(Request::ObjsByP { pred: 2 }), Response::Ids(vec![3, 6]));
+        assert_eq!(ask(Request::SubjectKeys), Response::Ids(vec![1, 4]));
+        assert_eq!(ask(Request::ObjectKeys), Response::Ids(vec![3, 6]));
+        assert_eq!(ask(Request::Predicates), Response::Ids(vec![2]));
+        assert_eq!(ask(Request::TripleCount), Response::Count(2));
+        assert_eq!(ask(Request::PredCard { pred: 2 }), Response::Count(2));
+        assert!(matches!(
+            ask(Request::ScanShard { shard: 0, num_shards: 1 }),
+            Response::Triples(v) if v.len() == 2
+        ));
+        assert!(matches!(
+            ask(Request::ClusterStatus),
+            Response::Status { role: 2, .. }
+        ));
+        assert!(matches!(ask(Request::GetConfig), Response::Config { .. }));
+
+        // Stale Raft traffic is answered without effect.
+        assert!(matches!(
+            ask(Request::RequestVote {
+                term: 0,
+                candidate_id: 9,
+                last_log_index: 0,
+                last_log_term: 0
+            }),
+            Response::Vote { granted: false, .. }
+        ));
+        assert!(matches!(
+            ask(Request::AppendEntries {
+                term: 0,
+                leader_id: 9,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                leader_commit: 0,
+                entries: vec![LogEntry::new(0, LogOp::Delete(t(1, 2, 3)))],
+            }),
+            Response::AppendAck { success: false, .. }
+        ));
+        assert!(matches!(
+            ask(Request::InstallSnapshot {
+                term: 0,
+                leader_id: 9,
+                last_included_index: 99,
+                last_included_term: 0,
+                triples: vec![],
+            }),
+            Response::SnapshotAck { .. }
+        ));
+        assert!(
+            node.0.is_leader(),
+            "stale traffic does not depose the leader"
+        );
+
+        // Writes go through the log.
+        let commit = node.0.commit_index();
+        assert_eq!(
+            ask(Request::Insert {
+                sub: 7,
+                pred: 2,
+                obj: 8
+            }),
+            Response::Bool(true)
+        );
+        assert!(matches!(
+            ask(Request::ClientWrite {
+                op: LogOp::Delete(t(4, 2, 6))
+            }),
+            Response::WriteAck { ok: true, .. }
+        ));
+        assert_eq!(node.0.commit_index(), commit + 2, "both writes were logged");
+
+        // Bucket purges are refused.
+        assert!(matches!(
+            ask(Request::PurgeShard {
+                shard: 0,
+                num_shards: 1
+            }),
+            Response::Error(_)
+        ));
+        assert_eq!(node.0.commit_index(), commit + 2);
+        assert!(node.0.store_contains(t(1, 2, 3)));
+        assert!(node.0.store_contains(t(7, 2, 8)));
+        assert!(!node.0.store_contains(t(4, 2, 6)));
+        assert_eq!(node.0.store_triple_count(), 2);
+    }
+
+    // ----- review cluster-nlqa#4: commit reporting ----------------------------
+
+    /// With both followers down the leader can append but never commit:
+    /// `insert_all` used to report 5 triples "newly committed" while the
+    /// cluster held none. Writes that cannot commit are reported as such
+    /// (`None`: outcome unknown, retry), and commit once a quorum is back.
+    #[test]
+    fn writes_without_a_quorum_are_not_reported_committed() {
+        let mut c = ShardedRaftCluster::with_compaction(1, 3, RaftConfig::default(), 0);
+        c.bootstrap();
+        let leader = c.group(0).leader().unwrap();
+        assert_eq!(
+            c.insert(t(100, 1, 1)),
+            Some(true),
+            "committed with a quorum"
+        );
+        let followers: Vec<NodeId> = c
+            .group(0)
+            .replicas()
+            .iter()
+            .copied()
+            .filter(|&r| r != leader)
+            .collect();
+        for &f in &followers {
+            c.set_replica_down(0, f, true);
+        }
+
+        let n = c.insert_all((1..=5).map(|s| t(s, 2, 3)));
+        assert_eq!(n, 0, "nothing was committed");
+        assert_eq!(c.try_triple_count().unwrap(), 1);
+        assert_eq!(c.insert(t(9, 9, 9)), None, "an uncommitted insert");
+        assert_eq!(
+            c.remove(t(100, 1, 1)),
+            None,
+            "a delete that cannot commit is not reported done"
+        );
+        assert!(c.try_exists(100, 1, 1).unwrap());
+
+        // A quorum returns: the appended entries commit (which is why the
+        // outcome was "unknown", not "failed").
+        for &f in &followers {
+            c.set_replica_down(0, f, false);
+        }
+        c.settle(5);
+        assert_eq!(c.try_triple_count().unwrap(), 6);
+        assert!(!c.try_exists(100, 1, 1).unwrap());
+    }
+
+    // ----- review cluster-nlqa#11: durable term, vote and log -----------------
+
+    /// A unique scratch directory, removed when dropped (also on failure).
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> TempDir {
+            use std::sync::atomic::AtomicUsize;
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "gstore_cluster_review_{}_{}_{tag}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            TempDir(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn vote(node: &ClusterNode, term: u64, candidate: NodeId) -> Response {
+        node.handle_request(Request::RequestVote {
+            term,
+            candidate_id: candidate,
+            last_log_index: 0,
+            last_log_term: 0,
+        })
+    }
+
+    /// The double vote the reviewer reproduced: a replica that voted in term
+    /// 5 and restarts must not vote for another candidate in term 5. With
+    /// [`ClusterNode::bind_persistent`] the vote survives the restart; the
+    /// in-memory [`ClusterNode::bind`] shows the hazard it closes.
+    #[test]
+    fn a_persistent_replica_keeps_its_vote_across_a_restart() {
+        let dir = TempDir::new("vote");
+        let cfg = RaftConfig::default();
+        let node = ClusterNode::bind_persistent(2, vec![0, 1], &dir.0, "127.0.0.1:0", cfg.clone())
+            .unwrap();
+        assert_eq!(
+            vote(&node, 5, 0),
+            Response::Vote {
+                term: 5,
+                granted: true
+            }
+        );
+        drop(node); // never started: no threads hold it
+
+        let node = ClusterNode::bind_persistent(2, vec![0, 1], &dir.0, "127.0.0.1:0", cfg.clone())
+            .unwrap();
+        assert_eq!(node.current_term(), 5, "the term survived");
+        assert_eq!(
+            vote(&node, 5, 1),
+            Response::Vote {
+                term: 5,
+                granted: false
+            },
+            "no second vote in term 5"
+        );
+        assert_eq!(
+            vote(&node, 5, 0),
+            Response::Vote {
+                term: 5,
+                granted: true
+            }
+        );
+
+        // An in-memory replica restarted the same way votes twice.
+        let fresh =
+            ClusterNode::bind(2, vec![0, 1], TripleStore::new(), "127.0.0.1:0", cfg).unwrap();
+        assert_eq!(
+            vote(&fresh, 5, 1),
+            Response::Vote {
+                term: 5,
+                granted: true
+            }
+        );
+    }
+
+    /// The log is durable too: entries a replica acknowledged — including a
+    /// conflicting suffix it later replaced — come back exactly after a
+    /// restart, and a restarted single-node cluster re-commits them and
+    /// rebuilds its store.
+    #[test]
+    fn a_persistent_replica_recovers_its_log_and_rebuilds_its_store() {
+        let dir = TempDir::new("log");
+        let cfg = RaftConfig::default();
+        let follower =
+            ClusterNode::bind_persistent(1, vec![0], &dir.0, "127.0.0.1:0", cfg.clone()).unwrap();
+        let append = |term, prev_log_index, prev_log_term, entries| {
+            follower.handle_request(Request::AppendEntries {
+                term,
+                leader_id: 0,
+                prev_log_index,
+                prev_log_term,
+                leader_commit: 0,
+                entries,
+            })
+        };
+        let e = |term, s| LogEntry::new(term, LogOp::Insert(t(s, 1, 1)));
+        assert!(matches!(
+            append(1, 0, 0, vec![e(1, 1), e(1, 2), e(1, 3)]),
+            Response::AppendAck { success: true, .. }
+        ));
+        // A new leader of term 2 overwrites index 3 onwards.
+        assert!(matches!(
+            append(2, 2, 1, vec![e(2, 30), e(2, 40)]),
+            Response::AppendAck { success: true, .. }
+        ));
+        let expected = follower.state.lock().unwrap().log.clone();
+        assert_eq!(expected, vec![e(1, 1), e(1, 2), e(2, 30), e(2, 40)]);
+        drop(follower);
+
+        // Restarted alone (as a single-node cluster) it elects itself,
+        // re-commits the recovered log and rebuilds the store from it.
+        let node = ClusterNode::bind_persistent(1, vec![], &dir.0, "127.0.0.1:0", cfg).unwrap();
+        assert_eq!(node.state.lock().unwrap().log, expected, "the log survived");
+        assert_eq!(node.current_term(), 2);
+        let live = LiveNode(node);
+        let _ = live.0.start();
+        live.wait_leader();
+        let start = Instant::now();
+        while live.0.store_triple_count() < 4 {
+            assert!(start.elapsed() < HANG_GUARD, "store not rebuilt");
+            thread::sleep(Duration::from_millis(2));
+        }
+        for s in [1, 2, 30, 40] {
+            assert!(live.0.store_contains(t(s, 1, 1)));
+        }
+        assert!(
+            !live.0.store_contains(t(3, 1, 1)),
+            "the replaced entry is gone"
+        );
+    }
+
+    /// A torn record at the journal's tail (a crash mid-append) is cut off,
+    /// a state directory of another node id is refused, and so is a second
+    /// copy of the same node while the first holds the journal.
+    #[test]
+    fn the_raft_journal_drops_a_torn_tail_and_refuses_a_foreign_or_second_node() {
+        use std::io::Write;
+        let dir = TempDir::new("journal");
+        let cfg = RaftConfig::default();
+        let node =
+            ClusterNode::bind_persistent(3, vec![4], &dir.0, "127.0.0.1:0", cfg.clone()).unwrap();
+        assert!(matches!(
+            vote(&node, 7, 4),
+            Response::Vote { granted: true, .. }
+        ));
+        drop(node);
+        let path = dir.0.join(RaftJournal::FILE);
+        let intact = std::fs::metadata(&path).unwrap().len();
+        // Half of a record: a length prefix announcing 50 bytes, 3 present.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(&[0, 0, 0, 50, 1, 2, 3, 4, 9, 9, 9]).unwrap();
+        drop(f);
+
+        let node =
+            ClusterNode::bind_persistent(3, vec![4], &dir.0, "127.0.0.1:0", cfg.clone()).unwrap();
+        assert_eq!(node.current_term(), 7);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            intact,
+            "torn tail cut"
+        );
+        assert!(matches!(
+            vote(&node, 7, 5),
+            Response::Vote { granted: false, .. }
+        ));
+        drop(node);
+
+        let err = ClusterNode::bind_persistent(9, vec![4], &dir.0, "127.0.0.1:0", cfg.clone())
+            .expect_err("node 3's state directory");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+
+        // One replica, one journal: a second copy of node 3 on the same
+        // directory is refused while the first one runs.
+        let first =
+            ClusterNode::bind_persistent(3, vec![4], &dir.0, "127.0.0.1:0", cfg.clone()).unwrap();
+        let err = ClusterNode::bind_persistent(3, vec![4], &dir.0, "127.0.0.1:0", cfg.clone())
+            .expect_err("the journal is held");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock, "{err}");
+        drop(first);
+        ClusterNode::bind_persistent(3, vec![4], &dir.0, "127.0.0.1:0", cfg)
+            .expect("released when the first node is gone");
+    }
+
+    /// Replace node `node`'s journal file handle: a read-only handle makes
+    /// every journal write fail (an injected disk failure), an append handle
+    /// makes them work again (the disk recovered).
+    fn swap_journal_file(node: &ClusterNode, file: std::fs::File) {
+        node.journal
+            .as_ref()
+            .expect("a persistent node")
+            .lock()
+            .unwrap()
+            .file = file;
+    }
+
+    /// review cluster-nlqa#11 (reviewer follow-up): once a journal write has
+    /// failed the node answers nothing more, even after the disk recovers.
+    /// The failed batch was already handed out by `take_durable_delta`, so
+    /// before this a retried vote request (same candidate, same term) found
+    /// nothing new to write and was *granted* — from a vote that never
+    /// reached the disk, which a restart forgets: a second vote in that term.
+    #[test]
+    fn a_vote_that_never_reached_the_journal_is_never_granted() {
+        let dir = TempDir::new("failstop_vote");
+        let cfg = RaftConfig::default();
+        let node = ClusterNode::bind_persistent(2, vec![0, 1], &dir.0, "127.0.0.1:0", cfg.clone())
+            .unwrap();
+        let path = dir.0.join(RaftJournal::FILE);
+        assert_eq!(
+            vote(&node, 5, 0),
+            Response::Vote {
+                term: 5,
+                granted: true
+            }
+        );
+
+        // The disk fails while the vote for candidate 1 in term 6 is written.
+        swap_journal_file(&node, std::fs::File::open(&path).unwrap());
+        assert!(
+            matches!(vote(&node, 6, 1), Response::Error(_)),
+            "a vote that could not be made durable is not granted"
+        );
+        assert!(!node.is_alive(), "the node stopped");
+        node.revive();
+        assert!(!node.is_alive(), "and stays stopped");
+
+        // The disk recovers; the candidate retries.
+        swap_journal_file(
+            &node,
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+        );
+        assert!(
+            matches!(vote(&node, 6, 1), Response::Error(_)),
+            "the retried vote must not be granted from state that is not on disk"
+        );
+        drop(node);
+
+        // What a restart sees is the last durable state, and the journal
+        // still opens: nothing was written after the failure.
+        let node = ClusterNode::bind_persistent(2, vec![0, 1], &dir.0, "127.0.0.1:0", cfg).unwrap();
+        assert_eq!(node.current_term(), 5);
+    }
+
+    /// A single-node leader counts an entry committed as it appends it, before
+    /// the journal write. When that write fails, the entry must never reach the
+    /// store — not through a concurrent waiter draining the log, and not
+    /// through a later proposal once the disk works again (which, before, was
+    /// accepted, applied the lost entry along with its own, and left a journal
+    /// with a hole in its log).
+    #[test]
+    fn a_failed_journal_write_stops_a_single_node_leader_before_anything_is_applied() {
+        let dir = TempDir::new("failstop_leader");
+        let cfg = RaftConfig::default();
+        let node =
+            ClusterNode::bind_persistent(1, vec![], &dir.0, "127.0.0.1:0", cfg.clone()).unwrap();
+        let path = dir.0.join(RaftJournal::FILE);
+        {
+            // Elect it by hand (no driver thread), journaling the new term.
+            let mut st = node.state.lock().unwrap();
+            while !st.is_leader() {
+                st.tick();
+            }
+            node.persist(&mut st).unwrap();
+        }
+        let (a, b, c) = (t(1, 1, 1), t(2, 2, 2), t(3, 3, 3));
+        node.propose_and_wait(LogOp::Insert(a), HANG_GUARD).unwrap();
+        assert!(node.store_contains(a));
+
+        swap_journal_file(&node, std::fs::File::open(&path).unwrap());
+        assert!(node.propose(LogOp::Insert(b)).is_err(), "b is not durable");
+        node.apply_actions(); // what a concurrent waiter's drain does
+        assert!(!node.store_contains(b), "a lost write reached the store");
+
+        swap_journal_file(
+            &node,
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap(),
+        );
+        assert!(
+            node.propose(LogOp::Insert(c)).is_err(),
+            "a stopped node accepts no more writes"
+        );
+        assert!(!node.store_contains(b));
+        assert!(!node.store_contains(c));
+        drop(node);
+
+        let node = ClusterNode::bind_persistent(1, vec![], &dir.0, "127.0.0.1:0", cfg).unwrap();
+        let log: Vec<LogOp> = node
+            .state
+            .lock()
+            .unwrap()
+            .log
+            .iter()
+            .map(|e| e.op)
+            .collect();
+        assert_eq!(
+            log,
+            vec![LogOp::Insert(a)],
+            "the journal holds exactly what was durable"
+        );
+    }
+
+    /// An intact journal record that this build cannot decode — a newer
+    /// format, a damaged file — is refused, not cut off with everything after
+    /// it (which silently forgot acknowledged votes); a zero-filled tail left
+    /// by a crash is still cut as torn.
+    #[test]
+    fn an_intact_journal_record_that_does_not_decode_is_refused_not_cut() {
+        use std::io::Write;
+        let dir = TempDir::new("undecodable");
+        let cfg = RaftConfig::default();
+        let node =
+            ClusterNode::bind_persistent(3, vec![4], &dir.0, "127.0.0.1:0", cfg.clone()).unwrap();
+        assert!(matches!(
+            vote(&node, 7, 4),
+            Response::Vote { granted: true, .. }
+        ));
+        drop(node);
+        let path = dir.0.join(RaftJournal::FILE);
+        let intact = std::fs::metadata(&path).unwrap().len();
+        let append = |bytes: &[u8]| {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(bytes).unwrap();
+        };
+
+        // A whole record (its CRC matches) with a tag this build does not know.
+        let payload = [9u8, 1, 2, 3];
+        let mut record = (payload.len() as u32).to_be_bytes().to_vec();
+        record.extend_from_slice(&crc32(&payload).to_be_bytes());
+        record.extend_from_slice(&payload);
+        append(&record);
+        let grown = std::fs::metadata(&path).unwrap().len();
+        let err = ClusterNode::bind_persistent(3, vec![4], &dir.0, "127.0.0.1:0", cfg.clone())
+            .expect_err("an intact record that does not decode is refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            grown,
+            "nothing was cut"
+        );
+
+        // Without it, a zero-filled tail (the file grew, its bytes never
+        // landed) is torn: cut, and the node starts with its vote.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(intact)
+            .unwrap();
+        append(&[0u8; 24]);
+        let node = ClusterNode::bind_persistent(3, vec![4], &dir.0, "127.0.0.1:0", cfg).unwrap();
+        assert_eq!(node.current_term(), 7);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), intact);
+        assert!(matches!(
+            vote(&node, 7, 5),
+            Response::Vote { granted: false, .. }
+        ));
+    }
+
+    /// A new state directory is created durably: the parent of every
+    /// directory `bind_persistent` creates is synced, so a power loss cannot
+    /// take the directory — and with it the journal and its vote — away.
+    #[test]
+    fn a_new_state_directory_is_created_durably() {
+        use crate::db::fsutil::DURABLE_DIR_PARENT_SYNCS;
+        let root = TempDir::new("mkdir");
+        let dir = root.0.join("a").join("b");
+        DURABLE_DIR_PARENT_SYNCS.with(|s| s.borrow_mut().clear());
+        let node =
+            ClusterNode::bind_persistent(1, vec![], &dir, "127.0.0.1:0", RaftConfig::default())
+                .unwrap();
+        drop(node);
+        let synced = DURABLE_DIR_PARENT_SYNCS.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        assert_eq!(
+            synced,
+            vec![root.0.join("a"), root.0.clone(), std::env::temp_dir()],
+            "the parent of each created directory, deepest first"
+        );
     }
 }
