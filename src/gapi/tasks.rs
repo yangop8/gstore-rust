@@ -1970,6 +1970,14 @@ mod tests {
             m.get(q).is_none(),
             "max_finished = 1 dropped the older result"
         );
+        // The runner retires `q` under the lock but deletes its file after
+        // releasing it, and `wait_state` can return in between. The runner
+        // counts as active until the deletion is done, so wait for that
+        // rather than sampling the file early.
+        assert!(
+            m.wait_async_idle(Duration::from_secs(10)),
+            "the runner finished small's job"
+        );
         assert!(!file.exists(), "and removed its file");
         let big = m
             .submit(
