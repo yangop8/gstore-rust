@@ -5,12 +5,12 @@
 //! which keeps the kernel's page cache: a write that was never `fsync`ed
 //! survives such a "crash", so none of those tests can tell a commit point
 //! that syncs from one that does not. This probe can. Each `fsync` /
-//! `fdatasync` a commit point relies on goes through [`sync_file`],
-//! [`sync_file_data`] or [`sync_dir`] here, which sync and then record what
+//! `fdatasync` a commit point relies on goes through `sync_file`,
+//! `sync_file_data` or `sync_dir` here, which sync and then record what
 //! was synced — the path, the file's identity (device and inode), its length
 //! and modification time at that moment, and the call site — for every live
 //! [`Probe`] watching a directory the path lies in; RocksDB's write-ahead-log
-//! sync reports itself through [`rocks_wal_synced`] with the lengths of the
+//! sync reports itself through `rocks_wal_synced` with the lengths of the
 //! store's log files. `tests/fsync_audit.rs` compares those records with
 //! what each acknowledged commit point changed on disk: every file it wrote
 //! must have been synced after its last write, and every directory whose
