@@ -7,7 +7,7 @@
 
 use crate::error::Result;
 use crate::llm::{LlmClient, LlmRequest};
-use crate::pipeline::Answer;
+use crate::pipeline::{Answer, Provenance};
 use crate::solve::{Mode, SolveEngine};
 
 /// System prompt for the rewrite step: resolve pronouns/ellipsis against the
@@ -130,6 +130,29 @@ const MAX_TURNS: usize = 64;
 pub struct Session<'a> {
     engine: &'a SolveEngine,
     history: Vec<(String, String)>,
+    /// Where each recorded answer came from (parallel to `history`), so a
+    /// later turn can tell whether replaying it to the LLM is allowed.
+    provenance: Vec<Provenance>,
+}
+
+/// May an earlier answer with `provenance` be replayed to the LLM (in the
+/// follow-up rewrite) while answering in `mode`? This is the documented
+/// privacy table (README "Answering modes & privacy"; review cluster-nlqa#14):
+///
+/// * a `gStore` answer is KB result data: it may only leave the machine in
+///   [`Mode::GraphRag`], the one mode whose contract sends KB data to the
+///   LLM (`auto` sends result data only on its GraphRAG fallback, which the
+///   rewrite step cannot know about in advance; `structured` and `open`
+///   promise none);
+/// * a `GraphRAG` answer was composed by the LLM from triples it already
+///   received, so it may be replayed in every mode but `structured`;
+/// * an `LLM` (open-mode) answer contains no KB data and is always replayable.
+fn replayable(provenance: Provenance, mode: Mode) -> bool {
+    match provenance {
+        Provenance::GStore => mode == Mode::GraphRag,
+        Provenance::GraphRag => mode != Mode::Structured,
+        Provenance::Llm => true,
+    }
 }
 
 impl<'a> Session<'a> {
@@ -138,6 +161,7 @@ impl<'a> Session<'a> {
         Session {
             engine,
             history: Vec::new(),
+            provenance: Vec::new(),
         }
     }
 
@@ -151,26 +175,31 @@ impl<'a> Session<'a> {
 
     /// Like [`ask`](Self::ask) but constrains the answering path (see [`Mode`]).
     ///
-    /// Data-egress: the follow-up rewrite is an LLM call. In [`Mode::Structured`]
-    /// — whose contract is that KB *result data* never leaves the machine — the
-    /// prior **answers** (KB values) are dropped from the history the rewriter
-    /// sees; only prior questions (already user-supplied) are sent. Other modes
-    /// already permit egress, so they keep the full history for better ellipsis
-    /// resolution.
+    /// Data-egress: the follow-up rewrite is an LLM call. Each prior answer is
+    /// sent to it only if the *current* mode allows that answer's data to
+    /// leave the machine (see the privacy table on `replayable`): a `gStore`
+    /// answer (KB result rows) only in [`Mode::GraphRag`], a GraphRAG answer
+    /// in every mode but [`Mode::Structured`], an open-mode (`LLM`) answer
+    /// always. Withheld answers are blanked; the prior questions (supplied by
+    /// the user) are always sent.
     pub fn ask_with_mode(&mut self, question: &str, mode: Mode) -> Result<Answer> {
-        let standalone = if mode == Mode::Structured {
-            let redacted: Vec<(String, String)> = self
-                .history
-                .iter()
-                .map(|(q, _)| (q.clone(), String::new()))
-                .collect();
-            self.engine.rewrite_followup_question(&redacted, question)
-        } else {
-            self.engine
-                .rewrite_followup_question(&self.history, question)
-        };
+        let visible: Vec<(String, String)> = self
+            .history
+            .iter()
+            .zip(&self.provenance)
+            .map(|((q, a), p)| {
+                let a = if replayable(*p, mode) {
+                    a.clone()
+                } else {
+                    String::new()
+                };
+                (q.clone(), a)
+            })
+            .collect();
+        let standalone = self.engine.rewrite_followup_question(&visible, question);
         let answer = self.engine.ask_with_mode(&standalone, mode)?;
         self.history.push((standalone, summarize_answer(&answer)));
+        self.provenance.push(answer.provenance);
         self.trim_history();
         Ok(answer)
     }
@@ -180,6 +209,7 @@ impl<'a> Session<'a> {
         let n = self.history.len();
         if n > MAX_TURNS {
             self.history.drain(0..n - MAX_TURNS);
+            self.provenance.drain(0..n - MAX_TURNS);
         }
     }
 
@@ -201,6 +231,7 @@ impl<'a> Session<'a> {
     /// Forget all prior turns (start a fresh topic on the same engine).
     pub fn clear(&mut self) {
         self.history.clear();
+        self.provenance.clear();
     }
 }
 
@@ -351,9 +382,9 @@ mod tests {
         }])
     }
 
-    /// Two structured turns: the follow-up rewrite must NOT carry the prior KB
-    /// answer value off-box; contrast with Auto, which (by contract) may.
-    fn run_two_turns(mode: Mode) -> Arc<SeqRecLlm> {
+    /// Two turns (`first` then `second` mode): returns the recording LLM so a
+    /// test can check whether turn 1's KB answer reached turn 2's rewrite.
+    fn run_turns(first: Mode, second: Mode) -> Arc<SeqRecLlm> {
         // per turn: intent, generation; plus a rewrite call on turn 2.
         let llm = SeqRecLlm::new(vec![
             r#"{"qtype":"list"}"#,
@@ -365,9 +396,9 @@ mod tests {
         let engine =
             SolveEngine::new(Box::new(llm.clone()), Box::new(secret_kb())).with_citations(false);
         let mut sess = Session::new(&engine);
-        let a1 = sess.ask_with_mode("who?", mode).unwrap();
+        let a1 = sess.ask_with_mode("who?", first).unwrap();
         assert!(a1.text.contains("SECRETVALUE"));
-        let _ = sess.ask_with_mode("and then?", mode).unwrap();
+        let _ = sess.ask_with_mode("and then?", second).unwrap();
         assert!(
             llm.saw("and then?"),
             "the rewrite step must have run on turn 2"
@@ -377,7 +408,7 @@ mod tests {
 
     #[test]
     fn structured_mode_rewrite_omits_prior_answer_data() {
-        let llm = run_two_turns(Mode::Structured);
+        let llm = run_turns(Mode::Structured, Mode::Structured);
         assert!(
             !llm.saw("SECRETVALUE"),
             "structured mode leaked a KB answer value to the LLM"
@@ -385,14 +416,39 @@ mod tests {
     }
 
     #[test]
-    fn auto_mode_rewrite_includes_prior_answer() {
-        // Contrast: confirms the redaction above is real (not that the value is
-        // simply never present). Auto permits egress, so it carries the answer.
-        let llm = run_two_turns(Mode::Auto);
+    fn auto_mode_rewrite_omits_prior_gstore_answer() {
+        // review cluster-nlqa#14: this test used to be
+        // `auto_mode_rewrite_includes_prior_answer` and asserted the leak. The
+        // documented privacy table says auto mode sends result data only on
+        // its GraphRAG fallback, so a gStore-provenance answer (result rows
+        // computed locally) must not be replayed by the follow-up rewrite.
+        let llm = run_turns(Mode::Auto, Mode::Auto);
+        assert!(
+            !llm.saw("SECRETVALUE"),
+            "auto mode replayed a locally computed KB answer to the LLM"
+        );
+    }
+
+    #[test]
+    fn graphrag_mode_rewrite_includes_prior_answer() {
+        // Contrast (the role the auto test above used to play): the redaction
+        // is selective, not "the value is never present". GraphRAG mode sends
+        // KB data to the LLM by contract, so it carries the prior answer.
+        let llm = run_turns(Mode::Auto, Mode::GraphRag);
         assert!(
             llm.saw("SECRETVALUE"),
-            "auto mode should fold the prior answer into the rewrite"
+            "graphrag mode should fold the prior answer into the rewrite"
         );
+    }
+
+    #[test]
+    fn privacy_table_for_replayed_answers() {
+        use Mode::*;
+        for mode in [Auto, Structured, GraphRag, Open] {
+            assert!(replayable(Provenance::Llm, mode));
+            assert_eq!(replayable(Provenance::GStore, mode), mode == GraphRag);
+            assert_eq!(replayable(Provenance::GraphRag, mode), mode != Structured);
+        }
     }
 
     use std::sync::{Arc, Mutex};

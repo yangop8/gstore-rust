@@ -17,6 +17,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::analytics::run_analytics;
+use crate::budget::CostLimits;
 use crate::intent::{Mention, MentionKind};
 use crate::kb::SparqlAnswer;
 use crate::solve::SolveEngine;
@@ -31,11 +32,25 @@ const MAX_MSG_BYTES: usize = 1 << 20;
 /// An MCP server backed by a [`SolveEngine`].
 pub struct McpServer {
     engine: Arc<SolveEngine>,
+    limits: CostLimits,
 }
 
 impl McpServer {
+    /// A server with no per-call cost budget (see [`with_limits`](Self::with_limits)).
     pub fn new(engine: Arc<SolveEngine>) -> McpServer {
-        McpServer { engine }
+        McpServer {
+            engine,
+            limits: CostLimits::unlimited(),
+        }
+    }
+
+    /// Run every `tools/call` under this per-call cost budget (LLM calls, KB
+    /// rows, time; review cluster-nlqa#13): an MCP client is an agent whose
+    /// inputs may be prompt-injected, so one tool call must not be able to
+    /// spend without bound. `gnlqa mcp` uses the same limits as `gnlqa serve`.
+    pub fn with_limits(mut self, limits: CostLimits) -> McpServer {
+        self.limits = limits;
+        self
     }
 
     /// Serve MCP over stdio until EOF: one JSON-RPC message per line.
@@ -169,13 +184,14 @@ impl McpServer {
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| json!({}));
-        let result = match name {
-            "ask_kg" => self.tool_ask_kg(&args),
-            "run_sparql" => self.tool_run_sparql(&args),
-            "link_entity" => self.tool_link_entity(&args),
-            "graph_analytics" => self.tool_graph_analytics(&args),
+        let tool: fn(&McpServer, &Value) -> Result<String, String> = match name {
+            "ask_kg" => McpServer::tool_ask_kg,
+            "run_sparql" => McpServer::tool_run_sparql,
+            "link_entity" => McpServer::tool_link_entity,
+            "graph_analytics" => McpServer::tool_graph_analytics,
             other => return err_response(id, -32602, &format!("unknown tool: {other}")),
         };
+        let result = crate::budget::with_limits(self.limits, || tool(self, &args));
         // Tool-level failures (bad arguments, engine/KB errors) are a normal result
         // with isError, so the calling model sees the message as tool output.
         match result {
@@ -186,7 +202,10 @@ impl McpServer {
 
     fn tool_ask_kg(&self, args: &Value) -> Result<String, String> {
         let q = str_arg(args, "question")?;
-        let a = self.engine.ask(q).map_err(|e| e.to_string())?;
+        let a = self
+            .engine
+            .ask(q)
+            .map_err(|e| tool_error("ask_kg", &e, false))?;
         let mut out = a.text;
         if let Some(s) = a.sparql {
             out.push_str(&format!("\n\n[sparql] {s}"));
@@ -213,9 +232,24 @@ impl McpServer {
         // The query text comes straight from an (untrusted, prompt-injectable) MCP
         // client, so enforce the SAME read-only gate every generated-query path
         // uses — an UPDATE/DELETE/LOAD/DROP must never reach the store.
-        crate::kb::validate_readonly_sparql(q).map_err(|e| e.to_string())?;
-        let ans = self.engine.kb().query(q).map_err(|e| e.to_string())?;
-        Ok(render_sparql_answer(&ans))
+        crate::kb::validate_readonly_sparql(q).map_err(|e| tool_error("run_sparql", &e, true))?;
+        // A partial result is useful here, but only with a visible signal
+        // (review cluster-nlqa#17).
+        let (ans, truncated) = self
+            .engine
+            .kb()
+            .query_capped(q)
+            .map_err(|e| tool_error("run_sparql", &e, true))?;
+        let mut out = render_sparql_answer(&ans);
+        if truncated {
+            out.push_str(&format!(
+                "\n[truncated] the result has more than {} rows; only the first {} were \
+                 fetched — add a LIMIT or narrow the query",
+                crate::kb::MAX_RESULT_ROWS,
+                ans.row_count()
+            ));
+        }
+        Ok(out)
     }
 
     fn tool_link_entity(&self, args: &Value) -> Result<String, String> {
@@ -234,7 +268,9 @@ impl McpServer {
             text: mention.to_string(),
             kind,
         };
-        let cands = linker.link_mention(&m, k).map_err(|e| e.to_string())?;
+        let cands = linker
+            .link_mention(&m, k)
+            .map_err(|e| tool_error("link_entity", &e, false))?;
         if cands.is_empty() {
             return Ok("(no candidates)".to_string());
         }
@@ -257,8 +293,24 @@ impl McpServer {
             })
             .unwrap_or_default();
         let res = run_analytics(self.engine.kb(), q, &seeds, self.engine.analytics_cfg())
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| tool_error("graph_analytics", &e, false))?;
         Ok(res.text)
+    }
+}
+
+/// The text of a tool-level error (review cluster-nlqa#18). The full error
+/// goes to the server log (stderr; the protocol runs on stdout). The client
+/// gets [`Error::client_message`] — except that `query_feedback` tools
+/// (`run_sparql`) keep the text of a SPARQL validation or gStore query error,
+/// which is the feedback a client needs to fix its query (endpoint userinfo
+/// is already redacted from it). Transport, provider and configuration
+/// detail is never echoed.
+fn tool_error(tool: &str, e: &crate::error::Error, query_feedback: bool) -> String {
+    use crate::error::Error;
+    eprintln!("gnlqa: MCP tool {tool} failed: {e}");
+    match e {
+        Error::Sparql(_) | Error::GStore(_) if query_feedback => e.to_string(),
+        _ => e.client_message(),
     }
 }
 
@@ -347,7 +399,7 @@ fn render_sparql_answer(ans: &SparqlAnswer) -> String {
                 out.push_str(&cells.join("\t"));
             }
             if rows.len() > 200 {
-                out.push_str(&format!("\n… ({} rows total)", rows.len()));
+                out.push_str(&format!("\n… ({} rows fetched, 200 shown)", rows.len()));
             }
             out
         }
@@ -557,5 +609,34 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("question"));
+    }
+
+    #[test]
+    fn tool_calls_run_under_the_cost_budget() {
+        // review cluster-nlqa#13: an MCP tool call is bounded like an HTTP request.
+        let llm = Arc::new(MockLlm::new(vec![
+            r#"{"qtype":"list"}"#.to_string(),
+            r#"["SELECT ?x WHERE { ?x <http://ex/p> ?o }"]"#.to_string(),
+        ]));
+        let kb = MockKb::new(vec![nonempty()]);
+        let engine = Arc::new(
+            SolveEngine::new(Box::new(Arc::clone(&llm)), Box::new(kb)).with_citations(false),
+        );
+        let srv = McpServer::new(engine).with_limits(CostLimits {
+            max_llm_calls: Some(1),
+            ..CostLimits::unlimited()
+        });
+        let req = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ask_kg","arguments":{"question":"which x?"}}}"#;
+        let v = parse(&srv.handle_message(req).unwrap());
+        assert_eq!(v["result"]["isError"], true, "{v}");
+        assert!(v["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("LLM call"));
+        assert_eq!(llm.call_count(), 1, "the second LLM call is refused");
+        // the budget is per call: the next call starts afresh
+        let v2 = parse(&srv.handle_message(req).unwrap());
+        assert_eq!(v2["result"]["isError"], true);
+        assert_eq!(llm.call_count(), 2);
     }
 }

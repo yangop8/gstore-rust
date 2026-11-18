@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::error::{Error, Result};
+use crate::error::{redact_userinfo, Error, Result};
 use crate::secret::Secret;
 
 /// Anything that turns text into fixed-dimension vectors.
@@ -100,6 +100,8 @@ pub struct HttpEmbedder {
     model: String,
     dim: usize,
     timeout: Duration,
+    /// Retries of transient provider failures (429/5xx; review cluster-nlqa#16).
+    retry: crate::net::RetryPolicy,
 }
 
 impl HttpEmbedder {
@@ -115,7 +117,14 @@ impl HttpEmbedder {
             model: model.into(),
             dim,
             timeout: Duration::from_secs(60),
+            retry: crate::net::RetryPolicy::default(),
         }
+    }
+
+    /// How transient provider failures (429, 5xx) are retried.
+    pub fn with_retry(mut self, retry: crate::net::RetryPolicy) -> HttpEmbedder {
+        self.retry = retry;
+        self
     }
 
     /// The request body (also used by tests).
@@ -177,21 +186,33 @@ impl Embedder for HttpEmbedder {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        let resp = ureq::post(&self.url)
-            .set(
-                "Authorization",
-                &format!("Bearer {}", self.api_key.expose()),
-            )
-            .set("content-type", "application/json")
-            .timeout(self.timeout)
-            .send_json(self.request_body(texts))
-            .map_err(|e| match e {
-                ureq::Error::Status(code, r) => Error::Http(format!(
-                    "HTTP {code}: {}",
-                    r.into_string().unwrap_or_default()
-                )),
-                other => Error::Http(other.to_string()),
-            })?;
+        // No redirects: the key must only reach the configured URL (review
+        // cluster-nlqa#15).
+        let agent = crate::net::agent();
+        let bearer = format!("Bearer {}", self.api_key.expose());
+        let body = self.request_body(texts);
+        let resp = crate::net::send_with_retry(
+            &self.retry,
+            "the embeddings endpoint",
+            crate::net::PROVIDER_RETRYABLE,
+            || {
+                agent
+                    .post(&self.url)
+                    .set("Authorization", &bearer)
+                    .set("content-type", "application/json")
+                    .timeout(crate::budget::cap_timeout(self.timeout))
+                    .send_json(body.clone())
+                    .map_err(Box::new)
+            },
+        )
+        .map_err(|e| match *e {
+            ureq::Error::Status(code, r) => Error::Http(redact_userinfo(&format!(
+                "HTTP {code}: {}",
+                r.into_string().unwrap_or_default()
+            ))),
+            other => Error::Http(redact_userinfo(&other.to_string())),
+        })?;
+        let resp = crate::net::refuse_redirect(resp, "the embeddings endpoint")?;
         let v: Value = resp.into_json().map_err(|e| Error::Json(e.to_string()))?;
         let vecs = HttpEmbedder::parse_response(&v)?;
         if vecs.len() != texts.len() {

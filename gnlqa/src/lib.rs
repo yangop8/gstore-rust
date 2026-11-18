@@ -14,6 +14,7 @@
 //! * [`llm`]    — the [`llm::LlmClient`] trait + an Anthropic (Claude) client and a mock
 
 pub mod analytics;
+pub mod budget;
 pub mod config;
 pub mod embed;
 pub mod error;
@@ -28,6 +29,7 @@ pub mod lang;
 pub mod link;
 pub mod llm;
 pub mod mcp;
+pub mod net;
 pub mod pipeline;
 pub mod repair;
 pub mod schema;
@@ -36,6 +38,7 @@ pub mod session;
 pub mod solve;
 
 pub use analytics::{run_analytics, AnalyticsCfg, AnalyticsOp, AnalyticsResult};
+pub use budget::CostLimits;
 pub use config::Config;
 pub use embed::{Embedder, HashEmbedder, HttpEmbedder, Scored, VectorIndex};
 pub use error::{Error, Result};
@@ -45,27 +48,34 @@ pub use eval::{
 };
 pub use generate::{generate_candidates, parse_candidates};
 pub use graphrag::{
-    answer_from_subgraph, is_dont_know, render_subgraph, retrieve_subgraph, RetrievalCfg, Triple,
+    answer_from_subgraph, is_dont_know, render_subgraph, retrieve_subgraph, try_retrieve_subgraph,
+    RetrievalCfg, Triple,
 };
 pub use ground::{explain, gather_citations, Citation};
-pub use http_server::HttpServer;
+pub use http_server::{HttpAuth, HttpLimits, HttpServer};
 pub use intent::{
     extract_intent, AggOp, Aggregation, Mention, MentionKind, Order, QType, QuestionIntent,
     RelationPhrase,
 };
 pub use kb::{
-    sparql_escape_literal, validate_readonly_sparql, validate_sparql, GStoreClient, KbClient,
-    MockKb, RdfTerm, SparqlAnswer, TermKind,
+    parse_results, parse_results_capped, sparql_escape_literal, validate_readonly_sparql,
+    validate_sparql, GStoreClient, KbClient, MockKb, RdfTerm, SparqlAnswer, TermKind,
+    MAX_RESULT_ROWS,
 };
 pub use lang::{
     abstain_message, detect_script_lang, lang_instruction, language_name, resolve_lang,
 };
-pub use link::{local_name, Candidate, LinkKind, Linker};
+pub use link::{
+    kb_fingerprint, local_name, Candidate, LinkKind, Linker, LinkerCache, LinkerLabels,
+};
 pub use llm::{AnthropicClient, LlmClient, LlmRequest, Message, MockLlm, OpenAiClient, Role};
 pub use mcp::McpServer;
+pub use net::RetryPolicy;
 pub use pipeline::{Answer, AskEngine, Provenance};
 pub use repair::{solve_with_repair, RepairOutcome};
 pub use schema::{entity_has_predicate, EntitySchema, PredicateSchema, SchemaContext};
 pub use secret::Secret;
 pub use session::{rewrite_followup, Session};
-pub use solve::{best_of, score_outcome, Mode, SolveEngine};
+pub use solve::{
+    answer_bytes, best_of, score_outcome, CacheUsage, Mode, SolveEngine, DEFAULT_CACHE_MAX_BYTES,
+};

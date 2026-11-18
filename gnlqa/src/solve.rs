@@ -5,7 +5,7 @@
 
 use crate::error::{Error, Result};
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::generate::generate_candidates;
@@ -39,8 +39,8 @@ fn dedup(uris: Vec<String>) -> Vec<String> {
 
 /// Solve every candidate (with repair) and return the highest-scoring outcome.
 /// A per-candidate query/repair failure is skipped (try the next), but a
-/// transport failure ([`Error::Http`] — the endpoint is unreachable) is fatal and
-/// propagated so the caller reports the outage instead of masking it as "no
+/// transport failure ([`Error::Http`] — the endpoint is unreachable) or an
+/// exhausted cost budget ([`Error::Limit`]) is fatal and propagated so the caller reports the outage instead of masking it as "no
 /// candidate produced an answer".
 #[allow(clippy::too_many_arguments)]
 pub fn best_of(
@@ -62,8 +62,9 @@ pub fn best_of(
                     best = Some((o, s));
                 }
             }
-            // Endpoint unreachable — no point trying the remaining candidates.
-            Err(e @ Error::Http(_)) => return Err(e),
+            // Endpoint unreachable or the request's cost budget is spent — no
+            // point trying the remaining candidates.
+            Err(e) if e.is_fatal() => return Err(e),
             // Invalid/unanswerable for this candidate — try the next one.
             Err(_) => {}
         }
@@ -71,14 +72,53 @@ pub fn best_of(
     Ok(best.map(|(o, _)| o))
 }
 
+/// Default byte budget of the answer cache (review cluster-nlqa#19).
+pub const DEFAULT_CACHE_MAX_BYTES: usize = 64 << 20;
+
+/// Occupancy of the answer cache (see [`SolveEngine::cache_usage`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheUsage {
+    pub entries: usize,
+    /// Estimated bytes held (see [`answer_bytes`]).
+    pub bytes: usize,
+    pub max_entries: usize,
+    pub max_bytes: usize,
+}
+
+/// A rough estimate of the heap bytes an [`Answer`] keeps alive (strings plus
+/// a per-allocation overhead) — what the cache's byte bound counts.
+pub fn answer_bytes(a: &Answer) -> usize {
+    const PER_STRING: usize = 32;
+    let s = |t: &str| t.len() + PER_STRING;
+    let mut n = 256 + s(&a.text);
+    n += a.sparql.as_deref().map_or(0, s);
+    n += a.explanation.as_deref().map_or(0, s);
+    n += a.values.iter().map(|v| s(v)).sum::<usize>();
+    n += a
+        .citations
+        .iter()
+        .map(|c| s(&c.subject) + s(&c.predicate) + s(&c.object))
+        .sum::<usize>();
+    n
+}
+
 /// A small bounded answer cache (FIFO eviction). gNLQA does not mutate the KB,
 /// but the KB may change externally, so entries can carry a TTL (staleness bound)
 /// and the whole cache can be cleared (e.g. on a chat `:reset`).
+///
+/// Bounded by entry count **and** by bytes (review cluster-nlqa#19): an answer
+/// larger than an eighth of the byte budget is not cached at all, and the
+/// oldest entries are evicted while the total exceeds the budget. Expired
+/// entries are dropped, not just skipped, so they stop holding memory.
 struct Cache {
     cap: usize,
+    max_bytes: usize,
+    bytes: usize,
     /// Optional entry lifetime; `None` = no expiry (bounded only by capacity).
     ttl: Option<Duration>,
-    map: HashMap<String, (Answer, Instant)>,
+    /// key → (answer, inserted at, estimated bytes)
+    map: HashMap<String, (Answer, Instant, usize)>,
+    /// Keys in insertion order (oldest first), so expired entries are at the front.
     order: VecDeque<String>,
 }
 
@@ -86,36 +126,79 @@ impl Cache {
     fn new(cap: usize) -> Cache {
         Cache {
             cap: cap.max(1),
+            max_bytes: DEFAULT_CACHE_MAX_BYTES,
+            bytes: 0,
             ttl: None,
             map: HashMap::new(),
             order: VecDeque::new(),
         }
     }
-    fn get(&self, k: &str) -> Option<Answer> {
-        let (v, at) = self.map.get(k)?;
-        // Expired entries are treated as a miss (and refreshed on the next `put`),
-        // so a long-running server doesn't serve pre-update answers forever.
-        if let Some(ttl) = self.ttl {
-            if at.elapsed() > ttl {
-                return None;
+    fn expired(&self, at: Instant, now: Instant) -> bool {
+        self.ttl
+            .is_some_and(|ttl| now.saturating_duration_since(at) > ttl)
+    }
+    fn remove(&mut self, k: &str) {
+        if let Some((_, _, b)) = self.map.remove(k) {
+            self.bytes -= b;
+            if let Some(i) = self.order.iter().position(|o| o == k) {
+                self.order.remove(i);
             }
+        }
+    }
+    fn get(&mut self, k: &str) -> Option<Answer> {
+        self.get_at(k, Instant::now())
+    }
+    fn get_at(&mut self, k: &str, now: Instant) -> Option<Answer> {
+        let (v, at, _) = self.map.get(k)?;
+        // An expired entry is a miss and is dropped, so a long-running server
+        // neither serves pre-update answers nor keeps holding their memory.
+        if self.expired(*at, now) {
+            self.remove(k);
+            return None;
         }
         Some(v.clone())
     }
     fn put(&mut self, k: String, v: Answer) {
-        if self.map.insert(k.clone(), (v, Instant::now())).is_some() {
-            return; // already present, order unchanged (value/timestamp refreshed)
+        self.put_at(k, v, Instant::now())
+    }
+    fn put_at(&mut self, k: String, v: Answer, now: Instant) {
+        self.remove(&k); // a refresh goes to the back with its new size
+        let size = answer_bytes(&v) + k.len();
+        if size > self.max_bytes / 8 {
+            return; // too big to be worth a slot: never cached
         }
-        self.order.push_back(k);
-        while self.map.len() > self.cap {
-            if let Some(old) = self.order.pop_front() {
-                self.map.remove(&old);
+        // drop expired entries (oldest first)
+        while let Some(front) = self.order.front() {
+            match self.map.get(front) {
+                Some((_, at, _)) if self.expired(*at, now) => {
+                    let f = front.clone();
+                    self.remove(&f);
+                }
+                _ => break,
             }
+        }
+        self.bytes += size;
+        self.map.insert(k.clone(), (v, now, size));
+        self.order.push_back(k);
+        while self.map.len() > self.cap || self.bytes > self.max_bytes {
+            let Some(old) = self.order.front().cloned() else {
+                break;
+            };
+            self.remove(&old);
         }
     }
     fn clear(&mut self) {
         self.map.clear();
         self.order.clear();
+        self.bytes = 0;
+    }
+    fn usage(&self) -> CacheUsage {
+        CacheUsage {
+            entries: self.map.len(),
+            bytes: self.bytes,
+            max_entries: self.cap,
+            max_bytes: self.max_bytes,
+        }
     }
 }
 
@@ -126,8 +209,15 @@ pub enum Mode {
     /// Structured SPARQL, then a GraphRAG fallback; never pure LLM. (default)
     #[default]
     Auto,
-    /// Structured SPARQL / graph-analytics only — the data never leaves the
-    /// machine; abstain if it can't be answered that way.
+    /// Structured SPARQL / graph-analytics only — the **result data** (answer
+    /// rows, supporting triples) stays on the machine; abstain if it can't be
+    /// answered that way. To *build* the query the LLM still receives the
+    /// question, the linked entity/type/predicate URIs and their labels,
+    /// small schema samples (predicates and types around the linked terms)
+    /// and, in the repair loop, gStore's error text for a failing query and
+    /// whether a query returned no rows (review cluster-nlqa#21). The
+    /// follow-up rewrite and [`SolveEngine::with_explain`] send no KB answer
+    /// in this mode.
     Structured,
     /// Retrieve a private subgraph from gStore and let the LLM answer from it.
     GraphRag,
@@ -161,7 +251,10 @@ impl Mode {
 pub struct SolveEngine {
     llm: Box<dyn LlmClient>,
     kb: Box<dyn KbClient>,
-    linker: Option<Linker>,
+    linker: OnceLock<Linker>,
+    /// How to (re)build the linker when it is missing (see
+    /// [`with_linker_builder`](Self::with_linker_builder)).
+    linker_source: Option<LinkerSource>,
     candidates: usize,
     max_rounds: usize,
     sample: usize,
@@ -182,6 +275,16 @@ pub struct SolveEngine {
     default_mode: Mode,
 }
 
+/// A deferred linker build that is retried until it succeeds (review
+/// cluster-nlqa#16: a KB that is unreachable at startup no longer leaves the
+/// engine without a linker for its whole life, silently).
+struct LinkerSource {
+    build: Box<dyn Fn() -> Result<Linker> + Send + Sync>,
+    retry_every: Duration,
+    /// When the last failed attempt started; the mutex also serializes builds.
+    last_failure: Mutex<Option<Instant>>,
+}
+
 /// Heuristic confidence for a GraphRAG answer: plausible-from-context, but not
 /// KB-verified the way a SELECT result is. Kept below the structured-answer band.
 const RAG_CONFIDENCE: f32 = 0.5;
@@ -193,9 +296,13 @@ const ANALYTICS_CONFIDENCE: f32 = 0.85;
 impl SolveEngine {
     pub fn new(llm: Box<dyn LlmClient>, kb: Box<dyn KbClient>) -> SolveEngine {
         SolveEngine {
-            llm,
-            kb,
-            linker: None,
+            // Every LLM call and KB query the engine makes is charged against
+            // the per-request budget a server surface installs (review
+            // cluster-nlqa#13); with no budget installed this is a pass-through.
+            llm: Box::new(crate::budget::MeteredLlm(llm)),
+            kb: Box::new(crate::budget::MeteredKb(kb)),
+            linker: OnceLock::new(),
+            linker_source: None,
             candidates: 4,
             max_rounds: 2,
             sample: 30,
@@ -261,6 +368,23 @@ impl SolveEngine {
         self
     }
 
+    /// Bound the answer cache by estimated bytes (default
+    /// [`DEFAULT_CACHE_MAX_BYTES`]); an answer above an eighth of it is not
+    /// cached. Has no effect without [`with_cache`](Self::with_cache).
+    pub fn with_cache_max_bytes(self, max_bytes: usize) -> SolveEngine {
+        if let Some(c) = &self.cache {
+            c.lock().unwrap_or_else(|e| e.into_inner()).max_bytes = max_bytes.max(1);
+        }
+        self
+    }
+
+    /// The answer cache's occupancy (`None` if caching is off).
+    pub fn cache_usage(&self) -> Option<CacheUsage> {
+        self.cache
+            .as_ref()
+            .map(|c| c.lock().unwrap_or_else(|e| e.into_inner()).usage())
+    }
+
     /// Give cached answers a time-to-live in seconds (0 = no expiry). Bounds
     /// staleness when the KB can change under a long-running server.
     pub fn with_cache_ttl(self, secs: u64) -> SolveEngine {
@@ -312,16 +436,41 @@ impl SolveEngine {
     /// Have the LLM phrase a grounded natural-language answer (default off).
     ///
     /// Data-egress note: enabling this sends the answer's supporting **KB triples**
-    /// to the LLM (to phrase the explanation), even on the structured path whose
-    /// provenance is [`Provenance::GStore`](crate::pipeline::Provenance::GStore).
-    /// Leave it off if the structured "result data stays local" guarantee matters.
+    /// to the LLM (to phrase the explanation) on the `auto` structured path,
+    /// whose provenance is [`Provenance::GStore`](crate::pipeline::Provenance::GStore).
+    /// [`Mode::Structured`] never does: its "result data stays local"
+    /// guarantee wins and the explanation is skipped (review cluster-nlqa#21).
     pub fn with_explain(mut self, on: bool) -> SolveEngine {
         self.explain = on;
         self
     }
     pub fn with_linker(mut self, linker: Linker) -> SolveEngine {
-        self.linker = Some(linker);
+        self.linker = OnceLock::from(linker);
         self
+    }
+
+    /// Build the linker lazily with `build`: on first use and, after a
+    /// failure, again on a later request once `retry_every` has passed. Each
+    /// failure is logged. The build runs outside any request budget (it
+    /// serves every later request) and at most one runs at a time; requests
+    /// that arrive meanwhile proceed without a linker.
+    pub fn with_linker_builder(
+        mut self,
+        retry_every: Duration,
+        build: impl Fn() -> Result<Linker> + Send + Sync + 'static,
+    ) -> SolveEngine {
+        self.linker_source = Some(LinkerSource {
+            build: Box::new(build),
+            retry_every,
+            last_failure: Mutex::new(None),
+        });
+        self
+    }
+
+    /// Try to make the linker available now (e.g. at server start, so the
+    /// first request does not pay for the build). Returns whether it is.
+    pub fn prepare_linker(&self) -> bool {
+        self.linker().is_some()
     }
     pub fn with_model(mut self, model: impl Into<String>) -> SolveEngine {
         self.model = Some(model.into());
@@ -349,9 +498,45 @@ impl SolveEngine {
     pub fn kb(&self) -> &dyn KbClient {
         self.kb.as_ref()
     }
-    /// The configured entity linker, if any.
+    /// The entity linker, if one is configured or a deferred build (see
+    /// [`with_linker_builder`](Self::with_linker_builder)) has succeeded —
+    /// this call may run that build.
     pub fn linker(&self) -> Option<&Linker> {
-        self.linker.as_ref()
+        if let Some(l) = self.linker.get() {
+            return Some(l);
+        }
+        let src = self.linker_source.as_ref()?;
+        // One build at a time; a concurrent caller goes on without a linker.
+        // A build that panicked leaves the lock poisoned, not the engine
+        // without a linker for good: its state is still a valid timestamp.
+        let mut last = match src.last_failure.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        if let Some(l) = self.linker.get() {
+            return Some(l); // built while we waited for the lock
+        }
+        if last.is_some_and(|t| t.elapsed() < src.retry_every) {
+            return None;
+        }
+        let started = Instant::now();
+        match crate::budget::unmetered(|| (src.build)()) {
+            Ok(l) => {
+                let _ = self.linker.set(l);
+                *last = None;
+                self.linker.get()
+            }
+            Err(e) => {
+                *last = Some(started);
+                eprintln!(
+                    "gnlqa: warning: building the entity linker failed (answers are not \
+                     grounded in the KB vocabulary until it succeeds; retrying after {} s): {e}",
+                    src.retry_every.as_secs()
+                );
+                None
+            }
+        }
     }
     /// The analytics retrieval configuration.
     pub fn analytics_cfg(&self) -> crate::analytics::AnalyticsCfg {
@@ -405,6 +590,12 @@ impl SolveEngine {
 
     /// Answer a follow-up given prior `(question, answer)` turns: rewrite the
     /// (possibly elliptical) question into a standalone one, then [`ask`](Self::ask).
+    ///
+    /// Data-egress: every `(question, answer)` pair in `history` is sent to the
+    /// LLM as given. A caller that keeps KB answers in it must drop the ones
+    /// the mode does not allow to leave the machine;
+    /// [`Session`](crate::session::Session) does that per answer provenance
+    /// (review cluster-nlqa#14).
     pub fn ask_followup(&self, history: &[(String, String)], question: &str) -> Result<Answer> {
         let standalone = self.rewrite_followup_question(history, question);
         self.ask(&standalone)
@@ -416,11 +607,21 @@ impl SolveEngine {
             return self.answer_direct(question);
         }
         // 1) Understand. Intent is a cheap classification → run it on the fast
-        // model. A parse failure shouldn't kill the query — degrade.
+        // model. A malformed reply shouldn't kill the query — degrade, but say
+        // so. A provider outage (after the client's retries) or an exhausted
+        // budget ends the request instead: generating ungrounded SPARQL with
+        // more calls to the same failing provider cannot help (review
+        // cluster-nlqa#16).
         self.note("understanding question… (model)");
         let intent_model = self.fast_model.clone().or_else(|| self.model.clone());
-        let intent = extract_intent(self.llm.as_ref(), question, intent_model.as_deref())
-            .unwrap_or_default();
+        let intent = match extract_intent(self.llm.as_ref(), question, intent_model.as_deref()) {
+            Ok(i) => i,
+            Err(e) if e.is_fatal() => return Err(e),
+            Err(e) => {
+                eprintln!("gnlqa: intent extraction failed, continuing without one: {e}");
+                QuestionIntent::default()
+            }
+        };
         // Resolve the answer language (LLM tag → script fallback → English) so
         // LLM-generated answers come back in the user's language.
         let lang = crate::lang::resolve_lang(&intent.lang, question);
@@ -438,7 +639,7 @@ impl SolveEngine {
         // mentions — not two disambiguation candidates of the same one (which the
         // flat `ent_uris` list would make seeds[0]/seeds[1] on a link_k > 1 run).
         let mut analytics_seeds: Vec<String> = Vec::new();
-        if let Some(linker) = &self.linker {
+        if let Some(linker) = self.linker() {
             for m in &intent.mentions {
                 let cands = linker.link_mention(m, self.link_k)?;
                 if !cands.is_empty() {
@@ -503,7 +704,7 @@ impl SolveEngine {
             }
             self.note("retrieving subgraph & composing answer… (gStore + model)");
             if !ent_uris.is_empty() {
-                if let Some(ans) = self.graphrag_answer(question, &ent_uris, model, &lang) {
+                if let Some(ans) = self.graphrag_answer(question, &ent_uris, model, &lang)? {
                     return Ok(ans);
                 }
             }
@@ -513,8 +714,8 @@ impl SolveEngine {
         // Graph-analytics routing: shortest path / centrality / PageRank /
         // communities / triangles aren't a single BGP — run gStore's analytics
         // engine over a retrieved edge sample. Gated by the abstain threshold for
-        // the same reason as the GraphRAG fallback. On any error, fall through to
-        // the normal Text-to-SPARQL pipeline.
+        // the same reason as the GraphRAG fallback. On a non-fatal error, fall
+        // through to the normal Text-to-SPARQL pipeline.
         if self.analytics
             && intent.qtype == QType::Analytics
             && ANALYTICS_CONFIDENCE >= self.abstain_below
@@ -547,6 +748,10 @@ impl SolveEngine {
                         provenance: Provenance::GStore,
                     });
                 }
+                // A KB outage or a spent request budget ends the request: the
+                // Text-to-SPARQL path would only pay for an LLM call and fail
+                // the same way (review cluster-nlqa#16).
+                Err(e) if e.is_fatal() => return Err(e),
                 // Don't mask the failure silently — surface it, then fall through
                 // to the Text-to-SPARQL path (which may still answer or abstain).
                 Err(e) => eprintln!("gnlqa: analytics routing failed, falling back to SPARQL: {e}"),
@@ -602,7 +807,7 @@ impl SolveEngine {
             && RAG_CONFIDENCE >= self.abstain_below
         {
             self.note("no direct result — trying GraphRAG… (gStore + model)");
-            if let Some(ans) = self.graphrag_answer(question, &ent_uris, model, &lang) {
+            if let Some(ans) = self.graphrag_answer(question, &ent_uris, model, &lang)? {
                 return Ok(ans);
             }
         }
@@ -621,14 +826,25 @@ impl SolveEngine {
                 }
 
                 let text = render_answer(&o.answer, &values);
+                // Citations are supporting evidence, not the answer: a failure
+                // (or an exhausted budget) drops them, but not silently.
                 let citations = if self.cite {
-                    gather_citations(self.kb.as_ref(), &o.answer, 5, 10, 30).unwrap_or_default()
+                    match gather_citations(self.kb.as_ref(), &o.answer, 5, 10, 30) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("gnlqa: gathering citations failed, answering without: {e}");
+                            Vec::new()
+                        }
+                    }
                 } else {
                     Vec::new()
                 };
                 // Grounded prose is exposed via `explanation` (only when it could
                 // be grounded on citations); `text` stays the rendered answer.
-                let explanation = if self.explain {
+                // The explanation sends the supporting KB triples to the LLM,
+                // which structured mode promises not to do (review
+                // cluster-nlqa#21): it is skipped there even when enabled.
+                let explanation = if self.explain && mode != Mode::Structured {
                     explain(self.llm.as_ref(), question, &citations, model, &lang)
                 } else {
                     None
@@ -695,33 +911,43 @@ impl SolveEngine {
     }
 
     /// Retrieve a subgraph around `seeds` and let the LLM answer from it. Returns
-    /// `None` when nothing was retrieved or the model declined ("I don't know"),
-    /// so the caller can fall through to the honest structured result/error.
+    /// `Ok(None)` when nothing was retrieved or the model declined ("I don't
+    /// know") or failed in a recoverable way (logged), so the caller can fall
+    /// through to the honest structured result/error. A KB/LLM outage or an
+    /// exhausted budget is returned as the error it is (review
+    /// cluster-nlqa#16), not reported as "no candidate produced an answer".
     fn graphrag_answer(
         &self,
         question: &str,
         seeds: &[String],
         model: Option<&str>,
         lang: &str,
-    ) -> Option<Answer> {
+    ) -> Result<Option<Answer>> {
         use crate::graphrag::{
-            answer_from_subgraph, is_dont_know, render_subgraph, retrieve_subgraph,
+            answer_from_subgraph, is_dont_know, render_subgraph, try_retrieve_subgraph,
         };
-        let triples = retrieve_subgraph(self.kb.as_ref(), seeds, self.rag);
+        let triples = try_retrieve_subgraph(self.kb.as_ref(), seeds, self.rag)?;
         if triples.is_empty() {
-            return None;
+            return Ok(None);
         }
         let subgraph = render_subgraph(&triples);
-        let raw = answer_from_subgraph(self.llm.as_ref(), question, &subgraph, model, lang).ok()?;
+        let raw = match answer_from_subgraph(self.llm.as_ref(), question, &subgraph, model, lang) {
+            Ok(raw) => raw,
+            Err(e) if e.is_fatal() => return Err(e),
+            Err(e) => {
+                eprintln!("gnlqa: GraphRAG answer failed: {e}");
+                return Ok(None);
+            }
+        };
         if is_dont_know(&raw) {
-            return None;
+            return Ok(None);
         }
         let citations = if self.cite {
             triples.iter().take(30).map(|t| t.to_citation()).collect()
         } else {
             Vec::new()
         };
-        Some(Answer {
+        Ok(Some(Answer {
             text: raw.trim().to_string(),
             values: Vec::new(),
             sparql: None, // GraphRAG has no single query to expose
@@ -731,7 +957,7 @@ impl SolveEngine {
             confidence: RAG_CONFIDENCE,
             abstained: false,
             provenance: Provenance::GraphRag,
-        })
+        }))
     }
 }
 
@@ -1069,5 +1295,71 @@ mod tests {
             "sub-threshold RAG must not override the abstain policy"
         );
         assert!(a.confidence < 0.7);
+    }
+
+    fn sized_answer(bytes: usize) -> Answer {
+        Answer {
+            text: "x".repeat(bytes),
+            values: Vec::new(),
+            sparql: None,
+            rounds: 0,
+            citations: Vec::new(),
+            explanation: None,
+            confidence: 1.0,
+            abstained: false,
+            provenance: Provenance::GStore,
+        }
+    }
+
+    #[test]
+    fn cache_is_bounded_by_bytes() {
+        // review cluster-nlqa#19
+        let mut c = Cache::new(1000);
+        c.max_bytes = 80_000;
+        let t = Instant::now();
+        for i in 0..50 {
+            c.put_at(format!("q{i}"), sized_answer(5_000), t);
+            assert!(c.bytes <= c.max_bytes, "bytes {} over budget", c.bytes);
+        }
+        assert!(c.map.len() < 50, "old entries were evicted");
+        assert!(c.get_at("q49", t).is_some(), "the newest survives");
+        assert!(c.get_at("q0", t).is_none(), "the oldest went first");
+        // an answer above an eighth of the budget is not cached at all
+        c.put_at("big".into(), sized_answer(20_000), t);
+        assert!(c.get_at("big", t).is_none());
+        let u = c.usage();
+        assert_eq!(u.entries, c.order.len());
+    }
+
+    #[test]
+    fn expired_entries_are_dropped_and_free_their_bytes() {
+        let mut c = Cache::new(10);
+        c.ttl = Some(Duration::from_secs(60));
+        let t0 = Instant::now();
+        c.put_at("a".into(), sized_answer(1000), t0);
+        let held = c.bytes;
+        assert!(held > 1000);
+        assert!(c.get_at("a", t0 + Duration::from_secs(59)).is_some());
+        assert!(c.get_at("a", t0 + Duration::from_secs(61)).is_none());
+        assert_eq!(c.bytes, 0, "an expired entry stops holding memory");
+        assert!(c.map.is_empty() && c.order.is_empty());
+        // a put also sweeps expired entries from the front
+        c.put_at("b".into(), sized_answer(10), t0);
+        c.put_at("c".into(), sized_answer(10), t0 + Duration::from_secs(120));
+        assert_eq!(c.map.len(), 1);
+        assert!(c.map.contains_key("c"));
+    }
+
+    #[test]
+    fn re_put_refreshes_age_and_order() {
+        let mut c = Cache::new(2);
+        let t = Instant::now();
+        c.put_at("a".into(), sized_answer(1), t);
+        c.put_at("b".into(), sized_answer(1), t);
+        c.put_at("a".into(), sized_answer(1), t); // a is now the newest
+        c.put_at("c".into(), sized_answer(1), t); // evicts b, not a
+        assert!(c.get_at("a", t).is_some());
+        assert!(c.get_at("b", t).is_none());
+        assert_eq!(c.order.len(), 2);
     }
 }

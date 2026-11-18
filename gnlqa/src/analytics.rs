@@ -191,8 +191,10 @@ fn edge_query(limit: usize) -> String {
 /// triangles). Fetches `limit + 1` so hitting the cap is detectable exactly.
 fn project(kb: &dyn KbClient, cfg: AnalyticsCfg) -> Result<ProjectedGraph> {
     let limit = cfg.max_edges.clamp(1, MAX_EDGES_CEILING);
-    // Ask for one extra row so `rows > limit` means "there was more".
-    let ans = kb.query(&edge_query(limit + 1))?;
+    // Ask for one extra row so `rows > limit` means "there was more". The
+    // backend may cap rows below `limit` (GStoreClient: MAX_RESULT_ROWS);
+    // then the sample is truncated too (review cluster-nlqa#17).
+    let (ans, capped) = kb.query_capped(&edge_query(limit + 1))?;
     let SparqlAnswer::Select { vars, rows } = &ans else {
         return Err(Error::GStore(
             "analytics edge query did not return a SELECT".into(),
@@ -206,7 +208,7 @@ fn project(kb: &dyn KbClient, cfg: AnalyticsCfg) -> Result<ProjectedGraph> {
             "analytics edge query must bind ?s and ?o".into(),
         ));
     };
-    let truncated = rows.len() > limit;
+    let truncated = capped || rows.len() > limit;
     let mut id_of: HashMap<String, EntityLiteralId> = HashMap::new();
     let mut term_of: Vec<String> = Vec::new();
     let mut triples: Vec<IdTriple> = Vec::with_capacity(rows.len().min(limit));
@@ -233,15 +235,21 @@ fn project(kb: &dyn KbClient, cfg: AnalyticsCfg) -> Result<ProjectedGraph> {
 /// present if connected within reach. Edges are added in **both** directions so
 /// the directed `GraphView::shortest_path` yields *undirected* reachability
 /// ("how is X related to Y" ignores edge orientation).
-fn project_seeded(kb: &dyn KbClient, seeds: &[String], cfg: AnalyticsCfg) -> ProjectedGraph {
-    use crate::graphrag::{retrieve_subgraph, RetrievalCfg};
+fn project_seeded(
+    kb: &dyn KbClient,
+    seeds: &[String],
+    cfg: AnalyticsCfg,
+) -> Result<ProjectedGraph> {
+    use crate::graphrag::{try_retrieve_subgraph, RetrievalCfg};
     let total = cfg.max_edges.clamp(1, MAX_EDGES_CEILING);
     let rcfg = RetrievalCfg {
         hops: cfg.path_hops.max(1),
         per_node: 128,
         total,
     };
-    let subgraph = retrieve_subgraph(kb, seeds, rcfg);
+    // A KB outage / spent budget is an error, not an empty graph that would
+    // read as "no path" (review cluster-nlqa#16).
+    let subgraph = try_retrieve_subgraph(kb, seeds, rcfg)?;
     let truncated = subgraph.len() >= total;
     let mut id_of: HashMap<String, EntityLiteralId> = HashMap::new();
     let mut term_of: Vec<String> = Vec::new();
@@ -254,12 +262,12 @@ fn project_seeded(kb: &dyn KbClient, seeds: &[String], cfg: AnalyticsCfg) -> Pro
     }
     let src = EdgeListSource { triples };
     let view = GraphView::from_source(&src);
-    ProjectedGraph {
+    Ok(ProjectedGraph {
         view,
         id_of,
         term_of,
         truncated,
-    }
+    })
 }
 
 /// Render a `(id, score)` ranking as a top-k list of surface forms.
@@ -359,7 +367,7 @@ pub fn run_analytics(
                 "shortest-path needs two linked entities as endpoints".into(),
             ));
         }
-        let g = project_seeded(kb, seeds, cfg);
+        let g = project_seeded(kb, seeds, cfg)?;
         let (a_key, b_key) = (format!("<{}>", seeds[0]), format!("<{}>", seeds[1]));
         if !g.id_of.contains_key(&a_key) || !g.id_of.contains_key(&b_key) {
             return Err(Error::GStore(

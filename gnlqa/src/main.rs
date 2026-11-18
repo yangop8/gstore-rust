@@ -8,7 +8,8 @@
 //! * `gnlqa` (no args)           — print configuration/readiness.
 //!
 //! Answering mode (`GNLQA_MODE` / `/mode` in chat): `auto` (structured then
-//! GraphRAG), `structured` (SPARQL only — data never leaves), `graphrag`
+//! GraphRAG), `structured` (SPARQL only — result rows stay local; the LLM
+//! still sees the question, linked URIs/labels and schema samples), `graphrag`
 //! (private subgraph → LLM), `open` (LLM general knowledge, no KB).
 
 use std::io::{self, Write};
@@ -16,9 +17,12 @@ use std::sync::Arc;
 
 use gnlqa::{
     load_lcquad, load_qald, run_eval, AnthropicClient, Config, EvalOptions, GStoreClient,
-    HashEmbedder, HttpServer, Linker, LlmClient, McpServer, Mode, OpenAiClient, Session,
-    SolveEngine,
+    HashEmbedder, HttpAuth, HttpServer, Linker, LinkerCache, LlmClient, McpServer, Mode,
+    OpenAiClient, Session, SolveEngine,
 };
+
+/// How long after a failed linker build the next request may try again.
+const LINKER_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Build the engine. `mode` is the default answering mode (so `GNLQA_MODE` applies
 /// on every surface, not just chat); `progress` turns on stage logging (for
@@ -38,7 +42,8 @@ fn build_engine(cfg: &Config, mode: Mode, progress: bool) -> SolveEngine {
                 cfg.model.clone(),
             )
             .with_timeout(timeout)
-            .with_max_tokens(cfg.max_tokens),
+            .with_max_tokens(cfg.max_tokens)
+            .with_retry(cfg.retry_policy()),
         )
     } else {
         Box::new(
@@ -51,31 +56,46 @@ fn build_engine(cfg: &Config, mode: Mode, progress: bool) -> SolveEngine {
                 cfg.model.clone(),
             )
             .with_timeout(timeout)
-            .with_max_tokens(cfg.max_tokens),
+            .with_max_tokens(cfg.max_tokens)
+            .with_retry(cfg.retry_policy()),
         )
     };
     // Build a linker from the KB so generation is grounded in the store's ACTUAL
     // vocabulary — without it the LLM guesses URIs (e.g. DBpedia) and misses.
     // HashEmbedder is offline (no embedding API needed); swap for HttpEmbedder
-    // for stronger semantic linking. Best-effort: if the KB is unreachable at
-    // startup, degrade to no linker.
-    let linker = Linker::build_from_kb(
-        &GStoreClient::from_config(cfg),
-        Box::new(HashEmbedder::new(256)),
-        0.0,
-        Some(10_000),
-    )
-    .ok();
-    let mut engine = SolveEngine::new(llm, Box::new(GStoreClient::from_config(cfg)))
+    // for stronger semantic linking. If the KB is unreachable at startup the
+    // failure is logged and the build is retried on a later request (review
+    // cluster-nlqa#16) instead of running without a linker for good.
+    let linker_cfg = cfg.clone();
+    let engine = SolveEngine::new(llm, Box::new(GStoreClient::from_config(cfg)))
         .with_model(cfg.model.clone())
         .with_fast_model(cfg.fast_model.clone())
         .with_mode(mode)
         .with_cache(cfg.cache_capacity)
         .with_cache_ttl(cfg.cache_ttl_secs)
-        .with_progress(progress);
-    if let Some(l) = linker {
-        engine = engine.with_linker(l);
-    }
+        .with_cache_max_bytes(cfg.cache_max_bytes)
+        .with_progress(progress)
+        .with_linker_builder(LINKER_RETRY, move || {
+            // The label index is cached on disk per KB fingerprint, so a
+            // one-shot question does not rescan the store (review
+            // cluster-nlqa#22).
+            let kb = GStoreClient::from_config(&linker_cfg);
+            let embedder = Box::new(HashEmbedder::new(256));
+            let limit = Some(linker_cfg.linker_max_labels);
+            match &linker_cfg.linker_cache_dir {
+                Some(dir) => Linker::build_cached(
+                    &kb,
+                    embedder,
+                    0.0,
+                    limit,
+                    &["en"],
+                    &linker_cfg.gstore_endpoint,
+                    &LinkerCache::new(dir),
+                ),
+                None => Linker::build_from_kb(&kb, embedder, 0.0, limit),
+            }
+        });
+    engine.prepare_linker();
     engine
 }
 
@@ -205,6 +225,9 @@ fn run_eval_cmd(cfg: &Config, args: &[String]) {
 
 fn main() {
     let cfg = Config::from_env();
+    for w in cfg.security_warnings() {
+        eprintln!("gnlqa: warning: {w}");
+    }
     let mode = Mode::parse(&cfg.mode).unwrap_or_else(|| {
         eprintln!(
             "gnlqa: warning: unknown GNLQA_MODE {:?}; using 'auto' \
@@ -241,7 +264,9 @@ fn main() {
         Some("mcp") => {
             let engine = Arc::new(build_engine(&cfg, mode, false));
             eprintln!("gNLQA MCP server on stdio (tools: ask_kg, run_sparql, link_entity, graph_analytics)");
-            McpServer::new(engine).serve_stdio();
+            McpServer::new(engine)
+                .with_limits(cfg.cost_limits())
+                .serve_stdio();
         }
         Some("eval") => run_eval_cmd(&cfg, &args),
         Some("serve") => {
@@ -249,9 +274,51 @@ fn main() {
                 .get(1)
                 .cloned()
                 .unwrap_or_else(|| "127.0.0.1:9100".to_string());
+            // review cluster-nlqa#13 / sec#18: never serve questions
+            // anonymously by accident. A client token is required; the only
+            // alternative is the explicit loopback-only opt-out.
+            let auth = cfg.http_auth();
+            if matches!(auth, HttpAuth::Unconfigured) {
+                eprintln!(
+                    "error: gnlqa serve needs a client token: set GNLQA_HTTP_TOKEN (clients send \
+                     'Authorization: Bearer <token>'), or set GNLQA_HTTP_ALLOW_UNAUTHENTICATED=on \
+                     to serve loopback clients without one"
+                );
+                std::process::exit(2);
+            }
+            let refuse_non_loopback = || -> ! {
+                eprintln!(
+                    "error: GNLQA_HTTP_ALLOW_UNAUTHENTICATED=on only serves loopback clients; \
+                     refusing to bind the non-loopback address {addr} (set GNLQA_HTTP_TOKEN \
+                     instead)"
+                );
+                std::process::exit(2);
+            };
+            // Refuse before building the engine (which contacts the KB).
+            if matches!(auth, HttpAuth::LoopbackOnly) {
+                let all_loopback = std::net::ToSocketAddrs::to_socket_addrs(addr.as_str())
+                    .map(|mut it| it.all(|a| a.ip().is_loopback()))
+                    .unwrap_or(false);
+                if !all_loopback {
+                    refuse_non_loopback();
+                }
+            }
             let engine = Arc::new(build_engine(&cfg, mode, false));
             match HttpServer::bind(engine, &addr) {
                 Ok(server) => {
+                    let server = server.with_auth(auth).with_limits(cfg.http_limits());
+                    if matches!(server.auth(), HttpAuth::LoopbackOnly) {
+                        // and check the address actually bound
+                        let local = server.local_addr().map(|a| a.ip().is_loopback());
+                        if !matches!(local, Ok(true)) {
+                            refuse_non_loopback();
+                        }
+                        eprintln!(
+                            "gnlqa: warning: GNLQA_HTTP_ALLOW_UNAUTHENTICATED=on — answering \
+                             loopback clients without a token; every local user can query the \
+                             KB with this server's credentials and spend its LLM credit"
+                        );
+                    }
                     eprintln!("gNLQA serving on http://{addr}  (POST /ask, /gSolve; GET /health)");
                     server.serve_forever();
                 }

@@ -92,7 +92,13 @@ pub fn explain(
     }
     match llm.complete(&req) {
         Ok(t) if !t.trim().is_empty() => Some(t.trim().to_string()),
-        _ => None,
+        Ok(_) => None,
+        // The explanation is optional; answer without it, but not silently
+        // (review cluster-nlqa#16).
+        Err(e) => {
+            eprintln!("gnlqa: explanation failed, answering without one: {e}");
+            None
+        }
     }
 }
 

@@ -5,10 +5,11 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::config::Config;
-use crate::error::{Error, Result};
+use crate::error::{redact_userinfo, Error, Result};
 use crate::secret::Secret;
 
 use super::{LlmClient, LlmRequest};
+use crate::net::RetryPolicy;
 
 /// Client for the Anthropic Messages API (`POST {base}/v1/messages`).
 #[derive(Debug, Clone)]
@@ -20,6 +21,9 @@ pub struct AnthropicClient {
     /// Minimum `max_tokens` floored onto every request (1 = effectively none).
     /// Wired from `GNLQA_MAX_TOKENS`.
     max_tokens_floor: u32,
+    /// Retries of transient provider failures (429/5xx/529; review
+    /// cluster-nlqa#16).
+    retry: RetryPolicy,
 }
 
 impl AnthropicClient {
@@ -35,7 +39,16 @@ impl AnthropicClient {
             default_model: default_model.into(),
             timeout: Duration::from_secs(60),
             max_tokens_floor: 1,
+            retry: RetryPolicy::default(),
         }
+    }
+
+    /// How transient provider failures (429, 5xx, 529 "overloaded") are
+    /// retried (default: 3 retries with exponential back-off honouring
+    /// `Retry-After`).
+    pub fn with_retry(mut self, retry: RetryPolicy) -> AnthropicClient {
+        self.retry = retry;
+        self
     }
 
     /// Override the per-request network timeout (builder-style).
@@ -63,6 +76,7 @@ impl AnthropicClient {
             default_model: cfg.model.clone(),
             timeout: Duration::from_secs(cfg.timeout_secs),
             max_tokens_floor: cfg.max_tokens.max(1),
+            retry: cfg.retry_policy(),
         })
     }
 
@@ -111,21 +125,38 @@ impl LlmClient for AnthropicClient {
     fn complete(&self, req: &LlmRequest) -> Result<String> {
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let body = self.request_body(req);
-        let resp = ureq::post(&url)
-            .set("x-api-key", self.api_key.expose())
-            .set("anthropic-version", "2023-06-01")
-            .set("content-type", "application/json")
-            .timeout(self.timeout)
-            .send_json(body)
-            // On a non-2xx, ureq returns Status(code, response); the Anthropic
-            // JSON error body holds the real reason, so surface it.
-            .map_err(|e| match e {
-                ureq::Error::Status(code, resp) => {
-                    let body = resp.into_string().unwrap_or_default();
-                    Error::Http(format!("HTTP {code}: {body}"))
-                }
-                other => Error::Http(other.to_string()),
-            })?;
+        // No redirects: `x-api-key` is not an Authorization header, so ureq
+        // would carry it to whatever host a redirect names (review
+        // cluster-nlqa#15).
+        let agent = crate::net::agent();
+        let resp = crate::net::send_with_retry(
+            &self.retry,
+            "the Anthropic API",
+            crate::net::PROVIDER_RETRYABLE,
+            || {
+                agent
+                    .post(&url)
+                    .set("x-api-key", self.api_key.expose())
+                    .set("anthropic-version", "2023-06-01")
+                    .set("content-type", "application/json")
+                    // never wait past the current request's time budget
+                    .timeout(crate::budget::cap_timeout(self.timeout))
+                    .send_json(body.clone())
+                    .map_err(Box::new)
+            },
+        )
+        // On a non-2xx, ureq returns Status(code, response); the Anthropic
+        // JSON error body holds the real reason, so surface it.
+        .map_err(|e| match *e {
+            ureq::Error::Status(code, resp) => {
+                let body = resp.into_string().unwrap_or_default();
+                Error::Http(redact_userinfo(&format!("HTTP {code}: {body}")))
+            }
+            // ureq prints the request URL, userinfo included (review
+            // cluster-nlqa#18).
+            other => Error::Http(redact_userinfo(&other.to_string())),
+        })?;
+        let resp = crate::net::refuse_redirect(resp, "the Anthropic API endpoint")?;
         let v: Value = resp.into_json().map_err(|e| Error::Json(e.to_string()))?;
         AnthropicClient::extract_text(&v)
     }

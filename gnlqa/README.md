@@ -37,7 +37,11 @@ Fallbacks and routing layered on top:
   subgraph around the linked entities and answer from it (cited, or "I don't
   know").
 - **Multi-turn** — follow-ups are rewritten into standalone questions against the
-  conversation history.
+  conversation history. The rewrite is an LLM call, so an earlier answer is
+  only included when the current mode allows its data to leave the machine:
+  `gStore` answers (locally computed result rows) only in `graphrag` mode,
+  GraphRAG answers in every mode but `structured`, open-mode (`LLM`) answers
+  always; prior questions are always sent.
 - **Multilingual** — the answer comes back in the question's language; entity
   linking can index labels in multiple languages.
 - **Confidence & abstention** — a ranking-derived confidence; below a configurable
@@ -47,15 +51,23 @@ Fallbacks and routing layered on top:
 
 gNLQA reads a **`gnlqa.conf`** file at startup (a simple `KEY=VALUE` list; real env
 vars override it), so you configure once instead of exporting every session. The
-default backend is **DeepSeek** (an OpenAI-compatible endpoint):
+file lives in your per-user config directory — `$GNLQA_CONFIG` if set, else
+`$XDG_CONFIG_HOME/gnlqa/gnlqa.conf`, else `~/.config/gnlqa/gnlqa.conf`. A
+`gnlqa.conf` in the **current directory is not read** (an untrusted checkout could
+ship one that points the endpoints, and so your API key and gStore password, at
+another host); `GNLQA_CONFIG=./gnlqa.conf` opts in for a directory you trust. A
+world-writable config file is refused. The default backend is **DeepSeek** (an
+OpenAI-compatible endpoint):
 
 ```sh
 cargo build -p gnlqa --release
-cp gnlqa.conf.example gnlqa.conf     # then edit gnlqa.conf: set OPENAI_API_KEY=<your key>
+mkdir -p ~/.config/gnlqa
+cp gnlqa.conf.example ~/.config/gnlqa/gnlqa.conf   # then set OPENAI_API_KEY=<your key>
+chmod 600 ~/.config/gnlqa/gnlqa.conf
 ```
 
-`gnlqa.conf` is git-ignored (it holds your key); only the fake `gnlqa.conf.example`
-is committed. It presets:
+Only the fake `gnlqa.conf.example` is committed (a `gnlqa.conf` in the checkout is
+git-ignored). It presets:
 
 ```ini
 GNLQA_LLM_PROVIDER=openai
@@ -88,6 +100,24 @@ block (`GNLQA_MODEL=claude-opus-4-8`, `GNLQA_FAST_MODEL=claude-sonnet-4-6`).
 The LLM and embedding clients are trait objects with mocks, so the crate compiles
 and its tests run **without** any API key.
 
+**Failures are reported, not swallowed.** Transient provider errors (429, 5xx,
+Anthropic's 529) and gStore overload (429, 502–504) are retried with exponential
+back-off that honours `Retry-After` and never waits past a server request's time
+budget. A provider or KB outage that persists ends the request with that error —
+including on the intent call and the GraphRAG fallback — instead of degrading into
+an ungrounded guess or "no candidate query produced an answer". If the KB is
+unreachable when the entity linker is built, the failure is logged and the build is
+retried on a later request (at most once a minute).
+
+**Entity linker.** The linker indexes the KB's `rdfs:label`s (up to
+`GNLQA_LINKER_MAX_LABELS`), distinct predicates and types, fetched in `ORDER BY`
+pages so a capped index is always the same prefix; the sizes, and any truncation,
+are logged. The fetched lists are cached on disk (`GNLQA_LINKER_CACHE_DIR`) under a
+fingerprint of the endpoint, the label settings and the number of `rdfs:label` and
+`rdf:type` triples, for at most a day: a repeated `gnlqa "<question>"` then costs two
+cheap `COUNT` queries instead of full-store `DISTINCT` scans. Delete the cache
+directory to force a rebuild.
+
 ## CLI
 
 ```sh
@@ -96,7 +126,7 @@ gnlqa chat                           # interactive multi-turn REPL (:reset / :qu
 gnlqa mcp                            # MCP server over stdio (see below)
 gnlqa eval qald   dataset.json       # score against a QALD benchmark
 gnlqa eval lcquad dataset.json       # score against LC-QuAD (gold resolved via KB)
-gnlqa serve 127.0.0.1:9100           # HTTP SPARQL-QA server (see below)
+gnlqa serve 127.0.0.1:9100           # HTTP SPARQL-QA server (needs GNLQA_HTTP_TOKEN; see below)
 gnlqa                                # print configuration/readiness
 ```
 
@@ -111,10 +141,12 @@ signal, not just attribution:
 
 - **`gStore`** — structured SPARQL / graph-analytics computed locally; the query
   **result data stays on the machine**. To *generate* the SPARQL, the LLM does
-  receive the question, the linked entity/predicate URIs and their labels, and
-  small schema samples — but never the answer rows/triples. (Enabling
+  receive the question, the linked entity/predicate URIs and their labels, small
+  schema samples (the predicates and types around the linked terms), and — in the
+  self-repair loop — gStore's error text for a failing query and the fact that a
+  query returned no rows; but never the answer rows/triples. (Enabling
   `with_explain` additionally sends the answer's supporting triples to the LLM to
-  phrase an explanation; it's off by default.)
+  phrase an explanation — off by default, and never done in `structured` mode.)
 - **`gStore+LLM (GraphRAG)`** — the LLM composed the answer from private triples
   **retrieved from gStore and sent to the LLM**.
 - **`LLM`** — the LLM answered from its **general knowledge**; no KB data involved.
@@ -124,7 +156,7 @@ You choose which path(s) are allowed with `GNLQA_MODE` (or `/mode` in chat):
 | Mode         | Behaviour | Provenance |
 |--------------|-----------|------------|
 | `auto` (default) | structured SPARQL, then GraphRAG fallback; **never** pure LLM | gStore / GraphRAG |
-| `structured` | SPARQL / analytics **only** — result data stays local; abstains otherwise | gStore |
+| `structured` | SPARQL / analytics **only** — result data stays local (no explanation, no answers replayed); abstains otherwise | gStore |
 | `graphrag`   | retrieve a private subgraph → LLM answers from it | GraphRAG |
 | `open`       | answer from the LLM's general knowledge; ignore the KB | LLM |
 
@@ -139,7 +171,7 @@ keeps its result data local too.
 
 ```sh
 gnlqa chat
-[auto]> /mode structured      # data never leaves the machine
+[auto]> /mode structured      # result rows stay local (the LLM sees URIs, labels, schema)
 [structured]> who directed Alien?
 [open]> what is SPARQL?        # /mode open → answered from the LLM
 ```
@@ -154,8 +186,40 @@ gnlqa chat
 | POST   | `/gSolve` | `{"question": "..."}`    | gAnswer-compatible shape (honours abstention with status `"abstained"`) |
 | GET    | `/health` | —                        | `{"status":"ok"}` |
 
-The server bounds request size and connection count and applies read/write
-timeouts.
+**Authentication.** `/ask` and `/gSolve` run LLM-chosen read-only SPARQL with
+the server's own gStore credentials and spend its LLM credit, so they are not
+open by default: `gnlqa serve` refuses to start unless a client token is set
+with `GNLQA_HTTP_TOKEN` (clients send `Authorization: Bearer <token>`). The only
+alternative is the explicit opt-out `GNLQA_HTTP_ALLOW_UNAUTHENTICATED=on`, which
+answers loopback clients only and refuses to bind a non-loopback address (behind
+a reverse proxy on the same host every client looks local — use a token there).
+`/health` needs no token.
+
+```sh
+GNLQA_HTTP_TOKEN=$(openssl rand -hex 24) gnlqa serve 127.0.0.1:9100
+curl -H "Authorization: Bearer $GNLQA_HTTP_TOKEN" -d '{"question":"who directed Alien?"}' \
+     http://127.0.0.1:9100/ask
+```
+
+**Errors.** A failed request answers with a generic message, a stable `code`
+(`upstream_unavailable`, `kb_error`, `llm_error`, `no_answer`, `limit_exceeded`,
+`config_error`) and a `request_id`; the detailed error (endpoint, provider reply,
+gStore message) is only written to the server's stderr log under that id. The same
+holds for MCP tool errors, except that `run_sparql` keeps the text of a SPARQL
+validation or gStore query error (the feedback needed to fix the query). URL
+userinfo (`user:password@`) is stripped from every error and log line; prefer
+`GSTORE_USER`/`GSTORE_PASSWORD` to credentials in `GSTORE_ENDPOINT` (gNLQA warns at
+startup).
+
+**Limits.** Each client IP (an IPv6 client: its /64 network) may send
+`GNLQA_HTTP_RATE_PER_MIN` (default 30) question requests per minute — counted before authentication, so token guessing
+is bounded too — and gets `429` with `Retry-After` beyond that. A question longer
+than `GNLQA_MAX_QUESTION_BYTES` (default 4096) gets `413`. The work one request
+may cause is budgeted: at most `GNLQA_MAX_LLM_CALLS` LLM calls (default 16),
+`GNLQA_MAX_KB_ROWS` KB rows (default 200000) and `GNLQA_REQUEST_TIMEOUT_SECS`
+seconds (default 120); a request that exhausts its budget gets `503` (`/gSolve`:
+`status: "error"`). The same budget applies to every MCP tool call. The server
+also bounds request size and connection count and applies read/write timeouts.
 
 ## MCP server
 
@@ -172,7 +236,16 @@ timeouts.
 Failures *inside* a correctly-invoked tool are returned as `isError` content;
 protocol faults (unknown tool, malformed params) are JSON-RPC `-32602` errors.
 `run_sparql` enforces a read-only gate (SELECT/ASK only — UPDATE/DELETE/DROP/LOAD
-are rejected before reaching the store), so an injected mutation can't run.
+are rejected before reaching the store), so an injected mutation can't run. The
+same gate (shared by generation and self-repair) also refuses any `SERVICE`
+clause, wherever it is nested, so neither the LLM nor an MCP client can make the
+store fetch an arbitrary URL.
+
+**Result size.** A SELECT result is parsed up to 100 000 rows (`MAX_RESULT_ROWS`)
+and 32 MiB. A larger result is never passed off as complete: the question-answering
+path gets an error asking for a `LIMIT` (which the self-repair loop can act on);
+`run_sparql` returns the first rows with a `[truncated]` note; graph analytics marks
+its result as computed over a capped sample.
 
 ## Evaluation
 
@@ -187,11 +260,17 @@ convention), macro-averaged over the questions:
 
 ## Configuration
 
-Settings come from **`gnlqa.conf`** (a `KEY=VALUE` file; path overridable with
-`GNLQA_CONFIG`) with **environment variables taking precedence** — so you can keep
-your defaults in the file and still override one for a single run
-(`GNLQA_MODEL=… gnlqa …`). Copy `gnlqa.conf.example` to `gnlqa.conf` to start. The
-same names work as env vars.
+Settings come from **`gnlqa.conf`** (a `KEY=VALUE` file read from `$GNLQA_CONFIG`,
+else `$XDG_CONFIG_HOME/gnlqa/gnlqa.conf`, else `~/.config/gnlqa/gnlqa.conf` — never
+from the current directory) with **environment variables taking precedence** — so
+you can keep your defaults in the file and still override one for a single run
+(`GNLQA_MODEL=… gnlqa …`). Copy `gnlqa.conf.example` there to start. The same names
+work as env vars.
+
+The clients never follow HTTP redirects, so an API key or the gStore password is
+only ever sent to the configured host (a redirecting endpoint is an error: configure
+its final URL). At startup gNLQA warns when a credential would travel in clear text
+over `http://` to a non-loopback host.
 
 | Variable             | Default                            | Meaning |
 |----------------------|------------------------------------|---------|
@@ -207,9 +286,21 @@ same names work as env vars.
 | `GSTORE_PASSWORD`    | —                                  | optional HTTP Basic password (redacted `Secret`) |
 | `GNLQA_MAX_TOKENS`   | `1024`                             | minimum completion-token budget floored onto every LLM request (raise it for reasoning models that spend tokens on hidden reasoning) |
 | `GNLQA_TIMEOUT_SECS` | `60`                               | per-request HTTP timeout |
+| `GNLQA_LINKER_MAX_LABELS` | `10000`                       | entity labels the linker indexes; a larger KB is indexed up to this many, in entity-IRI order, with a warning |
+| `GNLQA_LINKER_CACHE` | `on`                               | cache the linker's label index on disk per KB fingerprint (`off` = rebuild from the KB on every start) |
+| `GNLQA_LINKER_CACHE_DIR` | `$XDG_CACHE_HOME/gnlqa` or `~/.cache/gnlqa` | where that cache lives (files are mode 0600: labels are KB data) |
+| `GNLQA_RETRIES`      | `3`                                | retries of a transient LLM / embedding failure (429, 5xx, 529) or gStore overload (429, 502–504), with exponential back-off honouring `Retry-After` (`0` = none) |
 | `GNLQA_MODE`         | `auto`                             | answering mode: `auto`/`structured`/`graphrag`/`open` (see above); applies to CLI, chat, serve, and mcp |
 | `GNLQA_CACHE`        | `256`                              | answer-cache capacity in questions (`0` disables the cache) |
-| `GNLQA_CACHE_TTL_SECS` | `0`                              | cache entry lifetime in seconds (`0` = no expiry; set it when the KB changes under a long-running server) |
+| `GNLQA_CACHE_TTL_SECS` | `3600`                           | cache entry lifetime in seconds (`0` = no expiry); expired entries are dropped |
+| `GNLQA_CACHE_MAX_BYTES` | `67108864`                      | answer-cache byte budget (64 MiB); oldest entries are evicted beyond it, and an answer larger than an eighth of it is not cached |
+| `GNLQA_HTTP_TOKEN`   | — (required by `serve`)            | bearer token HTTP clients must send on `/ask` and `/gSolve` (redacted `Secret`) |
+| `GNLQA_HTTP_ALLOW_UNAUTHENTICATED` | `off`                | `on` = serve loopback clients without a token (refuses non-loopback binds) |
+| `GNLQA_HTTP_RATE_PER_MIN` | `30`                          | `/ask` + `/gSolve` requests per client IP (IPv6: per /64) per minute (`0` = unlimited) |
+| `GNLQA_MAX_QUESTION_BYTES` | `4096`                       | longest accepted question for `serve` (bytes) |
+| `GNLQA_MAX_LLM_CALLS` | `16`                              | LLM calls per `serve` request / MCP tool call (`0` = unlimited) |
+| `GNLQA_MAX_KB_ROWS`  | `200000`                           | KB rows fetched per `serve` request / MCP tool call (`0` = unlimited) |
+| `GNLQA_REQUEST_TIMEOUT_SECS` | `120`                      | wall-clock budget per `serve` request / MCP tool call (`0` = none) |
 
 ## Library
 
