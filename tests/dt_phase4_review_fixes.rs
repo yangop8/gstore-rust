@@ -508,7 +508,8 @@ fn a_wide_pfn_argument_neither_overflows_the_stack_nor_takes_quadratic_time() {
             text.push_str(&format!("\"k{i}\":\"?x\""));
         }
         text.push('}');
-        (n, gstore::pfn::call::parse_args("f", &text).unwrap())
+        let args = gstore::pfn::call::parse_args("f", &text).unwrap();
+        (n, text, args)
     };
     let inputs = [wide(65_000), wide(130_000)];
     // The 2 MiB stack of a `gstore-task` thread.
@@ -517,7 +518,7 @@ fn a_wide_pfn_argument_neither_overflows_the_stack_nor_takes_quadratic_time() {
         .stack_size(2 << 20)
         .spawn(move || {
             let mut runs = Vec::new();
-            for (n, args) in &inputs {
+            for (n, text, args) in &inputs {
                 let last = format!(r#""k{}":"<http://ex/a>""#, n - 1);
                 let calls = std::cell::Cell::new(0);
                 let expand = || {
@@ -546,7 +547,17 @@ fn a_wide_pfn_argument_neither_overflows_the_stack_nor_takes_quadratic_time() {
                     })
                     .min()
                     .unwrap();
-                runs.push((r.map_err(|e| e.to_string()), calls, bytes, cpu));
+                // The reference: parsing the same argument, a linear pass
+                // over the same keys, on the same thread and machine.
+                let parse_cpu = (0..3)
+                    .map(|_| {
+                        let t0 = thread_cpu_time();
+                        let _ = gstore::pfn::call::parse_args("f", text);
+                        thread_cpu_time() - t0
+                    })
+                    .min()
+                    .unwrap();
+                runs.push((r.map_err(|e| e.to_string()), calls, bytes, cpu, parse_cpu));
             }
             let _ = tx.send(runs);
         })
@@ -556,7 +567,7 @@ fn a_wide_pfn_argument_neither_overflows_the_stack_nor_takes_quadratic_time() {
     let runs = rx
         .recv_timeout(Duration::from_secs(300))
         .expect("the expansion neither finished nor failed (a quadratic regression?)");
-    for (r, calls, _, _) in &runs {
+    for (r, calls, ..) in &runs {
         assert_eq!(r.as_deref(), Ok("[1]"));
         assert_eq!(*calls, 1);
     }
@@ -574,13 +585,18 @@ fn a_wide_pfn_argument_neither_overflows_the_stack_nor_takes_quadratic_time() {
     // mechanism this test was written for — a per-key `Json::set`, which
     // scans the object for the key: O(n^2) comparisons but O(n) bytes (it
     // passed with that loop put back, at 30 s). So the time is compared
-    // too, doubled input against a generous ratio (convention 5): about 2x
-    // for a linear expansion, about 3.4x-4x for that loop.
-    let (t_half, t_full) = (runs[0].3, runs[1].3);
-    eprintln!("CPU time: {t_half:?} for 65 000 keys, {t_full:?} for 130 000");
+    // too, against a generous ratio (convention 5). Comparing the doubled
+    // input with the half left too little room (a linear expansion measured
+    // 3.07x on a GitHub runner where that loop gives 3.4x-4x), so the
+    // expansion of 130 000 keys is compared with parsing the same argument,
+    // a linear pass over the same keys on the same thread: the expansion
+    // costs about 6-8 parses here, the quadratic loop about a thousand
+    // (30 s against 25 ms); the bound is 60.
+    let (expand, parse) = (runs[1].3, runs[1].4);
+    eprintln!("CPU time for 130 000 keys: expansion {expand:?}, parse {parse:?}");
     assert!(
-        t_full < t_half * 3,
-        "{t_half:?} for 65 000 keys, {t_full:?} for 130 000: more than linear"
+        expand < parse * 60,
+        "expansion {expand:?} against parse {parse:?} for 130 000 keys: more than linear"
     );
 }
 
