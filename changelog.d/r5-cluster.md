@@ -19,10 +19,14 @@
   the owning node id) and are fsynced before the node answers a vote or
   append, sends a message, or counts its own entry toward a commit. A restart
   reloads term, vote and log and rebuilds the triple store as the log is
-  re-committed; a torn tail record (never acknowledged, including a
-  zero-filled one) is cut off, while an intact record that does not decode (a
-  newer format, a damaged file) refuses the start instead of being cut off
-  with every record after it; a new state directory is created durably (the
+  re-committed; a torn tail (what a crash leaves in the last, never
+  acknowledged batch: the file ends inside a record or a 512-byte sector of
+  it reads back as zeros, later records of that same batch possibly intact)
+  is cut off, while an intact record that does not decode (a newer format,
+  a damaged file) and a damaged record a crash cannot have left (its bytes
+  all present with a wrong checksum, or followed by well-formed records of a
+  later batch) refuse the start, naming the byte offset, instead of being
+  cut off with every record after it; a new state directory is created durably (the
   parent of each created directory is fsynced); a directory of another node
   id is refused, and so is a second running copy of the same node (exclusive
   advisory lock on the journal while the node lives); a journal write failure
@@ -219,3 +223,17 @@ none
   edit there), and stays stopped after a failed write (before, a retried
   vote whose journal write had failed was granted once the disk recovered);
   four tests in `cluster::review_fix_tests` cover these.
+- Round-5 review follow-up (cluster-nlqa#11): replay stopped at the first
+  record whose checksum failed and cut the file there, so one flipped bit in
+  an older vote record silently dropped every later, acknowledged vote and
+  entry (node 3 restarted at term 0 and granted a second vote in term 8).
+  `RaftJournal::open` now cuts only what a crash in the last batch can leave
+  (see the Changelog bullet) and otherwise refuses with `InvalidData`,
+  leaving the file untouched; the scan for later records checks each
+  candidate's kind and length before its CRC. No format change (`append`'s
+  batch encoding moved into `RaftJournal::batch`, unchanged).
+  `cluster::review_fix_tests::a_damaged_journal_record_before_acknowledged_ones_refuses_the_start`
+  (flipped bit and zero-filled first record before an acknowledged vote,
+  flipped bit in the last record: refused, file unchanged; a last batch
+  with its hard-state record zero-filled and its log suffix intact: cut)
+  failed before the fix at the first refusal.

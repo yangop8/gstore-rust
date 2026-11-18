@@ -2961,7 +2961,10 @@ struct RecoveredState {
 /// triples use the [`crate::rpc`] encodings. A torn record at the tail (a
 /// crash mid-append, never acknowledged) is cut off on open; an intact record
 /// that does not decode (a newer format, a damaged file) makes the open fail
-/// instead, so acknowledged state is never dropped silently.
+/// instead, and so does a damaged record that a crash cannot have left
+/// (see [`RaftJournal::check_torn_tail`]: its bytes are all there, or
+/// well-formed records of a later batch follow it), so acknowledged state is
+/// never dropped silently.
 #[derive(Debug)]
 struct RaftJournal {
     file: std::fs::File,
@@ -3058,12 +3061,148 @@ impl RaftJournal {
             at = next;
         }
         if at < bytes.len() {
-            // A torn (or damaged) tail: it was never acknowledged — every
-            // record is synced before the node acts on it — so drop it.
+            // Replay stopped at bytes that are not a well-formed record. Only
+            // the tail a crash leaves in the last, unacknowledged batch may be
+            // cut; damage anywhere else (review cluster-nlqa#11 follow-up: a
+            // flipped bit in an older vote record used to cut every later,
+            // acknowledged record with it) refuses the start and leaves the
+            // file untouched.
+            if let Err(why) = Self::check_torn_tail(&bytes, at) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{}: the record at byte {at} is damaged and {why}; refusing to start \
+                         rather than drop acknowledged raft state (restore the state directory \
+                         from a copy, or replace this replica)",
+                        path.display()
+                    ),
+                ));
+            }
+            // A torn tail: it was never acknowledged — every batch is synced
+            // before the node acts on it — so drop it.
             file.set_len(at as u64)?;
             file.sync_all()?;
         }
         Ok((RaftJournal { file }, state))
+    }
+
+    /// The unit a disk writes atomically, at least: a crash leaves each
+    /// 512-byte block of the file either written or as it was (zeros, for
+    /// bytes an append never got onto the disk).
+    const SECTOR: usize = 512;
+
+    /// Check that the bytes from `at` on — where replay stopped at something
+    /// that is not a well-formed record — are what a crash during the last
+    /// [`append`](Self::append) can leave, and so were never acknowledged.
+    /// `Err` says why not.
+    ///
+    /// `append` writes one batch (at most three records, tags 1, 2, 3 in that
+    /// order) with one `write` and one `sync_data`, and the node acts on a
+    /// batch only after that sync, so only the last batch can be torn. A
+    /// crash tears it by leaving sectors unwritten: the file ends inside the
+    /// record, or a sector of it reads back as zeros (see
+    /// [`looks_torn`](Self::looks_torn)); sectors written out of order may
+    /// leave later records of the same batch intact. Anything else is damage
+    /// to acknowledged state: a record whose bytes are all present but whose
+    /// checksum does not match (a flipped bit), or well-formed records after
+    /// the damage that cannot belong to its batch.
+    fn check_torn_tail(bytes: &[u8], at: usize) -> std::result::Result<(), String> {
+        if !Self::looks_torn(bytes, at) {
+            return Err("no part of it is missing or zero-filled, as a crash while \
+                 writing would leave it (a damaged file, not a torn write)"
+                .to_string());
+        }
+        // Everything after it must fit in its batch: walk the well-formed
+        // records that follow and the damaged stretches between them, giving
+        // each damaged stretch the smallest tag it could have; the tags must
+        // rise and stay within 1..=3.
+        let mut last_tag = 1u8; // the damaged record itself
+        let mut fits = |tag: Option<u8>| {
+            let tag = match tag {
+                None => last_tag + 1,
+                Some(t) if t > last_tag => t,
+                Some(_) => return false,
+            };
+            last_tag = tag;
+            tag <= 3
+        };
+        let mut from = at + 1;
+        while let Some(found) = (from..bytes.len()).find(|&p| Self::plausible_record_at(bytes, p)) {
+            let later = || {
+                format!(
+                    "well-formed records follow it (from byte {found} on) that a later batch \
+                     wrote, after this one had been synced and acted on"
+                )
+            };
+            let mut next = found;
+            while let Some((payload, end)) = Self::record_at(bytes, next) {
+                if !fits(Some(payload[0])) {
+                    return Err(later());
+                }
+                next = end;
+            }
+            if next == bytes.len() {
+                break;
+            }
+            // Damaged bytes again: at least one more record of the batch.
+            if !fits(None) {
+                return Err(later());
+            }
+            from = next + 1;
+        }
+        Ok(())
+    }
+
+    /// Whether the record at `at` looks torn by a crash: the file ends inside
+    /// its header or its declared payload, or one of its sector-aligned
+    /// stretches is all zeros (a zero-length header counts as the header
+    /// alone).
+    fn looks_torn(bytes: &[u8], at: usize) -> bool {
+        let Some(head) = bytes.get(at..at.saturating_add(8)) else {
+            return true;
+        };
+        let len = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
+        let end = (at + 8).saturating_add(len);
+        if end > bytes.len() {
+            return true;
+        }
+        let mut start = at;
+        while start < end {
+            let stop = ((start / Self::SECTOR + 1) * Self::SECTOR).min(end);
+            if bytes[start..stop].iter().all(|&b| b == 0) {
+                return true;
+            }
+            start = stop;
+        }
+        false
+    }
+
+    /// Whether a well-formed record of a known kind starts at `at`, with a
+    /// payload length its kind can have — checked before the checksum, so
+    /// scanning a damaged journal for later records stays cheap.
+    fn plausible_record_at(bytes: &[u8], at: usize) -> bool {
+        let Some(head) = bytes.get(at..at.saturating_add(9)) else {
+            return false;
+        };
+        let len = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
+        if (at + 8).saturating_add(len) > bytes.len() {
+            return false;
+        }
+        let count = |off: usize| {
+            bytes
+                .get(at + 8 + off..at + 12 + off)
+                .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize)
+        };
+        let plausible = match head[8] {
+            // term, has-vote, vote
+            1 => len == 18,
+            // base index, base term, then a count of 12-byte triples
+            2 => len >= 21 && count(17).is_some_and(|n| n.checked_mul(12) == Some(len - 21)),
+            // first index, then a count of entries of at least 9 bytes each
+            3 => len >= 13 && count(9).is_some_and(|n| n <= (len - 13) / 9),
+            _ => false,
+        };
+        plausible && Self::record_at(bytes, at).is_some()
     }
 
     /// The well-formed record starting at `at`: its payload and the offset of
@@ -3135,6 +3274,17 @@ impl RaftJournal {
     /// Append `delta` as one batch of records and `fsync` it.
     fn append(&mut self, delta: &DurableDelta) -> io::Result<()> {
         use std::io::Write as _;
+        let batch = Self::batch(delta);
+        if batch.is_empty() {
+            return Ok(());
+        }
+        self.file.write_all(&batch)?;
+        self.file.sync_data()
+    }
+
+    /// The records of one batch: `delta`'s hard state, snapshot and log
+    /// suffix, in that order (tags 1, 2, 3), each at most once.
+    fn batch(delta: &DurableDelta) -> Vec<u8> {
         let mut batch = Vec::new();
         let mut record = |payload: Vec<u8>| {
             batch.extend_from_slice(&(payload.len() as u32).to_be_bytes());
@@ -3161,11 +3311,7 @@ impl RaftJournal {
             rpc::put_entries(&mut p, entries);
             record(p);
         }
-        if batch.is_empty() {
-            return Ok(());
-        }
-        self.file.write_all(&batch)?;
-        self.file.sync_data()
+        batch
     }
 }
 
@@ -8335,6 +8481,104 @@ mod review_fix_tests {
             vote(&node, 7, 5),
             Response::Vote { granted: false, .. }
         ));
+    }
+
+    /// review cluster-nlqa#11 (round-5 review follow-up): damage in the middle
+    /// of the journal is not a torn tail. Before, replay stopped at the first
+    /// record whose checksum failed and cut the file there, with every later,
+    /// acknowledged record: after one flipped bit in node 3's vote of term 7
+    /// it restarted at term 0 and granted a second vote in term 8. Now the
+    /// start is refused and the file left as it is — for a flipped bit (its
+    /// bytes all there: no crash leaves that, not even in the last record)
+    /// and for a zero-filled record that a later batch's record follows. What
+    /// a crash in the last batch leaves (a record zero-filled, a later record
+    /// of the same batch intact) is still cut.
+    #[test]
+    fn a_damaged_journal_record_before_acknowledged_ones_refuses_the_start() {
+        let dir = TempDir::new("damaged_middle");
+        let cfg = RaftConfig::default();
+        let bind =
+            || ClusterNode::bind_persistent(3, vec![4, 5], &dir.0, "127.0.0.1:0", cfg.clone());
+        let node = bind().unwrap();
+        for (term, candidate) in [(7, 4), (8, 5)] {
+            assert_eq!(
+                vote(&node, term, candidate),
+                Response::Vote {
+                    term,
+                    granted: true
+                }
+            );
+        }
+        drop(node);
+        let path = dir.0.join(RaftJournal::FILE);
+        let intact = std::fs::read(&path).unwrap();
+        // The header, then two 26-byte hard-state records.
+        let (first, second) = (RaftJournal::HEADER_LEN, RaftJournal::HEADER_LEN + 26);
+        assert_eq!(intact.len(), second + 26);
+
+        let refused = |damaged: &[u8], at: usize, what: &str| {
+            std::fs::write(&path, damaged).unwrap();
+            let err = bind().expect_err(what);
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{what}: {err}");
+            assert!(
+                err.to_string()
+                    .contains(&format!("the record at byte {at} is damaged")),
+                "{what}: {err}"
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                damaged,
+                "{what}: the journal is left untouched"
+            );
+        };
+        // One flipped bit in the first record's term.
+        let mut flipped = intact.clone();
+        flipped[first + 8 + 4] ^= 0x10;
+        refused(&flipped, first, "a flipped bit before an acknowledged vote");
+        // The first record zero-filled (a lost block), the term-8 vote intact:
+        // a hard-state record starts a batch, so it was written later.
+        let mut zeroed = intact.clone();
+        zeroed[first..second].fill(0);
+        refused(
+            &zeroed,
+            first,
+            "a zero-filled record before an acknowledged vote",
+        );
+        // A flipped bit in the last record: its bytes are all there.
+        let mut last = intact.clone();
+        last[second + 8 + 4] ^= 0x10;
+        refused(&last, second, "a flipped bit in the last record");
+
+        // The intact journal still opens with both votes.
+        std::fs::write(&path, &intact).unwrap();
+        let node = bind().unwrap();
+        assert_eq!(node.current_term(), 8);
+        assert!(matches!(
+            vote(&node, 8, 4),
+            Response::Vote { granted: false, .. }
+        ));
+        drop(node);
+
+        // A crash in a last batch of [hard state, log suffix]: the hard-state
+        // record's sector never landed (zeros), the log suffix's did. Nothing
+        // of that batch was acknowledged, so the whole batch is cut.
+        let mut batch = RaftJournal::batch(&DurableDelta {
+            hard: Some((9, Some(4))),
+            snapshot: None,
+            entries: Some((1, vec![LogEntry::new(9, LogOp::Insert(t(1, 2, 3)))])),
+        });
+        batch[..26].fill(0);
+        let mut torn = intact.clone();
+        torn.extend_from_slice(&batch);
+        std::fs::write(&path, &torn).unwrap();
+        let node = bind().expect("a torn last batch is cut");
+        assert_eq!(node.current_term(), 8);
+        assert!(node.state.lock().unwrap().log.is_empty());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            intact,
+            "the torn batch is cut"
+        );
     }
 
     /// A new state directory is created durably: the parent of every
