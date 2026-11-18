@@ -104,7 +104,6 @@
 #[path = "common/cli.rs"]
 mod cli;
 
-use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -713,7 +712,7 @@ fn holds_more_than_its_lock(path: &Path) -> bool {
 fn park_before_claim() {
     #[cfg(debug_assertions)]
     if let Some(p) = std::env::var_os("GSTORE_GBUILD_PARK_BEFORE_CLAIM") {
-        let _ = fs::read(p);
+        let _ = std::fs::read(p);
     }
 }
 
