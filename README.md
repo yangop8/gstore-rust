@@ -25,9 +25,10 @@ HTTPS client, JSON) stay out of the lean `gstore` crate. It can talk to Claude
 **or** any OpenAI-compatible model (OpenAI, **DeepSeek**, …), and only sends data
 off-box on the paths you allow — see [Answering modes](#answering-modes--privacy).
 
-* **About 2,375 tests pass** across the workspace (incl. 159 for gNLQA; the
-  Phase 6 closure run, once with on-disk databases in each query mode), among
-  them ports of upstream gStore's own test scripts; the `pfn-wasm`, `zip`,
+* **About 3,316 tests pass** across the workspace (incl. 266 for gNLQA:
+  189 unit, 77 integration; `cargo test --workspace` after the review-fix
+  campaign, run once with on-disk databases in each query mode), among them
+  ports of upstream gStore's own test scripts; the `pfn-wasm`, `zip`,
   `gzip`, `tls`, `readline` and `rocksdb` features add their own. `cargo clippy
   --workspace --all-targets -- -D warnings` is clean on the toolchain CI pins
   (Rust 1.99.1, `RUST_TOOLCHAIN` in `.github/workflows/ci.yml`; a newer local
@@ -61,7 +62,11 @@ all pure Rust — and `rocksdb` (the RocksDB backend; needs clang). For
 example `cargo build --release -p gstore --features "pfn-wasm zip gzip"`.
 To run `gserver` in a container (the image enables `pfn-wasm`) or as a
 systemd service, or from `.deb` / `.rpm` packages, see
-[`docs/DEPLOY.md`](docs/DEPLOY.md).
+[`docs/DEPLOY.md`](docs/DEPLOY.md); its [Package
+smoke](docs/DEPLOY.md#package-smoke) section (`scripts/package-smoke.sh`)
+installs and runs what the packages and the image ship, as
+[`.github/workflows/packaging.yml`](.github/workflows/packaging.yml) does in
+CI.
 
 ### A) Use gStore directly (SPARQL)
 
@@ -78,15 +83,23 @@ cargo run -q -p gstore --bin gquery  -- movies -e "SELECT ?o WHERE { <a> <p> ?o 
 
 ```bash
 # 1) Configure the LLM backend once (default: DeepSeek, an OpenAI-compatible API)
-cp gnlqa.conf.example gnlqa.conf      # then edit gnlqa.conf: set OPENAI_API_KEY=<your key>
+mkdir -p ~/.config/gnlqa && cp gnlqa.conf.example ~/.config/gnlqa/gnlqa.conf
+                                      # then edit it: set OPENAI_API_KEY=<your key>
 
 # 2) Point it at a running gserver (step A) on port 9000, and ask:
 cargo run -q -p gnlqa -- "who directed Inception?"        # → Christopher Nolan
 cargo run -q -p gnlqa -- chat                             # interactive, multi-turn
 ```
 
-`gnlqa.conf` holds your key and is git-ignored; only the fake `gnlqa.conf.example`
-is committed. To use Claude instead, switch the whole backend block in
+`gnlqa` reads its configuration from `$GNLQA_CONFIG`, else
+`$XDG_CONFIG_HOME/gnlqa/gnlqa.conf`, else `~/.config/gnlqa/gnlqa.conf`; a
+`gnlqa.conf` in the working directory is no longer read (it is ignored with
+a note; `GNLQA_CONFIG=./gnlqa.conf` opts in explicitly), and a world-writable
+file is refused. The file holds your key; only the fake
+`gnlqa.conf.example` is committed. `gnlqa serve` (the HTTP server) needs a
+client token, `GNLQA_HTTP_TOKEN`, and refuses to start without one (see
+[`docs/DEPLOY.md`](docs/DEPLOY.md#gnlqa-server)). To use Claude instead,
+switch the whole backend block in
 `gnlqa.conf` — `GNLQA_LLM_PROVIDER=anthropic`, `ANTHROPIC_API_KEY`, **and** the
 model names (`GNLQA_MODEL`/`GNLQA_FAST_MODEL`), since the example pins DeepSeek
 models. Full details: **[`gnlqa/README.md`](gnlqa/README.md)**.
@@ -108,7 +121,12 @@ In every mode the LLM sees the question (and, to build a query, the linked
 entity/predicate URIs, their labels, and small schema samples). The distinction
 above is about the **answer data** — the result rows/triples: `structured` keeps
 them local, `graphrag` sends a retrieved subgraph, `open` uses no KB at all.
-`GNLQA_MODE` applies on every surface (CLI, chat, `serve`, `mcp`).
+`GNLQA_MODE` applies on every surface (CLI, chat, `serve`, `mcp`). The
+follow-up rewrite of a multi-turn chat honours the table too: an earlier
+answer is replayed to the LLM only where the current mode lets that data
+leave the machine (a locally computed gStore answer only in `graphrag`
+mode), and `structured` mode never sends an answer's supporting triples,
+not even with `with_explain`.
 
 A SPARQL-generation *failure* is never silently answered from LLM world-knowledge
 (that risks confident hallucination on private-data questions) — LLM-direct only
@@ -158,8 +176,11 @@ optimizer and a VS-tree signature filter.
 * **Three storage layouts** — the in-memory snapshot, an **on-disk B+ tree
   KVstore** (`gbuild --disk`) that answers queries from an in-memory working
   set (Materialize, the default) or straight off the B+ trees with an
-  out-of-core dictionary (**Stream**: it opens in milliseconds with a few MiB
-  of memory whatever the data's size), and an optional **RocksDB backend**
+  out-of-core dictionary (**Stream**: the default graph opens in
+  milliseconds with a few MiB of memory whatever its size; named graphs are
+  loaded into memory when the database opens, so open time and memory grow
+  with their quads — [`docs/PHASE6_PLAN.md`](docs/PHASE6_PLAN.md) §8 D11),
+  and an optional **RocksDB backend**
   (build with `--features rocksdb`, then `gbuild --rocksdb` / `gserver
   --rocksdb`). `gbuild --disk` / `--rocksdb` build in bulk (external sort,
   bottom-up B+ tree pages or SST ingest, a crash-safe install), and the ids
@@ -167,8 +188,11 @@ optimizer and a VS-tree signature filter.
   query modes](#storage-layouts-and-query-modes),
   [Performance](#performance) and
   [`docs/STORAGE_BACKEND.md`](docs/STORAGE_BACKEND.md).
-* **HTTP server** speaking upstream gStore's **`/api` protocol** (the upstream
-  SDKs work unchanged) and a REST/SPARQL-protocol API: content negotiation,
+* **HTTP server** speaking upstream gStore's **`/api` protocol** (upstream's
+  Python SDK works unchanged, as `scripts/conformance.sh` checks; the other
+  upstream SDKs speak the same protocol but are not tested) and a
+  REST/SPARQL-protocol API with secure defaults (see [HTTP
+  behaviour](#http-behaviour-and-secure-defaults)): content negotiation,
   users with per-database privileges, IP lists, query/access/transaction logs,
   asynchronous operations with callbacks, file upload/download, a built-in web
   console (`GET /`), task cancellation, and upstream's `conf.ini` and
@@ -183,25 +207,40 @@ optimizer and a VS-tree signature filter.
   logs, zip packages and zipped backups (feature `zip`), upstream 1.3's
   command-line spellings, and a container image, a systemd unit and deb /
   rpm packages ([`docs/DEPLOY.md`](docs/DEPLOY.md)).
-* **Transactions** — commit/rollback, per-key MVCC + snapshot isolation, four
-  named isolation levels, and full + **incremental** backup/restore. Reads of
-  one database run in parallel on both HTTP servers (writes are exclusive),
-  and an HTTP transaction's begin-time snapshot copies no triple on
-  in-memory and on-disk databases (copy-on-write stores, disk read views;
-  RocksDB still copies).
+* **Transactions** — `begin` / `commit` / `rollback` on both HTTP protocols
+  (REST `/begin`, `/tquery`, `/commit`, `/rollback` and the `/api`
+  operations), one transaction per database at a time: a database is
+  single-writer (while one is open, a second `begin` and every other write
+  to it are refused — `/api` codes `1008` / `1004`, REST `409`); upstream's
+  three `isolevel` values are validated, logged and echoed, and all behave
+  serializably. Reads of one database run in parallel on both HTTP servers
+  (writes are exclusive), and an HTTP transaction's begin-time snapshot
+  copies no triple on in-memory and on-disk databases (copy-on-write stores,
+  disk read views; RocksDB still copies). Full backup/restore (`gbackup` /
+  `grestore`, `/api` `backup` / `restore`). The library additionally offers
+  `concurrent::ConcurrentDb` — snapshot-isolated readers, optimistic
+  multi-writer transactions with four named isolation levels
+  (`ReadUncommitted` behaves as `ReadCommitted`) and per-key MVCC version
+  chains — and redo-log incremental backup / restore
+  (`Database::backup_incremental`); no server or command-line tool uses
+  either.
 * **Graph analytics** (`analytics`) — BFS/shortest-path, PageRank, connected
   components, degree/betweenness/closeness centrality, communities, triangles,
   k-core, weighted top-k.
 * **Reasoning** (`reason`) — upstream's JSON inference rules over `/api`
   (`reasonManage`: add, compile, execute, disable, … with exact retraction;
-  see [Reasoning](#reasoning-reasonmanage)) and RDFS materialization; the
+  see [Reasoning](#reasoning-reasonmanage)) and, as library APIs, RDFS
+  materialization and textual rules; the
   inferred `<Rule:…>` edges are ordinary data to SPARQL, the graph functions
-  and PFN functions. Also an **RPC cluster** (`rpc` / `cluster`), and
-  **concurrency/MVCC** (`concurrent`).
+  and PFN functions. Also an experimental **RPC cluster** (`rpc` /
+  `cluster`, see [Experimental: cluster](#experimental-cluster)) and the
+  library-only multi-writer **MVCC** wrapper (`concurrent::ConcurrentDb`).
 
 Remaining large-refactor items are tracked in
 [`docs/REFACTOR_BACKLOG.md`](docs/REFACTOR_BACKLOG.md); C++ parity is documented in
-[`docs/CPP_PARITY.md`](docs/CPP_PARITY.md).
+[`docs/CPP_PARITY.md`](docs/CPP_PARITY.md) (per component, with library-only
+and experimental items marked; the upstream gaps still open are listed in
+[`docs/GAP_PLAN.md`](docs/GAP_PLAN.md) §9.3).
 
 ### CLI tools
 
@@ -226,9 +265,13 @@ gconsole --local mydb        # the embedded REPL on mydb.db (no server)
 gserver mydb.db --port 9000  # single-DB HTTP SPARQL server + web console at /
                              # (no authentication: loopback only, unless
                              # --allow-unauthenticated)
-gserver --api . --port 9000  # full multi-DB API server (users/RBAC, upload, txns,
-                             # tasks, backup/restore); default login root / 123456,
-                             # served on loopback only (set a password to expose it)
+gserver --api . --port 9000 --password-file pw.txt
+                             # full multi-DB API server (users/RBAC, upload, txns,
+                             # tasks, backup/restore); root's password is read from
+                             # pw.txt when the user store is created (or conf.ini's
+                             # root_password): gserver refuses root's default
+                             # 123456 on every address, unless the loopback-only
+                             # compat switch allow_default_root_password=on
 gserver                      # the same API server rooted at db_home (./dbhome/)
                              # on port 9000, settings from ./conf/conf.ini
 gserver -b                   # … started in the background (-s: foreground)
@@ -243,7 +286,17 @@ grestore mydb2 bak           # the database first, then the backup (dir or .zip)
 
 The tools also take upstream 1.3's options (`-db NAME`, `-f FILE`, `-p PATH`,
 `-l`, `-z 0|1`, …), answer `-h`/`--help`, and exit with `0` (done), `1`
-(failed) or `2` (invalid arguments). `gbuild` without a source builds an
+(failed) or `2` (invalid arguments; `gserver` too, which used to exit `1`).
+`gbuild` also exits `3` when the database was built but tolerant mode
+skipped statements (listed in `parse_error.log`) — check for it in
+migration scripts. `gbuild` claims the database directory before it writes
+anything (a directory another process holds makes it fail at once), keeps
+a database it built even when its summary cannot be printed, and removes on
+failure only a directory it created; `gquery -f FILE` and `gexport` replace
+their output only with a complete one (written to `<dest>.part-<pid>-<n>`,
+then renamed); `gdrop` renames the directory aside durably
+(`<name>.db.drop-old`) before deleting it; `gbackup` refuses a destination
+inside the database. `gbuild` without a source builds an
 empty database and refuses to overwrite an existing one unless `--force`;
 `gbuild x.zip` reads a zip package (feature `zip`); `gshow` with no argument
 lists every database in the current directory. *Changed:* `grestore` used
@@ -257,14 +310,26 @@ Every tool opens a database directory whatever its layout (snapshot, on-disk
 write before acknowledging it (gStore's `check_point`; `--no-checkpoint` defers
 saving to `/checkpoint`, `/unload` and the graceful shutdown on Ctrl-C/SIGTERM).
 That save is the whole snapshot on the snapshot layout; the on-disk and
-RocksDB layouts commit each acknowledged write incrementally either way.
+RocksDB layouts commit each acknowledged write incrementally either way. A
+write whose save fails is never acknowledged: it is answered as a failure —
+HTTP `500` from REST and the single-database server, StatusCode `1005` from
+`/api` — with `"applied in memory but not durable: <cause>"`, and clients
+must treat such a reply as "not committed". The write stays applied in
+memory: on the snapshot layout the next successful save, `/checkpoint`,
+`/unload` or shutdown saves it (it is lost if the process dies first); on
+the on-disk layouts a failed commit point breaks the database (`storage
+failed: …`) until it is reopened (unload + load), which discards the
+non-durable writes (see [`docs/DEPLOY.md`](docs/DEPLOY.md#write-failures-and-storage-failed)).
 SPARQL `LOAD` (and `/build?db_path=`) sent to a server reads nothing unless
 `--load-dir DIR` allows it, `/backup` and `/restore` stay inside the server's
 backup directory (`<root>/backups`, or `conf.ini`'s `backup_path`), and SPARQL
 `SERVICE` contacts no remote endpoint unless `--allow-service` is given —
 which also lets `/api` `build` / `batchInsert` / `batchRemove` with
-`remote=true` download `http(s)://` sources (never from a loopback,
-link-local or other host-local address).
+`remote=true` download `http(s)://` sources. Neither `SERVICE` nor those
+downloads ever reach a loopback, link-local, cloud-metadata or other
+host-local address unless `--allow-local-hosts` is given too (unsafe on a
+shared server; the ranges are listed in
+[`docs/DEPLOY.md`](docs/DEPLOY.md#deploying-gstore-rust)).
 
 A database directory is open in **one process at a time**: opening it takes an
 operating-system lock on `<name>.db/LOCK` (every layout; a RocksDB database
@@ -293,12 +358,37 @@ then `kvstore.kv`, then the snapshot's `meta.bin`):
   `conf.ini`'s `[storage] default_layout`, else the snapshot layout.
 * **Disk query mode.** `[storage] disk_query_mode=memory|stream`,
   `GSTORE_DISK_QUERY_MODE=stream|memory`, or
-  `Database::open_with(dir, &OpenOptions::stream())`. Stream opens in
-  milliseconds and keeps only the named graphs, the per-predicate statistics
+  `Database::open_with(dir, &OpenOptions::stream())`. Stream opens the
+  default graph in milliseconds (the named graphs are read whole at open,
+  linear in their quads: [`docs/PHASE6_PLAN.md`](docs/PHASE6_PLAN.md) §8
+  D11) and keeps only the named graphs, the per-predicate statistics
   and bounded caches in memory; Materialize stays the default because Stream
   is still slower on queries with large results (see
   [Performance](#performance)). Both modes read and write the same
   `kvstore.kv`, so a directory can be opened in either, in turn.
+* **RocksDB statements are crash-atomic.** Every SPARQL UPDATE request
+  (`INSERT DATA`, `DELETE` / `INSERT … WHERE`, `LOAD`, `CLEAR`, `DROP`,
+  `ADD` / `COPY` / `MOVE`) and every import of `gadd`, `gsub` and `/api`
+  `batchInsert` / `batchRemove` is journaled in the store's undo journal,
+  so a crash part-way (SIGKILL, an OOM kill, a power loss) is undone as a
+  whole at the next open, without orphan dictionary terms; recovery of a
+  long journal is bounded and resumable. A statement that fails part-way
+  keeps what it applied. Not covered (atomic per triple; a crash leaves a
+  prefix): REST `/batchInsert` / `/batchRemove`, REST `/upload` into a
+  loaded database, and direct library writes (`insert_triple`,
+  `materialize_rdfs`, …). A `check_point` save of a RocksDB database is a
+  commit point (an fsync of RocksDB's write-ahead log); memtables are
+  flushed by `gcompact` / an explicit `Database::checkpoint`, a backup and
+  close. `[storage] rocksdb_max_open_files` bounds the files each RocksDB
+  database keeps open.
+* **Damaged stores are reported**, never a panic: a `kvstore.kv` shorter
+  than its header says, an unreadable write-ahead log, an empty or corrupt
+  `vstree.kv` header or an out-of-range RocksDB dictionary id fails the
+  open; a corrupt VList record or a wrong-length RocksDB key fails the
+  statement — each with an error naming the file or column family (a
+  corrupt VS-tree node met by a query only turns its candidate filtering
+  off). `gcompact --check` also verifies RocksDB's statistics against the
+  data.
 * **Id reclamation** (`[system] id_reclaim=on`, the default): after a delete,
   every term no triple or quad references any more leaves the dictionary and
   its id is reused by the next new term, lowest first, on every layout; the
@@ -310,7 +400,15 @@ then `kvstore.kv`, then the snapshot's `meta.bin`):
   older than Phase 6 refuse it. An existing version-1 `kvstore.kv` is never
   upgraded implicitly: reclamation stays off on it until `gcompact
   --enable-reclaim`. To go back, `gexport` with the new binary and `gbuild`
-  with the old one.
+  with the old one. In such an export → build migration, check `gbuild`'s
+  exit status: `3` means it built the database but skipped statements its
+  tolerant mode refuses (listed in `parse_error.log`), such as ill-typed
+  literals (`"x"^^xsd:integer`) a strict import or an older version stored;
+  rebuild with `--strict`, which keeps such literals as written (it stops
+  only at a statement that does not parse). The readers normalise
+  language tags (`zh_CN` → `zh-CN`, an empty tag → none) and refuse other
+  malformed ones, and SPARQL UPDATE refuses the numeric literals the
+  tolerant loader refuses, so new data exports and builds back whole.
 
 Details: [`docs/STORAGE_BACKEND.md`](docs/STORAGE_BACKEND.md).
 
@@ -401,13 +499,128 @@ SPARQL `LOAD` — reads RDF through one streaming pipeline
   keeps them too; `LOAD <src> INTO GRAPH <g>` loads the document's default
   graph into `<g>` and changes no other graph (SPARQL 1.1 Update).
 * **Blank nodes** are scoped per loaded document: two loads never merge their
-  `_:b`s.
+  `_:b`s. In an N-Quads / TriG document a blank node that names a graph
+  (`_:g`) co-refers with the same label as a subject or object, unless the
+  label was used as a subject or object before it named a graph: such a
+  graph is kept apart (a warning names it). In a document with millions of
+  blank labels, a graph whose label was not used before is also kept apart
+  about 0.5 % of the time — a false positive of the bounded-memory check
+  (about 4 bytes per label), warned about the same way.
+* **Terms are validated by one validator** for every reader and SPARQL: a
+  language tag is `[a-zA-Z]+(-[a-zA-Z0-9]+)*`. Where a format writes the tag
+  as an attribute or string (RDF/XML `xml:lang`, JSON-LD `@language`, RDFa
+  `lang`), surrounding whitespace is dropped, `_` reads as `-` (`zh_CN` is
+  stored as `zh-CN`) and an empty value means no tag; any other malformed
+  tag fails the document, and in N-Triples, N-Quads, Turtle and SPARQL it is
+  a syntax error. A blank-node label outside the grammar (a JSON-LD
+  `"_:a b"`) is stored as `h<16 hex digits>-<label>` (a stable hash, so one
+  label stays one node).
+* **Relative IRIs** resolve per RFC 3986 in every RDF format (Turtle / TriG
+  `@base`, RDF/XML `xml:base`, JSON-LD `@base`, RDFa `<base>`): with base
+  `http://a/b/c/d;p?q`, `../g` is `http://a/b/g`, `//g` is `http://g`.
+  RDF/XML keeps a literal's whitespace exactly, and `rdf:parseType="Literal"`
+  gives an `rdf:XMLLiteral` of the content as exclusive canonical XML. A
+  database built by an earlier version from RDF/XML, JSON-LD or RDFa with
+  such relative references keeps the old, wrong IRIs until it is rebuilt.
+  (SPARQL's own `BASE` still concatenates — a known gap.)
+* **Turtle / TriG details**: numbers follow the grammar (`1.e5` is an
+  `xsd:double`, `1e` or `1.5.5` fail their statement), a prefix may hold
+  inner dots (`@prefix ex.v2: <…>`), and invalid UTF-8 in a comment is an
+  error of the comment's line only. N-Triples / N-Quads: a trailing `.` ends
+  the statement, not a blank-node label (`_:o.` is `_:o`).
+* **Token limit**: one token of a streaming reader (a string, IRI, name,
+  number or language tag, or one N-Triples / N-Quads line) may be at most
+  64 MiB (`gserver` and `gbuild` take `[upload] rdf_max_token_size`, `0` =
+  no limit); a longer one fails its statement, which a tolerant load skips
+  and logs.
 * **Upstream's Turtle leniency**: its extra local-name characters, an IRI
   ending at a space, and raw line breaks inside `"…"` strings (which W3C
   Turtle allows only in `"""…"""`). Recovery stays per line: a statement
   whose string ran across a line break and then failed is reported on the
   string's line and read again from that line break (a string may run on for
   at most 256 KiB).
+
+### SPARQL semantics and known deviations
+
+The evaluator follows SPARQL 1.1 where earlier versions were lenient; the
+W3C-style subset in `tests/w3c/` pins each rule (see
+[Upstream `/api` compatibility and conformance](#upstream-api-compatibility-and-conformance)).
+
+* **Property paths** follow §18.4: `/` and `|` keep duplicates (a node
+  reached by two routes is two solutions), `*`, `+`, `?` and negated sets
+  match distinct nodes, negated property sets with inverse members
+  (`!^p`, `!(p|^q)`) walk the right direction, zero-length paths match
+  constants absent from the data (`ASK { <u> :p* <u> }` is true), solutions
+  come in a deterministic order (so `LIMIT` / `OFFSET` pages tile), and a
+  path whose end point the rest of the group (or the left side of an
+  `OPTIONAL`) binds is evaluated from that end. A query whose `/` or `|`
+  paths would hand out more than 4,194,304 repeated solutions (copies of a
+  pair reached by several routes) fails with a query error; `DISTINCT`,
+  `ASK`, `EXISTS`, a `LIMIT` or a closure (`*`, `+`) avoid it (the budget is
+  `Evaluator::with_path_max_duplicates`; the servers use the default, there
+  is no configuration key).
+* **Joins and scoping.** `GRAPH ?g { P }` keeps a solution only when P
+  leaves `?g` unbound or binds it to that graph; `EXISTS` / `NOT EXISTS`
+  honour the current solution inside `VALUES` blocks and sub-SELECTs; SELECT
+  expressions are evaluated once each, left to right, seeing the aliases to
+  their left; a sub-SELECT parses as a whole group in every position
+  (`WHERE { SELECT … }`, `OPTIONAL { SELECT … }`, …).
+* **`SERVICE`**: a failed non-`SILENT` `SERVICE` (a variable endpoint, an
+  inner pattern the request cannot carry, a connection, HTTP or JSON error)
+  fails the query with an error naming the endpoint, as SPARQL 1.1
+  Federated Query §4 requires — it used to answer no solutions; add
+  `SILENT` for the old reading.
+* **Functions.** `REGEX` / `REPLACE` take the XPath flags `s`, `m`, `i`,
+  `x`, `q` (another flag is an error) and XPath replacement strings (`$1`,
+  `\$`, `\\`); the pattern syntax is the regex crate's (no
+  back-references, no class subtraction). `BNODE()`, `UUID()`, `STRUUID()`
+  and `RAND()` give fresh values on every call, distinct across processes
+  (`BNODE(str)`: one fresh node per string within a solution), and a
+  labelled blank node in a `CONSTRUCT` / `INSERT` template is a fresh node
+  per solution; `NOW()` is one instant per
+  query (whole seconds, UTC); `SECONDS` returns an exact `xsd:decimal`.
+  `sameTerm` is the store's term identity (`"v"` and `"v"^^xsd:string` are
+  two terms); `IRI()` / `URI()` / `STRLANG()` / `STRDT()` reject text that
+  is not an IRI or a language tag. The string and hash functions (`STRLEN`,
+  `SUBSTR`, `UCASE`, `CONTAINS`, `STRSTARTS`, `CONCAT`, `REGEX`, `REPLACE`,
+  `STRLANG`, `MD5`, `SHA*`, …) reject non-string arguments as §17.4.3
+  requires (`STRLEN(1)` is an error: write `STRLEN(STR(?v))`); still
+  lenient: `ENCODE_FOR_URI`, `LANGMATCHES`, `STRDT`'s lexical form,
+  `CONTAINALL` / `CONTAINANY` / `SIMILARITY` and numeric `SUBSTR`
+  positions. `BOUND` of a variable the pattern never binds is false.
+* **Aggregates.** A non-grouped variable in an aggregate query's projection
+  is a query error (§11.4; `HAVING` and `ORDER BY` still see the group's
+  first solution); `MIN` / `MAX` follow the `ORDER BY` order and, like
+  `SAMPLE`, return the stored term; `AVG` divides by the number of numeric
+  values it summed; `DISTINCT` inside an aggregate compares RDF terms (so
+  `"01"^^xsd:integer` and `"1"^^xsd:integer` are two values), in linear
+  time.
+* **Updates.** One existence rule for graph management (§3.1.5, §3.2): a
+  named graph exists while it holds a triple, so `CREATE GRAPH` of an
+  existing graph and `DROP` / `CLEAR GRAPH` of a missing one fail unless
+  `SILENT`. Blank nodes are refused in `DELETE DATA`, `DELETE WHERE` and
+  DELETE templates; delete one stored blank node's triples with
+  `DELETE { <a> <p> ?o } WHERE { <a> <p> ?o FILTER(sameTerm(?o, _:x)) }`
+  (`FILTER isBlank` deletes the triples of every matching blank node).
+  `INSERT DATA`
+  and INSERT templates refuse the numeric literals the tolerant loader
+  refuses (`"x"^^xsd:integer`, an `xsd:integer` beyond 64 bits, `NaN`), so
+  what an update stores exports and builds back (REST `/batchInsert` and
+  `Database::insert_triple` do not check this yet).
+* **Grammar.** `PREFIX foaf:knows <…>` (a prefix with a local part), two
+  triple patterns without a `.` between them, and repeated or misplaced
+  `ORDER BY` / `LIMIT` / `OFFSET` are syntax errors.
+* **Output.** N-Triples output (CONSTRUCT / DESCRIBE answers, exports, TSV)
+  escapes every term, so a stored term can never end its line and forge a
+  statement; the XML results format stays well-formed XML 1.0.
+* **Known gaps.** `DESCRIBE` describes a resource by the triples it is the
+  subject of — not a Concise Bounded Description: blank-node objects are
+  not followed, incoming triples and named graphs are not described. A
+  request's syntax tree is capped at 1,024 links (`MAX_TREE_HEIGHT`),
+  counting every `UNION` branch, `||` / `&&` operand and `/` step of a
+  chain, so a generated query with more than about a thousand chained
+  alternatives is refused as "nested too deeply". `FROM` / `FROM NAMED` are
+  skipped, and SPARQL's `BASE` resolution is concatenation, not RFC 3986.
 
 ### Upstream `/api` compatibility and conformance
 
@@ -416,8 +629,10 @@ The multi-DB server speaks upstream gStore 1.4's `/api` protocol (`GET|POST
 `encryption=1`, the `StatusCode` JSON envelope): the database, user, privilege,
 transaction, log and task operations, `reasonManage` and the PFN operations
 (`funquery`, `funcudb`, `funreview`) with upstream's parameters, fields, codes
-and messages, so the upstream SDKs such as `GstoreConnector.py` work against
-it unchanged, plus upstream's `/shutdown` and `/restart` routes. Its graph
+and messages, so upstream's Python SDK (`GstoreConnector.py`) works against
+it unchanged (`scripts/conformance.sh`); upstream's Java, C++, Node.js, PHP
+and Go SDKs speak the same protocol but are not tested. Upstream's
+`/shutdown` and `/restart` routes are served too. Its graph
 functions answer as upstream's (see below), and `loadcsr` / `load` with
 `csr=1` build the adjacency they run on ahead of the first query. Known
 differences from upstream: a database is **single-writer** — one transaction
@@ -431,8 +646,60 @@ without it they answer `1003` naming the feature — and are unpacked only withi
 names; `export` takes an optional `format` (`nt` / `nq`) and, without it,
 writes N-Quads (`.nq`) for a database with named graphs where upstream's
 N-Triples would drop them; a user holding the restore privilege on a database
-restores only that database's own backups; and asynchronous results are kept
-out of the public export directory.
+restores only that database's own backups; and the export directory is not
+public. `/file/download` needs credentials (parameters, HTTP Basic, or a
+session token) and serves a file only to root / admin or to the user its
+owner record allows — an export to holders of the `export` privilege on its
+database, a query result to holders of `query`, an upload to its uploader;
+`[upload] anonymous_download=on` restores upstream's public directory (an
+upstream-compat switch, see [`docs/DEPLOY.md`](docs/DEPLOY.md#downloads-and-exports)).
+Export and query-result file names carry 128 random bits, exports and query
+results are deleted after `file_retention_hours` (a week by default), and
+spilled asynchronous results a previous run left under `<root>/tasks` are
+removed by the same lazy sweep. Further differences, all gstore-rust
+extensions or hardening:
+
+- **Credentials.** Root's default password `123456` is refused (see [HTTP
+  behaviour](#http-behaviour-and-secure-defaults)); failed logins are
+  locked out per account and client address on every password path, not
+  just per address (`/api` answers a refused attempt `1101`); and a request
+  without a `password` may present a `POST /login` session token instead
+  (`Authorization: Bearer`, `X-Session-Token`, `session=` / `token=`; also
+  for `/file/upload` and, with a `username`, `/file/download`) — as good as
+  the password until it expires (24 h), the user logs out or the password
+  changes. A request carrying a password is checked exactly as upstream's.
+- **Bodies.** A body labelled `application/sparql-query` or
+  `application/sparql-update` is never read as a form, so text inside the
+  statement (`&sparql=…&db_name=other`) cannot replace the statement or the
+  database; JSON, form and multipart bodies are read as before, and a body
+  with another or no `Content-Type` keeps upstream's sniffing. A JSON body
+  holds at most 65,536 values, a form, query string or multipart body at
+  most 65,536 parameters (`1003`). Before authentication a body may be
+  64 MiB: an upload larger than that needs `username` / `password` in the
+  URL query string (see [Configuration](#configuration-confini)).
+- **Transactions.** An open transaction idle for `txn_idle_timeout` (600 s)
+  is rolled back; any superuser (root or an `admin` user) may end any
+  transaction, and `rollback` needs no update privilege; a stale
+  `<begin>_<tid>` id never ends a newer transaction with the same number;
+  `show` and `monitor` report the open transaction as a `transaction`
+  object; a failed commit answers `1005` saying whether it was rolled back
+  or applied but not durable. Details in
+  [`docs/DEPLOY.md`](docs/DEPLOY.md#transactions).
+- **Operations.** `show` lists every database the registry finds (also
+  names shorter than three bytes a REST `/build` or `gbuild` created;
+  other `/api` operations on such a name still answer `1003`); `monitor` /
+  `schema` of an unloaded database are answered from cached statistics
+  while its files are unchanged; `ipmanage` keeps short IPv6 entries such
+  as `::1` in the list files (upstream skips lines shorter than 7
+  characters); `rename` is durable and undone when the registry or the
+  grants cannot be saved; failed `query` statements are recorded in the
+  query log with their real `statusCode` / `statusMsg`; and the
+  transaction log rotates at 32 MiB.
+- **Status codes.** HTTP stays 200 with upstream's `StatusCode`s: a
+  statement cancelled, timed out (`query_timeout`) or too large
+  (`max_result_bytes`), and a store read error, answer `1005 "Query fail:
+  …"`; a write applied in memory but not saved answers `1005` with
+  `"applied in memory but not durable: …"`.
 
 Conformance is tested against upstream's own material, vendored under
 [`testdata/upstream/`](testdata/upstream/README.md):
@@ -445,7 +712,163 @@ Conformance is tested against upstream's own material, vendored under
   Top-K optimizations on and off (two cases follow W3C where upstream's
   script records a different count; both suites document them in one table);
 - `scripts/conformance.sh` starts the real `gserver` and runs upstream's
-  scripts and Python SDK against it unmodified.
+  scripts and Python SDK against it unmodified. The server binds a port the
+  kernel picks (`port=0`; the script writes the port from the server's pid
+  file into `conf/conf.ini` for upstream's scripts), with exactly two
+  upstream-compat switches on (`allow_default_root_password=on`,
+  `anonymous_download=on`, which it checks gserver reported); a suite that
+  cannot run — the Python one without python3's `requests` — fails the run
+  unless `--allow-skip` is given.
+
+Further suites keep the executors and storage backends in step:
+
+- `cargo test --test w3c_subset` runs the hand-authored SPARQL 1.1
+  conformance subset on every storage layout and both executors
+  (`--features rocksdb` adds RocksDB), negative cases included
+  (`expected.error`: `syntax`, or `failure` for an update that must fail and
+  leave the dataset unchanged, also after a reopen); the case format is in
+  [`tests/w3c/README.md`](tests/w3c/README.md). SPARQL behaviour changes
+  should come with a case there, citing the spec section.
+- `tests/executor_differential.rs` checks that the materializing and
+  streaming executors answer every w3c case, LUBM and a probe battery alike
+  on every layout; `tests/storage_backend_conformance.rs` is the one
+  storage-contract suite over every backend. Rerun both after merges.
+- `tests/fsync_audit.rs` checks the fsyncs of every commit point through
+  `gstore::sync_probe`; `tests/adversarial_coverage.rs` maps the review's
+  adversarial categories to their regression tests.
+- New integration tests use `tests/common` (`mod common;`) for temporary
+  paths (`tmp::TempDir`, `tmp::thread_dir`), HTTP requests (`http::request`,
+  with an overall deadline per request) and in-process servers
+  (`server::Running`, stopped and joined on drop): no fixed temporary names,
+  no client read without a deadline, no server left running; bounds on
+  memory or work are asserted by bytes (`tests/common/alloc_counter.rs`) or
+  counters rather than wall-clock time.
+
+### HTTP behaviour and secure defaults
+
+Both HTTP servers — the multi-database API server (REST endpoints and
+`/api`) and the single-database `gserver DIR` — keep upstream's wire
+format, but default to the safe behaviour where upstream's is unsafe on a
+network. Where such a default changes what upstream clients see, an
+upstream-compat switch in `conf.ini` restores upstream's behaviour and makes
+`gserver` print an `upstream-compat: <key>=<value>` line at startup (the
+stricter framing, status codes and limits below have none); the table of
+switches, their risks and the two that `scripts/conformance.sh` turns on is
+in [`docs/DEPLOY.md`](docs/DEPLOY.md#secure-defaults-and-upstream-compat-switches).
+
+* **Root's password.** The API server refuses to start while root has the
+  default password `123456`, on every address: give it one with
+  `--password-file FILE` (or `$GSTORE_ROOT_PASSWORD_FILE`, or `conf.ini`'s
+  `root_password`) when the user store is created. The deb / rpm packages
+  write a random one to `/etc/gstore/root_password` on a fresh install.
+  `[server] allow_default_root_password=on` lets the server start on a
+  loopback address only, accepting `123456` from local clients only.
+* **Parameters follow the `Content-Type`** (REST endpoints and the
+  single-database server): parameters come from the URL query string and
+  from a form body (`application/x-www-form-urlencoded`, or an unlabelled
+  body shaped like a form) only. An `application/sparql-query` or
+  `application/sparql-update` body, and any other raw body, is the
+  statement or document verbatim, so text inside it (`&update=…`,
+  `&db_name=…`) never runs another statement or switches the database; a
+  form body without `query=` / `update=` is a missing statement (`400`).
+  The dataset parameters `default-graph-uri` / `named-graph-uri` (`/sparql`)
+  and `using-graph-uri` / `using-named-graph-uri` (`/update`) are refused
+  with `400` instead of being ignored (empty values are ignored; `FROM` /
+  `FROM NAMED` in the query text are still skipped, a known gap). `/api`
+  keeps upstream's parameter rules, except that a raw SPARQL body is never
+  read as a form.
+* **No updates by GET, no cross-site writes.** `GET /sparql` never runs an
+  UPDATE (`400`), and `POST /update` with `text/plain` or
+  `multipart/form-data` answers `415` (an UPDATE POSTed to `/sparql` still
+  runs); compat switch `allow_get_update`. A state-changing request whose
+  `Origin` is neither the server itself nor listed in `cors_allow_origin`
+  is refused (`403`; `/api`: `1101`), and a request arriving over loopback
+  must name a local host in `Host` (DNS-rebinding guard; `allowed_hosts`
+  lists more). No response carries `Access-Control-Allow-Origin` unless
+  `cors_allow_origin` lists the origin (`*` restores upstream's `ACAO: *`).
+  Clients that send no `Origin` (scripts, the SDKs, `gconsole`) are
+  unaffected; the bundled web console works when opened at the server's own
+  address. Behind a reverse proxy, see
+  [`docs/DEPLOY.md`](docs/DEPLOY.md#browser-facing-defaults-and-reverse-proxies):
+  a loopback peer forwarding `Forwarded` / `X-Forwarded-For` / `X-Real-IP`
+  is not a local client unless `trust_proxy_headers=on`.
+* **Sessions.** REST session tokens are read from the request head or URL
+  only (`Authorization: Bearer`, `X-Session-Token`, `session=` / `token=` URL
+  parameters), no longer from a body parameter; `/login` reads `username` /
+  `password` parameters (not a `Basic` header). Failed logins are counted
+  per account and client address on every password path and locked out
+  with a back-off (REST and single-database `429` with `Retry-After`; see
+  [`docs/DEPLOY.md`](docs/DEPLOY.md#login-lockout)).
+* **Bodies.** Before authentication a request body may be 64 MiB
+  (`preauth_max_body_size`); only a request authenticated from its head —
+  HTTP Basic or a session token on the REST payload routes,
+  `username` / `password` in the URL query string on `/file/upload` and
+  `/api` — may carry up to `upload_max_body_size` (256 MiB). A larger
+  `Content-Length` is answered `413` before the body is read. All bodies in
+  memory share `request_body_budget` (512 MiB; beyond it `503`). A body must
+  arrive at `min_body_rate` (64 KiB/s) on average after a 30 s grace, or the
+  request is answered `400` and the connection closed; one address may hold
+  `max_conns_per_ip` (64) connections.
+* **Strict framing.** Request framing follows RFC 9112 strictly:
+  `Content-Length` together with `Transfer-Encoding`, a signed, non-decimal
+  or conflicting `Content-Length`, any `Transfer-Encoding` but `chunked`
+  (`identity` included), header lines without a colon or with whitespace
+  before it, obs-fold, and control characters (other than tab) in a request
+  line, header or chunk line are answered `400` and the connection closed.
+  No known upstream client sends any of them.
+* **Keep-alive under load.** While connections wait for a worker, a
+  response says `Connection: close` and the connection closes after it; an
+  idle kept-alive connection yields its worker to a waiting one after a
+  1 ms look for a request already on its way.
+* **Status codes** (REST and the single-database server, the same on every
+  endpoint): `400` a syntax or evaluation error; `409` a lock another
+  process holds (a database directory or a paged file) or a transaction
+  conflict; `500` a storage or persistence failure (also a store read error
+  during a query, an I/O error on a lock file, a write applied in memory but
+  not durable); `503` a statement cancelled (`/cancel`, shutdown), timed out
+  (`query_timeout`), too large (`max_result_bytes`) or turned away by the
+  body budget. `/api` keeps HTTP 200 with upstream's `StatusCode`s.
+* **REST `/export`** exports the whole database: N-Triples, or N-Quads when
+  it has a non-empty named graph (`format=nt|nq` picks one; `Content-Type`
+  and file name follow). It is a task listed by `/tasklist` and stopped by
+  `/cancel` (`503`), written to a scratch file under the database's shared
+  guard and streamed once the guard is released.
+* **Downloads** (`/file/download`) need credentials and an owner check
+  (compat switch `anonymous_download`), are streamed in 64 KiB chunks and
+  never compressed: with the `gzip` feature only buffered responses (the
+  JSON envelopes, query results) are.
+* **HTTPS** needs a build with the `tls` feature
+  (`--tls-cert FILE --tls-key FILE`); a `gserver` built without it refuses
+  those options with an argument error (exit status `2`) instead of serving
+  plaintext HTTP.
+
+### Upgrading from an earlier version
+
+Most changes keep data and wire formats; what an upgraded server, client or
+script may notice is listed in [`docs/DEPLOY.md`'s upgrade
+notes](docs/DEPLOY.md#upgrade-notes) and, in full, in
+[`CHANGELOG.md`](CHANGELOG.md). In short: the API server refuses root's
+default password `123456` on every address; browser front ends served from
+another origin (e.g. upstream's Workbench) need their origin in
+`cors_allow_origin`; downloads need credentials, and exports and
+query results are deleted after a week; uploads whose credentials travel in
+the body stop at 64 MiB and every upload at 256 MiB; idle transactions are
+rolled back after 10 minutes; `conf.ini` inline comments follow a narrower
+rule (a note glued to its marker is now part of the value);
+`DELETE DATA { <a> <p> _:x }` is a parse error (use the `sameTerm` form
+above); `gbuild` may exit `3`; `gnode cluster` needs `--state-dir` or
+`--ephemeral`; and `gnlqa` reads no `gnlqa.conf` from the working
+directory.
+
+Data an older version loaded with a malformed language tag or blank-node
+label (`"x"@zh_CN`, a JSON-LD `_:a b`) is stored as it was, but the readers
+now normalise the tag (`zh-CN`) and hash the label, so removing it by
+re-reading its source — `gsub`, `/api` `batchRemove`, REST `/batchRemove` —
+does not match it: the command succeeds, counting those statements as read
+but not removed, and the legacy terms stay. Remove them by their stored
+form, e.g.
+`DELETE { ?s ?p ?o } WHERE { ?s ?p ?o FILTER(lang(?o) = "zh_CN") }`
+(`LANG()` returns the stored tag), or export, normalise and rebuild.
 
 ### Configuration (`conf.ini`)
 
@@ -466,30 +889,88 @@ snapshots included), and `refreshconf` re-applies it to the loaded ones:
 | `early_termination` | `on` | stop `LIMIT` / `ASK` / `EXISTS` evaluations once enough solutions are found |
 | `topk_bounded_heap` | `on` | `ORDER BY … LIMIT` keeps the best rows in a bounded heap |
 | `topk_dpb` | `auto` | DP-B Top-K for `ORDER BY <linear expr> LIMIT`: `auto`, `always`, `off` |
-| `gfun_max_output_bytes` | `67108864` | most bytes of JSON one graph-function call may produce (an embedded `Database` allows 256 MiB) |
+| `gfun_max_output_bytes` | `67108864` | most bytes of JSON the graph-function and `PFN.name` calls of one query may produce together — every call, each `GROUP BY` group and `GRAPH` block included (an embedded `Database` allows 256 MiB) |
 
 In code: `GStoreConfig::query_settings()`, `ApiServer::with_query_settings`,
 `Server::with_query_settings`, `Database::apply_query_settings`.
 
-Other gstore-rust keys: `[server]` `listen_addr`, `keep_alive_timeout`,
-`keep_alive_max`, `queue_size`, `cors`; `[upload]` `unzip_max_entries`
-(default 10000) and `unzip_max_size` (default 10 GiB), the limits a zip
-package must stay within; `[log]` `log_level`, `log_file`, `log_days`,
-`log_stderr` (below). `refreshconf` re-reads the file: the `[query]`
-and `[pfn]` settings, the log configuration (as upstream re-runs log4cplus; a log file
-that could not be opened is tried again), the IP lists, the database and
-user limits and the upload, backup and query / access-log settings take
-effect at once; the address, the worker pool, `check_point`, `db_home` and
-the cap `upload_max_body_size` puts on every HTTP request body need a
-restart (the upload operation's own size check follows the new value).
-A relative `querylog_path` / `accesslog_path` is taken relative to
-`db_home`.
+Other gstore-rust keys (the secure defaults and their upstream-compat
+switches are tabulated in
+[`docs/DEPLOY.md`](docs/DEPLOY.md#secure-defaults-and-upstream-compat-switches)):
+
+* `[server]`: `listen_addr`, `keep_alive_timeout`, `keep_alive_max`,
+  `queue_size`, `cors`; `min_body_rate` (65536 bytes/s a request body must
+  average after a 30 s grace; `0` = the per-read timeout alone) and
+  `max_conns_per_ip` (64 open connections per client address; `0` = no
+  limit); `query_timeout` (3600 s of evaluation per statement, fractions
+  allowed; `0` = off) and `max_result_bytes` (1 GiB per answer; `0` = off),
+  answered REST / single-database `503`, `/api` `1005`;
+  `login_lockout_failures` (4: the fifth failed login locks the account for
+  that client address) and `login_lockout_max_seconds` (900, the longest
+  back-off); and the upstream-compat switches, all off or empty by default:
+  `cors_allow_origin`, `allowed_hosts`, `allow_get_update`,
+  `trust_proxy_headers`, `allow_default_root_password` and
+  `upstream_login_lockout`.
+* `[system]`: `txn_idle_timeout` (600 s: an open transaction idle that long
+  is rolled back; `0` = never, upstream's behaviour, an upstream-compat
+  value).
+* `[upload]`: `upload_max_body_size` is upstream's key, but its default and
+  shipped value is 256 MiB (upstream: 1 GiB); `preauth_max_body_size`
+  (64 MiB, the body cap before authentication) and `request_body_budget`
+  (512 MiB of request bodies in memory per server, never below
+  `upload_max_body_size`); `unzip_max_entries` (default 10000) and
+  `unzip_max_size` (default 10 GiB), the limits a zip package must stay
+  within; `rdf_max_token_size` (64 MiB, the longest token the streaming RDF
+  readers hold and the longest N-Triples / N-Quads line; `0` = no limit) and
+  `sparql_max_size` (16 MiB, the longest SPARQL query or update `gserver`
+  and `gbuild` accept, refused before parsing; `0` = no limit; `gquery`,
+  `gconsole --local`, library callers and `gnode` have no limit);
+  `anonymous_download` (off: downloads need credentials, an upstream-compat
+  switch), `download_max_concurrent` (8 streaming downloads at once),
+  `file_retention_hours` (168: uploads, exports and query results the
+  server recorded are deleted after a week; `0` = keep) and
+  `upload_user_quota` (bytes of retained uploads per user; `0` = none).
+* `[log]`: `log_level`, `log_file`, `log_days`, `log_stderr` (below).
+
+A large upload must carry its credentials in its head to get past the
+64 MiB pre-authentication cap: in the URL query string for `/file/upload`
+and `/api` (an `Authorization` header does not count there), as HTTP Basic
+or a session token for the REST payload routes; the upstream SDKs, which
+send credentials in a JSON or form body, reach 64 MiB only.
+
+`refreshconf` re-reads the file: the `[query]` and `[pfn]` settings, the
+log configuration (as upstream re-runs log4cplus; a log file that could not
+be opened is tried again), the IP lists, the failed-login lockout keys (the
+counts are kept), the database and user limits and the upload, backup and
+query / access-log settings take effect at once; the address, the worker
+pool, `check_point`, `db_home`, the
+HTTP body caps (`upload_max_body_size`, `preauth_max_body_size`) and
+`request_body_budget` need a restart (the upload operation's own size check
+follows the new value). A new `txn_idle_timeout` applies at once to `begin`
+and the request path, but the background pass that reaps idle transactions
+keeps its interval until a restart. A relative `querylog_path` /
+`accesslog_path` is taken relative to `db_home`. In code, the
+single-database server takes the statement limits with
+`Server::with_query_timeout` / `Server::with_max_result_bytes`.
+
+`conf.ini` inline comments: a `#` or `;` starts a comment only when it
+stands as a word of its own after the value (`port=9000  # http`); a marker
+glued to more text stays in the value, as upstream reads it, nothing inside
+double quotes is a comment, `root_password` is never cut, and each cut is a
+startup warning. Command-line flags win over the file, and the `GSTORE_*`
+storage variables below win over their keys whenever a database is opened
+(details: [`docs/DEPLOY.md`](docs/DEPLOY.md#configuration-and-logs)).
 
 A `[pfn]` section (gstore-rust only) sets the sandbox limits of
 [PFN user functions](#pfn-user-graph-functions), applied the same way (to
 every served database, and re-applied by `refreshconf` to the loaded ones and
 to the function registry): `pfn_fuel_per_call` (instructions per call,
-default 10^9, `0` = unlimited), `pfn_max_memory_pages` (default 1024 =
+default 10^9, `0` = unlimited), `pfn_fuel_per_query` (the fuel all the PFN
+calls of one request may use together — every request starts from zero and
+the operations of one UPDATE share one budget; default 10000000000, `0` =
+unlimited; fuel counts instructions, host bytes and each call's
+instantiation, one unit per 8 bytes of its initial memory and data
+section), `pfn_max_memory_pages` (default 1024 =
 64 MiB), `pfn_max_module_bytes` (default 1 MiB) and `pfn_max_functions` (per
 user, default 100). Upstream's `[system] pfn_base_path` (default here:
 `<db_home>/pfn`) is where the functions are stored; it is read at startup.
@@ -509,6 +990,7 @@ query mode it was opened in.
 | `default_layout` | unset (`snapshot`) | the layout `gbuild`, REST `/build` and `/api build` create when the request names none: `snapshot`, `disk` or `rocksdb` |
 | `rocksdb_block_cache_mb` | `256` | MiB of the block cache a RocksDB database shares across its column families; `0` = RocksDB's own default (32 MiB per column family) |
 | `rocksdb_bloom` | `10` | bloom-filter bits per key on RocksDB's point-lookup column families; `on` (= 10) or `off` |
+| `rocksdb_max_open_files` | `4096` | the most files a RocksDB database keeps open; `0` = unlimited (RocksDB's default) |
 
 `[system]` gains `id_reclaim` (`on`, the default, or `off`: ids are then only
 freed by `gcompact --reclaim`; read by `gserver` and `gbuild`, the other
@@ -573,18 +1055,75 @@ computed once — a lone function yields one row; next to other projected
 variables its value is on the last row; with `GROUP BY`, once per group. The
 functions run on a per-predicate CSR that each database builds on the first
 such query after a change and then reuses (`Database::preload_csr` builds it
-eagerly, as the server's `loadcsr` and `load` with `csr=1` do). A call is
-cancelled like any query (`/cancel`, `operationTaskCancel`, shutdown) and its
-JSON is bounded (`[query] gfun_max_output_bytes`, 64 MiB on a server). Upstream parses `cycleBoolean`,
+eagerly, as the server's `loadcsr` and `load` with `csr=1` do — as a task
+`/tasklist` lists and `/cancel` stops). A call is cancelled like any query
+(`/cancel`, `operationTaskCancel`, shutdown), from inside its loops, and so
+are the CSR build and the substring-index build of a `CONTAINS`-style
+filter (a cancelled build caches nothing). The JSON of one query is bounded
+as a whole: `[query] gfun_max_output_bytes` (64 MiB on a server) bounds
+every graph-function and `PFN.name` call of the query together, each
+`GROUP BY` group and `GRAPH` block included, and a query past it fails
+(`<function>: more than N bytes of output in this query`). The iterative
+functions stop at a documented work bound (`gfun::MAX_ITERATION_WORK`,
+2^34 vertex / edge / community visits beyond the first 1024 sweeps, which
+are free, so `maxIter <= 1024` always runs to the end) with an error naming
+it — the typical cause is `tol < 0` / `increase < 0` with a huge `maxIter`.
+Upstream parses `cycleBoolean`,
 `simpleCycleBoolean`, `shortestPathLen` and `kHopReachable` inside `FILTER` but
 never evaluates them there; here that is a clear error. `PFN.name({…})` calls a
 user's own function (see [PFN](#pfn-user-graph-functions) below).
+
+**Upstream quirks, reproduced** for gStore 1.4 compatibility (wrong by
+design; `docs/GAP_PLAN.md` §3.1; details in the rustdoc of
+`src/analytics/gfun/{paths,metrics}.rs` and the `kplex` module):
+
+- `kHopReachable(u, v, directed, k, preds)` searches one round only (at most
+  10 forward pops from `u`, then one backward expansion of `v`): distant
+  pairs answer `false` although reachable (on a 16-node chain, `n0 → n11`
+  within 20 hops is `false`, `n0 → n10` `true`), and a `v → u` edge or a
+  predicate with more in- than out-edges can make an unreachable pair
+  `true`.
+- `cycleBoolean` / `cyclePath` with `directed = false` walk the path back
+  and call it a cycle (every connected pair "has a cycle", an acyclic chain
+  answers `true`, a single edge gives `u → v → u`), every edge printed as
+  forward.
+- `triangleCounting` returns `-1` when the raw total is not divisible by 3
+  (directed) / 6 (undirected), e.g. a self-loop or parallel edges next to a
+  triangle.
+- `maximumKplex` starts from a fake solution of `2k - 2` copies of CSR
+  vertex 0 and returns it when no larger k-plex is found (`k = 2` on an
+  edgeless predicate set gives `[<v0>,<v0>]`), maps ego-network ids through
+  an array the pruning overwrote (repeats or non-members possible) and
+  prints IRIs unquoted; `coreTruss` appends (shrunk) vertex 0 once per
+  peeled vertex while it has edges, IRIs unquoted.
+- `PPR` on graphs with fewer than 4 vertices returns the default slot
+  `{"dst":"<vertex 0>","PPR":0}` for every source, an all-zero result still
+  prints vertex 0, and `kth_ppr` indexes by PPR value (values are
+  deterministic here; upstream seeds with the time).
+- `labelProp` computes modularity with the vertex count as edge count and
+  maps the result through the last iteration's labels (stale labels fall
+  into community 0, a current label nobody carries prints `[]`); `louvain`
+  keeps upstream's `s_tot` assignment (the last edge's weight, not a sum)
+  and prints members as entity ids in a `{"count":C, "community":[…]}`
+  shape that differs from upstream's documentation.
+- `closenessCentrality` of an isolated or missing source prints
+  `"result":-nan`; `clusterCoeff` with a missing constant source answers the
+  global coefficient; `PR`'s entries use the key `"result"` (the docs say
+  `"results"`); `shortestPathCount` and closeness sums wrap like C `int`;
+  `JaccardSimilarity` and `degreeCorrelation` report missing sources as
+  nothing.
+
+The one deliberate deviation: a `,` between consecutive entries where
+upstream writes none (invalid JSON upstream).
 
 **The `rs:` namespace (breaking change).** The functions gstore-rust offered
 before — bare names such as `SSSP(?a, ?b)`, usable in `FILTER`/`BIND` and
 computed per row over a predicate-blind graph — now live in the IRI namespace
 `<urn:gstore-rust:fn:>`, predeclared as the prefix `rs:` (a query's own
-`PREFIX rs:` replaces it), with unchanged semantics and usable anywhere:
+`PREFIX rs:` replaces it), with unchanged answers and usable anywhere —
+except that `rs:LOUVAIN` is now deterministic (ties go to the smallest
+community id), and cycles and entity-to-entity paths run on the database's
+cached CSR:
 
 | before | now | upstream function of that name |
 |--------|-----|--------------------------------|
@@ -655,8 +1194,12 @@ format), so they survive unload / load and restarts, move with `rename`, are
 carried by `backup` / `restore` (zipped backups and `gbackup` / `grestore`
 too; `export` writes data only, as upstream's), kept in `<db>.db.bak` by
 `drop` and removed by `drop` with `is_backup=false` — and by a rebuild in
-place (REST `/build` over an existing database, `gbuild --force`), which
-replaces the database as a drop and a build would; incremental backups
+place (REST `/build` over an existing database, `gbuild --force`, a bulk
+rebuild), which replaces the database as a drop and a build would — under
+the rule lock, renaming the rules aside before deleting them, so neither an
+interrupted rule swap nor a crash during the removal can bring the old
+rules back to the rebuilt database. Rule directories are written
+all-or-nothing (staged, synced and swapped in). Incremental backups
 (`Database::backup_incremental`) carry the rules and ledgers of their time,
 which `restore_incremental` restores with the replayed triples; a database
 without a directory (built in memory through the library) keeps them in
@@ -668,6 +1211,17 @@ Execution is an ordinary autocommit update (query cache, CSR, write-through,
 durability and the query log behave as for a `query` update, and it can be
 cancelled); execute and disable are refused (`1004`) while a transaction is
 open on the database, and execute / disable / check need it loaded.
+
+RDFS materialization (`Database::materialize_rdfs` / `try_materialize_rdfs`)
+and textual rules (`Database::add_rule`, `RuleSet`; `run_rules` /
+`try_run_rules`) are library APIs only — no server operation runs them.
+Textual rules are not persisted (save, backup and open do not carry them),
+and their text is validated with the crate's one term validator (non-ASCII
+or malformed rule text is an error, not a panic). Every reasoner reads and
+writes the default graph only, and RDFS materialization takes only IRIs as
+properties: a literal or blank node in an `rdfs:subPropertyOf`, `domain` or
+`range` position (as OWL writes `[ owl:inverseOf :q ]`) is never made a
+predicate.
 
 **Retraction is exact.** Each execution records which triples the rule owns
 (`reason_rule_files/inferred/<rulename>.nt`): those it added, and those it
@@ -764,11 +1318,24 @@ difference from upstream.
 `gconsole` is upstream gStore 1.4's console: an interactive client of a
 running `gserver`'s `/api` at `127.0.0.1:<port>`, the port read from
 `./conf/conf.ini` like the server's (or `--port N`, `--host H`, `-c FILE`).
-Every request carries the logged-in user's credentials, so the server checks
-that user's privileges.
+It logs in once (`POST /login`) and sends the session token, not the
+password, with every `/api` request, so the password crosses the network
+once per login and the server checks the user's privileges; when the
+session ends (it expires after 24 h, or the user's password changed) the
+console logs in again and repeats the request once, and it logs out when it
+leaves. Against a server without `POST /login` (upstream's gserver) or
+whose `/api` does not take sessions (an older gstore-rust) it falls back to
+upstream's per-request password. `--tls [--ca-file FILE]` (feature `tls`)
+talks to a gserver serving HTTPS, verifying its certificate against
+`--ca-file`, else `$SSL_CERT_FILE`, else the system CA bundle (an unvouched
+certificate is a connection failure and nothing is sent); a plain-HTTP
+connection to a non-loopback host prints a warning that the password and
+every statement cross the network in clear text.
 
 ```text
-$ gserver -b --load-dir data          # let `create` read the data sets in ./data
+$ gserver -b --load-dir data --password-file pw.txt
+                                      # let `create` read the data sets in ./data; root's
+                                      # password from pw.txt (123456 is refused)
 $ gconsole -u root
 Enter password:                       # (not echoed; -p PW or $GSTORE_PASSWORD for scripts)
 ...
@@ -837,9 +1404,12 @@ gStore[lubm]> quit;
   `mdfpfn`, `delpfn`, `buildpfn`; see [Reasoning](#reasoning-reasonmanage)
   and [PFN](#pfn-user-graph-functions) above); `version`, `pwd`,
   `clear`, `quit` / `exit` (or Ctrl-D), and `history [<n>]`.
-* Ctrl-C abandons the statement being typed, or the request in flight: the
-  connection is dropped and, for SPARQL, the server's task is cancelled
-  (`operationTaskCancel`); the console stays open.
+* Ctrl-C abandons the statement being typed (also one typed just before
+  the prompt appeared), or the request in flight: the connection is dropped
+  and, for SPARQL, the server's task is cancelled (`operationTaskCancel`);
+  the console stays open. Every server field the console prints is printed
+  with control characters escaped, so server text cannot drive the
+  terminal.
 * Scripts: `gconsole -u root -p PW -e "use lubm; select * where {?s ?p ?o} limit 5"`,
   or commands on stdin (`gconsole -u root -p PW < script.txt`) run without
   banner or prompts, and the exit code is 1 if any command failed. A command
@@ -856,10 +1426,23 @@ gStore[lubm]> quit;
   fetched as JSON (an unbound cell is shown empty); a local file given to
   `create` / `batchinsert` is sent as an absolute path when the server runs
   on the same machine — the server still only reads files under its
-  `--load-dir` directories and its upload / export directories.
+  `--load-dir` directories and its upload / export directories; `setpriv`
+  accepts `0` alone for "no privilege", refuses an answer that is not a
+  list of privilege numbers (sending nothing), and grants what is missing
+  before revoking what is left over (upstream revokes all, then grants),
+  taking the grant back when the revoke fails.
 * `gconsole --local <db>` (gstore-rust extension; also the older `gconsole
   <db>`) is the embedded REPL that opens `<db>.db` directly, without a
-  server.
+  server. It ends statements by the remote console's rule (a `;` outside
+  `{…}`, strings, `<IRI>`s and comments; a script's last statement may lack
+  it) and keeps the updates it acknowledged: a snapshot-layout or new
+  in-memory database with unsaved updates is saved when the console leaves
+  it (`quit`, end of input, `load <other>`; it prints `saved to <dir>`, and
+  when the save fails `load` keeps the current database and an interactive
+  `quit` stays — a second `quit` leaves without saving). On-disk and
+  RocksDB databases write each update through. Ctrl-C discards only the
+  statement being typed; a console killed by `SIGTERM`, `SIGHUP` or
+  `SIGKILL` does not save.
 
 ### Library API
 
@@ -881,16 +1464,88 @@ let big = Database::open_with("big.db", &OpenOptions::stream())?;
 let r = big.query_read("SELECT ?o WHERE { <a> <p> ?o }", None, None)?;
 ```
 
+* **Errors.** `GStoreError::kind()` classifies an error
+  (`gstore::error::ErrorKind`, `#[non_exhaustive]`: `Parse`, `Query`,
+  `Locked`, `Conflict`, `Corrupt`, `Storage`, `Cancelled`, `Timeout`,
+  `Other`); the servers map it to one HTTP status per kind. A lock another
+  process holds is the variant `GStoreError::Locked` (code that matches
+  `GStoreError` exhaustively needs an arm for it); a database whose on-disk
+  store failed reports `GStoreError::StorageFailed` for every write until
+  it is reopened. `Database::commit_checked` returns `Result<(),
+  CommitFailure>` (`NotCommitted`, `RolledBack`, `NotDurable`,
+  `CommittedWithError`); `commit` reports each as an error.
+* **Inference with errors.** `try_materialize_rdfs()` / `try_run_rules()`
+  report read errors where `materialize_rdfs()` / `run_rules()` count
+  silently.
+* **Builds.** `build_from_ntriples_batched` streams the parse but buffers
+  the encoded ids (12 bytes a triple) and indexes them once: its bounded
+  memory is the parse's, not a bounded id buffer.
+* **Evaluators.** `Database::eval_settings()` and `Evaluator::with_settings`
+  (`EvalSettings`, `EvalProviders`, `StringIndexCell`) are for embedders
+  that build their own evaluators; `Evaluator::stats()` returns the work
+  counters (`EvalStats`), among them `bgp_bindings`, `path_steps` (one per
+  adjacency lookup of a path step) and `join_probe_rows` (rows the hashed
+  operands of `OPTIONAL`, `MINUS` and joins looked at).
+* **Redo log and incremental backup** (`Database::enable_redo_log*`,
+  `enable_update_log*`, `replay_*`, `backup_incremental`,
+  `restore_incremental`; no server or command-line tool turns them on).
+  The records of one commit (an auto-commit UPDATE, a transaction, a
+  `materialize_rdfs` / `run_rules` run) are appended with one write after
+  its commit point and `fdatasync`'ed; a direct-API mutation is appended
+  when applied (a batch call such as `insert_data` or `insert_sources` as
+  one commit) and synced by the next commit point, and `sync()` syncs the
+  logs. The update log takes committed statements only (a rolled-back
+  transaction's never reach it). Every record carries a CRC-32; replay
+  applies a commit only once it read the commit's last record, skips an
+  incomplete last commit (a torn tail, cut off by the next append) with a
+  warning, and reports a damaged record in the middle as corruption. A
+  failed append is reported (an UPDATE answers an error saying it is
+  applied and committed but not logged; `commit` reports
+  `CommittedWithError`) and its records stay owed to the next append;
+  `backup_incremental` refuses while records are owed, when the copied
+  range holds a corrupt record, and after a commit point that failed with
+  an unknown outcome (the logs are "in doubt") — until a full `backup()`
+  starts a new chain. `backup()` is refused inside an open transaction.
+  `restore_incremental` reads its base read-only: a disk or RocksDB base is
+  copied into `<base>.restore-tmp-<pid>-<n>-<nonce>` beside it (the system
+  temporary directory only when the base's parent cannot be written),
+  which needs about the base's size of free space there besides the memory
+  the restored database takes. `replay_update_log` replays records written
+  by earlier versions with the readings those versions had (a labelled
+  blank node in a DELETE names the stored node, `CREATE` / `DROP` / `CLEAR
+  GRAPH` as `SILENT`, the older grammar leniencies).
+* **Shared decoders.** `gstore::util::form` (`url_decode`,
+  `url_decode_bytes`, `parse_form`, `form_lookup`) and
+  `gstore::util::base64::decode(s, Rules)` (`BASIC_AUTH`, `LENIENT`) are
+  the decoders behind the REST endpoints, `/api` and PFN.
+* **`ConcurrentDb`** (`concurrent`) wraps a database for snapshot-isolated
+  readers and optimistic multi-writer transactions (library only): an
+  UPDATE that fails part-way is still published (overlapping transactions
+  conflict), and a panicking writer leaves no lock poisoned.
+
 ### Experimental: cluster
 
 The `cluster` / `rpc` modules and the `gnode` binary (sharded scatter-gather
 over TCP, Raft-style replication, elastic membership) are an **experimental
-library feature**: they are not wired into `gserver` or the HTTP API, keep all
-state in memory, speak an unauthenticated wire protocol that may change, and
+library feature**: they are not wired into `gserver` or the HTTP API, speak an
+unauthenticated wire protocol that may change (trusted networks only), and
 have no counterpart in upstream gStore 1.4 (whose `src/Cluster` is not built,
-and whose distributed edition is not open source). A shard that cannot answer
-fails the query with an error rather than yielding a partial result. Use it for
-experiments, not for data you need to keep.
+and whose distributed edition is not open source). Shard nodes and
+coordinators keep their data in memory. A `gnode cluster` replica needs
+`--state-dir DIR` — its Raft term, vote and log are journaled there
+(`raft.journal`, CRC-checked, fsynced before it answers), so it can be
+restarted safely — or `--ephemeral` (in memory, as before; never restart it
+under the same id); without either it exits with an error. A replica whose
+`raft.journal` is damaged anywhere but in the tail a crash leaves refuses to
+start, naming the byte offset: restore its state directory from a copy, or
+replace the replica (a new id, an empty state directory) rather than cutting
+the file by hand. Forged Raft terms are refused, `ShardedRaftCluster`
+reports only committed writes, a failed `ShardCluster` membership change is
+resumed by repeating it (or `resume_migrations`) and blocks other changes
+until then, and shard-node connections idle or stalled for 60 s are closed.
+A shard that cannot answer fails the query with an error rather than
+yielding a partial result. Use it for experiments, not for data you need to
+keep.
 
 ---
 
@@ -931,7 +1586,7 @@ Design: [`docs/NLQA_DESIGN.md`](docs/NLQA_DESIGN.md). Usage: [`gnlqa/README.md`]
 | `console`     | `gconsole`, the `/api` client (and `--local` REPL)      |
 | `logging`     | diagnostic log: levels, daily rolling file, retention   |
 | `zipio`       | zip packages, zipped backups / exports (feature `zip`) |
-| `rpc` / `cluster` / `concurrent` | RPC cluster, MVCC/transactions      |
+| `rpc` / `cluster` / `concurrent` | experimental RPC cluster; `ConcurrentDb`: library-only snapshot isolation + OCC multi-writer transactions |
 | `reason`      | upstream inference rules (`reasonManage`), RDFS, textual rules |
 | `pfn`         | PFN user graph functions: per-user registry, `GraphCtx`, sandboxed WebAssembly runtime (`pfn-wasm`) |
 | `bulk`        | bulk builds (`gbuild --disk` / `--rocksdb`): external sort, page images / SST ingest, crash-safe install |

@@ -48,12 +48,12 @@
 | 监控/统计API | ✅ | `getDBMonitorInfo` | `Database::stats()`→`DbStats`(计数+索引/事务状态) |
 | Turtle `[ ]` / `( )` | ✅ | `TurtleParser` | 空节点属性列表 + 集合(降级为rdf:first/rest/nil链),含嵌套 |
 | 备份/恢复 + 更新日志 | ✅(全量)/「库」(日志、增量) | `Database::backup/restore/write_update_log` | 全量:`backup`/`restore`(一致快照)+ `backup_dir`(含磁盘KVstore/日志的文件级拷贝),服务器与命令行可用(`/api backup`/`restore`、`gbackup`/`grestore`)。「库」:`enable_update_log`按UPDATE追加长度前缀记录、`replay_update_log`顺序重放;redo日志(`enable_redo_log*`)与增量备份(`backup_incremental`/`restore_incremental`,增量复制的是redo日志,不是update.log)——`gbackup`/`grestore`/`/api`都没有增量选项 |
-| CSR邻接 + 图算法 + topk | ✅(32个高级图函数)/「库」(其余) | `src/Query/topk/` | 上游的32个高级图函数(`analytics::gfun`)经SPARQL与`/api`可用;`analytics::GraphView`的其余算法(带权/带谓语边的Dijkstra与PageRank、Louvain、介数等)与**top-k子图匹配**(`topk_subgraph*`,分支限界)只有库API。缺:topk的GPU/并行实现细节 |
+| CSR邻接 + 图算法 + topk | ✅(32个高级图函数)/「库」(其余) | `src/Query/topk/`(只对应查询top-k,见说明) | 上游的32个高级图函数(`analytics::gfun`)经SPARQL与`/api`可用;`analytics::GraphView`的其余算法(带权/带谓语边的Dijkstra与PageRank、Louvain、介数等)只有库API。**topk**:上游`src/Query/topk`是`ORDER BY … LIMIT`的查询top-k(DP-B),本仓对应的是`src/query/topk.rs`(GAP_PLAN §3.4;仍缺的带环BGP的DP-B与非整数排序键见GAP_PLAN §3.4/§9.3),不是图算法;`WeightedGraphView`的分支限界**top-k子图匹配**(`topk_subgraph*`)是上游没有的额外功能,只有库API,没有SPARQL或服务器调用者(review analytics#10) |
 | 服务化:HTTP | ✅ | `src/Server`/`Api`/`ghttp` | `gserver`:上游`/api`协议(上游SDK可直接用)+ REST/SPARQL 1.1 Protocol端点(GET/POST /sparql、/update等),per-connection worker,鉴权、内容协商(SPARQL Results JSON/XML/CSV/TSV)、chunked流式;HTTPS:feature `tls`(rustls);gzip:feature `gzip`。偏离:不做gRPC(上游并不是protobuf,GAP_PLAN §6) |
 | 集群/分布式分片 | ⚠️「实验」 | `src/Cluster` | `src/cluster`/`rpc`/`gnode`:进程内`ShardedStore` + 网络分片(未鉴权的长度前缀TCP RPC)+ Raft式选举/复制/成员变更——实验特性「库」:不接入`gserver`与HTTP API,状态在内存,线协议可能变化,不是生产级副本/容错,不用于需要保留的数据(README "Experimental: cluster";GAP_PLAN §7第4项:冻结)。上游1.4的`src/Cluster`未编译进产物,分布式版不开源,无对应物 |
-| SERVICE联邦查询 | ✅ | — | `eval_service` + `http_client`:对远程SPARQL端点发HTTP查询并join本地解;SILENT语义(§18.5 join-identity)。缺:VALUES下推等优化 |
+| SERVICE联邦查询 | ✅ | — | `eval_service` + `http_client`:对远程SPARQL端点发HTTP查询并join本地解;SILENT语义(§18.5 join-identity):`SERVICE SILENT`的失败是一个空解,外层解保留。非`SILENT`的失败(连接、HTTP、JSON错误,请求带不了的内层模式)是整条查询的错误,点名端点与原因(Federated Query §4;review robust#6、tests-b#2、sec#17)。变量端点(`SERVICE ?var`)不支持:是错误(`SILENT`时为空解)。缺:VALUES下推等优化 |
 | ID freelist复用(BlockInfo链) | ✅ | `Database::allocEntityID`/`freeEntityID`/`freeLiteralID`/`freePredicateID` | 上游在非事务删除(`txn == nullptr`)后检查度数:实体、字面量、谓词的度数降到0即删字典项并把id放进`BlockInfo`空闲链(LIFO,后放先用;释放最高id时只把上限减一)。Phase 6(R4-RECLAIM)起本版同样释放:每条删除语句结束时(事务内在`commit`时)释放所有不再被三元组/四元组引用的实体、字面量、谓词(含图IRI),所有布局(快照、磁盘Stream/Materialize、RocksDB)都持久化;差异:复用**最低空闲id优先**(上游LIFO),释放最高id时连带下调(trim cascade),事务删除也释放(在提交时),`[system] id_reclaim=off`可关。早期本行写"gStore删除三元组时保留字典项、不适用",与上游源码不符,已更正 |
-| RDFParser分批 + 并行加载 + 数值范围校验 | ✅ | `Parser/RDFParser` | `build_from_ntriples_batched`(有界内存分批flush)+ `build_from_ntriples_parallel`(多线程并行解析);dateTime日域/时域已校验 |
+| RDFParser分批 + 并行加载 + 数值范围校验 | ✅ | `Parser/RDFParser` | `build_from_ntriples_batched`(流式解析,编码后的id一次批量建索引,每三元组缓冲12 B;review db#15:此前每批重排整个库,二次复杂度)+ `build_from_ntriples_parallel`(多线程并行解析);dateTime日域/时域已校验 |
 
 ## 代码检视结果
 

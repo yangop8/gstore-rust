@@ -13,7 +13,7 @@
 3. **gStore 标志性能力只做到"同名"**:24 个图分析函数在上游语法下**无一能解析**,语义和输出也不同;推理引擎和 PFN 自定义函数没有对外入口(§3)。
 4. **规模与运维**:没有真正的磁盘原生查询路径,导入不流式、不容错,没有 conf.ini、日志体系、打包和 CI(§4、§5)。
 
-**进度(截至 Phase 6 结束)**:Phase 0–6 都已完成(各阶段状态见下文各节的"状态"段、§8 表格与 §9 状态表,逐项变更见 `CHANGELOG.md`)。Phase 6(规模与性能,§8 第 6 行)按 `docs/PHASE6_PLAN.md` 分 4 轮实施,退出闸门 G1–G7 中 G1a–G1d、G3、G6、G7 通过,G2、G4、G5 各有一部分未达(实测值、原因与后续见 §9 与 `docs/BENCHMARKS.md`);仍未补齐的上游差距见 §9.3。
+**进度(截至 Phase 6 结束)**:Phase 0–6 都已完成(各阶段状态见下文各节的"状态"段、§8 表格与 §9 状态表,逐项变更见 `CHANGELOG.md`)。Phase 6(规模与性能,§8 第 6 行)按 `docs/PHASE6_PLAN.md` 分 4 轮实施,退出闸门 G1–G7 中 G1a–G1d、G3、G6、G7 通过,G2、G4、G5 各有一部分未达(实测值、原因与后续见 §9 与 `docs/BENCHMARKS.md`);仍未补齐的上游差距见 §9.3。Phase 6 之后,一次对 Phase 6 代码(`7bbf4ae`)的代码审查分五轮修复(review-fix campaign,2026-11);它改变了状态的各项见 [§10](#10-review-fix-campaign-的状态),逐项变更见 `CHANGELOG.md` 的 "Review-fix campaign" 一节,留待以后的项见 `docs/REFACTOR_BACKLOG.md`。
 
 ---
 
@@ -33,7 +33,7 @@
 | 1.10 | **CI 缺失,测试不稳定** | 没有 `.github/`;Raft 网络用例在"刚选出 leader 就 propose"时存在竞态;`.DS_Store` 被提交进了仓库 | 加 GitHub Actions(fmt、clippy、test,覆盖 default/gzip/tls/rocksdb 四种 feature);propose 遇到 NotLeader 时重试;删除 `.DS_Store` | S |
 | 1.11 | **文档自评失真** | `CPP_PARITY.md` 中至少 20 处表述与代码不符(如 HTTP ✅、图函数"已对齐"、流式磁盘查询 ✅、四级隔离、PFN 等价……) | 按本复核重写差距矩阵 | S |
 
-**状态(Phase 0 已完成)**:1.1–1.10 全部修复——磁盘库与 RocksDB 库的写入逐次落到各自存储(WAL 提交点、RocksDB 列族 + 撤销日志),快照保存按组原子化,`Database::open` 自动识别布局;restore 先暂存校验再整体替换;服务端按 `check_point` 落盘、优雅退出时保存,`/batchInsert` 只应用解析后的三元组,`LOAD` 受 `LoadPolicy` 约束;字典 ID 空间有界,内建函数参数个数在解析期校验;密码改为带版本的 PBKDF2-HMAC-SHA256;HTTP 事务对非持有者提供开始时快照;GitHub Actions CI。1.11:`CPP_PARITY.md` 保留原矩阵,各阶段的更正与补齐以"更新"段落记在其中。
+**状态(Phase 0 已完成)**:1.1–1.10 全部修复——磁盘库与 RocksDB 库的写入逐次落到各自存储(WAL 提交点、RocksDB 列族 + 撤销日志),快照保存按组原子化,`Database::open` 自动识别布局;restore 先暂存校验再整体替换;服务端按 `check_point` 落盘、优雅退出时保存,`/batchInsert` 只应用解析后的三元组,`LOAD` 受 `LoadPolicy` 约束;字典 ID 空间有界,内建函数参数个数在解析期校验;密码改为带版本的 PBKDF2-HMAC-SHA256;HTTP 事务对非持有者提供开始时快照;GitHub Actions CI。1.11:`docs/CPP_PARITY.md` 的三张状态表已按代码重写(2026-11,review gap-doc-claims#3/#4/#5):区分服务器、「库」与「实验」,旧"更新"段落中与代码不符的表述就地加〔更正〕(此前保留原矩阵,各阶段的更正与补齐以"更新"段落记在其中;见 §10)。
 
 ## 2. P1 · 上游兼容层(让 SDK / Workbench / 上游测试脚本直接可用)
 
@@ -109,7 +109,7 @@
 **④ 测试**
 - 以上游 `SPARQL_QUERY.md` 中的全部示例和 `scripts/test/bfs_test` 作为黄金用例。
 
-**状态(Phase 2 已完成)**:上游 1.4 的 32 个高级图函数按上游语法、语义与 JSON 输出重做,运行在按库缓存的 CSR 上(`loadcsr` / `load csr=1` 预建);旧的 Rust 语义保留在 `rs:` 命名空间下(§7 第 2 项按推荐执行);`SPARQL_QUERY.md` 示例与 bfs_test 输出与上游一致。
+**状态(Phase 2 已完成)**:上游 1.4 的 32 个高级图函数按上游语法、语义与 JSON 输出重做,运行在按库缓存的 CSR 上(`loadcsr` / `load csr=1` 预建);旧的 Rust 语义保留在 `rs:` 命名空间下(§7 第 2 项按推荐执行);`SPARQL_QUERY.md` 示例与 bfs_test 输出与上游一致。更新(review-fix campaign,analytics#4):旧的 `rs:` 图内建函数里,环与实体到实体的路径不再每次查询从全库重建 `GraphView`,改用数据库缓存的 CSR;其余的仍按查询构建(它们需要字面量宾语),现在可以取消(§10)。
 
 ### 3.2 推理引擎(`reasonManage`)
 
@@ -180,7 +180,7 @@
 - **命名图**:TriG/N-Quads 导入时保留命名图;导出支持命名图(N-Quads)和 zip。
 - **RDF/XML**:支持 DTD 实体和 `parseType="Collection"`。
 
-**状态(Phase 5 已完成)**:Turtle/TriG/N-Triples/N-Quads 流式读取,所有批量加载走同一条导入流水线(`src/parser/import.rs`),上游式容错导入(`parse_error.log`、`success_num`/`failed_num`);目录、URL、zip(feature `zip`)来源;按扩展名分派格式;空节点按每次加载分域;本地名宽松度对齐;TriG/N-Quads 保留命名图,导出支持 N-Quads 与 zip;RDF/XML 支持 DTD 实体与 `parseType="Collection"`;SPARQL `LOAD` 经同一流水线且原子。
+**状态(Phase 5 已完成)**:Turtle/TriG/N-Triples/N-Quads 流式读取,所有批量加载走同一条导入流水线(`src/parser/import.rs`),上游式容错导入(`parse_error.log`、`success_num`/`failed_num`);目录、URL、zip(feature `zip`)来源;按扩展名分派格式;空节点按每次加载分域;本地名宽松度对齐;TriG/N-Quads 保留命名图,导出支持 N-Quads 与 zip;RDF/XML 支持 DTD 实体与 `parseType="Collection"`;SPARQL `LOAD` 经同一流水线且原子。更新(review-fix campaign,r3-parser):Turtle / TriG、RDF/XML、JSON-LD 与 RDFa 共用一个 RFC 3986 解析器解析相对 IRI;RDF/XML 的 `parseType="Literal"`(`rdf:XMLLiteral`,规范 XML)与按 §7.2.21 的空属性元素;Turtle 的数值与前缀按 1.1 语法;单个记号的上限 `[upload] rdf_max_token_size` 与 SPARQL 请求的上限 `[upload] sparql_max_size`(§10)。
 
 ## 5. P2 · CLI / gconsole / 运维
 
@@ -199,7 +199,7 @@
   - `gshow` 改为列出全部库(上游语义)。
   - `gbuild` 支持建空库,并加防覆盖保护。
 
-**状态(Phase 5 已完成)**:`gconsole` 重写为 `/api` 客户端,实现上游 43 条命令(reason 与 pfn 系列在与 Phase 4 合并后对真实服务端可用)及交互体验(feature `readline` 提供行编辑与补全);`src/logging.rs` 按上游 `log_mode` 属性文件配置诊断日志,按天滚动与保留,查询日志为 JSON 并带 IP、结果数与耗时;Dockerfile、systemd unit、deb/rpm 元数据与 `docs/DEPLOY.md`;老工具兼容项全部完成。
+**状态(Phase 5 已完成)**:`gconsole` 重写为 `/api` 客户端,实现上游 43 条命令(reason 与 pfn 系列在与 Phase 4 合并后对真实服务端可用)及交互体验(feature `readline` 提供行编辑与补全);`src/logging.rs` 按上游 `log_mode` 属性文件配置诊断日志,按天滚动与保留,查询日志为 JSON 并带 IP、结果数与耗时;Dockerfile、systemd unit、deb/rpm 元数据与 `docs/DEPLOY.md`;老工具兼容项全部完成。更新(review-fix campaign,infra#7):Docker 镜像与 deb / rpm 包由 `.github/workflows/packaging.yml` 构建、安装并冒烟(`scripts/package-smoke.sh`,见 §10 与 `docs/DEPLOY.md` 的 "Package smoke")。
 
 ## 6. 不需要补 / 本仓已领先
 
@@ -235,7 +235,7 @@
 | 2 | §3.1 图函数 + CSR | 3 周 | `SPARQL_QUERY.md` 中的全部示例和 bfs_test 输出与上游一致 | 已完成 |
 | 3 | §4.1 SPARQL 细节 + §3.4 Top-K / 提前终止 | 2–3 周 | parser_test 50 组通过 | 已完成 |
 | 4 | §3.2 推理 + §3.3 PFN | 3 周 | reasonManage 走完全生命周期,PFN 示例可跑 | 已完成(含 gconsole 对接,见 §3.2/§3.3) |
-| 5 | §4.2 导入导出 + §5 gconsole/日志/打包 | 3 周 | README 中 `gconsole -u root` 的流程能照做;Docker 镜像可用 | 已完成 |
+| 5 | §4.2 导入导出 + §5 gconsole/日志/打包 | 3 周 | README 中 `gconsole -u root` 的流程能照做;Docker 镜像可用 | 已完成(review-fix campaign 起镜像与 deb / rpm 包在 CI 中安装并冒烟,见 §10) |
 | 6 | 规模与性能(长期):`Backend::Disk` 流式查询直接穿透 `Database`、字典与 VS-tree 留在磁盘、持久化 StringIndex、批量建索引(B+ 树 bulk load / RocksDB SST ingest)、读写锁或廉价快照替代 `Mutex<Database>`、删除时即时回收 ID | 持续 | LUBM/WatDiv 的规模和延迟与上游同量级 | 已完成(G7 达成;G2、G4、G5 部分未达,见 §9) |
 
 ## 9. 状态表与 Phase 6 结论
@@ -251,10 +251,10 @@
 | 2 | §3.1 高级图函数 + CSR | 已完成 | `SPARQL_QUERY.md` 全部示例与 bfs_test 输出与上游一致 |
 | 3 | §4.1 SPARQL 细节 + §3.4 Top-K / 提前终止 | 已完成 | parser_test 50 组在优化开 / 关两种设置下通过 |
 | 4 | §3.2 推理 + §3.3 PFN | 已完成 | `reasonManage` 走完全生命周期;PFN 示例可跑(`pfn-wasm`) |
-| 5 | §4.2 导入导出 + §5 gconsole / 日志 / 打包 | 已完成 | README 的 `gconsole -u root` 流程可照做;Docker 镜像可用 |
+| 5 | §4.2 导入导出 + §5 gconsole / 日志 / 打包 | 已完成 | README 的 `gconsole -u root` 流程可照做;Docker 镜像可用。review-fix campaign(infra#7):Docker 镜像与 deb / rpm 包由 `.github/workflows/packaging.yml` 构建、安装并冒烟(`scripts/package-smoke.sh`;deb 在 runner 上经 systemd 启动,rpm 在 Fedora 容器中 `rpm -V`,镜像在非默认端口上 healthy) |
 | 6a | `Backend::Disk` 流式查询直通 `Database`(Stream 模式) | 已完成;可选模式,默认仍是 Materialize | G1b、G1c、G1d 通过:热打开 0.92 ms、冷 7.5 ms,打开后 RSS 6.1 MiB,Q1–Q14 几何均值 11.55 ms = pre 磁盘布局的 0.079 倍、同一提交快照布局的 1.14 倍。R3-STREAM 自己的翻转条件(每条查询 ≤ 2.0 × Materialize、几何均值 ≤ 1.4 ×)仍不满足(Q14 2.15 倍、几何均值 1.48 倍),所以默认模式没有改 |
 | 6b | 字典与 VS-tree 留在磁盘 | 已完成 | out-of-core 字典 `DiskDict`(有界的 `TermCache` / `KeyCache`,结果按排序批量解析);`vstree.kv` 不在打开时重建,`VsPolicy::Auto` 下查询从 store 精确算出树给出的候选集、不读它的页(R4-VS 安静阶段,univ 38 Stream:几何均值 11.66 ms,强制旧的逐页遍历 `GSTORE_VS_POLICY=tree` 时 47.70 ms) |
-| 6c | 持久化 StringIndex | 已完成上游含义;trigram 索引持久化延后 | 上游含义(持久化 id → 串、按偏移排序的批量访问)= `id2*` IvArray + `Dictionary::prefetch` / `resolve_many`;内存字典的 trigram 子串索引按字典 generation 缓存(R2-DICT 安静阶段 univ 8:重复的子串查询 11.7–16.9 ms,首次 2,073.6–2,888.5 ms);持久化 `lexindex.kv` 按计划延后(`docs/PHASE6_PLAN.md` §8 D5) |
+| 6c | 持久化 StringIndex | 已完成上游含义;trigram 索引持久化延后 | 上游含义(持久化 id → 串、按偏移排序的批量访问)= `id2*` IvArray + `Dictionary::prefetch` / `resolve_many`;内存字典的 trigram 子串索引按字典 generation 缓存(R2-DICT 安静阶段 univ 8:重复的子串查询 11.7–16.9 ms,首次 2,073.6–2,888.5 ms);持久化 `lexindex.kv` 按计划延后(`docs/PHASE6_PLAN.md` §8 D5)。review-fix campaign(gap-accel-soundness#3、db#5):缓存的索引只存候选(不再复制词串),新增或释放词的写入之后增量扩展而不是重建 |
 | 6d | 批量建索引(B+ 树 bulk load / RocksDB SST ingest) | 已完成 | G1a、G3 通过:`gbuild --disk` 18.38–21.06 s(pre 1,627.59 s),1,024 MiB 预算下峰值 398–400 MiB,`kvstore.kv` 是 pre 的 0.697 倍;`gbuild --rocksdb` 19.50 s(pre 277.76 s);崩溃安全安装,id 与内存构建相同 |
 | 6e | 读写锁 / 廉价快照替代 `Mutex<Database>` | 已完成;G4 未全达 | 8 / 1 客户端的 Q4 吞吐比:快照布局 5.33(`/sparql`)/ 4.63(`/api`),Stream 4.06 / 4.73(pre 0.78 / 0.86);`/begin` 中位数 0.38 / 0.44 ms、RSS +0.07 / +0.06 MiB;未达:`/api stat` 每请求阻塞采样 200 ms CPU(201.6–219.8 ms,R4-SNAP 安静阶段;其余监控端点 ≤ 48.4 ms) |
 | 6f | 删除时即时回收 id | 已完成(所有布局,默认开);G5 未全达 | live 计数恰等于被引用的词、高水位 1.000(R4-RECLAIM 安静阶段,10 轮 churn,四种布局);未达:相对第 0 轮 +5.20%(churn 数据本身 +5.23%),内存与 Materialize 的删除开销 1.13 / 1.14(目标 ≤ 1.10) |
@@ -273,5 +273,24 @@ Phase 6 的目标是"LUBM/WatDiv 的规模和延迟与上游同量级"(§8 第 6
 - **磁盘布局的容量上限**:每个 id 空间至多 33,554,432 项(IvArray),字典键至多 2,038 字节(B+ 树半页);超出时明确报错,feature bit 1 / 2 为此保留(D7)。计划估计 LUBM-1000 约 22M 个实体,仍在上限内。
 - **空间回收与大事务原子性**:`kvstore.kv` 只增不减(没有 vacuum,D9;R4-RECLAIM 的 churn 里 Stream 文件涨到第 0 轮的 1.474 倍);大于页缓存的磁盘事务持久但不整体原子(D12)。
 - **快照布局在 `check_point` on 时每次写重写整个快照**(univ 38 每次约 1.1 s,混合负载读者 12.5 / 10.1 qps);需要逐次增量落盘时用磁盘布局(与上游 KVstore 的方式一致)。
-- **Top-K 与 SPARQL 细节**:DP-B 只处理树形 BGP 与整数排序键(上游还会切断一条环边);Phase 3 记下的其余已知差异(带标签空节点的语义、`FROM` / `FROM NAMED` 被跳过、部分字符串函数的参数兼容性检查等)见 `CHANGELOG.md` 的 Phase 3 "Known gaps"。
+- **Top-K 与 SPARQL 细节**:DP-B 只处理树形 BGP 与整数排序键(上游还会切断一条环边);Phase 3 记下的其余已知差异(带标签空节点的语义、`FROM` / `FROM NAMED` 被跳过等)见 `CHANGELOG.md` 的 Phase 3 "Known gaps"(其中字符串函数的参数兼容性检查已由 review-fix campaign 补上,sparqlconf#17)。
+- **SPARQL Protocol 的数据集参数**:协议参数 `default-graph-uri` / `named-graph-uri` / `using-graph-uri` / `using-named-graph-uri` 在两种服务器上都以 `400` 拒绝(review-fix campaign,gap-doc-claims#2;此前被静默忽略,在整个默认图上求值;空值不指定图,照旧忽略);查询文本里的 `FROM` / `FROM NAMED` 仍被解析器跳过(未变的已知差距)。
 - **刻意的偏离**(不计划补):PFN 函数体是 WebAssembly 文本而非上游的 C++(`docs/PFN.md`);推理规则精确撤回;id 复用取最低空闲 id(上游 LIFO);上游不开源的分布式版本没有对应物,本仓的 `cluster` / `rpc` 仍是实验特性(§7 第 4 项)。
+
+## 10. Review-fix campaign 的状态
+
+> 2026-11。Phase 6 结束后,一次对 Phase 6 代码(`7bbf4ae`)的代码审查(24 位审查者,去掉 3 项被驳回的之后 382 个发现编号,合并为 291 项)分五轮、37 个工作包修复,每轮合并后再审查一次并先修好确认的发现。逐项变更与测试见 `CHANGELOG.md` 的 "Review-fix campaign" 一节;部分修复的余项、10 个延后的编号与各包留下的后续见 `docs/REFACTOR_BACKLOG.md`;安全默认值与上游兼容开关见 `docs/DEPLOY.md` 的 "Secure defaults and upstream-compat switches";提交、恢复与格式方面的改动见 `docs/STORAGE_BACKEND.md` 的 "Review-fix campaign" 一节(没有任何数据库文件格式变化)。
+
+下表是改变了本文档所跟踪的某一项状态或说明的条目:各工作包报告的状态行,外加 §9.3 引用的 Phase 3 已知差异中已修掉的一项(最后一行);其余各包(以及每一轮的集成)都报告本文档跟踪的状态不变。"工作包"一列的名字可在 git 历史里找到(合并的分支 `fix/<包名>`,以及收尾时删除的片段 `changelog.d/<包名>.md`)。§8 与 §9.1 各行仍是"已完成"(第 6 行的部分未达不变),上面相应的状态段落与表格说明已就地注明。
+
+| 本文档中的位置 | 变化 | 审查编号 | 工作包 |
+|---|---|---|---|
+| §1 第 1.11 项(文档自评失真) | `docs/CPP_PARITY.md` 的三张状态表已按代码重写(2026-11):区分服务器、「库」与「实验」,旧"更新"段落中与代码不符的表述就地加〔更正〕 | gap-doc-claims#3、#4、#5 | r4-concurrent |
+| §3.1 状态 | 旧的 `rs:` 图内建函数里,环与实体到实体的路径不再每次查询从全库重建 `GraphView`,改用数据库缓存的 CSR;其余的仍按查询构建(它们需要字面量宾语),现在可以取消 | analytics#4 | r2-analytics |
+| §4.2 状态("RDF 导入导出") | Phase 5 的 RDF 读取器:Turtle / TriG、RDF/XML、JSON-LD 与 RDFa 共用一个 RFC 3986 解析器;RDF/XML 的 `parseType="Literal"`(`rdf:XMLLiteral`,规范 XML)与按 §7.2.21 的空属性元素;Turtle 的数值与前缀按 1.1 语法;单个记号上限 `[upload] rdf_max_token_size`(默认 64 MiB)与 SPARQL 请求上限 `[upload] sparql_max_size`(默认 16 MiB);两者 `0` = 不限 | parser#4、#5、#8、#9、#10、#11 | r3-parser |
+| §5 状态、§8 与 §9.1 第 5 行(打包) | Docker 镜像与 deb / rpm 包由 `.github/workflows/packaging.yml` 构建、安装并冒烟(`scripts/package-smoke.sh`;deb 在 runner 上经 systemd 启动,rpm 在 Fedora 容器中 `rpm -V`,镜像在非默认端口上 healthy;`docs/DEPLOY.md` 的 "Package smoke") | infra#7 | r5-packaging |
+| §9.1 第 6c 行(只改说明,状态不变) | 内存字典缓存的 trigram 子串索引只存候选(不再复制词串),新增或释放词的写入之后增量扩展而不是重建 | gap-accel-soundness#3、db#5 | r2-index-cancel |
+| §9.3(SPARQL Protocol 的数据集参数) | 协议参数 `default-graph-uri` / `named-graph-uri` / `using-graph-uri` / `using-named-graph-uri` 在两种服务器上都以 `400` 拒绝;查询文本里的 `FROM` / `FROM NAMED` 仍被解析器跳过(未变的已知差距) | gap-doc-claims#2 | r1-http-surface |
+| §9.3(SPARQL 细节) | 字符串与哈希函数按 SPARQL 1.1 检查参数类型与参数兼容性(Phase 3 "Known gaps" 中的一项);仍然宽松的几处见 `CHANGELOG.md` | sparqlconf#17 | r4-sparql-guard |
+
+§9.3 的其余各项(并发事务、默认磁盘查询模式、磁盘布局的容量上限、空间回收与大事务原子性、`check_point` 下的快照重写、刻意的偏离)不变。
