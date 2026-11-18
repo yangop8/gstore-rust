@@ -42,6 +42,26 @@ Wiring (integration commits):
   the table in `changelog.d/r5-test-audit.md` is left as that package
   wrote it (fragments are folded by the closing step).
 
+Round-5 review follow-ups (after f492b14; each fix with a test that
+failed before it, recorded in the fragment of the package whose code it
+corrects): the raft journal refuses damage before acknowledged records
+instead of cutting them (r5-cluster); gnlqa's limiter never resets a
+throttled bucket, connections are capped per client at accept time, a
+panicking linker build waits for the retry interval, the linker cache
+trusts only regular files of the process's own user, the dead test port
+is port 0 (r5-gnlqa); a session-token `/api` `login` leaves the
+failed-login lockout alone and Ctrl-C no longer ends `gconsole --local`
+with its unsaved updates (r5-console); a database directory that existed
+before its build or save is made durable, `gbuild`'s claim creates it
+durably, and the fsync audit compares content digests (r5-test-audit);
+the rewritten tests' closed-port probes, `/shutdown` hash park and split
+doc comment (r5-test-audit), the wide-PFN-argument CPU-time ratio and two
+failure-path temp cleanups (r5-test-hygiene). No compat switch, no format
+change, no public item removed (new: `BuildGuard::create_and_lock`,
+`HttpServer::with_max_conn_per_client`, the `Ctx::session_auth` field,
+the doc-hidden `sync_probe::content_digest` / `SyncEvent::digest` and
+`http_users::test_hooks::park_verification_attempt`).
+
 Nothing else to wire: no round-5 package added a compat switch (no
 standalone `upstream-compat` line to fold into
 `GStoreConfig::upstream_compat_warnings`, convention 13c), and only
@@ -161,6 +181,29 @@ jobs, but the feature, RocksDB and stream-mode runs overlapped each other
   gnlqa`: both pass on the merged tree.
 - The console-test guard commit: `cargo test -p gstore --lib console::`
   28 passed.
+
+- Round-5 review follow-ups (head of the follow-up commits; toolchain
+  1.99.1, debug info off, heavy steps through the two-slot limiter; other
+  campaign jobs ran meanwhile, load average up to about 7):
+  `cargo fmt --all -- --check` clean; `cargo clippy --workspace
+  --all-targets -- -D warnings` clean, and `-p gstore --features "zip
+  pfn-wasm readline tls gzip"` clean; `cargo test --workspace
+  --no-fail-fast`: `GSTORE_DISK_QUERY_MODE=memory` 236 runs, 3316 passed,
+  0 failed, 10 ignored; `stream` 236 runs, 3316 passed, 0 failed, 10
+  ignored (`tests/fsync_audit.rs` 23, gnlqa 189 unit + 77 integration).
+  RocksDB (target-rocks, sources touched, lock held): clippy `-p gstore
+  --all-targets --features rocksdb` clean; `cargo test -p gstore --features
+  rocksdb --no-fail-fast` 208 runs, 3055 passed, 0 failed, 10 ignored
+  (`fsync_audit` 27). `--features "zip pfn-wasm readline"`:
+  `dt_phase4_review_fixes`, `dt_gconsole`, `fsync_audit`,
+  `api_session_tokens` all pass. `scripts/conformance.sh` (TMPDIR in the
+  scratch directory, empty afterwards): all six suites PASS (parser's known
+  cases 15 and 17). `/tmp` listed before and after the two workspace runs
+  and the RocksDB run: identical (72 entries). The bench smoke gate was not
+  run: no hot path changed (one extra directory fsync per build and per
+  save elsewhere; the probe's digest only while a probe is alive).
+  MSRV 1.89 was not rechecked (that toolchain is not installed here); the
+  new code uses no API newer than 1.82.
 
 ## Requests/Not yet
 

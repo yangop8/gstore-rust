@@ -120,6 +120,10 @@ none
   for 60 s are closed; a failed `ShardCluster` membership change is resumed
   by repeating it (or `resume_migrations`) and blocks other changes until
   then; the wire protocol is still unauthenticated — trusted networks only.
+  A replica whose `raft.journal` is damaged anywhere but in the tail a
+  crash leaves refuses to start (the error names the byte offset): restore
+  its state directory from a copy, or replace the replica (a new id and an
+  empty state directory) rather than cutting the file by hand.
 - docs/DEPLOY.md (where `gnode` is listed among the packaged binaries): one
   line that `gnode cluster` requires `--state-dir DIR` or `--ephemeral`.
   This is not a gserver upstream-compat switch (`gnode` has no upstream 1.4
