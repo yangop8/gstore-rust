@@ -848,10 +848,14 @@ impl RocksStore {
     /// a power failure, not only a process crash. Cheaper than [`flush`](Self::flush)
     /// (no memtable → SST compaction); the `Database` facade calls it at each
     /// commit point.
+    #[track_caller]
     pub fn sync_wal(&self) -> Result<()> {
         self.db
             .flush_wal(true)
-            .map_err(|e| GStoreError::Database(format!("rocksdb WAL sync: {e}")))
+            .map_err(|e| GStoreError::Database(format!("rocksdb WAL sync: {e}")))?;
+        // Recorded for the fsync audit (review tests-b#3).
+        crate::sync_probe::rocks_wal_synced(self.db.path());
+        Ok(())
     }
 
     /// The directory this RocksDB store lives in.

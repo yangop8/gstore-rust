@@ -749,7 +749,8 @@ fn sync_tree(dir: &Path) -> Result<u64> {
         let meta = entry.metadata()?;
         if meta.is_file() {
             bytes += meta.len();
-            File::open(entry.path())?.sync_all()?;
+            let path = entry.path();
+            crate::sync_probe::sync_file(&File::open(&path)?, &path)?;
         }
     }
     sync_dir(dir)?;
@@ -768,7 +769,9 @@ pub(crate) fn build_rocksdb(
     bulk: &BulkOptions,
 ) -> Result<BulkReport> {
     let started = Instant::now();
-    fs::create_dir_all(dir)?;
+    // A new database directory's entry is made durable (review tests-b#3:
+    // the fsync audit found it was not).
+    fsutil::create_dir_durable(dir)?;
     // The claim and the lock in one step (review bulkcli#13): a database of
     // this process that has the directory open (replacing its files under
     // it would strand its later writes), another build of this process and
