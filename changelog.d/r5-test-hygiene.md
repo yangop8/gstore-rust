@@ -210,6 +210,34 @@ design, emptied by the next run); the first run also left
 `dt_phase4_wiring`'s four `upstream_p4w_*` scratch directories, which that
 test now removes (the same defect as review tests-a#10).
 
+**Independent review** (same machine, other agents' builds running; the
+breaks env-gated in a local build, reverted, never committed):
+
+- Breaks re-run, old test (as of 1f0ed8b) vs new: tests-a#4 (one shared
+  blank-node scope) old passes, new fails (COUNT 1); tests-b#19 (`/update`
+  on `ApiServer` always 409) old passes in 2.5 s, new fails; conc#16 (2000
+  combinations built before the count) old passes, new fails (4,591,302
+  bytes held; 4,457 unbroken); tests-a#12 (`bulk::build` refuses a FIFO
+  source, rocksdb) old hangs until killed after 90 s, new fails in under
+  1 s.
+- tests-a#17: the corpus files equal what the removed lexer extracts from
+  the three source files at 1f0ed8b (23, 18, 13 queries; 2, 4, 6 data
+  documents), except the documented curation (the `<http://ex/fn#twice>`
+  query dropped, one data document added to `syntax`).
+- Concurrent copies sharing one `TMPDIR` on this branch: dt_cli 3 × 4,
+  dt_persist_backends 3 × 3, the lib's `db::tests`, `disk_vstree`,
+  `vstree` and store-dispatch tests 3 × 3: 0 failed, nothing left.
+- No `temp_dir()` path without a pid or unique counter remains in `tests/`
+  or in `src/` test modules (grep over every `temp_dir()` use).
+- `--test-threads=1`: the lib tests and the 28 test files this package
+  edited, 1,595 passed, 0 failed, nothing left in the private `TMPDIR`.
+- Full runs: `cargo test --workspace` 3,099 passed, 0 failed, 10 ignored
+  in Materialize and in Stream mode; `cargo test -p gstore --features
+  rocksdb` 2,965 passed, 0 failed, 10 ignored; `--features pfn-wasm --test
+  dt_phase4_review_fixes` 17 passed; clippy `-D warnings` (workspace,
+  rocksdb, pfn-wasm) and rustfmt clean; nothing left in any private
+  `TMPDIR`, `target/tmp` only `upstream_bfs_*`.
+
 ## Requests/Not yet
 
 - **Edits outside the owned files** (the smallest change each; no other
