@@ -16,6 +16,7 @@
 //!   INTO GRAPH`, `INSERT DATA` with `[ … ]` / `( … )`) are updates and need
 //!   the update privilege; graph-function SELECTs are reads.
 
+mod common;
 #[path = "upstream_scripts/harness.rs"]
 mod harness;
 
@@ -72,6 +73,9 @@ fn write_file(dir: &Path, name: &str, content: &str) -> String {
 #[test]
 fn every_write_path_invalidates_the_query_cache_and_the_csr() {
     let data = scratch("xphase_cache_data");
+    // review tests-a#10: the data directory is removed when the test ends,
+    // also when it fails (it used to pile up under target/tmp, one per run).
+    common::tmp::remove_at_thread_exit(&data);
     let base = write_file(&data, "base.nt", BASE);
     let extra = write_file(&data, "extra.nt", EXTRA);
     let srv = Server::start_with_dir("xphase_cache", Some(&data));
@@ -157,6 +161,8 @@ fn every_write_path_invalidates_the_query_cache_and_the_csr() {
 #[test]
 fn update_forms_need_the_update_privilege_and_graph_functions_only_query() {
     let data = scratch("xphase_priv_data");
+    // review tests-a#10: removed when the test ends.
+    common::tmp::remove_at_thread_exit(&data);
     let base = write_file(&data, "base.nt", &format!("{BASE}{EXTRA}"));
     let srv = Server::start_with_dir("xphase_priv", Some(&data));
     ok(&srv.build("priv", Path::new(&base)));
