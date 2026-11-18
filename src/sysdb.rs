@@ -315,7 +315,9 @@ impl SysDb {
         let doc = Json::obj().with("format", FORMAT).with("databases", list);
         let mut text = doc.to_string();
         text.push('\n');
-        fs::create_dir_all(&self.root)?;
+        // The root's own entry durably, as the registry written into it
+        // (round-5 review follow-up of db#12).
+        crate::db::fsutil::create_dir_durable(&self.root).map_err(to_io)?;
         crate::db::fsutil::atomic_write(&self.path, text.as_bytes()).map_err(to_io)
     }
 
@@ -597,7 +599,10 @@ fn to_io(e: crate::error::GStoreError) -> io::Error {
 /// module docs.
 pub fn open_system(root: impl AsRef<Path>, root_password: &str) -> io::Result<(UserStore, SysDb)> {
     let root = root.as_ref();
-    fs::create_dir_all(root)?;
+    // Durably: the user table and the registry written into it must not
+    // vanish with a root whose entry was never synced (round-5 review
+    // follow-up of db#12).
+    crate::db::fsutil::create_dir_durable(root).map_err(to_io)?;
     let users_path = root.join(USERS_FILE);
     let first_start = !root.join(SYSTEM_FILE).exists();
     let migrate = first_start && users_path.is_file();

@@ -226,9 +226,10 @@ pub(crate) fn build_disk(
     bulk: &BulkOptions,
 ) -> Result<BulkReport> {
     let started = Instant::now();
-    // A new database directory's entry is made durable (review tests-b#3:
-    // the fsync audit found it was not).
-    crate::db::fsutil::create_dir_durable(dir)?;
+    // The database directory's entry is made durable (review tests-b#3: the
+    // fsync audit found it was not), also when it already existed: `gbuild`
+    // and other callers create it before the build without a sync.
+    crate::db::fsutil::ensure_dir_durable(dir)?;
     // The claim and the lock in one step (review bulkcli#13): refused while
     // a database of this process has the directory open (replacing its
     // files under it would strand its later writes, and a WAL of the old

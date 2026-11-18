@@ -17,7 +17,26 @@ format change, no API removed):
   were synced, but the new directory's entry in its parent was not, so a
   power cut after the success answer could lose the whole database, backup
   or function. All of them now use `fsutil::create_dir_durable` (the parent
-  of every created directory is fsynced).
+  of every created directory is fsynced). Round-5 review follow-up:
+  `create_dir_durable` syncs only what it creates, and `gbuild` claims the
+  database directory (`create_dir_all`) before it builds, so a `gbuild`
+  build (snapshot, `--disk`, `--disk --incremental`) still never synced
+  the directory's entry. The builds (disk and RocksDB bulk builds, the
+  incremental disk build, `build_rocksdb_from_str`) and every save into a
+  directory that is not the database's home now sync the directory's
+  parent also when it already existed (`fsutil::ensure_dir_durable`, one
+  directory fsync per build or save); `gbuild` claims with the new
+  `BuildGuard::create_and_lock`, which creates the directory and any
+  missing ancestor durably; a restore's (and a zip restore's) new parent
+  directory and a server's new root directory (`ApiServer::bind`,
+  `sysdb::open_system`, the registry's save) are created durably too
+  (`fsync_audit::a_database_directory_created_before_the_build_is_made_durable`
+  and, with `--features rocksdb`,
+  `rocks::rocksdb_builds_into_a_directory_created_before_them_make_it_durable`;
+  each part failed before its fix). The unit test
+  `dirlock::tests::creating_a_database_directory_syncs_the_parent_of_each_new_directory`
+  pinned "an existing directory syncs no parent" and now expects the one
+  parent sync (review comment).
 - **Reasoning-rule directories are created durably** (tests-b#3).
   `reason_rule_files/` (created by the first `reasonManage add`) and its
   `inferred/` ledger directory are fsynced into their parents when they are
@@ -88,7 +107,9 @@ none
 - docs/STORAGE_BACKEND.md (durability / commit points): the fsync claims
   are now enforced by `tests/fsync_audit.rs` (see the Changelog list of
   covered commit points); every directory a commit point creates is made
-  durable in its parent. Format registry: no on-disk format change.
+  durable in its parent, and a database directory that existed before a
+  build or a save elsewhere (a tool's claim) has its entry synced as well.
+  Format registry: no on-disk format change.
 - README.md (testing section, if it lists the suites): `tests/fsync_audit.rs`
   checks the fsyncs of every commit point through `gstore::sync_probe`;
   `tests/adversarial_coverage.rs` maps the adversarial categories to their

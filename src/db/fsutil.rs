@@ -94,10 +94,28 @@ pub(crate) fn create_dir_durable(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Make database directory `dir`'s own entry durable, whoever created it:
+/// [`create_dir_durable`] when it is missing, else one `fsync` of its parent.
+/// A directory that already exists may have been created without a sync —
+/// `gbuild` claims the directory before it builds into it, a library caller
+/// may `create_dir_all` it first — and [`create_dir_durable`] syncs only
+/// what it creates itself (round-5 review follow-up of tests-b#3 / db#12).
+/// For the builds and the saves into a directory that is not the database's
+/// home; the cost is one directory sync per build or save.
+pub(crate) fn ensure_dir_durable(dir: &Path) -> Result<()> {
+    if !dir.exists() {
+        return create_dir_durable(dir);
+    }
+    let parent = parent_of(dir);
+    #[cfg(test)]
+    DURABLE_DIR_PARENT_SYNCS.with(|s| s.borrow_mut().push(parent.to_path_buf()));
+    sync_dir(parent)
+}
+
 #[cfg(test)]
 thread_local! {
-    /// Test hook: the parent directories [`create_dir_durable`] synced on
-    /// this thread, in order.
+    /// Test hook: the parent directories [`create_dir_durable`] and
+    /// [`ensure_dir_durable`] synced on this thread, in order.
     pub(crate) static DURABLE_DIR_PARENT_SYNCS: std::cell::RefCell<Vec<PathBuf>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }

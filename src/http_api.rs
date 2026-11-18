@@ -3484,7 +3484,12 @@ impl ApiServer {
         addr: A,
     ) -> std::io::Result<ApiServer> {
         let root = root_dir.as_ref().to_path_buf();
-        fs::create_dir_all(&root)?;
+        // Durably (round-5 review follow-up of db#12; `open_system` below
+        // does the same for a root it creates).
+        crate::db::fsutil::create_dir_durable(&root).map_err(|e| match e {
+            crate::GStoreError::Io(e) => e,
+            other => std::io::Error::other(other.to_string()),
+        })?;
         // The system store: `users.db` (users, per-database privileges) and
         // `system.json` (the database registry), migrated on first start.
         let (users, sysdb) = crate::sysdb::open_system(&root, root_password)?;

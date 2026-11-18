@@ -774,12 +774,19 @@ impl Database {
 
     /// [`save`](Self::save), with `persist_lock` held by the caller.
     pub(super) fn save_locked(&self, dir: &Path) -> Result<()> {
-        // A new directory's entry is made durable too (review db#12).
-        fsutil::create_dir_durable(dir)?;
         let at_home = self
             .home
             .as_deref()
             .is_some_and(|h| fsutil::same_dir(h, dir));
+        // A new directory's entry is made durable too (review db#12), and so
+        // is the entry of one that is not the database's home but already
+        // existed: its creator (`gbuild`'s claim, a caller's
+        // `create_dir_all`) may not have synced it.
+        if at_home {
+            fsutil::create_dir_durable(dir)?;
+        } else {
+            fsutil::ensure_dir_durable(dir)?;
+        }
         // Saving over a database another process has open — replacing its
         // files, removing its other layouts — would strand every write it
         // acknowledges later; saving into a new (or empty) directory another
@@ -1143,7 +1150,9 @@ impl Database {
         log: &mut dyn import::ErrorLog,
     ) -> Result<import::ImportReport> {
         let dir = dir.as_ref();
-        fs::create_dir_all(dir)?;
+        // The directory's entry durably, whoever created it (round-5 review
+        // follow-up of tests-b#3: this build used a plain `create_dir_all`).
+        fsutil::ensure_dir_durable(dir)?;
         // Another build of this process rebuilding `dir` would share the
         // staging area below, and replacing the files of a database another
         // process serves (or one of this process has open) would strand its
@@ -1426,9 +1435,9 @@ impl Database {
             default: ids,
             named,
         } = acc;
-        // A new database directory's entry durably (review tests-b#3: the
-        // fsync audit found it was not).
-        fsutil::create_dir_durable(dir)?;
+        // The database directory's entry durably (review tests-b#3: the
+        // fsync audit found it was not), also when it already existed.
+        fsutil::ensure_dir_durable(dir)?;
         // A database of this process serving `dir` would lose its files below
         // (and a RocksDB one its store), and another build of this process
         // would share the staging directory — refused, like a bulk build, the
@@ -1655,9 +1664,9 @@ impl Database {
         } else {
             None
         };
-        // A new directory's entry durably (review tests-b#3: the fsync
-        // audit found it was not).
-        fsutil::create_dir_durable(dst)?;
+        // The directory's entry durably (review tests-b#3: the fsync audit
+        // found it was not), also when it already existed.
+        fsutil::ensure_dir_durable(dst)?;
         // A database another process has open in `dst` is not rewritten
         // under it (as a save into another directory refuses).
         let _dst_lock = if Database::storage_kind(dst).is_some() {
@@ -1818,7 +1827,9 @@ impl Database {
         // Finish (or clean up after) an interrupted earlier restore of `target`.
         Database::recover_restore(target)?;
         if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
-            fs::create_dir_all(parent)?;
+            // The swap below syncs the parent; a parent created here is made
+            // durable in its own parent (round-5 review follow-up of db#12).
+            fsutil::create_dir_durable(parent)?;
         }
         let staged = fsutil::RESTORE_SWAP.staging(target);
         fsutil::remove_dir_if_exists(&staged)?;
@@ -1943,7 +1954,9 @@ impl Database {
             return Err(crate::zipio::ZipError::FeatureMissing.into());
         }
         if let Some(parent) = target.parent().filter(|p| !p.as_os_str().is_empty()) {
-            fs::create_dir_all(parent)?;
+            // Durably, as the restore's own parent (round-5 review follow-up
+            // of db#12).
+            fsutil::create_dir_durable(parent)?;
         }
         let mut scratch = target.as_os_str().to_owned();
         scratch.push(".unzip-tmp");

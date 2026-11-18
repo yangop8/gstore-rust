@@ -684,6 +684,18 @@ impl BuildGuard {
         Ok((guard, lock))
     }
 
+    /// Create `dir` and its missing ancestors durably — the parent of every
+    /// directory created is `fsync`ed — and claim it as [`lock`](Self::lock)
+    /// does: what a tool that claims a new database directory before it
+    /// prepares its input and builds into it (`gbuild`) needs, so the
+    /// directory survives a power loss like the files the build syncs into
+    /// it (round-5 review follow-up of tests-b#3: `gbuild` created it with a
+    /// plain `create_dir_all`).
+    pub fn create_and_lock(dir: &Path) -> Result<(BuildGuard, DirLock)> {
+        super::fsutil::create_dir_durable(dir)?;
+        BuildGuard::lock(dir)
+    }
+
     /// Whether a build of this process is rebuilding `dir`.
     pub fn active(dir: &Path) -> bool {
         let Ok(canonical) = fs::canonicalize(dir) else {
@@ -975,7 +987,8 @@ mod tests {
 
     /// Review db#12: creating a database directory fsyncs the parent of
     /// every directory created, for a save and for a snapshot write on its
-    /// own; an existing directory syncs no parent.
+    /// own; a save into an existing directory syncs only that directory's
+    /// parent.
     #[test]
     fn creating_a_database_directory_syncs_the_parent_of_each_new_directory() {
         use crate::db::fsutil::{SnapshotWriter, DURABLE_DIR_PARENT_SYNCS};
@@ -992,8 +1005,17 @@ mod tests {
             synced.contains(&base.0.join("a")) && synced.contains(&base.0),
             "the parents of both new directories: {synced:?}"
         );
+        // review tests-b#3 (round-5 follow-up): this asserted that a save
+        // into an existing directory syncs no parent, which is the gap the
+        // review found — a directory created before the save (`gbuild`'s
+        // claim) never had its entry synced. A save into a directory that is
+        // not the database's home now syncs that directory's parent, once.
         db.save(&target).unwrap();
-        assert_eq!(take(), Vec::<PathBuf>::new(), "nothing new to make durable");
+        assert_eq!(
+            take(),
+            vec![base.0.join("a")],
+            "the existing directory's own entry, nothing else"
+        );
 
         let other = base.0.join("c.db");
         drop(SnapshotWriter::begin(&other, &["x.bin"]).unwrap());

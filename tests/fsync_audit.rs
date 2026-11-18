@@ -1301,6 +1301,78 @@ fn a_bulk_install_syncs_every_step() {
     }
 }
 
+/// Round-5 review follow-up (tests-b#3, db#12): a database directory that
+/// already exists when the build or save starts — `gbuild` claims it before
+/// it builds, a library caller may `create_dir_all` it — never had its own
+/// entry synced: `create_dir_durable` syncs only the directories it creates.
+/// Every build and every save into a directory other than the database's
+/// home now syncs the directory's parent, and `gbuild`'s claim
+/// (`BuildGuard::create_and_lock`) syncs every directory it creates — a
+/// missing ancestor too.
+#[test]
+fn a_database_directory_created_before_the_build_is_made_durable() {
+    let tmp = TmpDir::new("precreated");
+    let rdf = tmp.path().join("data.nt");
+    fs::write(&rdf, BASE).unwrap();
+    for how in ["build_disk", "build_disk_incremental", "save"] {
+        let dir = tmp.path().join(format!("{how}.db"));
+        let audit = Audit::begin(tmp.path());
+        // What a caller's claim does: the directory, unsynced.
+        fs::create_dir_all(&dir).unwrap();
+        match how {
+            "build_disk" => Database::build_disk(&dir, &[&rdf]).unwrap(),
+            "build_disk_incremental" => Database::build_disk_incremental(&dir, &[&rdf]).unwrap(),
+            _ => Database::build_from_str("audit", BASE)
+                .unwrap()
+                .save(&dir)
+                .unwrap(),
+        }
+        audit.finish(&format!("{how} into a directory created before it"), &[]);
+    }
+
+    // `gbuild`'s claim of a directory whose parent is missing too, and the
+    // build under it.
+    let dir = tmp.path().join("new").join("audit.db");
+    let audit = Audit::begin(tmp.path());
+    let claim = gstore::db::dirlock::BuildGuard::create_and_lock(&dir).unwrap();
+    Database::build_disk(&dir, &[&rdf]).unwrap();
+    drop(claim);
+    audit.finish("a build under gbuild's claim of a new directory", &[]);
+
+    // A restore of a zipped backup into a directory whose parent is
+    // missing: the parent it creates is durable.
+    #[cfg(feature = "zip")]
+    {
+        let bak = tmp.path().join("bak");
+        Database::open(&dir).unwrap().backup(&bak).unwrap();
+        let zip = tmp.path().join("bak.zip");
+        Database::pack_backup(&bak, &zip).unwrap();
+        let audit = Audit::begin(tmp.path());
+        Database::restore_from_zip(
+            &zip,
+            tmp.path().join("restored").join("target.db"),
+            &gstore::zipio::ZipLimits::default(),
+        )
+        .unwrap();
+        audit.finish(
+            "a zip restore into a new parent directory",
+            &[Exempt {
+                prefix: "restored/target.db.unzip-tmp",
+                how: How::MayResurrect,
+                why: "the unpacked package's scratch directory: the next zip restore \
+                      of that target removes a leftover one first (ScratchDir::fresh)",
+            }],
+        );
+    }
+
+    // A server's new root directory (the system store is written into it).
+    let root = tmp.path().join("server").join("home");
+    let audit = Audit::begin(tmp.path());
+    let server = gstore::http_api::ApiServer::bind(&root, "root-password", "127.0.0.1:0").unwrap();
+    drop(server);
+    audit.finish("an /api server's new root", &[]);
+}
+
 /// An in-memory database saved over a disk database: the snapshot set is
 /// committed (its record retired durably) while the disk layout is still
 /// there, and only then is the disk layout removed — durably.
@@ -1881,6 +1953,44 @@ mod rocks {
                 );
                 assert_eq!(count(&mut Database::open(&dir).unwrap()), 1, "{what}");
             }
+        }
+    }
+
+    /// Round-5 review follow-up (tests-b#3): the RocksDB builds into a
+    /// directory that existed before them (a caller's or `gbuild`'s claim)
+    /// make its entry durable too.
+    #[test]
+    fn rocksdb_builds_into_a_directory_created_before_them_make_it_durable() {
+        use gstore::bulk::{self, BulkInput, BulkOptions, BulkTarget};
+        use gstore::parser::import::{ImportOptions, RdfFormat};
+        for path in ["build_rocksdb_from_str", "bulk::build"] {
+            // `audit.db`: the name `ROCKSDB_FILES` exempts the store's files by.
+            let tmp = TmpDir::new("rocks_precreated");
+            let dir = tmp.path().join("audit.db");
+            let audit = Audit::begin(tmp.path());
+            fs::create_dir_all(&dir).unwrap();
+            if path == "bulk::build" {
+                bulk::build(
+                    &dir,
+                    "audit",
+                    BulkInput::Text {
+                        text: BASE,
+                        format: RdfFormat::Turtle,
+                        name: "base.nt",
+                    },
+                    &ImportOptions::strict(),
+                    &mut (),
+                    BulkTarget::RocksDb,
+                    &BulkOptions::default(),
+                )
+                .unwrap();
+            } else {
+                drop(Database::build_rocksdb_from_str("audit", &dir, BASE).unwrap());
+            }
+            audit.finish(
+                &format!("RocksDB {path} into a directory created before it"),
+                &[ROCKSDB_FILES],
+            );
         }
     }
 

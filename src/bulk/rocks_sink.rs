@@ -769,9 +769,10 @@ pub(crate) fn build_rocksdb(
     bulk: &BulkOptions,
 ) -> Result<BulkReport> {
     let started = Instant::now();
-    // A new database directory's entry is made durable (review tests-b#3:
-    // the fsync audit found it was not).
-    fsutil::create_dir_durable(dir)?;
+    // The database directory's entry is made durable (review tests-b#3: the
+    // fsync audit found it was not), also when it already existed: `gbuild`
+    // and other callers create it before the build without a sync.
+    fsutil::ensure_dir_durable(dir)?;
     // The claim and the lock in one step (review bulkcli#13): a database of
     // this process that has the directory open (replacing its files under
     // it would strand its later writes), another build of this process and

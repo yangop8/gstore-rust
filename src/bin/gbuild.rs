@@ -374,11 +374,12 @@ fn main() -> ExitCode {
     // claim through the build (review bulkcli#2, #6): another process
     // building, loading or dropping the same database is refused from here
     // on (the builds below nest in this claim), and a failed build removes
-    // the directory only while it holds it.
-    let claim = match fs::create_dir_all(&dir)
-        .map_err(gstore::GStoreError::from)
-        .and_then(|()| BuildGuard::lock(Path::new(&dir)))
-    {
+    // the directory only while it holds it. The directory and any ancestor
+    // the claim creates are made durable in their parents (round-5 review
+    // follow-up of tests-b#3: a plain `create_dir_all` here left the
+    // library builds, which sync only the directories they create, nothing
+    // to sync).
+    let claim = match BuildGuard::create_and_lock(Path::new(&dir)) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("gbuild: cannot build '{dir}': {e}");
