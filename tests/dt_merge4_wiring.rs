@@ -9,6 +9,7 @@
 //! query log; and rules over the blank nodes the import pipeline mints
 //! (per-load scopes) retract exactly, whatever is imported after them.
 
+mod common;
 #[path = "upstream_scripts/harness.rs"]
 mod harness;
 
@@ -703,6 +704,9 @@ fn one_refreshconf_reapplies_query_pfn_and_log_sections() {
     cfg.root_password = harness::PASSWORD.into();
     // What gserver does at startup: install the log from conf.ini.
     let (log_cfg, _) = LogConfig::from_gstore_config(&cfg);
+    // review tests-b#16: reset however the test ends (it used to be reset
+    // on its last line only).
+    let _log = common::globals::LoggerReset;
     logging::init(&log_cfg).unwrap();
     let server = Arc::new(
         ApiServer::bind_with_config(cfg)

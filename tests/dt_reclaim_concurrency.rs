@@ -10,14 +10,16 @@
 //!   deletes and inserts pairs that reuse freed ids while 8 readers query the
 //!   same invariant non-transactionally.
 
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
-use std::path::PathBuf;
+mod common;
+
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use common::server::Running;
+use common::tmp::TempDir;
 use gstore::http_api::ApiServer;
 use gstore::json::{self, Json};
 use gstore::{ConcurrentDb, QueryResult};
@@ -110,76 +112,22 @@ fn concurrent_readers_keep_the_pair_invariant_under_churn() {
 
 // ---- HTTP -----------------------------------------------------------------------
 
-/// The temp directories the current test thread made, removed when the
-/// thread ends — also when the test fails (a thread-local's destructor runs
-/// after the unwinding).
-struct TmpDirs(std::cell::RefCell<Vec<std::path::PathBuf>>);
-
-impl Drop for TmpDirs {
-    fn drop(&mut self) {
-        for p in self.0.borrow().iter() {
-            // A directory, or a file (a store path).
-            let _ = std::fs::remove_dir_all(p).or_else(|_| std::fs::remove_file(p));
-        }
-    }
-}
-
-thread_local! {
-    static TMP_DIRS: TmpDirs = const { TmpDirs(std::cell::RefCell::new(Vec::new())) };
-}
-
-fn tmp_root(tag: &str) -> PathBuf {
-    static CTR: AtomicU64 = AtomicU64::new(0);
-    let n = CTR.fetch_add(1, Ordering::Relaxed);
-    let p = std::env::temp_dir().join(format!(
-        "gstore_reclaim_conc_{tag}_{}_{n}",
-        std::process::id()
-    ));
-    TMP_DIRS.with(|t| t.0.borrow_mut().push(p.clone()));
-    let _ = std::fs::remove_dir_all(&p);
-    p
-}
-
-/// The server root, removed on drop (also when the test panics).
-struct Root(PathBuf);
-impl Drop for Root {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
+/// One request (`(status, body)`); review tests-b#11: through the shared
+/// client, whose deadline fails the test (naming the request) when the
+/// server hangs, where this file's own client waited in `read_to_end` for
+/// ever.
 fn send(addr: &SocketAddr, method: &str, target: &str, auth: bool, body: &str) -> (u16, String) {
-    let mut s = TcpStream::connect(addr).unwrap();
-    let mut raw = format!("{method} {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n");
-    if auth {
+    let headers: &[(&str, &str)] = if auth {
         // root:root
-        raw.push_str("Authorization: Basic cm9vdDpyb290\r\n");
+        &[("Authorization", "Basic cm9vdDpyb290")]
     } else {
-        raw.push_str("Content-Type: application/json\r\nAccept-Encoding: identity\r\n");
-    }
-    raw.push_str(&format!(
-        "Content-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    ));
-    s.write_all(raw.as_bytes()).unwrap();
-    s.write_all(body.as_bytes()).unwrap();
-    let mut resp = Vec::new();
-    s.read_to_end(&mut resp).unwrap();
-    let split = resp
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .expect("header end");
-    let head = String::from_utf8_lossy(&resp[..split]).into_owned();
-    let status = head
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|c| c.parse().ok())
-        .expect("status");
-    (
-        status,
-        String::from_utf8_lossy(&resp[split + 4..]).into_owned(),
-    )
+        &[
+            ("Content-Type", "application/json"),
+            ("Accept-Encoding", "identity"),
+        ]
+    };
+    let r = common::http::request(addr, method, target, headers, body.as_bytes());
+    (r.status, r.text())
 }
 
 fn api(addr: &SocketAddr, pairs: &[(&str, &str)]) -> Json {
@@ -229,11 +177,11 @@ fn api_rows(j: &Json) -> Vec<(String, String)> {
 
 #[test]
 fn http_transaction_reusing_ids_while_readers_read() {
-    let root = Root(tmp_root("http"));
-    let server = Arc::new(ApiServer::bind(&root.0, "root", "127.0.0.1:0").unwrap());
-    let addr = server.local_addr().unwrap();
-    let s2 = Arc::clone(&server);
-    thread::spawn(move || s2.serve_forever());
+    // The root outlives the server: the guards drop in reverse order.
+    let root = TempDir::reserve("reclaim_conc_http");
+    // review tests-b#11: stopped and joined when the test ends or fails.
+    let server = Running::start(ApiServer::bind(root.path(), "root", "127.0.0.1:0").unwrap());
+    let addr = server.addr();
     let data: String = (0..PAIRS).map(pair).collect::<Vec<_>>().join("\n");
     let (status, body) = send(&addr, "POST", "/build?db_name=rdb", true, &data);
     assert_eq!(status, 200, "build: {body}");

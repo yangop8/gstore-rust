@@ -3,45 +3,24 @@
 //! Runs the actual compiled binaries (via Cargo's `CARGO_BIN_EXE_*` paths) to
 //! validate argument handling, persistence on disk, and result printing.
 
+mod common;
+
 use std::path::PathBuf;
 use std::process::Command;
 
-/// The temp directories (or files) the current test thread made, removed
-/// when the thread ends — also when the test fails (a thread-local's
-/// destructor runs after the unwinding).
-struct TmpDirs(std::cell::RefCell<Vec<std::path::PathBuf>>);
-
-impl Drop for TmpDirs {
-    fn drop(&mut self) {
-        for p in self.0.borrow().iter() {
-            // A directory, or a file (a store path).
-            let _ = std::fs::remove_dir_all(p).or_else(|_| std::fs::remove_file(p));
-        }
-    }
-}
-
-thread_local! {
-    static TMP_DIRS: TmpDirs = const { TmpDirs(std::cell::RefCell::new(Vec::new())) };
-}
-
-/// Remove `p` when the current test thread ends.
-fn remove_when_done(p: impl Into<std::path::PathBuf>) {
-    TMP_DIRS.with(|t| t.0.borrow_mut().push(p.into()));
-}
+use common::tmp::TempDir;
 
 fn small_nt() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/small/small.nt")
 }
 
-fn db_name() -> PathBuf {
-    std::env::temp_dir().join("gstore_dt_cli_small")
-}
-
 #[test]
 fn gbuild_then_gquery_roundtrip() {
-    let name = db_name();
-    remove_when_done(format!("{}.db", name.display()));
-    let _ = std::fs::remove_dir_all(format!("{}.db", name.display()));
+    // review tests-a#6: the database was `<temp>/gstore_dt_cli_small.db`, a
+    // fixed name two concurrent runs (two checkouts sharing /tmp) removed
+    // and rebuilt under each other; now a unique directory per run and test.
+    let work = TempDir::new("dt_cli_small");
+    let name = work.join("small");
 
     // gbuild <name> small.nt
     let build = Command::new(env!("CARGO_BIN_EXE_gbuild"))
@@ -68,16 +47,13 @@ fn gbuild_then_gquery_roundtrip() {
     // Row count is reported on stderr.
     let err = String::from_utf8_lossy(&query.stderr);
     assert!(err.contains("5 row(s)"), "row count line: {err}");
-
-    let _ = std::fs::remove_dir_all(format!("{}.db", name.display()));
 }
 
 #[test]
 fn gquery_update_persists_to_disk() {
-    let name = std::env::temp_dir().join("gstore_dt_cli_update");
-    let dir = format!("{}.db", name.display());
-    remove_when_done(&dir);
-    let _ = std::fs::remove_dir_all(&dir);
+    // review tests-a#6: a unique directory, not `<temp>/gstore_dt_cli_update`.
+    let work = TempDir::new("dt_cli_update");
+    let name = work.join("update");
 
     // review tests-a#11: gbuild's exit status was ignored (a failed build then
     // surfaced only as a puzzling gquery failure).
@@ -106,8 +82,6 @@ fn gquery_update_persists_to_disk() {
         .expect("gquery ask");
     let out = String::from_utf8_lossy(&q.stdout);
     assert!(out.trim() == "true", "expected true, got: {out}");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Run `cmd` with its standard output a pipe whose reader is already gone
@@ -132,10 +106,7 @@ fn run_with_closed_stdout(cmd: &mut Command) -> (std::process::ExitStatus, Strin
 /// "failed printing to stdout: Broken pipe" panic, no error message.
 #[test]
 fn a_closed_stdout_pipe_ends_the_output_quietly() {
-    let work = std::env::temp_dir().join(format!("gstore_dt_cli_epipe_{}", std::process::id()));
-    remove_when_done(work.clone());
-    let _ = std::fs::remove_dir_all(&work);
-    std::fs::create_dir_all(&work).unwrap();
+    let work = TempDir::new("dt_cli_epipe");
     let name = work.join("epipe");
     let build = Command::new(env!("CARGO_BIN_EXE_gbuild"))
         .arg(&name)
@@ -238,5 +209,4 @@ fn a_closed_stdout_pipe_ends_the_output_quietly() {
         before + 2,
         "gadd with a closed stdout did not add its triples"
     );
-    let _ = std::fs::remove_dir_all(&work);
 }

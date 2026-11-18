@@ -127,7 +127,9 @@ fn vstree_filter_preserves_results() {
 
 #[test]
 fn save_load_preserves_lubm_query() {
-    let dir = std::env::temp_dir().join("gstore_dt_lubm_roundtrip");
+    // review tests-b#9: unique to the process (the fixed name was shared by
+    // concurrent runs).
+    let dir = std::env::temp_dir().join(format!("gstore_dt_lubm_roundtrip_{}", std::process::id()));
     remove_when_done(dir.clone());
     let _ = std::fs::remove_dir_all(&dir);
 

@@ -63,6 +63,9 @@ fn request(
     body: &str,
 ) -> (u16, String) {
     let mut s = TcpStream::connect(addr).unwrap();
+    // review tests-b#11: a server that never answers fails the test instead
+    // of stalling it (this read had no timeout).
+    s.set_read_timeout(Some(Duration::from_secs(120))).unwrap();
     let mut raw = format!("{method} {target} HTTP/1.1\r\nHost: x\r\n");
     if let Some(a) = auth {
         raw.push_str(&format!("Authorization: {a}\r\n"));
@@ -296,6 +299,9 @@ fn single_server_shutdown_lets_an_in_flight_request_finish() {
     // A request whose body arrives only after the shutdown was requested: the
     // connection is already accepted (in flight), so it must still be served.
     let mut s = TcpStream::connect(addr).unwrap();
+    // review tests-b#11: a server that never answers fails the test instead
+    // of stalling it (this read had no timeout).
+    s.set_read_timeout(Some(Duration::from_secs(120))).unwrap();
     write!(
         s,
         "POST /update HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",

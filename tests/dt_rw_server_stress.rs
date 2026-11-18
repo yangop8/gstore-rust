@@ -20,15 +20,19 @@
 //! Each test runs `GSTORE_RW_STRESS_SECS` seconds of load (default 2) under
 //! a 120 s watchdog that aborts the process if the servers wedge.
 
+mod common;
+
 use std::collections::BTreeSet;
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
-use std::path::{Path, PathBuf};
+use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use common::globals::DefaultOpenOptions;
+use common::server::Running;
+use common::tmp::TempDir;
 use gstore::http_api::ApiServer;
 use gstore::json::{self, Json};
 use gstore::server::Server;
@@ -73,27 +77,9 @@ impl Drop for Watchdog {
     }
 }
 
-/// A temp directory removed when dropped (also when the test fails).
-struct TmpDir(PathBuf);
-
-impl TmpDir {
-    fn new(tag: &str) -> TmpDir {
-        static CTR: AtomicU64 = AtomicU64::new(0);
-        let n = CTR.fetch_add(1, Ordering::Relaxed);
-        let p =
-            std::env::temp_dir().join(format!("gstore_rwstress_{tag}_{}_{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        TmpDir(p)
-    }
-}
-
-impl Drop for TmpDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// One HTTP/1.1 request (`Connection: close`): `(status, body)`.
+/// One HTTP/1.1 request (`Connection: close`): `(status, body)`, through
+/// the shared client (an overall deadline; a hung server fails the test
+/// naming the request).
 fn request(
     addr: &SocketAddr,
     method: &str,
@@ -101,26 +87,19 @@ fn request(
     auth: Option<&str>,
     body: &str,
 ) -> (u16, String) {
-    let mut s = TcpStream::connect(addr).unwrap();
-    s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
-    let mut raw = format!("{method} {target} HTTP/1.1\r\nHost: x\r\n");
+    let mut headers = vec![("Host", "x")];
     if let Some(a) = auth {
-        raw.push_str(&format!("Authorization: {a}\r\n"));
+        headers.push(("Authorization", a));
     }
-    raw.push_str(&format!(
-        "Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    ));
-    s.write_all(raw.as_bytes()).unwrap();
-    let mut resp = String::new();
-    s.read_to_string(&mut resp).unwrap();
-    let status = resp
-        .split_whitespace()
-        .nth(1)
-        .and_then(|c| c.parse().ok())
-        .unwrap_or(0);
-    let body = resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
-    (status, body.to_string())
+    let r = common::http::request_with_timeout(
+        addr,
+        method,
+        target,
+        &headers,
+        body.as_bytes(),
+        Duration::from_secs(60),
+    );
+    (r.status, r.text())
 }
 
 /// `Basic root:root`.
@@ -184,10 +163,16 @@ fn reopened(db: &mut Database, pred: &str) -> BTreeSet<String> {
 
 /// The writer: inserts pairs and deletes some again (two operations per
 /// request) until `stop`, through `send` (which returns the HTTP status and
-/// body). Returns the ledger of acknowledged pairs.
-fn write_pairs(stop: &AtomicBool, send: impl Fn(&str) -> (u16, String)) -> BTreeSet<u64> {
+/// body), telling `acked` about the first acknowledged pair. Returns the
+/// ledger of acknowledged pairs.
+fn write_pairs(
+    stop: &AtomicBool,
+    acked: mpsc::Sender<u64>,
+    send: impl Fn(&str) -> (u16, String),
+) -> BTreeSet<u64> {
     let mut ledger = BTreeSet::new();
     let mut next = 0u64;
+    let mut acked = Some(acked);
     while !stop.load(Ordering::SeqCst) {
         let i = next;
         next += 1;
@@ -198,6 +183,9 @@ fn write_pairs(stop: &AtomicBool, send: impl Fn(&str) -> (u16, String)) -> BTree
                 "{b}"
             );
             ledger.insert(i);
+            if let Some(tx) = acked.take() {
+                let _ = tx.send(i);
+            }
         } else {
             // Refused while a transaction is open (409): not applied.
             assert_eq!(s, 409, "insert pair {i}: {b}");
@@ -226,12 +214,13 @@ fn write_pairs(stop: &AtomicBool, send: impl Fn(&str) -> (u16, String)) -> BTree
 #[test]
 fn single_db_server_keeps_writes_whole_under_concurrent_reads() {
     let _dog = watchdog("single_db_server_keeps_writes_whole_under_concurrent_reads");
-    let dir = TmpDir::new("single");
+    let work = TempDir::new("rwstress_single");
+    let dir = work.join("stress.db");
     Database::build_from_str("stress", BASE)
         .unwrap()
-        .save(&dir.0)
+        .save(&dir)
         .unwrap();
-    single_db_stress(&dir.0, &OpenOptions::default(), "single-db");
+    single_db_stress(&dir, &OpenOptions::default(), "single-db");
 }
 
 /// The same over an on-disk (`kvstore.kv`) database served in Stream mode:
@@ -240,9 +229,10 @@ fn single_db_server_keeps_writes_whole_under_concurrent_reads() {
 #[test]
 fn single_db_server_on_a_stream_disk_database_keeps_writes_whole() {
     let _dog = watchdog("single_db_server_on_a_stream_disk_database_keeps_writes_whole");
-    let dir = TmpDir::new("single_stream");
-    build_disk_base(&dir.0);
-    single_db_stress(&dir.0, &OpenOptions::stream(), "single-db (stream disk)");
+    let work = TempDir::new("rwstress_single_stream");
+    let dir = work.join("stress.db");
+    build_disk_base(&dir);
+    single_db_stress(&dir, &OpenOptions::stream(), "single-db (stream disk)");
 }
 
 /// An on-disk (`kvstore.kv`) database holding [`BASE`] in `dir` (the bulk
@@ -260,14 +250,13 @@ fn build_disk_base(dir: &Path) {
 /// server under eight readers and a writer of pairs; then check the
 /// reopened database against the writer's ledger.
 fn single_db_stress(dir: &Path, options: &OpenOptions, label: &str) {
-    let server = Arc::new(
+    // Stopped and joined when the test ends or fails (tests/common).
+    let server = Running::start(
         Server::bind(Database::open_with(dir, options).unwrap(), "127.0.0.1:0")
             .unwrap()
             .with_db_dir(dir),
     );
-    let addr = server.local_addr().unwrap();
-    let s2 = Arc::clone(&server);
-    let serving = thread::spawn(move || s2.serve_forever());
+    let addr = server.addr();
 
     let stop = Arc::new(AtomicBool::new(false));
     let reads = Arc::new(AtomicU64::new(0));
@@ -284,9 +273,12 @@ fn single_db_stress(dir: &Path, options: &OpenOptions, label: &str) {
             })
         })
         .collect();
+    let (acked, _first_ack) = mpsc::channel();
     let writer = {
         let stop = Arc::clone(&stop);
-        thread::spawn(move || write_pairs(&stop, |u| request(&addr, "POST", "/update", None, u)))
+        thread::spawn(move || {
+            write_pairs(&stop, acked, |u| request(&addr, "POST", "/update", None, u))
+        })
     };
     thread::sleep(load_time());
     stop.store(true, Ordering::SeqCst);
@@ -301,9 +293,7 @@ fn single_db_stress(dir: &Path, options: &OpenOptions, label: &str) {
     );
     assert!(reads > 0);
     assert!(!ledger.is_empty());
-    server.shutdown();
-    serving.join().unwrap();
-    drop(server);
+    server.stop();
 
     let mut db = Database::open_with(dir, options).unwrap();
     let on_disk = reopened(&mut db, PAIR);
@@ -363,8 +353,8 @@ fn tid_of(body: &str) -> u64 {
 #[test]
 fn api_server_isolates_transactions_and_keeps_writes_whole_under_concurrent_reads() {
     let _dog = watchdog("api_server_isolates_transactions");
-    let root = TmpDir::new("api");
-    api_stress(&root.0, false, "api");
+    let root = TempDir::new("rwstress_api");
+    api_stress(root.path(), false, "api");
 }
 
 /// The same over an on-disk (`kvstore.kv`) database, which the server opens
@@ -375,10 +365,12 @@ fn api_server_isolates_transactions_and_keeps_writes_whole_under_concurrent_read
 #[test]
 fn api_server_on_a_disk_database_isolates_transactions_and_keeps_writes_whole() {
     let _dog = watchdog("api_server_on_a_disk_database");
-    gstore::set_default_open_options(OpenOptions::stream());
-    let root = TmpDir::new("api_disk");
-    build_disk_base(&root.0.join("stress.db"));
-    api_stress(&root.0, true, "api (disk)");
+    // review tests-b#16: installed for this test only, and put back also
+    // when it fails (the binary's other tests pass their options).
+    let _defaults = DefaultOpenOptions::install(OpenOptions::stream());
+    let root = TempDir::new("rwstress_api_disk");
+    build_disk_base(&root.join("stress.db"));
+    api_stress(root.path(), true, "api (disk)");
 }
 
 /// Serve database `stress` from root `root` on an `ApiServer` — built there
@@ -386,10 +378,8 @@ fn api_server_on_a_disk_database_isolates_transactions_and_keeps_writes_whole() 
 /// under eight readers, a writer of pairs and a transaction cycle; then
 /// check the reopened database against the clients' ledgers.
 fn api_stress(root: &Path, on_disk: bool, label: &str) {
-    let server = Arc::new(ApiServer::bind(root, "root", "127.0.0.1:0").unwrap());
-    let addr = server.local_addr().unwrap();
-    let s2 = Arc::clone(&server);
-    let serving = thread::spawn(move || s2.serve_forever());
+    let server = Running::start(ApiServer::bind(root, "root", "127.0.0.1:0").unwrap());
+    let addr = server.addr();
     let (s, b) = if on_disk {
         request(&addr, "POST", "/load?db_name=stress", Some(ROOT), "")
     } else {
@@ -432,10 +422,11 @@ fn api_stress(root: &Path, on_disk: bool, label: &str) {
             })
         })
         .collect();
+    let (acked, first_ack) = mpsc::channel();
     let writer = {
         let stop = Arc::clone(&stop);
         thread::spawn(move || {
-            write_pairs(&stop, |u| {
+            write_pairs(&stop, acked, |u| {
                 request(&addr, "POST", "/update?db_name=stress", Some(ROOT), u)
             })
         })
@@ -493,6 +484,11 @@ fn api_stress(root: &Path, on_disk: bool, label: &str) {
         })
     };
     thread::sleep(load_time());
+    // review tests-b#19: the whole-pair check is vacuous unless pairs were
+    // written, so the load runs until the writer has one acknowledged (at
+    // most a minute: a writer that is always refused — /update answering
+    // 409 whenever a transaction exists — fails the assertion below).
+    let first = first_ack.recv_timeout(Duration::from_secs(60));
     stop.store(true, Ordering::SeqCst);
     for r in readers {
         r.join().unwrap();
@@ -506,6 +502,11 @@ fn api_stress(root: &Path, on_disk: bool, label: &str) {
     );
     assert!(reads > 0);
     assert!(
+        first.is_ok() && !ledger.is_empty(),
+        "no two-operation write was acknowledged next to the transactions: \
+         the readers' whole-pair check checked nothing"
+    );
+    assert!(
         cycles >= 2,
         "at least one commit and one rollback ({cycles})"
     );
@@ -514,9 +515,7 @@ fn api_stress(root: &Path, on_disk: bool, label: &str) {
         seen.is_subset(&committed),
         "a reader saw {seen:?}, committed {committed:?}"
     );
-    server.shutdown();
-    serving.join().unwrap();
-    drop(server);
+    server.stop();
 
     let mut db = Database::load(root.join("stress.db")).unwrap();
     assert_eq!(Database::is_disk(root.join("stress.db")), on_disk);

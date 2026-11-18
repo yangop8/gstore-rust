@@ -6,13 +6,13 @@
 //! transaction (commit visible, rollback not), a backup→restore round-trip,
 //! batch insert reflected in a query, and the `/show` + `/drop` lifecycle.
 
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
+mod common;
+
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::thread;
 
+use common::server::Running;
 use gstore::http_api::ApiServer;
 use gstore::Database;
 
@@ -51,17 +51,19 @@ fn tmp_root(tag: &str) -> PathBuf {
     p
 }
 
-/// Start an `ApiServer` (root password "root") in a background thread.
-fn start(tag: &str) -> (Arc<ApiServer>, SocketAddr, PathBuf) {
+/// Start an `ApiServer` (root password "root") in a background thread;
+/// stopped and joined when the guard is dropped (review tests-a#8: it was
+/// never shut down).
+fn start(tag: &str) -> (Running<ApiServer>, SocketAddr, PathBuf) {
     let root = tmp_root(tag);
-    let server = Arc::new(ApiServer::bind(&root, "root", "127.0.0.1:0").expect("bind"));
-    let addr = server.local_addr().expect("addr");
-    let s2 = Arc::clone(&server);
-    thread::spawn(move || s2.serve_forever());
+    let server = Running::start(ApiServer::bind(&root, "root", "127.0.0.1:0").expect("bind"));
+    let addr = server.addr();
     (server, addr, root)
 }
 
-/// Send one HTTP/1.1 request and return `(status_code, body)`.
+/// Send one HTTP/1.1 request and return `(status_code, body)` — through the
+/// shared client (review tests-a#8: a hung server fails the test naming
+/// the request, where this read had no timeout).
 fn request(
     addr: &SocketAddr,
     method: &str,
@@ -69,26 +71,12 @@ fn request(
     auth: Option<&str>,
     body: &str,
 ) -> (u16, String) {
-    let mut s = TcpStream::connect(addr).unwrap();
-    let mut raw = format!("{method} {target} HTTP/1.1\r\nHost: x\r\n");
+    let mut headers = vec![("Host", "x")];
     if let Some(a) = auth {
-        raw.push_str(&format!("Authorization: {a}\r\n"));
+        headers.push(("Authorization", a));
     }
-    raw.push_str(&format!(
-        "Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    ));
-    s.write_all(raw.as_bytes()).unwrap();
-    let mut resp = String::new();
-    s.read_to_string(&mut resp).unwrap();
-    let status = resp
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|c| c.parse::<u16>().ok())
-        .expect("status code");
-    let body = resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
-    (status, body.to_string())
+    let r = common::http::request(addr, method, target, &headers, body.as_bytes());
+    (r.status, r.text())
 }
 
 /// RFC 4648 base64 (client side of the server's decoder).

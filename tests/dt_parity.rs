@@ -27,10 +27,18 @@ thread_local! {
     static TMP_DIRS: TmpDirs = const { TmpDirs(std::cell::RefCell::new(Vec::new())) };
 }
 
+/// `<unique dir>/<tag>` (not created): the directory, unique to the process
+/// and call, is removed when the test's thread ends, with the `<tag>.db` a
+/// tool builds beside the name. review tests-b#9: this was the fixed
+/// `<temp>/gstore_dt_parity_<tag>`, shared by concurrent runs.
 fn tmp(tag: &str) -> PathBuf {
-    let p = std::env::temp_dir().join(format!("gstore_dt_parity_{tag}"));
-    TMP_DIRS.with(|t| t.0.borrow_mut().push(p.clone()));
-    p
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("gstore_dt_parity_{}_{n}", std::process::id()));
+    TMP_DIRS.with(|t| t.0.borrow_mut().push(dir.clone()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.join(tag)
 }
 
 fn run(bin: &str, args: &[&std::ffi::OsStr]) -> std::process::Output {

@@ -1,0 +1,75 @@
+# Corpus "sparql11" of the_sparql_corpora_answer_identically_in_both_modes
+# (tests/dt_disk_stream.rs): data documents (after "#@data") and read
+# queries (after "#@query"); each record runs to the next marker line.
+# Taken in 2026-11 from the string literals of tests/dt_sparql11.rs (review
+# tests-a#17: the test no longer lexes that file).
+#@data
+
+@prefix : <http://ex/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+:alice :dept :d1 ; :salary 2500 ; :name "Alice" ; :knows :bob .
+:bob   :dept :d1 ; :salary 3000 ; :name "Bob" .
+:carol :dept :d2 ; :salary 4000 ; :name "Carol" .
+
+#@data
+
+@prefix : <http://ex/> .
+:a :p :b . :b :p :c . :c :p :d .
+:a :type :T .
+
+#@query
+CONSTRUCT { ?p <http://ex/worksIn> ?d } WHERE { ?p <http://ex/dept> ?d }
+#@query
+DESCRIBE * WHERE { ?p <http://ex/dept> <http://ex/d1> }
+#@query
+DESCRIBE <http://ex/alice>
+#@query
+DESCRIBE ?p WHERE { ?s ?p ?o }
+#@query
+SELECT (AVG(?s) AS ?a) (MIN(?s) AS ?mn) (MAX(?s) AS ?mx) (COUNT(*) AS ?n)
+             WHERE { ?p <http://ex/salary> ?s }
+#@query
+SELECT (COUNT(DISTINCT ?dept) AS ?c) WHERE { ?p <http://ex/dept> ?dept }
+#@query
+SELECT (GROUP_CONCAT(?n ; SEPARATOR=",") AS ?names)
+             WHERE { ?p <http://ex/name> ?n }
+#@query
+SELECT ?dept (COUNT(?p) AS ?c) WHERE { ?p <http://ex/dept> ?dept } GROUP BY ?dept
+#@query
+SELECT ?dept (SUM(?s) AS ?total) WHERE {
+                ?p <http://ex/dept> ?dept . ?p <http://ex/salary> ?s
+             } GROUP BY ?dept HAVING(COUNT(?p) > 1)
+#@query
+SELECT ?o WHERE { <http://ex/alice> <http://ex/knows>? ?o }
+#@query
+SELECT ?p ?bonus WHERE { ?p <http://ex/salary> ?s . BIND(?s * 2 AS ?bonus) }
+#@query
+SELECT ?p ?k WHERE { ?p <http://ex/salary> ?s OPTIONAL { ?p <http://ex/knows> ?k } }
+#@query
+SELECT ?p WHERE {
+            ?p <http://ex/salary> ?s
+            FILTER EXISTS {
+                ?p <http://ex/knows> ?k . ?k <http://ex/salary> ?ks
+                FILTER(?ks > ?s)
+            }
+         }
+#@query
+SELECT ?p WHERE { ?p <http://ex/salary> ?s FILTER EXISTS { ?p <http://ex/knows> ?k } }
+#@query
+SELECT ?p WHERE { ?p <http://ex/salary> ?s FILTER NOT EXISTS { ?p <http://ex/knows> ?k } }
+#@query
+SELECT ?p WHERE { ?p <http://ex/salary> ?s MINUS { ?p <http://ex/knows> ?k } }
+#@query
+SELECT ?p WHERE { VALUES ?p { <http://ex/alice> <http://ex/carol> } ?p <http://ex/salary> ?s }
+#@query
+SELECT ?p WHERE { { SELECT ?p WHERE { ?p <http://ex/dept> <http://ex/d1> } } }
+#@query
+SELECT ?x WHERE { <http://ex/a> (<http://ex/p>|<http://ex/type>) ?x }
+#@query
+SELECT ?x WHERE { <http://ex/a> <http://ex/p>* ?x }
+#@query
+SELECT ?x WHERE { <http://ex/a> <http://ex/p>+ ?x }
+#@query
+SELECT ?x WHERE { <http://ex/a> <http://ex/p>/<http://ex/p> ?x }
+#@query
+SELECT ?x WHERE { <http://ex/b> ^<http://ex/p> ?x }

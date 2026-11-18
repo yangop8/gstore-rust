@@ -12,6 +12,8 @@
 //! * unloading while reads run gives clean answers (200 or 404);
 //! * `/api build layout=disk` answers like `layout=snapshot`.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
@@ -24,33 +26,10 @@ use gstore::db::OpenOptions;
 use gstore::http_api::ApiServer;
 use gstore::json::{self, Json};
 
-/// The temp directories the current test thread made, removed when the
-/// thread ends — also when the test fails (a thread-local's destructor runs
-/// after the unwinding).
-struct TmpDirs(std::cell::RefCell<Vec<std::path::PathBuf>>);
-
-impl Drop for TmpDirs {
-    fn drop(&mut self) {
-        for p in self.0.borrow().iter() {
-            // A directory, or a file (a store path).
-            let _ = std::fs::remove_dir_all(p).or_else(|_| std::fs::remove_file(p));
-        }
-    }
-}
-
-thread_local! {
-    static TMP_DIRS: TmpDirs = const { TmpDirs(std::cell::RefCell::new(Vec::new())) };
-}
-
-/// A unique server root, removed with the server (also when the test fails).
+/// A fresh, empty directory for the test, removed when its thread ends —
+/// also when it fails (tests/common).
 fn tmp_root(tag: &str) -> PathBuf {
-    static CTR: AtomicU64 = AtomicU64::new(0);
-    let n = CTR.fetch_add(1, Ordering::Relaxed);
-    let d = std::env::temp_dir().join(format!("gstore_snapdisk_{tag}_{}_{n}", std::process::id()));
-    TMP_DIRS.with(|t| t.0.borrow_mut().push(d.clone()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    std::fs::canonicalize(&d).unwrap()
+    common::tmp::thread_dir(&format!("snapdisk_{tag}"))
 }
 
 /// An `ApiServer` serving in a background thread; stopped and its root
@@ -322,7 +301,11 @@ fn commit_does_not_wait_for_a_long_snapshot_query() {
         &tid,
         "INSERT DATA { <http://ex/n> <http://ex/p> <http://ex/m> }",
     );
-    let expired_before = gstore::http_api::expired_snapshot_reads();
+    // review tests-b#10: this server's count. The process-wide
+    // `gstore::http_api::expired_snapshot_reads()` also counts the reads the
+    // other tests of this binary expire at their own commits, concurrently:
+    // it could move while this read never expired.
+    let expired_before = srv.server.expired_snapshot_reads();
     let reader = {
         let srv = Arc::clone(&srv);
         thread::spawn(move || srv.req("POST", "/sparql?db_name=l", LONG_ASK))
@@ -349,7 +332,7 @@ fn commit_does_not_wait_for_a_long_snapshot_query() {
     );
     // The read expired (and re-runs on the live database): cancel it.
     let deadline = Instant::now() + Duration::from_secs(10);
-    while gstore::http_api::expired_snapshot_reads() == expired_before {
+    while srv.server.expired_snapshot_reads() == expired_before {
         assert!(Instant::now() < deadline, "the snapshot read never expired");
         thread::sleep(Duration::from_millis(10));
     }

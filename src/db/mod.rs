@@ -5764,10 +5764,46 @@ mod tests {
 <node1> <own> <point1> .
 ";
 
+    /// The temp paths the current test thread made, removed when the thread
+    /// ends — also when the test fails (a thread-local's destructor runs
+    /// after the unwinding).
+    struct TmpPaths(std::cell::RefCell<Vec<std::path::PathBuf>>);
+
+    impl Drop for TmpPaths {
+        fn drop(&mut self) {
+            for p in self.0.borrow().iter() {
+                let _ = fs::remove_dir_all(p).or_else(|_| fs::remove_file(p));
+            }
+        }
+    }
+
+    thread_local! {
+        static TMP_PATHS: TmpPaths = const { TmpPaths(std::cell::RefCell::new(Vec::new())) };
+    }
+
+    /// A fresh path `<temp>/gstore_ut_<tag>_<pid>_<n>` (not created), removed
+    /// when the test's thread ends. Review db#22: it was the fixed
+    /// `<temp>/gstore_ut_<tag>`, which two test processes sharing the temp
+    /// directory (two checkouts, two agents) removed and rewrote under each
+    /// other.
     fn temp_dir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("gstore_ut_{tag}"));
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("gstore_ut_{tag}_{}_{n}", std::process::id()));
+        // A leftover of an earlier run whose pid was the same.
         let _ = fs::remove_dir_all(&dir);
+        TMP_PATHS.with(|t| t.0.borrow_mut().push(dir.clone()));
         dir
+    }
+
+    /// A data file `name` in a fresh [`temp_dir`] (its extension picks the
+    /// parser), removed with it.
+    fn temp_file(tag: &str, name: &str, content: &str) -> std::path::PathBuf {
+        let dir = temp_dir(tag);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        fs::write(&path, content).unwrap();
+        path
     }
 
     /// An UPDATE's WHERE clause runs under the request's cancel flag, like a
@@ -5951,7 +5987,7 @@ mod tests {
 
     #[test]
     fn load_missing_dir_errors() {
-        let e = Database::load(std::env::temp_dir().join("gstore_does_not_exist_xyz")).unwrap_err();
+        let e = Database::load(temp_dir("does_not_exist")).unwrap_err();
         assert!(matches!(e, GStoreError::Database(_)));
     }
 
@@ -6772,8 +6808,7 @@ mod tests {
             ));
         }
         content.push_str("<http://ex/special> <http://ex/marker> <http://ex/target> .\n");
-        let rdf = std::env::temp_dir().join("gstore_ut_disk_vstree.nt");
-        fs::write(&rdf, &content).unwrap();
+        let rdf = temp_file("disk_vstree_src", "data.nt", &content);
 
         Database::build_disk(&dir, &[&rdf]).unwrap();
         assert!(Database::is_disk(&dir));
@@ -6856,8 +6891,7 @@ mod tests {
         for mode in [DiskQueryMode::Materialize, DiskQueryMode::Stream] {
             let dir = temp_dir(&format!("disk_vstree_mut_{mode}"));
             let content = "<a> <p> <b> .\n<b> <p> <c> .\n";
-            let rdf = std::env::temp_dir().join("gstore_ut_disk_vstree_mut.nt");
-            fs::write(&rdf, content).unwrap();
+            let rdf = temp_file("disk_vstree_mut_src", "data.nt", content);
             Database::build_disk(&dir, &[&rdf]).unwrap();
             let options = OpenOptions::new().with_disk_query_mode(mode);
             let mut db = Database::load_disk_with(&dir, &options).unwrap();

@@ -3002,7 +3002,10 @@ mod tests {
 
     #[test]
     fn build_files_dispatches_on_extension() {
-        let dir = std::env::temp_dir().join("gstore_disk_formats_ut");
+        // Review disk#13: unique to the process (the fixed name was removed
+        // and rewritten under each other by concurrent test processes).
+        let dir =
+            std::env::temp_dir().join(format!("gstore_disk_formats_ut_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let ttl = dir.join("d.ttl");

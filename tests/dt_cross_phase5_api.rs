@@ -12,12 +12,13 @@
 //! behind: a cached `COUNT`, a `loadcsr`'d CSR and a graph-function answer
 //! computed before the write are never served after it.
 
+mod common;
 #[path = "upstream_scripts/harness.rs"]
 mod harness;
 
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::io::{BufRead, BufReader, Write};
+use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -135,22 +136,19 @@ impl Srv {
         body.extend_from_slice(data);
         body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
         // (The harness's `http_with` always sends `Content-Type:
-        // application/json`.)
-        let mut s = TcpStream::connect(self.addr).unwrap();
-        let mut req = format!(
-            "POST /file/upload HTTP/1.1\r\nHost: 127.0.0.1\r\n\
-             Content-Type: multipart/form-data; boundary={boundary}\r\n\
-             Content-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        )
-        .into_bytes();
-        req.extend_from_slice(&body);
-        s.write_all(&req).unwrap();
-        let mut resp = String::new();
-        s.read_to_string(&mut resp).unwrap();
-        let (head, text) = resp.split_once("\r\n\r\n").unwrap();
-        assert!(head.starts_with("HTTP/1.1 200"), "{resp}");
-        let j = json::parse(text).unwrap();
+        // application/json`.) review tests-a#8: the shared client, whose
+        // deadline fails the test naming the request when the server hangs
+        // (this read had no timeout).
+        let content_type = format!("multipart/form-data; boundary={boundary}");
+        let r = common::http::request(
+            &self.addr,
+            "POST",
+            "/file/upload",
+            &[("Content-Type", &content_type)],
+            &body,
+        );
+        assert_eq!(r.status, 200, "{}", r.text());
+        let j = r.json();
         ok(&j);
         string(&j, "filepath")
     }
@@ -260,6 +258,8 @@ fn write_file(dir: &Path, name: &str, content: &str) -> String {
 #[test]
 fn phase5_batch_and_load_paths_leave_no_stale_cache_or_csr() {
     let data = scratch("x5_batch_data");
+    // review tests-a#10: removed when the test ends, also when it fails.
+    common::tmp::remove_at_thread_exit(&data);
     let base = write_file(&data, "base.nt", BASE);
     let extra = write_file(&data, "extra.nt", EXTRA);
     let extra_dir = data.join("extra_dir");
@@ -357,6 +357,8 @@ fn phase5_batch_and_load_paths_leave_no_stale_cache_or_csr() {
 #[test]
 fn phase5_build_and_restore_paths_leave_no_stale_cache_or_csr() {
     let data = scratch("x5_build_data");
+    // review tests-a#10: removed when the test ends, also when it fails.
+    common::tmp::remove_at_thread_exit(&data);
     let base = write_file(&data, "base.nt", BASE);
     let both = write_file(&data, "both.nt", &format!("{BASE}{EXTRA}"));
     let part1 = write_file(&data, "dir/1.nt", BASE);

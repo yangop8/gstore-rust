@@ -19,7 +19,8 @@
 //! - The VS-tree is used only while fresh, never rebuilt at open unless
 //!   `vstree_on_open`, and `rebuild_index` makes it fresh again.
 
-use std::collections::BTreeSet;
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -39,30 +40,10 @@ const QUADS: &str = "\
 <http://ex/a> <http://ex/q> <http://ex/c> .
 ";
 
-/// The temp directories the current test thread made, removed when the
-/// thread ends — also when the test fails (a thread-local's destructor runs
-/// after the unwinding).
-struct TmpDirs(std::cell::RefCell<Vec<std::path::PathBuf>>);
-
-impl Drop for TmpDirs {
-    fn drop(&mut self) {
-        for p in self.0.borrow().iter() {
-            // A directory, or a file (a store path).
-            let _ = std::fs::remove_dir_all(p).or_else(|_| std::fs::remove_file(p));
-        }
-    }
-}
-
-thread_local! {
-    static TMP_DIRS: TmpDirs = const { TmpDirs(std::cell::RefCell::new(Vec::new())) };
-}
-
+/// A fresh, empty directory for the test, removed when its thread ends —
+/// also when it fails (tests/common).
 fn tmp(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("gstore_dt_stream_{tag}_{}", std::process::id()));
-    TMP_DIRS.with(|t| t.0.borrow_mut().push(d.clone()));
-    let _ = fs::remove_dir_all(&d);
-    fs::create_dir_all(&d).unwrap();
-    d
+    common::tmp::thread_dir(&format!("dt_stream_{tag}"))
 }
 
 fn lubm_nt() -> PathBuf {
@@ -413,152 +394,75 @@ fn stream_and_materialize_answer_lubm_and_named_graphs_identically() {
 
 // ---- the SPARQL corpora ----------------------------------------------------
 
-/// Every string literal of a Rust source file (`"…"` with escapes and line
-/// continuations, `r"…"` and `r#"…"#`), skipping comments and char literals.
-fn string_literals(src: &str) -> Vec<String> {
-    let c: Vec<char> = src.chars().collect();
-    let mut out = Vec::new();
-    let mut i = 0;
-    let ident = |ch: char| ch.is_alphanumeric() || ch == '_';
-    while i < c.len() {
-        match c[i] {
-            '/' if c.get(i + 1) == Some(&'/') => {
-                while i < c.len() && c[i] != '\n' {
-                    i += 1;
+/// The corpus `name` of `tests/dt_disk_stream_corpus/`: its data documents
+/// (records after a `#@data` line) and read queries (after `#@query`), each
+/// record the lines up to the next marker line; lines before the first
+/// marker are the file's header.
+///
+/// review tests-a#17: the corpora used to be lexed out of the string
+/// literals of dt_sparql11.rs, dt_sparql_semantics.rs and
+/// dt_sparql_syntax.rs at compile time, so an edit to those files (a query
+/// moved into a `format!` template, a lexer gap) silently shrank what this
+/// test compared. They are this test's own files now (the 2026-11 snapshot
+/// of what the lexer found there).
+fn corpus(name: &str) -> (Vec<String>, Vec<String>) {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/dt_disk_stream_corpus")
+        .join(format!("{name}.txt"));
+    let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let (mut data, mut queries) = (Vec::new(), Vec::new());
+    let mut record: Option<(bool, String)> = None;
+    let mut finish = |record: Option<(bool, String)>| {
+        if let Some((is_data, mut text)) = record {
+            // The line end before the next marker belongs to the format.
+            text.pop();
+            if is_data {
+                data.push(text);
+            } else {
+                queries.push(text);
+            }
+        }
+    };
+    for line in text.split_inclusive('\n') {
+        match line.trim_end_matches('\n') {
+            marker @ ("#@data" | "#@query") => {
+                finish(record.take());
+                record = Some((marker == "#@data", String::new()));
+            }
+            _ => {
+                if let Some((_, text)) = record.as_mut() {
+                    text.push_str(line);
                 }
             }
-            '\'' => {
-                // A char literal ('x', '\n', '\u{..}') or a lifetime.
-                if c.get(i + 2) == Some(&'\'') {
-                    i += 3;
-                } else if c.get(i + 1) == Some(&'\\') {
-                    i += 2;
-                    while i < c.len() && c[i] != '\'' {
-                        i += 1;
-                    }
-                    i += 1;
-                } else {
-                    i += 1;
-                }
-            }
-            'r' if (i == 0 || !ident(c[i - 1]))
-                && matches!(c.get(i + 1), Some('"') | Some('#')) =>
-            {
-                let mut j = i + 1;
-                let mut hashes = 0;
-                while c.get(j) == Some(&'#') {
-                    hashes += 1;
-                    j += 1;
-                }
-                if c.get(j) != Some(&'"') {
-                    i += 1;
-                    continue;
-                }
-                j += 1;
-                let start = j;
-                loop {
-                    if j >= c.len() {
-                        return out;
-                    }
-                    if c[j] == '"' && (0..hashes).all(|h| c.get(j + 1 + h) == Some(&'#')) {
-                        break;
-                    }
-                    j += 1;
-                }
-                out.push(c[start..j].iter().collect());
-                i = j + 1 + hashes;
-            }
-            '"' => {
-                let mut s = String::new();
-                let mut j = i + 1;
-                while j < c.len() && c[j] != '"' {
-                    if c[j] == '\\' {
-                        j += 1;
-                        match c.get(j) {
-                            Some('n') => s.push('\n'),
-                            Some('t') => s.push('\t'),
-                            Some('r') => s.push('\r'),
-                            Some('0') => s.push('\0'),
-                            Some('\\') => s.push('\\'),
-                            Some('"') => s.push('"'),
-                            Some('\'') => s.push('\''),
-                            Some('u') => {
-                                // \u{XXXX}
-                                let close = (j..c.len()).find(|&k| c[k] == '}').unwrap_or(j);
-                                let hex: String = c[j + 2..close].iter().collect();
-                                if let Some(ch) =
-                                    u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32)
-                                {
-                                    s.push(ch);
-                                }
-                                j = close;
-                            }
-                            Some('\n') => {
-                                while c.get(j + 1).is_some_and(|ch| ch.is_whitespace()) {
-                                    j += 1;
-                                }
-                            }
-                            Some(other) => s.push(*other),
-                            None => {}
-                        }
-                        j += 1;
-                    } else {
-                        s.push(c[j]);
-                        j += 1;
-                    }
-                }
-                out.push(s);
-                i = j + 1;
-            }
-            _ => i += 1,
         }
     }
-    out
+    finish(record);
+    (data, queries)
 }
 
-/// The data documents (Turtle that loads at least one triple) and the read
-/// queries among a corpus file's string literals.
-fn corpus(src: &str) -> (Vec<String>, Vec<String>) {
-    let mut data = Vec::new();
-    let mut queries = BTreeSet::new();
-    for lit in string_literals(src) {
-        if lit.trim().is_empty() {
-            continue;
-        }
-        // A `format!` template without placeholders: un-double its braces.
-        let lit = if lit.contains("{{") && Statement::parse(&lit).is_err() {
-            let plain = lit.replace("{{", "{").replace("}}", "}");
-            if Statement::parse(&plain).is_ok() {
-                plain
-            } else {
-                lit
-            }
-        } else {
-            lit
-        };
-        if let Ok(stmt) = Statement::parse(&lit) {
-            if !stmt.is_update() {
-                queries.insert(lit);
-            }
-            continue;
-        }
-        if Database::build_from_str("probe", &lit).is_ok_and(|db| db.triple_num() > 0) {
-            data.push(lit);
-        }
+/// Whether an outcome is an answer worth comparing: rows, triples or a
+/// true ASK (an empty or false answer agrees with any broken engine).
+fn informative(o: &Outcome) -> bool {
+    match o {
+        Outcome::Rows(_, rows) => !rows.is_empty(),
+        Outcome::Triples(ts) => !ts.is_empty(),
+        Outcome::Ask(b) => *b,
+        Outcome::Update(_) | Outcome::Failed => false,
     }
-    (data, queries.into_iter().collect())
 }
 
 #[test]
 fn the_sparql_corpora_answer_identically_in_both_modes() {
-    let corpora = [
-        ("sparql11", include_str!("dt_sparql11.rs")),
-        ("semantics", include_str!("dt_sparql_semantics.rs")),
-        ("syntax", include_str!("dt_sparql_syntax.rs")),
-    ];
+    // review tests-a#17: `compare` counts an error in all three engines as
+    // agreement, and nothing required an answer, so a corpus whose queries
+    // all failed (or answered nothing) passed. Each corpus now needs this
+    // many queries with a non-empty answer, and none may fail.
+    // (The floors are the counts measured when the corpora became files:
+    // 22 of 23, 14 of 17 and 9 of 13.)
+    let corpora = [("sparql11", 22), ("semantics", 14), ("syntax", 9)];
     let mut total = 0;
-    for (name, src) in corpora {
-        let (data, queries) = corpus(src);
+    for (name, min_answered) in corpora {
+        let (data, queries) = corpus(name);
         assert!(
             !data.is_empty() && queries.len() > 10,
             "{name}: {} / {}",
@@ -580,9 +484,21 @@ fn the_sparql_corpora_answer_identically_in_both_modes() {
         let mut mem = Database::build_from_files(name, &files).unwrap();
         let mut stream = open(&db_dir, DiskQueryMode::Stream);
         let mut mat = open(&db_dir, DiskQueryMode::Materialize);
+        let mut answered = 0;
         for q in &queries {
-            compare(&mut stream, &mut mat, &mut mem, q);
+            let o = compare(&mut stream, &mut mat, &mut mem, q);
+            assert!(o != Outcome::Failed, "{name}: failed in every mode: {q}");
+            if informative(&o) {
+                answered += 1;
+            }
         }
+        eprintln!("{name}: {answered} of {} queries answered", queries.len());
+        assert!(
+            answered >= min_answered,
+            "{name}: only {answered} of {} queries have an answer to compare (at least \
+             {min_answered} expected)",
+            queries.len()
+        );
         total += queries.len();
         drop((stream, mat, mem));
         let _ = fs::remove_dir_all(&dir);

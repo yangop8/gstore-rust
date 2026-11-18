@@ -7,13 +7,12 @@
 //! multipart bodies, `curl -d '{…}'`. Every outcome must be HTTP 200 with the
 //! upstream `StatusCode` / `StatusMsg` envelope and upstream field names.
 
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::thread;
+mod common;
 
+use std::net::SocketAddr;
+use std::path::PathBuf;
+
+use common::server::Running;
 use gstore::http_api::ApiServer;
 use gstore::json::{self, Json};
 use gstore::query::hash::{hex_encode, md5_hex, pbkdf2_hmac_sha256};
@@ -28,44 +27,22 @@ const DATA: &str = "@prefix : <http://ex/> .\n\
 :a :knows _:x .\n\
 _:x :name \"Bob\" .\n";
 
-/// The temp directories the current test thread made, removed when the
-/// thread ends — also when the test fails (a thread-local's destructor runs
-/// after the unwinding).
-struct TmpDirs(std::cell::RefCell<Vec<std::path::PathBuf>>);
-
-impl Drop for TmpDirs {
-    fn drop(&mut self) {
-        for p in self.0.borrow().iter() {
-            // A directory, or a file (a store path).
-            let _ = std::fs::remove_dir_all(p).or_else(|_| std::fs::remove_file(p));
-        }
-    }
-}
-
-thread_local! {
-    static TMP_DIRS: TmpDirs = const { TmpDirs(std::cell::RefCell::new(Vec::new())) };
-}
-
-/// A unique, empty server root (a leftover of an earlier run with the same
-/// pid is removed first: pids are reused).
+/// A unique server root (not created: `ApiServer::bind` does), removed when
+/// the test's thread ends — also when the test fails.
 fn tmp_root(tag: &str) -> PathBuf {
-    static CTR: AtomicU64 = AtomicU64::new(0);
-    let n = CTR.fetch_add(1, Ordering::Relaxed);
-    let p = std::env::temp_dir().join(format!("gstore_gapi_{tag}_{}_{n}", std::process::id()));
-    TMP_DIRS.with(|t| t.0.borrow_mut().push(p.clone()));
-    let _ = std::fs::remove_dir_all(&p);
-    p
+    common::tmp::thread_path(&format!("gapi_{tag}"))
 }
 
-fn serve(server: ApiServer) -> (Arc<ApiServer>, SocketAddr) {
-    let server = Arc::new(server);
-    let addr = server.local_addr().unwrap();
-    let s2 = Arc::clone(&server);
-    thread::spawn(move || s2.serve_forever());
-    (server, addr)
+/// Serve `server` until the returned guard is dropped (review tests-a#8: the
+/// servers of this file were never shut down; the guard stops and joins it,
+/// also when the test fails).
+fn serve(server: ApiServer) -> (Running<ApiServer>, SocketAddr) {
+    let running = Running::start(server);
+    let addr = running.addr();
+    (running, addr)
 }
 
-fn start(tag: &str) -> (Arc<ApiServer>, SocketAddr, PathBuf) {
+fn start(tag: &str) -> (Running<ApiServer>, SocketAddr, PathBuf) {
     let root = tmp_root(tag);
     let (srv, addr) = serve(ApiServer::bind(&root, "root", "127.0.0.1:0").unwrap());
     (srv, addr, root)
@@ -90,6 +67,9 @@ impl Reply {
     }
 }
 
+/// One request; review tests-a#8: through the shared client, whose deadline
+/// fails the test (naming the request) when the server hangs, where this
+/// file's own client waited in `read_to_end` for ever.
 fn send(
     addr: &SocketAddr,
     method: &str,
@@ -97,39 +77,11 @@ fn send(
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> Reply {
-    let mut s = TcpStream::connect(addr).unwrap();
-    let mut raw = format!("{method} {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n");
-    for (k, v) in headers {
-        raw.push_str(&format!("{k}: {v}\r\n"));
-    }
-    raw.push_str(&format!(
-        "Content-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    ));
-    let mut bytes = raw.into_bytes();
-    bytes.extend_from_slice(body);
-    s.write_all(&bytes).unwrap();
-    let mut resp = Vec::new();
-    s.read_to_end(&mut resp).unwrap();
-    let split = resp
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .expect("header end");
-    let head = String::from_utf8_lossy(&resp[..split]).into_owned();
-    let mut lines = head.lines();
-    let status = lines
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|c| c.parse().ok())
-        .expect("status");
-    let headers = lines
-        .filter_map(|l| l.split_once(':'))
-        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-        .collect();
+    let r = common::http::request(addr, method, target, headers, body);
     Reply {
-        status,
-        headers,
-        body: String::from_utf8_lossy(&resp[split + 4..]).into_owned(),
+        status: r.status,
+        body: r.text(),
+        headers: r.headers,
     }
 }
 

@@ -3001,6 +3001,9 @@ pub(crate) struct ApiInner {
     /// is set, else `<root>/pfn`. A query calls the functions of the user it
     /// runs for ([`pfn_caller`](Self::pfn_caller)).
     pub(crate) pfn: Arc<crate::pfn::PfnRegistry>,
+    /// This server's share of `EXPIRED_SNAPSHOT_READS` (see
+    /// [`ApiServer::expired_snapshot_reads`]).
+    expired_snapshot_reads: AtomicU64,
 }
 
 impl ApiInner {
@@ -3526,6 +3529,7 @@ impl ApiServer {
                 storage_refresh: AtomicBool::new(false),
                 open_options: RwLock::new(None),
                 pfn,
+                expired_snapshot_reads: AtomicU64::new(0),
             }),
             listener: Mutex::new(Some(listener)),
             addr,
@@ -3834,6 +3838,17 @@ impl ApiServer {
     /// work through it ([`TaskManager::submit`]).
     pub fn task_manager(&self) -> &TaskManager {
         &self.inner.tasks
+    }
+
+    /// How many reads of a transaction's on-disk snapshot this server saw
+    /// expire under them (the transaction committed meanwhile) and re-ran on
+    /// the live database: this server's share of the process-wide
+    /// `expired_snapshot_reads()`. For tests and diagnostics — a test that
+    /// reads the process-wide count also counts the reads of every other
+    /// server the process runs (review tests-b#10).
+    #[doc(hidden)]
+    pub fn expired_snapshot_reads(&self) -> u64 {
+        self.inner.expired_snapshot_reads.load(Ordering::Relaxed)
     }
 
     /// Accept connections until [`shutdown`](Self::shutdown) (or `/shutdown`,
@@ -4530,6 +4545,7 @@ impl ApiInner {
             let read = snapshot.read_as(stmt, Some(clock.cancel()), Some(caller));
             if matches!(read, Err(SnapshotReadError::Expired)) {
                 EXPIRED_SNAPSHOT_READS.fetch_add(1, Ordering::Relaxed);
+                self.expired_snapshot_reads.fetch_add(1, Ordering::Relaxed);
             }
             match read {
                 Ok(result) => return Ok(result),

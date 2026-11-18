@@ -9,14 +9,14 @@
 //! speaks the upstream protocol (JSON bodies as `GstoreConnector.py` sends
 //! them) and, where the same rules apply, the Rust-only REST endpoints.
 
-use std::collections::BTreeSet;
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::thread;
+mod common;
 
+use std::collections::BTreeSet;
+use std::net::SocketAddr;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+use std::path::{Path, PathBuf};
+
+use common::server::Running;
 use gstore::config::GStoreConfig;
 use gstore::http_api::ApiServer;
 use gstore::http_users::{Privilege, UserStore};
@@ -32,52 +32,28 @@ const INSERT: &str = "INSERT DATA { <http://ex/x> <http://ex/p> <http://ex/y> }"
 
 // ---- harness ------------------------------------------------------------------
 
-/// The temp directories the current test thread made, removed when the
-/// thread ends — also when the test fails (a thread-local's destructor runs
-/// after the unwinding).
-struct TmpDirs(std::cell::RefCell<Vec<std::path::PathBuf>>);
-
-impl Drop for TmpDirs {
-    fn drop(&mut self) {
-        for p in self.0.borrow().iter() {
-            // A directory, or a file (a store path).
-            let _ = std::fs::remove_dir_all(p).or_else(|_| std::fs::remove_file(p));
-        }
-    }
-}
-
-thread_local! {
-    static TMP_DIRS: TmpDirs = const { TmpDirs(std::cell::RefCell::new(Vec::new())) };
-}
-
+/// A unique server root (not created: `ApiServer::bind` does), removed when
+/// the test's thread ends — also when the test fails.
 fn tmp_root(tag: &str) -> PathBuf {
-    static CTR: AtomicU64 = AtomicU64::new(0);
-    let n = CTR.fetch_add(1, Ordering::Relaxed);
-    let p = std::env::temp_dir().join(format!(
-        "gstore_gapi_users_{tag}_{}_{n}",
-        std::process::id()
-    ));
-    TMP_DIRS.with(|t| t.0.borrow_mut().push(p.clone()));
-    let _ = std::fs::remove_dir_all(&p);
-    p
+    common::tmp::thread_path(&format!("gapi_users_{tag}"))
 }
 
-fn serve(server: ApiServer) -> (Arc<ApiServer>, SocketAddr) {
-    let server = Arc::new(server);
-    let addr = server.local_addr().unwrap();
-    let s2 = Arc::clone(&server);
-    thread::spawn(move || s2.serve_forever());
+/// Serve `server` until the returned guard is dropped (review tests-a#8:
+/// stopped and joined when the test ends or fails; it was never shut down).
+fn serve(server: ApiServer) -> (Running<ApiServer>, SocketAddr) {
+    let server = Running::start(server);
+    let addr = server.addr();
     (server, addr)
 }
 
-fn start(tag: &str) -> (Arc<ApiServer>, SocketAddr, PathBuf) {
+fn start(tag: &str) -> (Running<ApiServer>, SocketAddr, PathBuf) {
     let root = tmp_root(tag);
     let (srv, addr) = serve(ApiServer::bind(&root, "root", "127.0.0.1:0").unwrap());
     (srv, addr, root)
 }
 
 /// A server whose `conf.ini` settings are `config` (bound in `root`).
-fn start_with(root: &Path, config: GStoreConfig) -> (Arc<ApiServer>, SocketAddr) {
+fn start_with(root: &Path, config: GStoreConfig) -> (Running<ApiServer>, SocketAddr) {
     serve(
         ApiServer::bind(root, "root", "127.0.0.1:0")
             .unwrap()
@@ -96,6 +72,9 @@ impl Reply {
     }
 }
 
+/// One request, through the shared client (review tests-a#8: a hung
+/// server fails the test naming the request, where this read had no
+/// timeout).
 fn send(
     addr: &SocketAddr,
     method: &str,
@@ -103,29 +82,10 @@ fn send(
     headers: &[(&str, &str)],
     body: &str,
 ) -> Reply {
-    let mut s = TcpStream::connect(addr).unwrap();
-    let mut raw = format!("{method} {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n");
-    for (k, v) in headers {
-        raw.push_str(&format!("{k}: {v}\r\n"));
-    }
-    raw.push_str(&format!(
-        "Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    ));
-    s.write_all(raw.as_bytes()).unwrap();
-    let mut resp = Vec::new();
-    s.read_to_end(&mut resp).unwrap();
-    let text = String::from_utf8_lossy(&resp).into_owned();
-    let (head, body) = text.split_once("\r\n\r\n").expect("header end");
-    let status = head
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|c| c.parse().ok())
-        .expect("status");
+    let r = common::http::request(addr, method, target, headers, body.as_bytes());
     Reply {
-        status,
-        body: body.to_string(),
+        status: r.status,
+        body: r.text(),
     }
 }
 
@@ -794,13 +754,10 @@ fn max_user_num_caps_usermanage() {
 fn a_users_db_fixture_is_migrated_on_first_start() {
     let root = tmp_root("migrate");
     {
-        let srv = Arc::new(ApiServer::bind(&root, "root", "127.0.0.1:0").unwrap());
-        let addr = srv.local_addr().unwrap();
-        let s2 = Arc::clone(&srv);
-        let serving = thread::spawn(move || s2.serve_forever());
+        let srv = Running::start(ApiServer::bind(&root, "root", "127.0.0.1:0").unwrap());
+        let addr = srv.addr();
         build(&addr, "legacy");
-        srv.shutdown();
-        serving.join().unwrap();
+        srv.stop();
     }
     let raw_entry = |name: &str, pw: &str, privs: &str| {
         let salt = b"0123456789abcdef";
@@ -1131,8 +1088,72 @@ fn ipmanage_round_trip() {
 
 // ---- logs ---------------------------------------------------------------------------
 
+/// The local date as the server names its daily log files (`YYYYMMDD`).
+fn server_today() -> String {
+    sysdb::clock::now().date_compact()
+}
+
+/// Run `scenario`, which writes records into the daily (`YYYYMMDD.log`)
+/// query and access logs and expects them all in one day's file. When the
+/// date (`today`) changed while it ran — the run crossed midnight and its
+/// records went into two files — it runs once more (each run starts a server
+/// of its own) instead of failing; a failure on a day that did not change
+/// is a failure. Review tests-a#15: the log tests assumed that no run
+/// crosses midnight.
+fn on_one_day(today: impl Fn() -> String, scenario: impl Fn()) {
+    for attempt in 1..=2 {
+        let day = today();
+        let outcome = catch_unwind(AssertUnwindSafe(&scenario));
+        let now = today();
+        match outcome {
+            Ok(()) => return,
+            Err(e) if now == day || attempt == 2 => resume_unwind(e),
+            Err(_) => eprintln!("the date changed during the run ({day} -> {now}): once more"),
+        }
+    }
+}
+
+/// The guard itself, on a fake clock: a run that failed while the date
+/// changed runs again; a failure on an unchanged day is reported at once.
+#[test]
+fn a_log_scenario_that_crossed_midnight_runs_again() {
+    let calls = std::cell::Cell::new(0);
+    let first_run_crosses_midnight = || {
+        calls.set(calls.get() + 1);
+        if calls.get() == 1 {
+            "20261231"
+        } else {
+            "20270101"
+        }
+        .to_string()
+    };
+    let runs = std::cell::Cell::new(0);
+    on_one_day(first_run_crosses_midnight, || {
+        runs.set(runs.get() + 1);
+        assert!(runs.get() > 1, "the records went into two daily files");
+    });
+    assert_eq!(runs.get(), 2);
+
+    let runs = std::cell::Cell::new(0);
+    let failed = catch_unwind(AssertUnwindSafe(|| {
+        on_one_day(
+            || "20261231".to_string(),
+            || {
+                runs.set(runs.get() + 1);
+                panic!("a real failure");
+            },
+        )
+    }));
+    assert!(failed.is_err(), "a failure on an unchanged day is reported");
+    assert_eq!(runs.get(), 1);
+}
+
 #[test]
 fn query_access_and_transaction_logs_are_written_and_paged() {
+    on_one_day(server_today, logs_are_written_and_paged);
+}
+
+fn logs_are_written_and_paged() {
     let (_srv, addr, root) = start("logs");
     build(&addr, "alpha");
     for i in 0..3 {
@@ -1313,6 +1334,10 @@ fn query_access_and_transaction_logs_are_written_and_paged() {
 
 #[test]
 fn log_switches_and_paths_come_from_the_configuration() {
+    on_one_day(server_today, log_switches_and_paths);
+}
+
+fn log_switches_and_paths() {
     let root = tmp_root("logcfg");
     let mut cfg = GStoreConfig::default();
     cfg.querylog_mode = false;

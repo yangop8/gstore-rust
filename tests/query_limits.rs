@@ -99,6 +99,9 @@ fn send(
     body: &str,
 ) -> Reply {
     let mut s = TcpStream::connect(addr).unwrap();
+    // review tests-b#11: a server that never answers fails the test instead
+    // of stalling it (this read had no timeout).
+    s.set_read_timeout(Some(Duration::from_secs(120))).unwrap();
     let mut raw = format!("{method} {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n");
     for (k, v) in headers {
         raw.push_str(&format!("{k}: {v}\r\n"));

@@ -13,8 +13,10 @@
 //! - `gserver` refuses to serve a directory whose database it cannot open
 //!   (instead of serving an empty stand-in that could be saved over it).
 
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
+mod common;
+
+use std::io::Read;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -64,27 +66,17 @@ fn build_disk(dir: &Path) {
     assert_eq!(Database::storage_kind(dir), Some(StorageKind::Disk));
 }
 
+/// One request (`(status, body)`), as root when `auth`, through the shared
+/// client (review tests-b#11: a hung server fails the test naming the
+/// request, where this read had no timeout).
 fn request(addr: &SocketAddr, method: &str, target: &str, auth: bool, body: &str) -> (u16, String) {
-    let mut s = TcpStream::connect(addr).unwrap();
-    let mut raw = format!("{method} {target} HTTP/1.1\r\nHost: x\r\n");
+    let mut headers = vec![("Host", "x")];
     if auth {
         // root:root
-        raw.push_str("Authorization: Basic cm9vdDpyb290\r\n");
+        headers.push(("Authorization", "Basic cm9vdDpyb290"));
     }
-    raw.push_str(&format!(
-        "Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    ));
-    s.write_all(raw.as_bytes()).unwrap();
-    let mut resp = String::new();
-    s.read_to_string(&mut resp).unwrap();
-    let status = resp
-        .split_whitespace()
-        .nth(1)
-        .and_then(|c| c.parse().ok())
-        .unwrap_or_else(|| panic!("no status in {resp:?}"));
-    let body = resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
-    (status, body.to_string())
+    let r = common::http::request(addr, method, target, &headers, body.as_bytes());
+    (r.status, r.text())
 }
 
 fn ask(db: &mut Database, s: &str, p: &str, o: &str) -> bool {

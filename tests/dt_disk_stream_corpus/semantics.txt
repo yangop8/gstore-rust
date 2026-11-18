@@ -1,0 +1,57 @@
+# Corpus "semantics" of the_sparql_corpora_answer_identically_in_both_modes
+# (tests/dt_disk_stream.rs): data documents (after "#@data") and read
+# queries (after "#@query"); each record runs to the next marker line.
+# Taken in 2026-11 from the string literals of tests/dt_sparql_semantics.rs (review
+# tests-a#17: the test no longer lexes that file).
+# Dropped: the query calling <http://ex/fn#twice>, a function only that
+# file registers (it failed in every mode here, comparing nothing).
+#@data
+
+@prefix : <http://ex/> .
+:alice :dept :d1 ; :salary 2500 ; :name "Alice" .
+:bob   :dept :d1 ; :salary 3000 ; :name "Bob" .
+:carol :dept :d2 ; :salary 4000 ; :name "Carol" .
+:dave  :dept :d3 .
+:salary a :Property .
+
+#@data
+<http://ex/l> <http://ex/p> "loaded" .
+
+#@data
+@prefix : <http://ex/> . @prefix xsd: <http://www.w3.org/2001/XMLSchema#> . :a :v "abc"^^xsd:integer . :b :v "01"^^xsd:integer . :c :v "300"^^xsd:byte . :d :v "1"^^xsd:byte . :e :v "2020-13-01T00:00:00Z"^^xsd:dateTime . :f :v "2020-01-01T00:00:00Z"^^xsd:dateTime . :g :v "1e3"^^xsd:decimal . :h :v "-0"^^xsd:nonPositiveInteger .
+#@data
+ <http://ex/s{i}> <http://ex/p> "value number {i}" .
+#@query
+PREFIX : <http://ex/> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT ?s (?o + 1 AS ?x) (xsd:integer(?o) AS ?i) (STR(?o) AS ?l) (DATATYPE(?o) AS ?t) WHERE { ?s :v ?o }
+#@query
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT (1e0/0 AS ?a) (-1e0/0 AS ?b) (0e0/0 AS ?n) (STR(1e0/0) AS ?s) (xsd:float("-INF") AS ?f) (xsd:float("1.5") * 0 / 0 AS ?fn) WHERE {}
+#@query
+SELECT (7/2 AS ?a) (6/2 AS ?b) (-7/2 AS ?c) (7.0/2 AS ?d) (1/0 AS ?e) (7e0/2 AS ?f) WHERE {}
+#@query
+SELECT (?f * 2 AS ?y) (ABS(-?f) AS ?z) (DATATYPE(?f + 1) AS ?t) (?f + 1e0 AS ?d) (ROUND(?f) AS ?r) WHERE { <http://ex/x> <http://ex/f> ?f }
+#@query
+SELECT (NOW() AS ?t) WHERE {}
+#@query
+SELECT (RAND() AS ?r) WHERE {}
+#@query
+SELECT (STRUUID() AS ?u) WHERE {}
+#@query
+SELECT (UUID() AS ?u) WHERE {}
+#@query
+SELECT * WHERE { SERVICE SILENT <urn:x-no-network:sparql> { ?s ?p ?o } }
+#@query
+SELECT ?b WHERE { BIND(BNODE() AS ?b) }
+#@query
+SELECT ?n (COUNT(*) AS ?c) WHERE { ?s <http://ex/n> ?n } GROUP BY ?n
+#@query
+SELECT ?o WHERE { <http://ex/a> <http://ex/v> ?o }
+#@query
+SELECT ?o WHERE { <http://ex/c> <http://ex/v> ?o }
+#@query
+SELECT ?o WHERE { <http://ex/s1> <http://ex/p> ?o }
+#@query
+SELECT ?p WHERE { ?p <http://ex/salary> ?s } ORDER BY (RAND())
+#@query
+SELECT ?s ?o WHERE { ?s <http://ex/p> ?o }
+#@query
+SELECT ?s ?p ?o WHERE { ?s ?p ?o }

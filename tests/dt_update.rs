@@ -162,7 +162,9 @@ fn update_sequence_applies_in_order() {
 fn load_reads_local_turtle_file() {
     let mut db = db();
     let dir = std::env::temp_dir();
-    let path = dir.join("gstore_load_test.ttl");
+    // review tests-b#9: unique to the process (the fixed name was shared by
+    // concurrent runs).
+    let path = dir.join(format!("gstore_load_test_{}.ttl", std::process::id()));
     remove_when_done(path.clone());
     {
         let mut f = std::fs::File::create(&path).unwrap();

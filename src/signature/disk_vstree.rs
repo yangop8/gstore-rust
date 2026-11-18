@@ -604,12 +604,38 @@ mod tests {
     use super::*;
     use crate::signature::EdgeDir;
 
+    /// The temp files the current test thread made, removed when the
+    /// thread ends — also when the test fails.
+    struct TmpFiles(std::cell::RefCell<Vec<std::path::PathBuf>>);
+
+    impl Drop for TmpFiles {
+        fn drop(&mut self) {
+            for p in self.0.borrow().iter() {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+
+    thread_local! {
+        static TMP_FILES: TmpFiles = const { TmpFiles(std::cell::RefCell::new(Vec::new())) };
+    }
+
+    /// A fresh store path `<temp>/gstore_diskvs_<tag>_<pid>_<n>.kv` (and its
+    /// `.wal`), removed when the test's thread ends. Review disk#13: it was
+    /// the fixed `gstore_diskvs_<tag>.kv`, which two test processes sharing
+    /// the temp directory removed and rewrote under each other.
     fn tmp(tag: &str) -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("gstore_diskvs_{tag}.kv"));
-        let _ = std::fs::remove_file(&p);
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let p =
+            std::env::temp_dir().join(format!("gstore_diskvs_{tag}_{}_{n}.kv", std::process::id()));
         let mut wal = p.clone().into_os_string();
         wal.push(".wal");
-        let _ = std::fs::remove_file(std::path::PathBuf::from(wal));
+        let wal = std::path::PathBuf::from(wal);
+        // A leftover of an earlier run whose pid was the same.
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&wal);
+        TMP_FILES.with(|t| t.0.borrow_mut().extend([p.clone(), wal]));
         p
     }
 
