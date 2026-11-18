@@ -5,16 +5,23 @@ name: bench
 #   WatDiv-like scale 1, snapshot and disk layouts, with the concurrency and
 #   mixed-workload phases) gated against bench/baselines/smoke.json — a
 #   workload or query the baseline does not have yet is reported as new, not
-#   gated — plus the canary (a 3x slowdown of the same result must fail) and
-#   a check that the tables generated from committed results into README.md
-#   and CHANGELOG.md are current (ci.yml's test job runs that check too, on
-#   every push and PR: this workflow skips the ones changing only docs);
+#   gated — plus the canary (a 2x and a 3x slowdown of the same result must
+#   each fail) and a check that the tables generated from committed results
+#   into every tracked Markdown file (README.md, CHANGELOG.md,
+#   docs/BENCHMARKS.md, bench/README.md, …) are current (ci.yml's test job
+#   runs that check too, on every push and PR: this workflow skips the ones
+#   changing only docs);
 # * rocksdb-correctness — every push / PR: the harness's tests with RocksDB
 #   (every backend must answer alike), sharing ci.yml's RocksDB build cache;
 # * reference — manual or weekly, report-only: the `reference` profile
 #   (LUBM-like univ 8 by default, plus WatDiv-like scale 10) on every
-#   layout, compared with bench/results/pre-phase6-lubm<scale>.json when it
-#   exists (which has no WatDiv-like section: reported as new).
+#   layout, recorded as the Phase 6 closure was (snapshot and RocksDB, the
+#   disk layout in each query mode under its label), and compared with the
+#   latest post-Phase-6 results bench/results/phase6-final-lubm<scale>.json
+#   and, for the WatDiv-like section, phase6-final-watdiv10.json; the
+#   pre-Phase-6 file follows as a second table (review infra#8: only that
+#   one was used, so a regression since the Phase 6 closure was invisible
+#   and the WatDiv-like section was always new).
 
 on:
   push:
@@ -73,10 +80,15 @@ jobs:
       - name: release build (gbuild, gstore-bench)
         run: cargo build --release --locked -p gstore -p gstore-bench --bin gbuild --bin gstore-bench
       # The tables between `<!-- gstore-bench report … -->` markers must be
-      # what `gstore-bench report` makes of the committed results (fix with
-      # `gstore-bench report --update README.md CHANGELOG.md`).
+      # what `gstore-bench report` makes of the committed results, in every
+      # tracked Markdown file that has one (a marker starts a line; fix with
+      # `gstore-bench report --update FILE...`). Listing the files here used
+      # to leave docs/BENCHMARKS.md and bench/README.md unchecked.
       - name: generated documentation tables are current
-        run: target/release/gstore-bench report --check README.md CHANGELOG.md
+        run: |
+          docs=$(git grep -l -E '^[[:space:]]*<!-- gstore-bench report ' -- '*.md')
+          echo "checking: $docs"
+          target/release/gstore-bench report --check $docs
       - name: gstore-bench ci
         run: >
           target/release/gstore-bench ci
@@ -84,20 +96,24 @@ jobs:
           --summary "$GITHUB_STEP_SUMMARY"
           --out target/gstore-bench/smoke.json
       # The result against itself, so the canary tests the gates, not how far
-      # the tree has moved from the blessed baseline.
-      - name: canary (the same result slowed down 3x must fail with exit 1)
+      # the tree has moved from the blessed baseline. 2x is caught by the
+      # per-workload query geomean alone (its limit stays at most 1.6 however
+      # noisy the runner), 3x by the build gates too.
+      - name: canary (the same result slowed down 2x and 3x must each fail with exit 1)
         run: |
-          set +e
-          target/release/gstore-bench check --baseline target/gstore-bench/smoke.json \
-            --from target/gstore-bench/smoke.json --self-test-slowdown 3 \
-            > target/gstore-bench/canary.md
-          code=$?
-          set -e
-          if [ "$code" != 1 ]; then
-            echo "the canary exited $code, expected 1"
-            cat target/gstore-bench/canary.md
-            exit 1
-          fi
+          for x in 2 3; do
+            set +e
+            target/release/gstore-bench check --baseline target/gstore-bench/smoke.json \
+              --from target/gstore-bench/smoke.json --self-test-slowdown $x \
+              > target/gstore-bench/canary-$x.md
+            code=$?
+            set -e
+            if [ "$code" != 1 ]; then
+              echo "the ${x}x canary exited $code, expected 1"
+              cat target/gstore-bench/canary-$x.md
+              exit 1
+            fi
+          done
       - name: upload the results and phase logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -161,21 +177,60 @@ jobs:
         run: >
           cargo build --release --locked -p gstore -p gstore-bench --bin gbuild --bin gstore-bench
           --features gstore/rocksdb,gstore-bench/rocksdb
+      # As the Phase 6 closure recorded bench/results/phase6-final-*.json
+      # (bench/README.md), so the run keys match theirs: snapshot and
+      # RocksDB, then the disk layout in each query mode under its label
+      # (the variable selects the mode, the label keys the run); each
+      # invocation measures the WatDiv-like workload on its layouts too, and
+      # `merge` joins them. A failed invocation fails the step after the
+      # others ran; whatever was written is merged and reported.
       - name: gstore-bench run --profile reference
-        run: >
-          target/release/gstore-bench run --profile reference --scale "$SCALE"
-          --out "target/gstore-bench/reference-lubm$SCALE.json"
+        run: |
+          B=target/release/gstore-bench
+          o=target/gstore-bench
+          rc=0
+          $B run --profile reference --scale "$SCALE" --backends snapshot,rocksdb \
+            --out "$o/ref-a.json" || rc=1
+          $B run --profile reference --scale "$SCALE" --backends disk \
+            --env GSTORE_DISK_QUERY_MODE=memory --label materialize --out "$o/ref-b.json" || rc=1
+          $B run --profile reference --scale "$SCALE" --backends disk \
+            --env GSTORE_DISK_QUERY_MODE=stream --label stream --out "$o/ref-c.json" || rc=1
+          parts=$(ls "$o"/ref-a.json "$o"/ref-b.json "$o"/ref-c.json 2>/dev/null || true)
+          set -- $parts
+          if [ $# -ge 2 ]; then
+            $B merge --out "$o/reference-lubm$SCALE.json" "$@" || rc=1
+          elif [ $# -eq 1 ]; then
+            cp "$1" "$o/reference-lubm$SCALE.json"
+          fi
+          exit $rc
       - name: report
         if: always()
         run: |
+          B=target/release/gstore-bench
           r="target/gstore-bench/reference-lubm$SCALE.json"
-          base="bench/results/pre-phase6-lubm$SCALE.json"
+          final="bench/results/phase6-final-lubm$SCALE.json"
+          watdiv="bench/results/phase6-final-watdiv10.json"
+          pre="bench/results/pre-phase6-lubm$SCALE.json"
           [ -f "$r" ] || exit 0
-          if [ -f "$base" ]; then
-            target/release/gstore-bench report "$r" --markdown --compare "$base" >> "$GITHUB_STEP_SUMMARY"
-          else
-            target/release/gstore-bench report "$r" --markdown >> "$GITHUB_STEP_SUMMARY"
-          fi
+          {
+            if [ -f "$final" ]; then
+              echo "## Compared with the Phase 6 closure ($final)"
+              echo
+              $B report "$r" --markdown --compare "$final"
+            else
+              $B report "$r" --markdown
+            fi
+            if [ -f "$watdiv" ]; then
+              echo "## WatDiv-like queries compared with the Phase 6 closure ($watdiv)"
+              echo
+              $B report --table queries "$r" --compare "$watdiv"
+            fi
+            if [ -f "$pre" ]; then
+              echo "## Compared with pre-Phase-6 ($pre)"
+              echo
+              $B report --table overview "$r" --compare "$pre"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: upload the result and phase logs
         if: always()
         uses: actions/upload-artifact@v4

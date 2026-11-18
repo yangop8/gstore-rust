@@ -4,11 +4,16 @@
 //! sidecar, results merge, and every backend answers alike.
 //!
 //! The build phase runs the real `gbuild` from the same target directory
-//! when it is there (`cargo test --workspace` builds it; for
-//! `--features rocksdb` build it with the feature first, as the bench
-//! workflow does). `cargo test -p gstore-bench` alone does not build the
-//! gstore binaries; the tests then use the library builder and say so.
-//! `GSTORE_BENCH_TEST_BUILDER=cli|lib` forces one.
+//! (`cargo test --workspace` builds it; for `--features rocksdb` build it
+//! with the feature first, as the bench workflow does). `cargo test -p
+//! gstore-bench` alone does not build the gstore binaries, and a `gbuild`
+//! left by an older build would be measured without notice, so a missing
+//! `gbuild`, one older than a source file it is compiled from (as rustc's
+//! dep-info files in its target directory list them), or one without
+//! RocksDB for `--features rocksdb` fails the tests (review infra#18; they
+//! used to fall back to the library builder, or use the stale binary,
+//! saying so only on captured stderr). `GSTORE_BENCH_TEST_BUILDER=lib`
+//! chooses the library builder explicitly.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -46,25 +51,261 @@ fn gbuild_has_rocksdb(tmp: &Path) -> bool {
     ok
 }
 
-fn builder(tmp: &Path, rocksdb: bool) -> String {
-    if let Ok(b) = std::env::var("GSTORE_BENCH_TEST_BUILDER") {
-        return b;
+type Newest = Option<(std::time::SystemTime, PathBuf)>;
+
+fn newer(p: &Path, best: &mut Newest) {
+    if let Ok(t) = std::fs::metadata(p).and_then(|m| m.modified()) {
+        if best.as_ref().is_none_or(|(b, _)| t > *b) {
+            *best = Some((t, p.to_path_buf()));
+        }
     }
-    if !gbuild().is_file() {
-        eprintln!(
-            "note: {} is not built; using the library builder",
-            gbuild().display()
+}
+
+/// The source files under `root` that the `gbuild` at `bin` is compiled
+/// from, as rustc recorded them in the dep-info files of its target
+/// directory: `deps/gbuild-*.d` (the binary) and `deps/gstore-*.d` of every
+/// library unit, i.e. one with a `deps/libgstore-*.rlib` (the library's
+/// unit-test harness also writes a `gstore-*.d`, which lists its
+/// `#[cfg(test)]` modules: those, the other binaries and any other file
+/// under `src/` cannot make `gbuild` stale, and cargo does not relink it
+/// when they change). `None` when there is no such file.
+fn gbuild_sources(bin: &Path, root: &Path) -> Option<Vec<PathBuf>> {
+    let deps = bin.parent()?.join("deps");
+    let mut files = std::collections::BTreeSet::new();
+    for e in std::fs::read_dir(&deps).ok()?.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(stem) = name.strip_suffix(".d") else {
+            continue;
+        };
+        let unit = stem.starts_with("gbuild-")
+            || stem
+                .strip_prefix("gstore-")
+                .is_some_and(|h| deps.join(format!("libgstore-{h}.rlib")).is_file());
+        if !unit {
+            continue;
+        }
+        // After the `target: deps…` rules, rustc writes one empty rule
+        // `path:` per source file.
+        for line in std::fs::read_to_string(e.path())
+            .unwrap_or_default()
+            .lines()
+        {
+            if let Some(p) = line.strip_suffix(':') {
+                if !p.is_empty() && !p.starts_with('#') && !p.contains(": ") {
+                    files.insert(root.join(p.replace("\\ ", " ")));
+                }
+            }
+        }
+    }
+    (!files.is_empty()).then(|| files.into_iter().collect())
+}
+
+/// The newest of the gstore sources `gbuild` is built from (see
+/// [`gbuild_sources`]; without dep-info files, every file of `src/**`,
+/// `Cargo.toml` and `Cargo.lock` under `root`) and that file.
+fn newest_source(bin: &Path, root: &Path) -> Newest {
+    fn walk(p: &Path, best: &mut Newest) {
+        match std::fs::read_dir(p) {
+            Ok(rd) => {
+                for e in rd.flatten() {
+                    walk(&e.path(), best);
+                }
+            }
+            Err(_) => newer(p, best),
+        }
+    }
+    let mut best = None;
+    match gbuild_sources(bin, root) {
+        Some(files) => files.iter().for_each(|f| newer(f, &mut best)),
+        None => {
+            for rel in ["src", "Cargo.toml", "Cargo.lock"] {
+                walk(&root.join(rel), &mut best);
+            }
+        }
+    }
+    best
+}
+
+/// Why the `gbuild` at `bin` cannot measure the gstore sources under
+/// `root`: missing, or older than one of the files it is compiled from.
+fn gbuild_problem(bin: &Path, root: &Path) -> Option<String> {
+    let Ok(built) = std::fs::metadata(bin).and_then(|m| m.modified()) else {
+        return Some(format!("{} is not built", bin.display()));
+    };
+    match newest_source(bin, root) {
+        Some((t, f)) if t > built => Some(format!(
+            "{} is older than {}: it was built from other sources",
+            bin.display(),
+            f.display()
+        )),
+        _ => None,
+    }
+}
+
+/// The builder of the end-to-end runs: the real `gbuild`, which must be
+/// there, current and (for `--features rocksdb`) built with RocksDB; or the
+/// library builder when `GSTORE_BENCH_TEST_BUILDER=lib` asks for it.
+fn builder(tmp: &Path, rocksdb: bool) -> String {
+    match std::env::var("GSTORE_BENCH_TEST_BUILDER").as_deref() {
+        Ok("lib") => return "lib".into(),
+        Ok("cli") | Err(_) => {}
+        Ok(other) => panic!("GSTORE_BENCH_TEST_BUILDER={other}: give cli or lib"),
+    }
+    let features = if rocksdb { " --features rocksdb" } else { "" };
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    if let Some(why) = gbuild_problem(&gbuild(), root) {
+        panic!(
+            "{why}; build it with `cargo build --profile test -p gstore --bin gbuild{features}` \
+             (or run `cargo test --workspace`), or set GSTORE_BENCH_TEST_BUILDER=lib for the \
+             library builder"
         );
-        return "lib".into();
     }
     if rocksdb && !gbuild_has_rocksdb(tmp) {
-        eprintln!(
-            "note: {} lacks --features rocksdb; using the library builder",
+        panic!(
+            "{} lacks RocksDB; build it with `cargo build --profile test -p gstore --bin gbuild \
+             --features rocksdb`, or set GSTORE_BENCH_TEST_BUILDER=lib",
             gbuild().display()
         );
-        return "lib".into();
     }
     "cli".into()
+}
+
+/// The builder check itself (review infra#18): a missing `gbuild` or one
+/// older than a source file is refused, a current one accepted.
+#[test]
+fn a_missing_or_stale_gbuild_is_refused() {
+    let t = Tmp::new("stale");
+    let root = t.0.join("repo");
+    std::fs::create_dir_all(root.join("src/db")).unwrap();
+    std::fs::write(root.join("Cargo.toml"), "[package]\n").unwrap();
+    std::fs::write(root.join("src/lib.rs"), "").unwrap();
+    let bin = t.0.join("gbuild");
+    let why = gbuild_problem(&bin, &root).unwrap();
+    assert!(why.ends_with("is not built"), "{why}");
+    std::fs::write(&bin, "").unwrap();
+    let set = |p: &Path, secs: u64| {
+        std::fs::File::options()
+            .write(true)
+            .open(p)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            .unwrap();
+    };
+    set(&root.join("Cargo.toml"), 1_000);
+    set(&root.join("src/lib.rs"), 1_000);
+    set(&bin, 2_000);
+    assert_eq!(gbuild_problem(&bin, &root), None);
+    // A source file changed after the build.
+    std::fs::write(root.join("src/db/mod.rs"), "// edited").unwrap();
+    set(&root.join("src/db/mod.rs"), 3_000);
+    let why = gbuild_problem(&bin, &root).unwrap();
+    assert!(
+        why.contains("is older than") && why.contains("mod.rs"),
+        "{why}"
+    );
+    // The real one next to the harness is current (the tests use it).
+    let real_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    if std::env::var("GSTORE_BENCH_TEST_BUILDER").as_deref() != Ok("lib") {
+        assert_eq!(gbuild_problem(&gbuild(), real_root), None);
+    }
+}
+
+/// With the dep-info files of its target directory, only the files `gbuild`
+/// is compiled from make it stale: a `#[cfg(test)]` module of the library,
+/// another binary or any other file under `src/` changes nothing cargo
+/// relinks `gbuild` for, so the old walk over all of `src/` refused a
+/// current `gbuild` after such an edit until a library file was touched (no
+/// build command helped: `cargo build -p gstore --bin gbuild` found it
+/// fresh).
+#[test]
+fn only_the_sources_gbuild_is_compiled_from_make_it_stale() {
+    let t = Tmp::new("depinfo");
+    let root = t.0.join("repo");
+    let deps = t.0.join("target/debug/deps");
+    for d in ["src/db", "src/bin/common"] {
+        std::fs::create_dir_all(root.join(d)).unwrap();
+    }
+    std::fs::create_dir_all(&deps).unwrap();
+    let sources = [
+        "src/lib.rs",
+        "src/db/mod.rs",
+        "src/db/review_tests.rs",
+        "src/bin/gbuild.rs",
+        "src/bin/common/cli.rs",
+        "src/bin/gserver.rs",
+        "Cargo.toml",
+    ];
+    for f in sources {
+        std::fs::write(root.join(f), "").unwrap();
+    }
+    let rules = |out: &str, files: &[&str]| {
+        let mut s = format!("{out}: {}\n\n", files.join(" "));
+        for f in files {
+            s.push_str(&format!("{f}:\n"));
+        }
+        s
+    };
+    let bin_files = ["src/bin/gbuild.rs", "src/bin/common/cli.rs"];
+    let lib_files = ["src/lib.rs", "src/db/mod.rs"];
+    let harness_files = ["src/lib.rs", "src/db/mod.rs", "src/db/review_tests.rs"];
+    for (unit, files) in [
+        ("gbuild-1", &bin_files[..]),
+        ("gstore-2", &lib_files[..]),
+        ("gstore-3", &harness_files[..]),
+    ] {
+        let out = deps.join(unit);
+        std::fs::write(
+            deps.join(format!("{unit}.d")),
+            rules(&out.to_string_lossy(), files),
+        )
+        .unwrap();
+    }
+    std::fs::write(deps.join("libgstore-2.rlib"), "").unwrap();
+    // gstore-3 is the library's test harness: an executable, no rlib.
+    std::fs::write(deps.join("gstore-3"), "").unwrap();
+    let bin = t.0.join("target/debug/gbuild");
+    std::fs::write(&bin, "").unwrap();
+    let set = |p: &Path, secs: u64| {
+        std::fs::File::options()
+            .write(true)
+            .open(p)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            .unwrap();
+    };
+    let reset = || {
+        for f in sources {
+            set(&root.join(f), 1_000);
+        }
+    };
+    reset();
+    set(&bin, 2_000);
+    assert_eq!(gbuild_problem(&bin, &root), None);
+    for f in ["src/db/review_tests.rs", "src/bin/gserver.rs", "Cargo.toml"] {
+        reset();
+        set(&root.join(f), 3_000);
+        assert_eq!(gbuild_problem(&bin, &root), None, "{f} edited");
+    }
+    for f in [
+        "src/lib.rs",
+        "src/db/mod.rs",
+        "src/bin/gbuild.rs",
+        "src/bin/common/cli.rs",
+    ] {
+        reset();
+        set(&root.join(f), 3_000);
+        let why = gbuild_problem(&bin, &root).unwrap_or_else(|| panic!("{f} edited"));
+        assert!(
+            why.contains("is older than")
+                && why.ends_with(&format!("{f}: it was built from other sources")),
+            "{why}"
+        );
+    }
+    // Without dep-info files every file under src/ counts.
+    std::fs::remove_dir_all(&deps).unwrap();
+    reset();
+    set(&root.join("src/db/review_tests.rs"), 3_000);
+    assert!(gbuild_problem(&bin, &root).is_some());
 }
 
 struct Tmp(PathBuf);
@@ -568,7 +809,9 @@ fn new_workloads_pass_check_and_labelled_runs_merge() {
         "1",
     ];
     let base = t.path("base.json");
-    let mut a = args(&["bless", "--to", &base]);
+    // review infra#10: bless refuses what a debug test build measures unless
+    // --provisional (check only warns about such a baseline).
+    let mut a = args(&["bless", "--to", &base, "--provisional"]);
     a.extend(args(&quick));
     a.extend(c.clone());
     ok(&bench(&a), "bless");

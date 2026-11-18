@@ -398,11 +398,37 @@ pub struct UpdateResult {
     pub answers_unchanged: bool,
     #[serde(default)]
     pub mismatched: Vec<String>,
+    /// The final checkpoint (after the chunk's delete) and reopen.
     pub checkpoint_ms: f64,
     pub reopen_ms: f64,
     pub reopen_triple_num: u64,
     /// The reopened database holds the original triple count.
     pub reopen_ok: bool,
+    /// The checkpoint and reopen while the chunk is inserted (review
+    /// infra#9: every write used to be undone before the only checkpoint,
+    /// so a checkpoint that lost pending inserts and deletes alike still
+    /// reopened with the original count). `None` in files written before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grown_checkpoint_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grown_reopen_ms: Option<f64>,
+    /// The triple count after that reopen (the original plus the chunk).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grown_reopen_triple_num: Option<u64>,
+    /// The triples the chunk's `DELETE DATA` removed after that reopen
+    /// (every one of the chunk's, when none was lost).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_deleted_after_reopen: Option<u64>,
+    /// Both held: the reopened database had every chunk triple.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grown_reopen_ok: Option<bool>,
+    /// The queries answering differently after the final reopen than the
+    /// query phase did (they are re-run after it, not only before the
+    /// checkpoint).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reopen_mismatched: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answers_after_reopen_ok: Option<bool>,
     /// Dictionary growth (report-only: deleted terms may stay allocated).
     pub entities_before: u64,
     pub entities_after: u64,
@@ -411,9 +437,15 @@ pub struct UpdateResult {
 }
 
 impl UpdateResult {
-    /// Whether every exact check of the phase held.
+    /// Whether every exact check of the phase held (a check a file does not
+    /// record, written before it existed, counts as held).
     pub fn round_trip_ok(&self) -> bool {
-        self.singles_ok && self.chunk_delta_ok && self.answers_unchanged && self.reopen_ok
+        self.singles_ok
+            && self.chunk_delta_ok
+            && self.answers_unchanged
+            && self.reopen_ok
+            && self.grown_reopen_ok != Some(false)
+            && self.answers_after_reopen_ok != Some(false)
     }
 }
 

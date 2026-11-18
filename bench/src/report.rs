@@ -44,9 +44,26 @@ fn ratio_opt(m: Option<f64>, b: Option<f64>) -> String {
     }
 }
 
-/// The section of `base` that `s` is compared with (same id).
+/// The section of `base` that `s` is compared with: the one with the same
+/// id (the main workload, or the extra workload of that id) of the same
+/// workload, else the one of the same workload and parameters wherever it
+/// sits — so the WatDiv-like section of a reference run compares with a
+/// result whose main workload it is, `bench/results/phase6-final-watdiv10.json`
+/// (review infra#8), and a main workload is not compared with another
+/// workload's.
 fn base_section<'a>(base: Option<&'a BenchResult>, s: &Section<'_>) -> Option<Section<'a>> {
-    base.and_then(|b| b.sections().into_iter().find(|x| x.id == s.id))
+    let secs = base?.sections();
+    let same_id = secs
+        .iter()
+        .find(|x| x.id == s.id && x.workload.id == s.workload.id)
+        .copied();
+    same_id.or_else(|| {
+        secs.into_iter().find(|x| {
+            x.workload.id == s.workload.id
+                && x.workload.spec == s.workload.spec
+                && x.workload.version == s.workload.version
+        })
+    })
 }
 
 /// A Markdown report of `r`, with ratios against `base` when given.

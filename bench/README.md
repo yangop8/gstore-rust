@@ -28,16 +28,19 @@ for data, databases and results) are relative paths.
 | `queries [--workload watdiv] [--scale N] [--seed S] [--shrink K] [--data-dir DIR] [--verify-data]` | print the workload's queries as the runs use them: the WatDiv-like templates bound against the (cached) data, with each binding and its ASK tries | 0 |
 | `run [--profile P] [RUN OPTIONS] [--out FILE] [--note TEXT]` | measure a profile, write the result JSON, print a Markdown report | 0, or 1 when the result fails its own exact checks |
 | `check [--baseline FILE] [--from RESULT] [--thresholds FILE] [--self-test-slowdown X] [--summary FILE] [RUN OPTIONS] [--out FILE]` | measure what the baseline measured (or take `--from` RESULT) and apply the gates; failing timing/memory gates re-run only those phases (2 retries, minimum of the medians); `--backends` also limits which baseline backends are gated; workloads, runs and queries the baseline lacks are reported as **new**, not gated | 0 pass, 1 fail |
-| `ci [same options]` | `check` with the smoke baseline, the summary appended to `$GITHUB_STEP_SUMMARY` | 0 pass, 1 fail |
+| `ci [same options] [--allow-provisional]` | `check` with the smoke baseline, the summary appended to `$GITHUB_STEP_SUMMARY`; refuses (exit 2, before measuring) a provisional baseline or one `bless` would refuse, unless `--allow-provisional` (`check` only warns) | 0 pass, 1 fail |
 | `compare BASELINE RESULT [--thresholds FILE] [--self-test-slowdown X] [--backends a,b] [--markdown] [--summary FILE]` | gate two existing files (`--backends`: only those backends or run keys) | 0 pass, 1 fail |
 | `report RESULT... [--markdown] [--table KIND] [--compare BASELINE]...` | Markdown: the full report of one result (ratios and the gate table against BASELINE), or with `--table` one compact table over several results (see [Reports](#reports-and-documentation-tables)) | 0 |
 | `report --update DOC... \| --check DOC...` | regenerate (`--update`) or verify (`--check`) the tables between `<!-- gstore-bench report ARGS -->` and `<!-- /gstore-bench report -->` in documents | 0, or 1 when `--check` finds a stale table |
-| `bless --to FILE [--from RESULT] [--provisional] [--note TEXT] [RUN OPTIONS]` | turn a result (or a fresh run) into a baseline; refuses one that fails its own exact checks | 0, or 1 when refused |
+| `bless --to FILE [--from RESULT] [--provisional] [--note TEXT] [--thresholds FILE] [RUN OPTIONS]` | turn a result (or a fresh run) into a baseline; refuses one that fails its own exact checks, and one measured by a debug build, from a dirty tree or no commit, with the library builder or a `gbuild` from a `debug` directory, on a busy machine (1-minute load above `bless.max_load_per_cpu` × CPUs) or with noisy query processes (spread above `geomean.max_spread`), unless `--provisional`, which blesses it marked provisional with the reasons in the note | 0, or 1 when refused |
 | `merge --out FILE RESULT RESULT...` | join results of the same workloads measured by different binaries or settings (RocksDB from a `--features rocksdb` build; the disk layout in both query modes under two `--label`s); a run key may appear once per workload | 0, or 1 on a failed self-check |
 | `calibrate [--quick]` | print this machine's calibration | 0 |
 
 Every command exits **2** on a usage error, a crashed or timed-out phase, or
-an unreadable file — never 0.
+an unreadable file — never 0. Only `compare`, `merge`, `report` and its
+`--update` / `--check` take positional arguments; any other command refuses
+one (review infra#5: `check --from X other.json` used to gate X against the
+default baseline).
 
 Run options: `--profile micro|smoke|reference`, `--workload lubm|watdiv|tiny`
 (alone: drops the profile's extra workloads), `--scale`, `--seed`,
@@ -60,7 +63,13 @@ name), `--drop-caches` (drop the page cache before the first open; needs
 root), `--no-calibrate`, `--verify-data` (re-hash a cached data file and
 re-run the ASK walk of cached WatDiv bindings), `--quiet`. The concurrency
 and mixed-workload query choices apply to the main workload; extra
-workloads use their own defaults.
+workloads use their own defaults. `--conc-secs` and `--mixed-secs` must be
+finite, positive and at most 3600, `--conc-clients` at least 1, and a mixed
+point may not need more than 100 000 writes (`--mixed-secs` × 1000 ÷
+`--mixed-write-ms`): checked before anything is generated (review
+infra#16: a negative or NaN value used to panic the phase child after the
+build and query phases, and the writer built all its statements up front —
+it now makes them as it sends them).
 
 ## Profiles
 
@@ -127,9 +136,19 @@ code 2):
 5. **update** (last, it writes) — `singles` single-triple `INSERT DATA`
    statements and their `DELETE DATA` (median, p95; each must change exactly
    one triple); the update chunk (a disjoint department) inserted with one
-   `INSERT DATA` (`triple_num` must grow by exactly its unique triples) and
-   deleted again; every query re-run (answers must be unchanged); a
-   checkpoint; a reopen (the triple count must match). Dictionary growth is
+   `INSERT DATA` (`triple_num` must grow by exactly its unique triples), a
+   checkpoint and a reopen with it inserted (the original count plus the
+   chunk's), the chunk's `DELETE DATA` (it must remove every chunk triple,
+   and the count must be the original again); every query re-run (answers
+   must be unchanged); a checkpoint; a reopen (the original count); every
+   query re-run on the reopened database (answers must be unchanged).
+   Before review infra#9 every write was undone before the only checkpoint
+   and the answers were not re-checked after the reopen, so a checkpoint
+   that lost pending inserts and deletes alike passed; `--inject
+   lose-writes:update` (a checkpoint that restores the database as the phase
+   found it) now fails `exact.update_round_trip`. The first checkpoint and
+   reopen are recorded as `grown_checkpoint_ms` / `grown_reopen_ms`;
+   `checkpoint_ms` / `reopen_ms` remain the final ones. Dictionary growth is
    reported only.
 6. **mixed** (it writes too) — readers plus a paced writer on the bundled
    servers, per endpoint (`/sparql`, `/api`) and `check_point` setting (off,
@@ -244,7 +263,9 @@ Further workloads of the run follow in `extra_workloads`, each with its own
 workload and runs. A run is keyed by its backend, or `backend@label` with
 `--label` (`BackendRun::key`). Times are ms, memory MiB, sizes bytes,
 hashes 16 hex digits. A baseline is the same document with `"kind":
-"baseline"`; `"provisional": true` marks one recorded on a busy machine.
+"baseline"`; `"provisional": true` marks one `bless --provisional` accepted
+although it was unfit (the note says why): `ci` refuses to gate against it
+(review infra#10).
 
 * `bench/baselines/smoke.json` — the CI baseline (re-bless it when a change
   makes things ≥ 1.5× faster, or after an intended format change).
@@ -264,11 +285,22 @@ hashes 16 hex digits. A baseline is the same document with `"kind":
   concurrent bodies, every baseline backend and phase present.
 * **Timing**, one-sided and calibration-normalized (measured times are
   divided by the calibration ratio, clamped to [0.5, 2]): per query
-  `(m + 2 ms) / (b + 2 ms) > 3.0` fails; the per-backend geomean of the raw
-  warm medians `> 1.5` fails (it covers the queries whose baseline median is
-  ≥ 1 ms, all of them when fewer than three are: sub-millisecond jitter
-  would dominate it, and the per-query gate covers those); build `> 2.0` (`> 2.5` for disk, 100 ms floor);
-  warm open `> 2.5` (20 ms floor).
+  `(m + 0.1 ms) / (b + 0.1 ms) > 3.0` fails; the per-backend geomean over
+  **every** query of `(m + 0.05 ms) / (b + 0.05 ms)`, each ratio clamped to
+  `[1/3, 3]`, fails above `max(1.5, s)`, where `s` is the baseline run's
+  own process-to-process spread (the same geomean of each query's slowest
+  process median against its fastest, `gates::query_spread`) and the limit
+  never exceeds `max_spread` 1.6; build `> 2.0` (`> 2.5` for disk, 100 ms
+  floor); warm open `> 2.5` (20 ms floor). Until review infra#2/#4 the
+  per-query floor was 2 ms and the geomean left out queries under 1 ms, so
+  most smoke queries (0.01–0.7 ms) could regress 50–300× with CI green,
+  while the 1.5 limit sat inside the baseline's own spread (1.68 for the
+  LUBM snapshot run): `tests/smoke_gate_sensitivity.rs` pins both at the
+  smoke baseline's magnitudes.
+* **Configuration** (exact): every run is measured with the baseline run's
+  builder, warm repetitions and query processes (`exact.config`; `check`
+  takes `--builder`, `--reps` and `--query-procs` from the baseline unless
+  given).
 * **Memory**: `(m + 32 MiB) / (b + 32 MiB) > 1.5` fails (build peak, after
   open, query high-water mark). **Size**: database bytes `> 1.10×` fails
   (1.25× until the Phase 6 closure; the bytes are deterministic, so the
@@ -296,9 +328,15 @@ the medians. The gates run after the update and mixed phases, so a retried
 open or query phase first rebuilds the database those phases changed (and
 a retried open must see the first attempt's term counts).
 `--self-test-slowdown X` multiplies every measured time by X: CI checks that
-the run's own result, slowed 3× and checked against itself, fails (exit 1). A uniform 1.3× slowdown passes, 1.6× fails, one query of
+the run's own result, slowed 2× and 3× and checked against itself, fails
+(exit 1). A uniform 1.3× slowdown passes, 1.6× fails, one query of
 ≥ 20 ms slowed 4× fails, and a row-hash change fails without a retry
-(`tests/gates.rs`).
+(`tests/gates.rs`); on `bench/baselines/smoke.json` itself
+(`tests/smoke_gate_sensitivity.rs`) the baseline against its own slowest
+query processes passes, any single query slowed 50× fails (also a 0.01 ms
+one), a 0.02 ms query slowed 20× fails, every sub-millisecond query
+regressed to 3 ms fails, and the canary fails at 2× in every workload's
+geomean.
 
 ## Reports and documentation tables
 
@@ -323,20 +361,37 @@ Documents embed generated tables between markers whose first line holds
 
 `gstore-bench report --update README.md CHANGELOG.md` regenerates every
 marked table from the committed results; `report --check …` exits 1 when
-one is stale (the smoke CI job runs it).
+one is stale. CI (ci.yml's test job and bench.yml's smoke job) checks every
+tracked Markdown file with a marker at the start of a line (`git grep -l -E
+'^[[:space:]]*<!-- gstore-bench report ' -- '*.md'`: README.md,
+CHANGELOG.md, docs/BENCHMARKS.md and this file; review infra#6 — the
+listed README.md and CHANGELOG.md used to be all).
+
+A report compares each workload section of a result with the baseline's
+section of the same id and workload, else with the baseline's section of
+the same workload and parameters wherever it sits: the WatDiv-like section
+of a reference run compares with `phase6-final-watdiv10.json`, whose main
+workload it is.
 
 ## CI (`.github/workflows/bench.yml`)
 
-* `smoke` (push, PR): release build, the documentation-table check
-  (`report --check README.md CHANGELOG.md`), `gstore-bench ci` (LUBM-like
-  univ 1 and WatDiv-like scale 1, both gated since the Phase 6 closure
-  re-blessed `smoke.json` with them), the canary, results and phase logs as
-  an artifact.
+* `smoke` (push, PR): release build, the documentation-table check (every
+  marked Markdown file, see above), `gstore-bench ci` (LUBM-like univ 1 and
+  WatDiv-like scale 1, both gated since the Phase 6 closure re-blessed
+  `smoke.json` with them), the canary at 2× and at 3×, results and phase
+  logs as an artifact.
 * `rocksdb-correctness` (push, PR): `cargo test -p gstore-bench --features
   rocksdb` after building `gbuild` with RocksDB; the RocksDB build cache is
   shared with ci.yml's rocksdb job.
 * `reference` (manual with a `scale` input, weekly): report-only run of the
-  reference profile with RocksDB, compared with the pre-Phase-6 file.
+  reference profile with RocksDB, recorded as the Phase 6 closure was
+  (snapshot and RocksDB, then the disk layout under `--label materialize`
+  and `--label stream`, merged), so its run keys match
+  `phase6-final-lubm<scale>.json`, which it is compared with; its
+  WatDiv-like section is compared with `phase6-final-watdiv10.json`, and the
+  pre-Phase-6 file follows as a second table (review infra#8: only the
+  pre-Phase-6 file was used, so a regression since the Phase 6 closure did
+  not show, and the WatDiv-like section was always new).
 
 ## Recording a reference (for example the pre-Phase-6 one)
 
@@ -394,8 +449,17 @@ splicing, every committed result still loading and comparing); and the
 binary end to end with the `micro` profile (bless → check, the canary, an
 injected crash and timeout exiting 2, the data cache, merging, every backend
 answering alike, a WatDiv-like run on snapshot and disk with the mixed phase,
-a check that reports a new workload and passes). The end-to-end tests use
-the `gbuild` next to the test binary when it exists (`cargo test
---workspace` builds it) and otherwise the library build, and say so;
-`GSTORE_BENCH_TEST_BUILDER=cli|lib` forces one. The LUBM micro run on the
-disk layout is `#[ignore]` (slow in a debug build).
+a check that reports a new workload and passes). The end-to-end tests
+run the `gbuild` next to the test binary (`cargo test --workspace` builds
+it; alone, build it first with `cargo build --profile test -p gstore --bin
+gbuild`, adding `--features rocksdb` for a RocksDB test run): a missing
+`gbuild`, one older than a source file it is compiled from (the files
+rustc's dep-info in its target directory lists for `gbuild` and the gstore
+library, so editing a `#[cfg(test)]` module or another binary does not
+count), or one without RocksDB for `--features rocksdb` fails them with
+that instruction (review infra#18:
+they used to fall back to the library build, or measure a stale binary,
+saying so only on captured stderr). `GSTORE_BENCH_TEST_BUILDER=lib`
+chooses the library build explicitly. The tests of the update phase
+(`tests/update_phase_reopen.rs`) build with the library on purpose. The
+LUBM micro run on the disk layout is `#[ignore]` (slow in a debug build).

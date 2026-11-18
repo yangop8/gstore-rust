@@ -1,13 +1,14 @@
 {
   "schema": "gstore-bench-gates/1",
-  "about": "Gates of `gstore-bench check` / `compare` / `ci` (see bench/README.md). Exact gates always apply. Timing gates are one-sided and calibration-normalized: a measured time m is divided by clamp(calib_measured / calib_baseline) and compared with the baseline time b as (m + floor_ms) / (b + floor_ms); the per-backend query geomean uses the raw medians of the queries whose baseline median is at least min_base_ms (all queries when fewer than three are). Memory: (m + floor_mib) / (b + floor_mib). Sizes: m / b. A failing timing or memory gate re-runs only the failing phases, up to `retries` times, keeping the minimum of the medians.",
+  "about": "Gates of `gstore-bench check` / `compare` / `ci` (see bench/README.md). Exact gates always apply. Timing gates are one-sided and calibration-normalized: a measured time m is divided by clamp(calib_measured / calib_baseline) and compared with the baseline time b as (m + floor_ms) / (b + floor_ms). Per query the floor is 0.1 ms, so a sub-millisecond query slowed 50x fails (review infra#2). The per-backend query geomean takes every query's (m + 0.05 ms) / (b + 0.05 ms), each clamped to [1/3, 3]; its limit is max(max_ratio, the baseline run's own process-to-process spread) but at most max_spread (review infra#4). Memory: (m + floor_mib) / (b + floor_mib). Sizes: m / b. A failing timing or memory gate re-runs only the failing phases, up to `retries` times, keeping the minimum of the medians. `bless` (and `ci`, of its baseline) refuses a debug build, a dirty tree, the library builder, a load above max_load_per_cpu per CPU and a run whose spread exceeds geomean.max_spread (review infra#10).",
   "normalize_by_calibration": true,
   "calibration_clamp": [0.5, 2.0],
-  "query": { "floor_ms": 2.0, "max_ratio": 3.0 },
-  "geomean": { "max_ratio": 1.5, "epsilon_ms": 0.001, "min_base_ms": 1.0 },
+  "query": { "floor_ms": 0.1, "max_ratio": 3.0 },
+  "geomean": { "max_ratio": 1.5, "epsilon_ms": 0.001, "floor_ms": 0.05, "min_base_ms": 0.0, "max_spread": 1.6 },
   "build": { "floor_ms": 100.0, "max_ratio": 2.0, "max_ratio_disk": 2.5 },
   "open": { "floor_ms": 20.0, "max_ratio": 2.5 },
   "rss": { "floor_mib": 32.0, "max_ratio": 1.5 },
   "disk_bytes": { "max_ratio": 1.10 },
-  "retries": 2
+  "retries": 2,
+  "bless": { "max_load_per_cpu": 1.0 }
 }

@@ -45,6 +45,35 @@ pub struct ConcSettings {
     pub endpoints: Vec<String>,
 }
 
+impl ConcSettings {
+    /// Check the settings before anything runs (review infra#16): the point
+    /// duration ([`point_duration`]) and at least one client per point.
+    pub fn validate(&self) -> Result<(), String> {
+        point_duration("--conc-secs", self.secs)?;
+        if self.clients.contains(&0) {
+            return Err("--conc-clients: a point needs at least one client".into());
+        }
+        Ok(())
+    }
+}
+
+/// The longest measurement point (`--conc-secs`, `--mixed-secs`): an hour.
+pub const MAX_POINT_SECS: f64 = 3600.0;
+
+/// `secs` as a measurement point's duration: finite, positive and at most
+/// [`MAX_POINT_SECS`]. (Review infra#16: a negative, NaN or infinite value
+/// panicked the phase child in `Duration::from_secs_f64`, after the build
+/// and query phases had run.)
+pub fn point_duration(what: &str, secs: f64) -> Result<Duration, String> {
+    if secs.is_finite() && secs > 0.0 && secs <= MAX_POINT_SECS {
+        Ok(Duration::from_secs_f64(secs))
+    } else {
+        Err(format!(
+            "{what}: {secs} is not a duration in seconds in (0, {MAX_POINT_SECS}]"
+        ))
+    }
+}
+
 const API_USER: &str = "root";
 const API_PASSWORD: &str = "123456";
 
@@ -225,6 +254,7 @@ fn drive(
     secs: f64,
     hash: fn(&str, &[u8]) -> u64,
 ) -> Result<(Load, f64), String> {
+    let window = point_duration("the point duration", secs)?;
     let stop = Arc::new(AtomicBool::new(false));
     let total = Arc::new(Mutex::new(Load {
         ok: 0,
@@ -302,7 +332,7 @@ fn drive(
         }));
     }
     let started = Instant::now();
-    std::thread::sleep(Duration::from_secs_f64(secs));
+    std::thread::sleep(window);
     stop.store(true, Ordering::Relaxed);
     let mut err = None;
     for h in handles {
@@ -375,6 +405,7 @@ fn measure(
 
 /// Run the concurrency phase on the database in `dir`.
 pub fn conc_phase(dir: &Path, w: &dyn Workload, s: &ConcSettings) -> Result<ConcResult, String> {
+    s.validate()?;
     let names = if s.queries.is_empty() {
         w.conc_queries()
     } else {
@@ -520,6 +551,30 @@ pub struct MixedSettings {
 const MIXED_FIRST: usize = 1_000_000;
 const POINT_STRIDE: usize = 100_000;
 
+impl MixedSettings {
+    /// The writes one point may send: one every `write_ms` for `secs`, plus
+    /// a margin.
+    fn writes_per_point(&self) -> f64 {
+        (self.secs * 1000.0 / self.write_ms.max(1) as f64).ceil() + 16.0
+    }
+
+    /// Check the settings before anything runs (review infra#16): the point
+    /// duration ([`point_duration`]), and that a point's writes fit in its
+    /// `POINT_STRIDE` insert numbers (beyond them they would repeat the next
+    /// point's triples, which acknowledge no change).
+    pub fn validate(&self) -> Result<(), String> {
+        point_duration("--mixed-secs", self.secs)?;
+        if self.writes_per_point() > POINT_STRIDE as f64 {
+            return Err(format!(
+                "--mixed-secs {} with --mixed-write-ms {} needs more than {POINT_STRIDE} \
+                 writes per point",
+                self.secs, self.write_ms
+            ));
+        }
+        Ok(())
+    }
+}
+
 fn post(path: &str, body: &str, content_type: &str) -> String {
     format!(
         "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: {content_type}\r\n\
@@ -563,12 +618,13 @@ struct Writes {
     lat_ms: Vec<f64>,
 }
 
-/// The writer: `insert(i)` every `every` until `stop`, through `request`.
+/// The writer: the next of `statements` every `every` until `stop`, through
+/// `request`. The statements are made as they are sent.
 fn write_loop(
     addr: SocketAddr,
     every: Duration,
-    stop: Arc<AtomicBool>,
-    statements: Vec<String>,
+    stop: &AtomicBool,
+    statements: impl Iterator<Item = String>,
     request: impl Fn(&str) -> String,
 ) -> Writes {
     let mut w = Writes {
@@ -695,9 +751,40 @@ fn start_server(endpoint: &str, dir: &Path, check_point: bool) -> Result<Running
     }
 }
 
+/// Sets its flag when dropped, also while unwinding.
+struct StopOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Run `writer` on a scoped thread and `driver` on this one; `stop` (which
+/// the writer polls) is set as soon as `driver` returns or unwinds, so a
+/// panicking driver cannot leave `thread::scope` waiting for a writer that
+/// nobody stops (the scoped writer replaced a detached thread for review
+/// infra#16, which a panic simply left behind). The writer's panic is
+/// returned, not propagated.
+fn alongside<W: Send, D>(
+    stop: &AtomicBool,
+    writer: impl FnOnce() -> W + Send,
+    driver: impl FnOnce() -> D,
+) -> (D, std::thread::Result<W>) {
+    std::thread::scope(|sc| {
+        let w = sc.spawn(writer);
+        let d = {
+            let _stop = StopOnDrop(stop);
+            driver()
+        };
+        (d, w.join())
+    })
+}
+
 /// Run the mixed-workload phase on the database in `dir`. It writes, so it
 /// runs after every other phase.
 pub fn mixed_phase(dir: &Path, w: &dyn Workload, s: &MixedSettings) -> Result<MixedResult, String> {
+    s.validate()?;
     let name = match &s.query {
         Some(q) => q.clone(),
         None => w
@@ -842,17 +929,20 @@ fn mixed_point(
         ));
     }
     let reference = unordered_body_hash(endpoint, &body);
-    // Enough statements for the whole point; the writer stops early.
+    // Enough statements for the whole point, made as the writer sends them
+    // (they used to be built up front: `--mixed-secs 1e9` asked for 480 GB
+    // at once, review infra#16); the writer stops early, and never writes
+    // past the point's own insert numbers.
     let every = Duration::from_millis(s.write_ms.max(1));
-    let n = (s.secs * 1000.0 / s.write_ms.max(1) as f64).ceil() as usize + 16;
-    let statements: Vec<String> = (first..first + n).map(|i| w.single_insert(i)).collect();
-    let stop = Arc::new(AtomicBool::new(false));
-    let writer = {
-        let (stop, addr) = (Arc::clone(&stop), server.addr);
-        let api = endpoint != "sparql";
-        let db_name = api_cred(dir).map(|(_, n, _)| n).unwrap_or_default();
-        std::thread::spawn(move || {
-            write_loop(addr, every, stop, statements, move |st: &str| {
+    let n = (s.writes_per_point() as usize).min(POINT_STRIDE);
+    let stop = AtomicBool::new(false);
+    let api = endpoint != "sparql";
+    let db_name = api_cred(dir).map(|(_, n, _)| n).unwrap_or_default();
+    let (driven, writes) = alongside(
+        &stop,
+        || {
+            let statements = (first..first + n).map(|i| w.single_insert(i));
+            write_loop(server.addr, every, &stop, statements, |st: &str| {
                 if api {
                     post(
                         "/api",
@@ -868,19 +958,20 @@ fn mixed_point(
                     post("/update", st, "application/sparql-update")
                 }
             })
-        })
-    };
-    let driven = drive(
-        server.addr,
-        endpoint,
-        &path,
-        accept,
-        readers,
-        s.secs,
-        unordered_body_hash,
+        },
+        || {
+            drive(
+                server.addr,
+                endpoint,
+                &path,
+                accept,
+                readers,
+                s.secs,
+                unordered_body_hash,
+            )
+        },
     );
-    stop.store(true, Ordering::Relaxed);
-    let writes = writer.join().map_err(|_| "the writer panicked")?;
+    let writes = writes.map_err(|_| "the writer panicked")?;
     let (load, secs) = driven?;
     let mut distinct = load.hashes.clone();
     distinct.insert(reference);
@@ -940,6 +1031,118 @@ mod tests {
         assert!(!acknowledged_one(br#"{"changed":11}"#));
         assert!(!acknowledged_one(b"not json"));
         assert_eq!(json_string("a\"b\n"), r#""a\"b\n""#);
+    }
+
+    #[test]
+    fn point_settings_are_validated() {
+        for bad in [
+            -1.0,
+            0.0,
+            f64::NAN,
+            f64::INFINITY,
+            1e9,
+            MAX_POINT_SECS * 1.01,
+        ] {
+            assert!(point_duration("--conc-secs", bad).is_err(), "{bad}");
+        }
+        assert_eq!(
+            point_duration("--conc-secs", 0.25),
+            Ok(Duration::from_millis(250))
+        );
+        assert!(point_duration("x", MAX_POINT_SECS).is_ok());
+        let c = ConcSettings {
+            clients: vec![1, 8],
+            secs: 1.0,
+            queries: Vec::new(),
+            endpoints: vec!["sparql".into()],
+        };
+        assert!(c.validate().is_ok());
+        assert!(ConcSettings {
+            secs: -1.0,
+            ..c.clone()
+        }
+        .validate()
+        .is_err());
+        assert!(ConcSettings {
+            clients: vec![0],
+            ..c.clone()
+        }
+        .validate()
+        .is_err());
+        let m = MixedSettings {
+            readers: 2,
+            write_ms: 100,
+            secs: 5.0,
+            check_point: vec![false],
+            endpoints: vec!["sparql".into()],
+            query: None,
+            begins: 0,
+        };
+        assert!(m.validate().is_ok());
+        assert!(MixedSettings {
+            secs: f64::NAN,
+            ..m.clone()
+        }
+        .validate()
+        .is_err());
+        // An hour at one write per 100 ms fits a point's insert numbers; at
+        // one per millisecond it does not.
+        assert!(MixedSettings {
+            secs: 3600.0,
+            ..m.clone()
+        }
+        .validate()
+        .is_ok());
+        let e = MixedSettings {
+            secs: 3600.0,
+            write_ms: 1,
+            ..m.clone()
+        }
+        .validate()
+        .unwrap_err();
+        assert!(e.contains("writes per point"), "{e}");
+    }
+
+    /// A driver that panics stops the writer, and the panic reaches the
+    /// caller instead of `thread::scope` waiting forever (the receive
+    /// timeout is only a hang guard).
+    #[test]
+    fn a_panicking_driver_stops_the_writer() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let stop = AtomicBool::new(false);
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                alongside(
+                    &stop,
+                    || {
+                        while !stop.load(Ordering::Relaxed) {
+                            std::thread::yield_now();
+                        }
+                    },
+                    || -> u8 { panic!("the driver failed") },
+                )
+            }));
+            let _ = tx.send(r.is_err() && stop.load(Ordering::Relaxed));
+        });
+        assert_eq!(rx.recv_timeout(Duration::from_secs(120)), Ok(true));
+        // A driver that returns stops it too; a panicking writer is
+        // returned as an error.
+        let stop = AtomicBool::new(false);
+        let (d, w) = alongside(
+            &stop,
+            || {
+                while !stop.load(Ordering::Relaxed) {
+                    std::thread::yield_now();
+                }
+                7
+            },
+            || 5,
+        );
+        assert_eq!((d, w.ok()), (5, Some(7)));
+        let stop = AtomicBool::new(false);
+        let (d, w) = alongside(&stop, || -> u8 { panic!("the writer failed") }, || 1);
+        assert_eq!(d, 1);
+        assert!(w.is_err());
     }
 
     #[test]

@@ -96,12 +96,23 @@ jobs:
           GSTORE_DISK_QUERY_MODE: stream
         run: cargo test --workspace
       # The tables between `<!-- gstore-bench report … -->` markers must be
-      # what `gstore-bench report` makes of the committed results (fix with
-      # `gstore-bench report --update README.md CHANGELOG.md`). Here, with
-      # no paths-ignore, a docs-only change is checked too (bench.yml's
-      # smoke job skips those).
+      # what `gstore-bench report` makes of the committed results, in every
+      # tracked Markdown file that has one — a marker starts a line (fix with
+      # `gstore-bench report --update FILE...`; listing README.md and
+      # CHANGELOG.md here left docs/BENCHMARKS.md and bench/README.md
+      # unchecked). Here, with no paths-ignore, a docs-only change is
+      # checked too (bench.yml's smoke job skips those). It runs the
+      # target/debug/gstore-bench the test steps built (gstore-bench's
+      # integration tests run that binary): `cargo run -p gstore-bench`
+      # compiled gstore and gstore-bench a second time — in the dev profile
+      # (opt-level 0; Cargo.toml's [profile.test] has 1), and even with
+      # `--profile test`, since features resolved for gstore-bench alone
+      # differ from the workspace's (serde), which gives gstore another unit.
       - name: generated documentation tables are current
-        run: cargo run --locked -q -p gstore-bench --bin gstore-bench -- report --check README.md CHANGELOG.md
+        run: |
+          docs=$(git grep -l -E '^[[:space:]]*<!-- gstore-bench report ' -- '*.md')
+          echo "checking: $docs"
+          target/debug/gstore-bench report --check $docs
 
   # The feature matrix: one job per optional feature of the gstore crate,
   # plus the console / zip / PFN features together (gconsole driving the PFN
