@@ -299,12 +299,17 @@ fn a_planted_link_or_a_file_of_another_user_is_not_trusted() {
     );
 
     // A 0600 file owned by another user: only root can make one, and only a
-    // process that can read another user's private file is at risk.
+    // process that can read another user's private file is at risk. The
+    // other user is any uid but the process's own: run as `nobody` (65534),
+    // giving a file to 65534 succeeded without root and changed nothing.
+    use std::os::unix::fs::MetadataExt;
     let probe = std::fs::File::create(dir.path().join("probe")).unwrap();
-    let as_root = std::os::unix::fs::fchown(&probe, Some(65534), None).is_ok();
+    let own = probe.metadata().unwrap().uid();
+    let other = if own == 65534 { 65533 } else { 65534 };
+    let as_root = std::os::unix::fs::fchown(&probe, Some(other), None).is_ok();
     drop(probe);
     if as_root {
-        std::os::unix::fs::chown(&file, Some(65534), None).unwrap();
+        std::os::unix::fs::chown(&file, Some(other), None).unwrap();
         let kb = PagedKb::new(10);
         build(&kb, &cache);
         assert_eq!(
