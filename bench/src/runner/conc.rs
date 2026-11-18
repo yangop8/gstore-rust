@@ -751,6 +751,36 @@ fn start_server(endpoint: &str, dir: &Path, check_point: bool) -> Result<Running
     }
 }
 
+/// Sets its flag when dropped, also while unwinding.
+struct StopOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Run `writer` on a scoped thread and `driver` on this one; `stop` (which
+/// the writer polls) is set as soon as `driver` returns or unwinds, so a
+/// panicking driver cannot leave `thread::scope` waiting for a writer that
+/// nobody stops (the scoped writer replaced a detached thread for review
+/// infra#16, which a panic simply left behind). The writer's panic is
+/// returned, not propagated.
+fn alongside<W: Send, D>(
+    stop: &AtomicBool,
+    writer: impl FnOnce() -> W + Send,
+    driver: impl FnOnce() -> D,
+) -> (D, std::thread::Result<W>) {
+    std::thread::scope(|sc| {
+        let w = sc.spawn(writer);
+        let d = {
+            let _stop = StopOnDrop(stop);
+            driver()
+        };
+        (d, w.join())
+    })
+}
+
 /// Run the mixed-workload phase on the database in `dir`. It writes, so it
 /// runs after every other phase.
 pub fn mixed_phase(dir: &Path, w: &dyn Workload, s: &MixedSettings) -> Result<MixedResult, String> {
@@ -908,8 +938,9 @@ fn mixed_point(
     let stop = AtomicBool::new(false);
     let api = endpoint != "sparql";
     let db_name = api_cred(dir).map(|(_, n, _)| n).unwrap_or_default();
-    let (driven, writes) = std::thread::scope(|sc| {
-        let writer = sc.spawn(|| {
+    let (driven, writes) = alongside(
+        &stop,
+        || {
             let statements = (first..first + n).map(|i| w.single_insert(i));
             write_loop(server.addr, every, &stop, statements, |st: &str| {
                 if api {
@@ -927,19 +958,19 @@ fn mixed_point(
                     post("/update", st, "application/sparql-update")
                 }
             })
-        });
-        let driven = drive(
-            server.addr,
-            endpoint,
-            &path,
-            accept,
-            readers,
-            s.secs,
-            unordered_body_hash,
-        );
-        stop.store(true, Ordering::Relaxed);
-        (driven, writer.join())
-    });
+        },
+        || {
+            drive(
+                server.addr,
+                endpoint,
+                &path,
+                accept,
+                readers,
+                s.secs,
+                unordered_body_hash,
+            )
+        },
+    );
     let writes = writes.map_err(|_| "the writer panicked")?;
     let (load, secs) = driven?;
     let mut distinct = load.hashes.clone();
@@ -1070,6 +1101,48 @@ mod tests {
         .validate()
         .unwrap_err();
         assert!(e.contains("writes per point"), "{e}");
+    }
+
+    /// A driver that panics stops the writer, and the panic reaches the
+    /// caller instead of `thread::scope` waiting forever (the receive
+    /// timeout is only a hang guard).
+    #[test]
+    fn a_panicking_driver_stops_the_writer() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let stop = AtomicBool::new(false);
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                alongside(
+                    &stop,
+                    || {
+                        while !stop.load(Ordering::Relaxed) {
+                            std::thread::yield_now();
+                        }
+                    },
+                    || -> u8 { panic!("the driver failed") },
+                )
+            }));
+            let _ = tx.send(r.is_err() && stop.load(Ordering::Relaxed));
+        });
+        assert_eq!(rx.recv_timeout(Duration::from_secs(120)), Ok(true));
+        // A driver that returns stops it too; a panicking writer is
+        // returned as an error.
+        let stop = AtomicBool::new(false);
+        let (d, w) = alongside(
+            &stop,
+            || {
+                while !stop.load(Ordering::Relaxed) {
+                    std::thread::yield_now();
+                }
+                7
+            },
+            || 5,
+        );
+        assert_eq!((d, w.ok()), (5, Some(7)));
+        let stop = AtomicBool::new(false);
+        let (d, w) = alongside(&stop, || -> u8 { panic!("the writer failed") }, || 1);
+        assert_eq!(d, 1);
+        assert!(w.is_err());
     }
 
     #[test]

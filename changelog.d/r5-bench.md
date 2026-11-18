@@ -46,7 +46,9 @@ workflows; no gstore library, server or on-disk change):
   before anything is generated, and again in each phase child (which
   returns an error instead of panicking in `Duration::from_secs_f64`). The
   mixed writer makes its statements as it sends them (`--mixed-secs 1e9`
-  asked for 480 GB up front).
+  asked for 480 GB up front), on a scoped thread that is stopped as soon
+  as the readers' drive returns or unwinds (a panic there would otherwise
+  leave the scope waiting for the writer until the phase timeout).
 - **Stray positional arguments are usage errors** (infra#5): `gen`,
   `queries`, `run`, `check`, `ci`, `bless` and `calibrate` exit 2 on one
   (`check --from X other.json` gated X against the default baseline, `run
