@@ -9509,55 +9509,63 @@ mod tests {
     /// while clients hammered it ("held in under a quarter of the samples").
     #[test]
     fn bad_credentials_never_hash_under_the_state_lock() {
-        use crate::http_users::test_hooks::park_verifications_of;
+        use crate::http_users::test_hooks::{park_verification_attempt, park_verifications_of};
         let (server, addr) = start("pbkdf2_lock");
-        type Send = fn(&SocketAddr, &str) -> String;
+        type Send = fn(&SocketAddr, &str, &str) -> String;
         let paths: [(&str, Send); 4] = [
-            ("Basic auth", |addr, name| {
-                raw_request(addr, "GET", "/tasklist", Some(&basic(name, "x")), "")
+            ("Basic auth", |addr, name, password| {
+                raw_request(addr, "GET", "/tasklist", Some(&basic(name, password)), "")
             }),
-            ("/login", |addr, name| {
+            ("/login", |addr, name, password| {
                 raw_request(
                     addr,
                     "POST",
                     "/login",
                     None,
-                    &format!("username={name}&password=x"),
+                    &format!("username={name}&password={password}"),
                 )
             }),
-            ("/shutdown", |addr, name| {
+            ("/shutdown", |addr, name, password| {
                 raw_request(
                     addr,
                     "POST",
                     "/shutdown",
                     None,
-                    &format!("username={name}&password=x"),
+                    &format!("username={name}&password={password}"),
                 )
             }),
-            ("/api", |addr, name| {
+            ("/api", |addr, name, password| {
                 raw_request(
                     addr,
                     "POST",
                     "/api",
                     None,
-                    &format!(r#"{{"operation":"testConnect","username":"{name}","password":"x"}}"#),
+                    &format!(
+                        r#"{{"operation":"testConnect","username":"{name}","password":"{password}"}}"#
+                    ),
                 )
             }),
         ];
         for (i, (path, send)) in paths.into_iter().enumerate() {
-            // An unknown user each (one failure apiece: no lockout) — but
-            // `/shutdown` verifies only root's credentials (one wrong
-            // password does not lock root out either).
-            let name = if path == "/shutdown" {
-                "root".to_string()
+            // An unknown user each (one failure apiece: no lockout), parked by
+            // name — but `/shutdown` verifies only root's credentials (one
+            // wrong password does not lock root out either), and other tests
+            // of this binary verify root's in parallel: parked by name, their
+            // first (uncached) root login could be the one `wait_parked`
+            // saw, while this request had not reached its hash. So it is
+            // parked by this request's own wrong password (round-5 review
+            // follow-up of http#20).
+            let (name, password, park) = if path == "/shutdown" {
+                let password = "hash_lock_probe_shutdown".to_string();
+                let park = park_verification_attempt("root", &password);
+                ("root".to_string(), password, park)
             } else {
-                format!("hash_lock_probe_{i}")
+                let name = format!("hash_lock_probe_{i}");
+                let park = park_verifications_of(&name);
+                (name, "x".to_string(), park)
             };
-            let park = park_verifications_of(&name);
-            let request = {
-                let name = name.clone();
-                std::thread::spawn(move || split_status_body(&send(&addr, &name)))
-            };
+            let request =
+                std::thread::spawn(move || split_status_body(&send(&addr, &name, &password)));
             assert!(
                 park.wait_parked(Duration::from_secs(60)),
                 "{path}: the bad credentials were never verified"
@@ -10739,7 +10747,6 @@ mod tests {
         }
     }
 
-    /// The served handle of database `name`.
     /// Wait until a writer queues for `h` behind the reader the caller
     /// holds. The standard library's lock refuses new readers while a
     /// writer waits (`try_read` fails then, which is also why monitoring
@@ -10756,6 +10763,7 @@ mod tests {
         }
     }
 
+    /// The served handle of database `name`.
     fn served(server: &ApiServer, name: &str) -> DbHandle {
         Arc::clone(
             locked(&server.inner.state)

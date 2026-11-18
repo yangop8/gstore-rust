@@ -320,7 +320,7 @@ impl CredentialAttempt {
         let outcome = if self.cached {
             CredentialCheck::Valid
         } else {
-            test_hooks::note_verification(&self.name);
+            test_hooks::note_verification(&self.name, &self.secret);
             match &self.stored {
                 Some(hash) => match hash.verify_as(&self.secret, self.form) {
                     Some(true) => CredentialCheck::Valid,
@@ -1926,7 +1926,7 @@ pub mod test_hooks {
         }
     }
 
-    pub(super) fn note_verification(name: &str) {
+    pub(super) fn note_verification(name: &str, secret: &str) {
         if COUNTING.load(Ordering::Relaxed) {
             if let Some(n) = counts().get_mut(name) {
                 *n += 1;
@@ -1934,6 +1934,7 @@ pub mod test_hooks {
         }
         if PARKING.load(Ordering::Relaxed) {
             park_point(&verification_key(name));
+            park_point(&attempt_key(name, secret));
         }
     }
 
@@ -1941,6 +1942,22 @@ pub mod test_hooks {
     /// test parks starts with a NUL.
     fn verification_key(name: &str) -> String {
         format!("\0verify:{name}")
+    }
+
+    /// The parking key of the verifications of `secret` presented for
+    /// `name` (see [`park_verification_attempt`]).
+    fn attempt_key(name: &str, secret: &str) -> String {
+        format!("\0attempt:{name}\0{secret}")
+    }
+
+    /// Park the password verifications of `secret` presented for user name
+    /// `name` — and only those — until the returned guard is released: for a
+    /// name other tests use too (`root`), with a secret no other test
+    /// presents. A park by name alone ([`park_verifications_of`]) would also
+    /// catch, and report as parked, another test's verification of that
+    /// name (round-5 review follow-up of http#20).
+    pub fn park_verification_attempt(name: &str, secret: &str) -> HashPark {
+        park_hash_of(&attempt_key(name, secret))
     }
 
     /// Park every password verification of user name `name` — the slow hash
@@ -2051,6 +2068,57 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.0);
         }
+    }
+
+    /// Round-5 review follow-up (http#20): a park by attempt holds only the
+    /// verification of its own secret. Another verification of the same
+    /// user name — what a test running in parallel makes when it logs in as
+    /// that user — neither waits nor counts as the parked one (a park by
+    /// name alone took either, so a test could look at the server while
+    /// its own request had not reached the hash yet).
+    #[test]
+    fn an_attempt_park_holds_only_its_own_secret() {
+        use test_hooks::park_verification_attempt;
+        let path = tmp("attempt_park");
+        let _cleanup = RemoveFile(path.clone());
+        let mut store = UserStore::open(&path, "rootpw").unwrap();
+        let park = park_verification_attempt("attempt_park_user", "attempt-park-probe");
+        // Another secret, on another thread (were it held, this one must
+        // still be able to look and release it).
+        let attempt = store.begin_check("attempt_park_user", "another-secret", PasswordForm::Plain);
+        let (done, finished) = std::sync::mpsc::channel();
+        let other = std::thread::spawn(move || {
+            let checked = attempt.verify();
+            let _ = done.send(());
+            checked
+        });
+        let t0 = Instant::now();
+        while finished.try_recv().is_err() {
+            assert!(
+                !park.wait_parked(Duration::ZERO),
+                "another secret's verification was held as the parked one"
+            );
+            assert!(t0.elapsed() < Duration::from_secs(60), "hang guard");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            store.finish_check(other.join().unwrap()),
+            CredentialCheck::Invalid
+        );
+        assert!(!park.wait_parked(Duration::ZERO));
+        let attempt = store.begin_check(
+            "attempt_park_user",
+            "attempt-park-probe",
+            PasswordForm::Plain,
+        );
+        let verifying = std::thread::spawn(move || attempt.verify());
+        assert!(
+            park.wait_parked(Duration::from_secs(60)),
+            "hang guard: its own secret is parked"
+        );
+        park.release();
+        let checked = verifying.join().unwrap();
+        assert_eq!(store.finish_check(checked), CredentialCheck::Invalid);
     }
 
     /// review gapi#6 / http#7: a change prepared before another save is not
