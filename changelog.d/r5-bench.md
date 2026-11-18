@@ -68,7 +68,8 @@ workflows; no gstore library, server or on-disk change):
   dep-info in the target directory lists for `gbuild` and the gstore
   library; a `#[cfg(test)]` module, another binary or any other file under
   `src/` does not count, since cargo does not relink `gbuild` for it);
-  `GSTORE_BENCH_TEST_BUILDER=lib` chooses the library builder explicitly. `cargo test -p gstore-bench` alone now needs
+  `GSTORE_BENCH_TEST_BUILDER=lib` chooses the library builder explicitly.
+  `cargo test -p gstore-bench` alone now needs
   `cargo build --profile test -p gstore --bin gbuild [--features rocksdb]`
   first (`cargo test --workspace` and both CI jobs already build it).
 - **Reports match sections by workload** (infra#8): a section is compared
@@ -200,6 +201,18 @@ two runs, calibration 74.6 and 79.6 ms against the baseline's 72.1).
   while other packages build would record exactly the noisy baseline the new
   rules refuse. The current `bench/baselines/smoke.json` passes every new
   baseline check and is kept.
+- infra#18 residual (left as is): the staleness check takes the union of
+  the files every gstore library unit in the target directory was compiled
+  from, so in a target directory shared by builds with different features
+  (say with and without `--features rocksdb`), editing a file only the
+  other feature set compiles makes a current `gbuild` look stale; cargo's
+  dep-info does not say which library unit a `gbuild` linked (the
+  uplifted `target/debug/gbuild.d` is not written by `cargo test`). The
+  test then fails naming that file; touching `src/lib.rs` and rebuilding
+  clears it. It never misses an edit of a source file the current
+  `gbuild` is compiled from (a dependency change in `Cargo.lock` alone is
+  not seen: rustc's dep-info lists no manifest), and CI and the campaign's
+  separate RocksDB target directory do not mix feature sets.
 - The closing step's CI run must confirm on GitHub Actions that the smoke job
   passes with the new gates on a runner (the 2× canary relies on the LUBM
   geomean, about 1.75 against a limit of at most 1.6) and that the weekly

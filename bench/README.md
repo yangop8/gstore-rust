@@ -299,7 +299,8 @@ although it was unfit (the note says why): `ci` refuses to gate against it
   smoke baseline's magnitudes.
 * **Configuration** (exact): every run is measured with the baseline run's
   builder, warm repetitions and query processes (`exact.config`; `check`
-  takes `--reps` and `--query-procs` from the baseline unless given).
+  takes `--builder`, `--reps` and `--query-procs` from the baseline unless
+  given).
 * **Memory**: `(m + 32 MiB) / (b + 32 MiB) > 1.5` fails (build peak, after
   open, query high-water mark). **Size**: database bytes `> 1.10×` fails
   (1.25× until the Phase 6 closure; the bytes are deterministic, so the
