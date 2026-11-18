@@ -25,11 +25,20 @@
 //! work it causes runs under a per-request [`CostLimits`] budget (LLM
 //! calls, KB rows, wall-clock time; see [`crate::budget`]). See
 //! [`HttpLimits`] for the defaults.
+//!
+//! Connections are capped twice when they are accepted, before a byte of the
+//! request is read: in total ([`HttpServer::with_max_conn`], excess → 503)
+//! and per client — the same key as the rate limit
+//! ([`HttpServer::with_max_conn_per_client`], excess → 429) — so one client
+//! that opens connections and never completes a request (the rate limit and
+//! the token check only see complete requests) cannot hold every slot.
+//! Behind a reverse proxy every client is the proxy's address: raise the
+//! per-client cap there.
 
 use std::collections::HashMap;
 use std::io::{BufReader, ErrorKind, Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -117,12 +126,14 @@ pub struct HttpServer {
     engine: Arc<SolveEngine>,
     listener: TcpListener,
     max_conn: usize,
+    /// Per-client connection cap; `None` = derived from `max_conn`.
+    max_conn_per_client: Option<usize>,
     auth: HttpAuth,
     limits: HttpLimits,
     read_deadline: Duration,
     /// Test failpoint: fail this many thread spawns (review conc#10).
     #[cfg(test)]
-    fail_spawns: AtomicUsize,
+    fail_spawns: std::sync::atomic::AtomicUsize,
 }
 
 impl HttpServer {
@@ -137,11 +148,12 @@ impl HttpServer {
             engine,
             listener,
             max_conn: 64,
+            max_conn_per_client: None,
             auth: HttpAuth::Unconfigured,
             limits: HttpLimits::default(),
             read_deadline: REQUEST_DEADLINE,
             #[cfg(test)]
-            fail_spawns: AtomicUsize::new(0),
+            fail_spawns: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -154,9 +166,29 @@ impl HttpServer {
     }
 
     /// Cap the number of concurrently-handled connections (excess → 503).
+    /// Unless [`with_max_conn_per_client`](Self::with_max_conn_per_client)
+    /// sets it, one client may hold an eighth of them (at least 1).
     pub fn with_max_conn(mut self, n: usize) -> HttpServer {
         self.max_conn = n.max(1);
         self
+    }
+
+    /// Cap the number of connections one client — an IP address, an IPv6
+    /// client per /64 network — may have open at once (excess → 429, answered
+    /// without reading the request). Default: an eighth of
+    /// [`with_max_conn`](Self::with_max_conn)'s cap, at least 1. Behind a
+    /// reverse proxy on the same host every client is the proxy: set it to
+    /// the total cap there.
+    pub fn with_max_conn_per_client(mut self, n: usize) -> HttpServer {
+        self.max_conn_per_client = Some(n.max(1));
+        self
+    }
+
+    /// The effective per-client connection cap.
+    fn conn_cap_per_client(&self) -> usize {
+        self.max_conn_per_client
+            .unwrap_or(self.max_conn / 8)
+            .clamp(1, self.max_conn)
     }
 
     /// Require `Authorization: Bearer <token>` on `/ask` and `/gSolve`. An
@@ -204,7 +236,8 @@ impl HttpServer {
 
     /// Accept and serve connections forever. Each connection gets socket
     /// timeouts (anti-slowloris) and runs on its own thread, with a cap on the
-    /// number of concurrent handlers (excess connections get a 503).
+    /// number of concurrent handlers (excess connections get a 503) and on
+    /// those of one client (excess connections get a 429).
     pub fn serve_forever(&self) {
         let ctx = Arc::new(Ctx {
             engine: Arc::clone(&self.engine),
@@ -214,24 +247,39 @@ impl HttpServer {
             read_deadline: self.read_deadline,
             failures: AtomicU64::new(0),
         });
-        let active = Arc::new(AtomicUsize::new(0));
+        let conns = Arc::new(ConnTable::new(self.max_conn, self.conn_cap_per_client()));
         for stream in self.listener.incoming() {
             let Ok(mut stream) = stream else { continue };
             let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
             let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
 
-            if active.load(Ordering::Acquire) >= self.max_conn {
-                let _ = write_json(
-                    &mut stream,
-                    503,
-                    &json!({"status":"error","message":"server busy"}),
-                );
-                continue;
-            }
-            // The slot is released by a drop guard (review conc#10 /
+            // The slot is taken before the request is read, so the per-client
+            // cap also bounds clients that never complete one (round-5 review
+            // follow-up of cluster-nlqa#13: idle connections from one address
+            // held every slot, and the rate limit and the token check never
+            // saw them). It is released by a drop guard (review conc#10 /
             // cluster-nlqa#20): a handler that panics no longer leaks it, so
             // max_conn panics can't turn into a permanent "server busy".
-            let slot = Slot::take(&active);
+            let client = stream.peer_addr().ok().map(|a| client_key(a.ip()));
+            let slot = match conns.take(client) {
+                Ok(slot) => slot,
+                Err(Busy::Server) => {
+                    let _ = write_json(
+                        &mut stream,
+                        503,
+                        &json!({"status":"error","message":"server busy"}),
+                    );
+                    continue;
+                }
+                Err(Busy::Client) => {
+                    let _ = write_json(
+                        &mut stream,
+                        429,
+                        &json!({"status":"error","message":"too many connections from this client"}),
+                    );
+                    continue;
+                }
+            };
             // A second handle on the socket, so a failed thread spawn can
             // still answer 503 instead of taking the accept loop down.
             let fallback = stream.try_clone().ok();
@@ -280,19 +328,80 @@ impl HttpServer {
     }
 }
 
-/// One taken connection slot; dropping it gives the slot back.
-struct Slot(Arc<AtomicUsize>);
+/// The open connections of one server: in total and per client (see
+/// [`client_key`]).
+struct ConnTable {
+    max_total: usize,
+    max_per_client: usize,
+    open: Mutex<(usize, HashMap<IpAddr, usize>)>,
+}
 
-impl Slot {
-    fn take(active: &Arc<AtomicUsize>) -> Slot {
-        active.fetch_add(1, Ordering::AcqRel);
-        Slot(Arc::clone(active))
+/// Why a connection got no slot.
+#[derive(Debug, PartialEq, Eq)]
+enum Busy {
+    /// The server holds `max_total` connections.
+    Server,
+    /// This client holds `max_per_client` connections.
+    Client,
+}
+
+impl ConnTable {
+    fn new(max_total: usize, max_per_client: usize) -> ConnTable {
+        ConnTable {
+            max_total,
+            max_per_client,
+            open: Mutex::default(),
+        }
     }
+
+    /// A slot for a connection from `client` (`None`: its address is
+    /// unknown, counted in the total only).
+    fn take(self: &Arc<Self>, client: Option<IpAddr>) -> std::result::Result<Slot, Busy> {
+        let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        let (total, per_client) = &mut *open;
+        if *total >= self.max_total {
+            return Err(Busy::Server);
+        }
+        if let Some(ip) = client {
+            let n = per_client.entry(ip).or_insert(0);
+            if *n >= self.max_per_client {
+                return Err(Busy::Client);
+            }
+            *n += 1;
+        }
+        *total += 1;
+        Ok(Slot {
+            table: Arc::clone(self),
+            client,
+        })
+    }
+
+    /// Connections open now (tests).
+    #[cfg(test)]
+    fn open(&self) -> usize {
+        self.open.lock().unwrap_or_else(|e| e.into_inner()).0
+    }
+}
+
+/// One taken connection slot; dropping it gives the slot back.
+struct Slot {
+    table: Arc<ConnTable>,
+    client: Option<IpAddr>,
 }
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        let mut open = self.table.open.lock().unwrap_or_else(|e| e.into_inner());
+        let (total, per_client) = &mut *open;
+        *total -= 1;
+        if let Some(ip) = self.client {
+            if let Some(n) = per_client.get_mut(&ip) {
+                *n -= 1;
+                if *n == 0 {
+                    per_client.remove(&ip);
+                }
+            }
+        }
     }
 }
 
@@ -361,14 +470,23 @@ fn client_key(ip: IpAddr) -> IpAddr {
 /// burst, refilled at `per_minute / 60` per second.
 struct RateLimiter {
     per_minute: u32,
-    buckets: Mutex<HashMap<IpAddr, (f64, Instant)>>,
+    buckets: Mutex<Buckets>,
+}
+
+/// The rate limiter's table: one `(tokens, last update)` bucket per tracked
+/// client, at most [`MAX_TRACKED_CLIENTS`] of them, and the bucket new
+/// clients share while every tracked client is being limited.
+#[derive(Default)]
+struct Buckets {
+    clients: HashMap<IpAddr, (f64, Instant)>,
+    overflow: Option<(f64, Instant)>,
 }
 
 impl RateLimiter {
     fn new(per_minute: u32) -> RateLimiter {
         RateLimiter {
             per_minute,
-            buckets: Mutex::new(HashMap::new()),
+            buckets: Mutex::default(),
         }
     }
 
@@ -387,17 +505,29 @@ impl RateLimiter {
         let refill = |tokens: f64, at: Instant| {
             (tokens + now.saturating_duration_since(at).as_secs_f64() * per_sec).min(cap)
         };
-        let mut map = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
-        if map.len() >= MAX_TRACKED_CLIENTS && !map.contains_key(&ip) {
-            // Forget clients whose bucket has refilled completely (they are
-            // indistinguishable from new ones); if a flood from many addresses
-            // still fills the table, start over rather than refuse new clients.
-            map.retain(|_, (t, at)| refill(*t, *at) < cap);
-            if map.len() >= MAX_TRACKED_CLIENTS {
-                map.clear();
+        let mut table = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
+        let Buckets { clients, overflow } = &mut *table;
+        if clients.len() >= MAX_TRACKED_CLIENTS && !clients.contains_key(&ip) {
+            // Make room. First forget clients whose bucket has refilled
+            // completely (they are indistinguishable from new ones), then
+            // clients with a token left (forgetting refills their bucket, but
+            // they were not being limited). A client that is being limited is
+            // never forgotten: a flood of new addresses used to clear the whole
+            // table, which handed every throttled client — the flooder's own
+            // address too — a full bucket again (round-5 review follow-up of
+            // cluster-nlqa#13).
+            clients.retain(|_, (t, at)| refill(*t, *at) < cap);
+            if clients.len() >= MAX_TRACKED_CLIENTS {
+                clients.retain(|_, (t, at)| refill(*t, *at) < 1.0);
             }
         }
-        let (tokens, at) = map.entry(ip).or_insert((cap, now));
+        let (tokens, at) = if clients.len() < MAX_TRACKED_CLIENTS || clients.contains_key(&ip) {
+            clients.entry(ip).or_insert((cap, now))
+        } else {
+            // Every tracked client is being limited: new clients share one
+            // bucket until a tracked one refills.
+            overflow.get_or_insert((cap, now))
+        };
         let available = refill(*tokens, *at);
         *at = now;
         if available >= 1.0 {
@@ -992,7 +1122,102 @@ mod tests {
             let ip = IpAddr::from(std::net::Ipv4Addr::from(i));
             let _ = rl.check_at(ip, t0);
         }
-        assert!(rl.buckets.lock().unwrap().len() <= MAX_TRACKED_CLIENTS);
+        assert!(rl.buckets.lock().unwrap().clients.len() <= MAX_TRACKED_CLIENTS);
+    }
+
+    /// Round-5 review follow-up (cluster-nlqa#13): when the table was full of
+    /// buckets that had not refilled, a new client cleared the whole table —
+    /// so a throttled client that sent one request from each of 10 000 /64s
+    /// of its IPv6 /48 got a fresh bucket for its throttled address. Limited
+    /// clients are never forgotten now; when every tracked client is being
+    /// limited, new clients share one overflow bucket.
+    #[test]
+    fn a_flood_of_new_clients_never_resets_a_throttled_one() {
+        let rl = RateLimiter::new(2);
+        let t0 = Instant::now();
+        let throttled = IpAddr::from([10, 0, 0, 1]);
+        assert!(rl.check_at(throttled, t0).is_ok());
+        assert!(rl.check_at(throttled, t0).is_ok());
+        assert!(rl.check_at(throttled, t0).is_err());
+        for i in 0..MAX_TRACKED_CLIENTS as u16 {
+            let net: IpAddr = format!("2001:db8:1:{i:x}::1").parse().unwrap();
+            assert!(rl.check_at(net, t0).is_ok(), "a new client is served");
+        }
+        assert!(
+            rl.check_at(throttled, t0).is_err(),
+            "the throttled client got a fresh bucket after the flood"
+        );
+
+        // Every tracked client limited: new clients share the overflow
+        // bucket (2 requests here), and still nobody is forgotten.
+        let rl = RateLimiter::new(1);
+        for i in 0..MAX_TRACKED_CLIENTS as u32 {
+            let ip = IpAddr::from(std::net::Ipv4Addr::from(i));
+            assert!(rl.check_at(ip, t0).is_ok());
+            assert!(rl.check_at(ip, t0).is_err());
+        }
+        let late = |n: u8| IpAddr::from([198, 51, 100, n]);
+        assert!(
+            rl.check_at(late(1), t0).is_ok(),
+            "the overflow bucket serves one"
+        );
+        assert!(rl.check_at(late(2), t0).is_err(), "and is then empty");
+        assert!(rl
+            .check_at(IpAddr::from(std::net::Ipv4Addr::from(7)), t0)
+            .is_err());
+        assert_eq!(
+            rl.buckets.lock().unwrap().clients.len(),
+            MAX_TRACKED_CLIENTS
+        );
+        // Once tracked buckets refill, new clients get their own again.
+        let later = t0 + Duration::from_secs(61);
+        assert!(rl.check_at(late(3), later).is_ok());
+        assert!(rl.buckets.lock().unwrap().clients.contains_key(&late(3)));
+    }
+
+    /// Round-5 review follow-up (cluster-nlqa#13): connections are capped per
+    /// client when they are accepted, so one client cannot hold every slot.
+    #[test]
+    fn one_client_cannot_take_every_connection_slot() {
+        let table = Arc::new(ConnTable::new(4, 2));
+        let a = Some(IpAddr::from([192, 0, 2, 1]));
+        let b = Some(IpAddr::from([192, 0, 2, 2]));
+        let a1 = table.take(a).expect("a's first");
+        let a2 = table.take(a).expect("a's second");
+        assert_eq!(table.take(a).err(), Some(Busy::Client));
+        let b1 = table.take(b).expect("b is another client");
+        let unknown = table
+            .take(None)
+            .expect("an unknown peer counts in the total");
+        assert_eq!(table.take(b).err(), Some(Busy::Server), "the total cap");
+        drop(a1);
+        assert_eq!(table.open(), 3);
+        let a3 = table.take(a).expect("a slot came back");
+        drop((a2, a3, b1, unknown));
+        assert_eq!(table.open(), 0);
+        assert!(
+            table.open.lock().unwrap().1.is_empty(),
+            "no client left behind"
+        );
+
+        // The default share: an eighth of the total, at least 1, at most all.
+        let engine = || {
+            Arc::new(SolveEngine::new(
+                Box::new(MockLlm::fixed("x")),
+                Box::new(MockKb::new(vec![])),
+            ))
+        };
+        let server = |n| {
+            HttpServer::bind(engine(), "127.0.0.1:0")
+                .unwrap()
+                .with_max_conn(n)
+        };
+        assert_eq!(server(64).conn_cap_per_client(), 8);
+        assert_eq!(server(8).conn_cap_per_client(), 1);
+        assert_eq!(
+            server(3).with_max_conn_per_client(10).conn_cap_per_client(),
+            3
+        );
     }
 
     #[test]

@@ -220,6 +220,12 @@ may cause is budgeted: at most `GNLQA_MAX_LLM_CALLS` LLM calls (default 16),
 seconds (default 120); a request that exhausts its budget gets `503` (`/gSolve`:
 `status: "error"`). The same budget applies to every MCP tool call. The server
 also bounds request size and connection count and applies read/write timeouts.
+Connections are counted when they are accepted, before the request is read: at
+most 64 at once (`503` beyond), and at most an eighth of them (8) from one client
+IP / IPv6 /64 (`429` beyond), so a client that opens connections and never
+finishes a request cannot hold every slot (`HttpServer::with_max_conn` /
+`with_max_conn_per_client`; behind a reverse proxy every client is the proxy's
+address).
 
 ## MCP server
 
