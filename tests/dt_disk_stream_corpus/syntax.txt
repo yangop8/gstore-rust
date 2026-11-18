@@ -1,0 +1,70 @@
+# Corpus "syntax" of the_sparql_corpora_answer_identically_in_both_modes
+# (tests/dt_disk_stream.rs): data documents (after "#@data") and read
+# queries (after "#@query"); each record runs to the next marker line.
+# Taken in 2026-11 from the string literals of tests/dt_sparql_syntax.rs (review
+# tests-a#17: the test no longer lexes that file).
+# Added: the last data document, so that the queries over <http://p> and
+# the four-object pattern have an answer to compare.
+#@data
+
+@prefix : <http://ex/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+:alice :age 30 ; :temp -5 ; :ok true ; :name "Alice" ; :knows :bob ; :dept :d1 ; :salary 100 .
+:bob   :age 25 ; :temp 7 ; :ok false ; :name "Bob" ; :knows :carol ; :dept :d1 ; :salary 200 .
+:carol :age 35 ; :temp -1.5e3 ; :name "Carol" ; :dept :d2 ; :salary 50 .
+
+#@data
+
+@prefix : <http://ex/> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+:a :tags "red,green,blue"^^xsd:list ; :need "red, blue"^^xsd:list ; :one "green" .
+:b :tags "red;yellow"^^xsd:list ; :need "red,green"^^xsd:list ; :one "black" .
+:c :tags "x"^^xsd:string ; :need ""^^xsd:list ; :one "x" .
+
+#@data
+@prefix : <http://ex/> .
+           :a :x "bb" ; :y 1 ; :z "10" .
+           :b :x "cc" ; :y 1 ; :z "9" .
+           :c :x "dd" ; :y 2 ; :z "5" .
+           :d :x "e" ; :y 0 ; :z "7" .
+#@data
+@prefix : <http://ex/> . :x :p ( 1 2 :z ) . :y :p () .
+#@data
+<http://ex/s> <http://ex/p> <http://ex/o0> .
+#@data
+<http://ex/a-b> <http://ex/p> <http://ex/a:b> .
+<http://ex/a~b.c> <http://ex/p> <http://ex/x%20y> .
+<http://ex/s> <http://ex/p> <http://ex/o.> .
+<http://ex/n> <http://ex/v2.p> <http://ex/o> .
+#@data
+<http://ex/s1> <http://p> 7 .
+<http://ex/s1> <http://p> <http://ex/o1> .
+<http://ex/o1> <http://p> 7 .
+<http://ex/s2> <http://p> ( 1 2 ) .
+<http://ex/s3> <http://ex/v> -1.5e3, +2, -.5, true .
+#@query
+CONSTRUCT WHERE { }
+#@query
+SELECT * WHERE { ?s <http://p> (1 ?x) }
+#@query
+SELECT * WHERE { ?s <http://p> +7 }
+#@query
+SELECT * WHERE { ?s <http://p>+ 7 }
+#@query
+SELECT * WHERE { ?s <http://p>+ ?o }
+#@query
+SELECT * WHERE { ?s <http://p>+7 }
+#@query
+SELECT * WHERE { ?s <http://p>+?o }
+#@query
+SELECT * WHERE { ?s ?p -1.5e3, +2, -.5, true }
+#@query
+SELECT * WHERE { ?s ?p ?o FILTER(?o NOT IN (1)) }
+#@query
+SELECT * WHERE { ?s ?p _:b.}
+#@query
+SELECT * WHERE { } VALUES () { () () }
+#@query
+SELECT ?o WHERE { <http://ex/s> <http://ex/p> ?o }
+#@query
+SELECT ?x WHERE { } VALUES ?x { 1 2 3 }
