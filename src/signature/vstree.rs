@@ -1060,9 +1060,27 @@ mod tests {
 
     // ---- out-of-core VS-tree (task 1) -------------------------------------
 
+    /// The store files [`diskvs_tmp`] handed out on this thread, removed
+    /// when the thread ends — also when its test fails (round-5 review
+    /// follow-up: they were removed only after the last assertion, and the
+    /// `.wal` never), as `disk_vstree`'s test files are.
+    struct TmpFiles(std::cell::RefCell<Vec<std::path::PathBuf>>);
+
+    impl Drop for TmpFiles {
+        fn drop(&mut self) {
+            for p in self.0.borrow().iter() {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+
+    thread_local! {
+        static TMP_FILES: TmpFiles = const { TmpFiles(std::cell::RefCell::new(Vec::new())) };
+    }
+
     /// A store path unique to this process and call (review disk#13: the
     /// fixed `gstore_vstree_disk_<tag>.kv` was shared by concurrent test
-    /// processes).
+    /// processes), and its `.wal`, removed when the test's thread ends.
     fn diskvs_tmp(tag: &str) -> std::path::PathBuf {
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1073,7 +1091,9 @@ mod tests {
         let _ = std::fs::remove_file(&p);
         let mut wal = p.clone().into_os_string();
         wal.push(".wal");
-        let _ = std::fs::remove_file(std::path::PathBuf::from(wal));
+        let wal = std::path::PathBuf::from(wal);
+        let _ = std::fs::remove_file(&wal);
+        TMP_FILES.with(|t| t.0.borrow_mut().extend([p.clone(), wal]));
         p
     }
 

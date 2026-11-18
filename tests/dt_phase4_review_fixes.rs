@@ -519,22 +519,34 @@ fn a_wide_pfn_argument_neither_overflows_the_stack_nor_takes_quadratic_time() {
             let mut runs = Vec::new();
             for (n, args) in &inputs {
                 let last = format!(r#""k{}":"<http://ex/a>""#, n - 1);
-                let mut calls = 0;
-                let (r, bytes) = alloc_counter::allocated_during(|| {
+                let calls = std::cell::Cell::new(0);
+                let expand = || {
                     gstore::pfn::call::evaluate(
                         "f",
                         args,
                         false,
                         |v| (v == "x").then(|| vec!["<http://ex/a>".to_string()]),
                         |p| {
-                            calls += 1;
+                            calls.set(calls.get() + 1);
                             assert!(p.contains(&last));
                             Ok("1".into())
                         },
                         1 << 20,
                     )
-                });
-                runs.push((r.map_err(|e| e.to_string()), calls, bytes));
+                };
+                let (r, bytes) = alloc_counter::allocated_during(expand);
+                let calls = calls.replace(0);
+                // review conc#16 (round-5 follow-up): the time too, as this
+                // thread's CPU time, the least of three runs.
+                let cpu = (0..3)
+                    .map(|_| {
+                        let t0 = thread_cpu_time();
+                        let _ = expand();
+                        thread_cpu_time() - t0
+                    })
+                    .min()
+                    .unwrap();
+                runs.push((r.map_err(|e| e.to_string()), calls, bytes, cpu));
             }
             let _ = tx.send(runs);
         })
@@ -544,7 +556,7 @@ fn a_wide_pfn_argument_neither_overflows_the_stack_nor_takes_quadratic_time() {
     let runs = rx
         .recv_timeout(Duration::from_secs(300))
         .expect("the expansion neither finished nor failed (a quadratic regression?)");
-    for (r, calls, _) in &runs {
+    for (r, calls, _, _) in &runs {
         assert_eq!(r.as_deref(), Ok("[1]"));
         assert_eq!(*calls, 1);
     }
@@ -558,6 +570,47 @@ fn a_wide_pfn_argument_neither_overflows_the_stack_nor_takes_quadratic_time() {
         full * 2 < half * 5,
         "{half} bytes for 65 000 keys, {full} for 130 000: more than linear"
     );
+    // review conc#16 (round-5 follow-up): bytes alone miss the quadratic
+    // mechanism this test was written for — a per-key `Json::set`, which
+    // scans the object for the key: O(n^2) comparisons but O(n) bytes (it
+    // passed with that loop put back, at 30 s). So the time is compared
+    // too, doubled input against a generous ratio (convention 5): about 2x
+    // for a linear expansion, about 3.4x-4x for that loop.
+    let (t_half, t_full) = (runs[0].3, runs[1].3);
+    eprintln!("CPU time: {t_half:?} for 65 000 keys, {t_full:?} for 130 000");
+    assert!(
+        t_full < t_half * 3,
+        "{t_half:?} for 65 000 keys, {t_full:?} for 130 000: more than linear"
+    );
+}
+
+/// This thread's CPU time (64-bit Linux: `CLOCK_THREAD_CPUTIME_ID`, so a
+/// busy machine's other work does not count; elsewhere the wall clock since
+/// a fixed start).
+fn thread_cpu_time() -> Duration {
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    {
+        #[repr(C)]
+        struct Timespec {
+            sec: i64,
+            nsec: i64,
+        }
+        extern "C" {
+            fn clock_gettime(clock: i32, tp: *mut Timespec) -> i32;
+        }
+        const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
+        let mut ts = Timespec { sec: 0, nsec: 0 };
+        // SAFETY: `ts` is a valid, writable `struct timespec` (64-bit Linux
+        // layout: two 64-bit fields).
+        let rc = unsafe { clock_gettime(CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+        assert_eq!(rc, 0, "clock_gettime");
+        Duration::new(ts.sec as u64, ts.nsec as u32)
+    }
+    #[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
+    {
+        static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        START.get_or_init(Instant::now).elapsed()
+    }
 }
 
 /// Finding: every argument combination was built (and held) before the

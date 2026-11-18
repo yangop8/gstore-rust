@@ -44,7 +44,13 @@ doc-hidden library addition and test-suite changes.
   store.rs`'s `gstore_disk_formats_ut`, and `tests/dt_cli.rs`,
   `dt_persist_backends.rs`, `dt_graph.rs`, `dt_lubm.rs`, `dt_parity.rs`,
   `dt_persist.rs`, `dt_small.rs`, `dt_update.rs` now use pid- (and
-  counter-) unique names, removed also when a test fails. Two test runs
+  counter-) unique names, removed also when a test fails (round-5 review
+  follow-up: `store.rs`'s `build_files_dispatches_on_extension` and
+  `vstree.rs`'s `diskvs_tmp` removed theirs only on the success path, and
+  the VS-tree store's `.wal` never; the first now has a drop guard, the
+  second a thread-local registry like `disk_vstree.rs`'s — checked by
+  injecting a failing assertion: the three paths were left in the temp
+  directory before, none after). Two test runs
   sharing `/tmp` (two checkouts, two agents) no longer remove, lock and
   rebuild each other's databases (see Measured numbers).
 - **Servers stop and clients time out** in `dt_gapi_core`, `dt_gapi_users`,
@@ -78,8 +84,10 @@ doc-hidden library addition and test-suite changes.
     answer (22 of 23, 14 of 17, 9 of 13) (review tests-a#17);
   - `dt_phase4_review_fixes` bounds work by bytes instead of wall-clock
     time: the PFN combination count holds < 256 KiB, the wide-argument
-    expansion allocates < 2.5× for 2× the keys, the `emit_json_str` bound
-    holds < 192 MiB (pfn-wasm) (review conc#16);
+    expansion allocates < 2.5× for 2× the keys and (round-5 review
+    follow-up) takes < 3× the thread CPU time, the least of three runs,
+    for 2× the keys, the `emit_json_str` bound holds < 192 MiB (pfn-wasm)
+    (review conc#16);
   - `dt_gapi_users`'s log tests run once more when the local date changed
     while they ran (`on_one_day`, checked on a fake clock), with every
     assertion as strict as before (review tests-a#15);
@@ -176,6 +184,7 @@ breaks in a local build, never committed; "old" = the test as of
 | tests-a#17 | `Database::query` fails for every statement | passes | fails (query failed in every mode) |
 | conc#16 | the first 2000 combinations built before the count | passes | fails (bytes held) |
 | conc#16 | a quadratic allocation (n/8 vectors of growing size) in `evaluate` | passes | fails (ratio > 2.5) |
+| conc#16 (round-5 review) | the original mechanism, a per-key `Json::set` on a clone of the argument object (quadratic comparisons, linear bytes) | passes (bytes 2.01×, 30 s) | fails (CPU time 6.24 s → 23.65 s, 3.8×; bytes passed at 2.0×) |
 | conc#16 | `emit_json_str` builds the escaped copy first (pfn-wasm) | passes | fails (bytes held) |
 | tests-a#12 | `bulk::build` refuses its FIFO input at the start (rocksdb) | hangs (killed by a 90 s timeout) | fails in 1 s |
 
@@ -183,7 +192,10 @@ breaks in a local build, never committed; "old" = the test as of
 combinations are counted and refused (bound 256 KiB); 31,229,899 bytes
 allocated for 65,000 keys and 62,713,883 for 130,000 (ratio 2.01, bound
 2.5); 67,135,507 bytes held by the over-long `emit_json_str` (bound 192
-MiB; an escaped copy would add 384 MiB).
+MiB; an escaped copy would add 384 MiB). Round-5 review follow-up, the
+same test's CPU time (least of three runs, this machine, other jobs
+idle): 76-99 ms for 65,000 keys and 166-180 ms for 130,000 over five runs
+(ratio 2.06-2.24, bound 3).
 
 **tests-a#10**: after one run of `dt_cross_phase_api`, `target/tmp` held
 `upstream_xphase_cache_data_<pid>_1` and `upstream_xphase_priv_data_<pid>_0`

@@ -3006,7 +3006,16 @@ mod tests {
         // and rewritten under each other by concurrent test processes).
         let dir =
             std::env::temp_dir().join(format!("gstore_disk_formats_ut_{}", std::process::id()));
+        /// Removes the directory also when an assertion fails (round-5
+        /// review follow-up: it was removed only on the success path).
+        struct Rm(std::path::PathBuf);
+        impl Drop for Rm {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
+        let _rm = Rm(dir.clone());
         std::fs::create_dir_all(&dir).unwrap();
         let ttl = dir.join("d.ttl");
         std::fs::write(
@@ -3028,7 +3037,6 @@ mod tests {
         let quads = ds.quads().unwrap();
         let g = ds.id_to_string(quads[0].0).unwrap();
         assert_eq!(g.as_deref(), Some("<http://ex/g>"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- out-of-core dictionary (lazy str↔id resolution) ------------------
