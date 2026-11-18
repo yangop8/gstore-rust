@@ -407,6 +407,10 @@ fn request(
     json: Option<&str>,
 ) -> Option<(u16, String)> {
     let mut s = TcpStream::connect(addr).unwrap();
+    // review tests-b#11: a server that never answers fails the test instead
+    // of stalling it (this read had no timeout).
+    s.set_read_timeout(Some(std::time::Duration::from_secs(120)))
+        .unwrap();
     let body = json.unwrap_or("");
     let mut raw = format!(
         "{method} {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: {}\r\n",

@@ -333,6 +333,10 @@ fn an_api_server_built_from_conf_ini_uses_its_settings() {
     assert!(body.contains(r#""licensetype":"trial""#), "{body}");
     // keep_alive_timeout=0 ⇒ every response closes; cors=off ⇒ no CORS header.
     let mut sock = TcpStream::connect(addr).unwrap();
+    // review tests-b#11: a connection the server keeps open fails the test
+    // instead of stalling it (this read had no timeout).
+    sock.set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
     sock.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
         .unwrap();
     let mut resp = String::new();

@@ -52,7 +52,12 @@ doc-hidden library addition and test-suite changes.
   `dt_http_parity`, `dt_gapi_async_wiring` (servers under `Running`) and in
   `dt_cross_phase5_api`, `dt_logging`, `dt_phase0_review`,
   `dt_phase0_wiring` (requests through `tests/common/http`) (review
-  tests-a#8, tests-b#11).
+  tests-a#8, tests-b#11); the seven remaining clients that read with no
+  timeout at all (`dt_http_durability`, `layout_replacement`,
+  `login_lockout`, `password_changes_do_not_block_other_requests`,
+  `query_limits`, `rocksdb_checkpoint_resources`: 120 s;
+  `dt_gserver_lifecycle`'s keep-alive check: 30 s, as its other client)
+  got a read timeout, so no HTTP read in the suite blocks without a bound.
 - **Corrected assertions** (each checked against deliberately broken code,
   see Measured numbers):
   - `dt_bulk_import` blank-node scoping compares the rows with the memory
@@ -119,13 +124,14 @@ none
     `dt_security_review`, `dt_small`, `dt_sparql_semantics`, `dt_update`,
     `dt_zip_io`); they are pid-unique and remove their paths, so only the
     duplication is left.
-  - Six files read HTTP responses without any timeout: `dt_http_durability`,
+  - About 55 test files hand-roll an HTTP client with a per-read timeout
+    only (the seven that read without any timeout — `dt_http_durability`,
     `layout_replacement`, `login_lockout`,
     `password_changes_do_not_block_other_requests`, `query_limits`,
-    `rocksdb_checkpoint_resources` (some guard the call with a channel);
-    about 50 others hand-roll a client with a per-read timeout only; about
-    60 files spawn `serve_forever` without a guard that joins it. Move them
-    to `tests/common/http` and `tests/common/server`.
+    `rocksdb_checkpoint_resources`, one site of `dt_gserver_lifecycle` — got
+    a read timeout in this package's review); about 60 files spawn
+    `serve_forever` without a guard that joins it. Move them to `tests/common/http` and
+    `tests/common/server`.
   - `tests/upstream_scripts/harness.rs` (15 binaries): `Server`'s drop asks
     the server to stop but does not join it, `http_with` has a 600 s
     per-read timeout, `scratch` directories are removed only where a test
@@ -222,7 +228,12 @@ test now removes (the same defect as review tests-a#10).
     (server guard; `dt_http_parity` also the client); `dt_cross_phase5_api`
     (client, scratch removal); `dt_logging`, `dt_phase0_review`,
     `dt_phase0_wiring` (client); `dt_logging`, `dt_merge4_wiring` (logger
-    guard); `dt_phase4_wiring` (scratch removal).
+    guard); `dt_phase4_wiring` (scratch removal); `dt_http_durability`,
+    `layout_replacement`, `login_lockout`,
+    `password_changes_do_not_block_other_requests`, `query_limits`,
+    `rocksdb_checkpoint_resources`, `dt_gserver_lifecycle` (one
+    read-timeout line after each connect that had none, review tests-b#11;
+    added in the package's review).
   - Merge note: `fix/r5-test-audit` also edits `src/http_api.rs`
     (`DbSlot` save, `ApiInner::dispatch`/`handle_update` parse hooks,
     backup directory creation); the regions are disjoint from the lines
