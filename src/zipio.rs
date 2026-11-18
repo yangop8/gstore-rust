@@ -677,8 +677,10 @@ fn check(
 /// every file and sub-directory below `src`, relative to it, sorted by path
 /// — upstream `CompressZip::compressDirExportZip(src, dest)` (no base
 /// directory in the archive; a sub-directory gets its own `name/` entry).
-/// Symbolic links are skipped. Written to `<dest>.part`, synced and renamed
-/// into place. Returns the number of files packed.
+/// Symbolic links are skipped. Written to a temporary file beside `dest`
+/// (`<dest>.part-<pid>-<n>`, created exclusively), synced and renamed into
+/// place (a `dest` that is a symbolic link: over the file it names).
+/// Returns the number of files packed.
 #[cfg(feature = "zip")]
 pub fn pack_dir(src: &Path, dest: &Path) -> std::result::Result<u64, ZipError> {
     let mut items: Vec<(String, PathBuf, bool)> = Vec::new();
@@ -716,6 +718,33 @@ pub fn pack_file(src: &Path, dest: &Path, entry: &str) -> std::result::Result<()
 /// Without the `zip` feature: [`ZipError::FeatureMissing`].
 #[cfg(not(feature = "zip"))]
 pub fn pack_file(_src: &Path, _dest: &Path, _entry: &str) -> std::result::Result<(), ZipError> {
+    Err(ZipError::FeatureMissing)
+}
+
+/// [`pack_file`] into `w` (an empty file, or anything that can be written
+/// and sought like one) instead of a path: for a caller that creates and
+/// commits the archive file itself — `gexport -z` writes it through the
+/// output file of a plain export (an exclusively created temporary name, a
+/// symbolic link's file replaced keeping its mode). Returns `w`, flushed
+/// by the archive writer but not synced.
+#[cfg(feature = "zip")]
+pub fn pack_file_to<W: io::Write + io::Seek>(
+    src: &Path,
+    w: W,
+    entry: &str,
+) -> std::result::Result<W, ZipError> {
+    let mut zw = zip::ZipWriter::new(w);
+    add_file(&mut zw, entry, src)?;
+    zw.finish().map_err(zip_io)
+}
+
+/// Without the `zip` feature: [`ZipError::FeatureMissing`].
+#[cfg(not(feature = "zip"))]
+pub fn pack_file_to<W: io::Write + io::Seek>(
+    _src: &Path,
+    _w: W,
+    _entry: &str,
+) -> std::result::Result<W, ZipError> {
     Err(ZipError::FeatureMissing)
 }
 
@@ -787,7 +816,11 @@ fn options_for(path: &Path) -> std::result::Result<zip::write::SimpleFileOptions
 }
 
 #[cfg(feature = "zip")]
-fn add_file(zw: &mut Writer, name: &str, path: &Path) -> std::result::Result<(), ZipError> {
+fn add_file<W: io::Write + io::Seek>(
+    zw: &mut zip::ZipWriter<W>,
+    name: &str,
+    path: &Path,
+) -> std::result::Result<(), ZipError> {
     let opts = options_for(path)?;
     zw.start_file(name, opts).map_err(zip_io)?;
     let mut f = std::fs::File::open(path)?;
@@ -795,19 +828,51 @@ fn add_file(zw: &mut Writer, name: &str, path: &Path) -> std::result::Result<(),
     Ok(())
 }
 
-/// Write an archive to `<dest>.part` with `fill`, then sync and rename it to
-/// `dest`; the partial file is removed on error.
+/// Write an archive to a temporary file beside `dest` with `fill`, then sync
+/// and rename it to `dest`; the partial file is removed on error.
+///
+/// The temporary file is `<dest>.part-<pid>-<n>`, created exclusively, and
+/// a `dest` that is a symbolic link to a file is resolved first, so the
+/// file it names is replaced and the link stays (round-4 review of
+/// bulkcli#11: a fixed `<dest>.part` was opened truncating and following a
+/// symbolic link — a link planted there had its target overwritten, two
+/// writers of one archive shared the file — and the rename replaced the
+/// link itself).
 #[cfg(feature = "zip")]
 fn write_archive<T>(
     dest: &Path,
     fill: impl FnOnce(&mut Writer) -> std::result::Result<T, ZipError>,
 ) -> std::result::Result<T, ZipError> {
     use std::fs;
-    let mut part = dest.as_os_str().to_owned();
-    part.push(".part");
-    let part = PathBuf::from(part);
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dest = match fs::symlink_metadata(dest) {
+        Ok(m) if m.file_type().is_symlink() => {
+            fs::canonicalize(dest).unwrap_or_else(|_| dest.to_path_buf())
+        }
+        _ => dest.to_path_buf(),
+    };
+    let dest = dest.as_path();
+    let mut attempt = 0;
+    let (part, file) = loop {
+        let mut part = dest.as_os_str().to_owned();
+        part.push(format!(
+            ".part-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let part = PathBuf::from(part);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&part)
+        {
+            Ok(file) => break (part, file),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && attempt < 100 => attempt += 1,
+            Err(e) => return Err(ZipError::Io(e)),
+        }
+    };
     let result = (|| {
-        let file = fs::File::create(&part)?;
         let mut zw = zip::ZipWriter::new(io::BufWriter::new(file));
         let value = fill(&mut zw)?;
         let file = zw
@@ -1431,6 +1496,66 @@ mod tests {
             name.ends_with(".nt")
         }
 
+        /// The archive temporary files (`*.part*`) in `d`.
+        fn part_files(d: &Path) -> Vec<String> {
+            let mut left: Vec<String> = fs::read_dir(d)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.contains(".part"))
+                .collect();
+            left.sort();
+            left
+        }
+
+        /// Round-4 review of bulkcli#11: an archive is written to a
+        /// temporary name created exclusively beside it — never through
+        /// what sits at the old fixed `<dest>.part` (a symbolic link planted
+        /// there had its target overwritten) — and a destination that is a
+        /// symbolic link stays one (the file it names is replaced).
+        #[cfg(unix)]
+        #[test]
+        fn archives_never_write_through_a_planted_part_and_keep_a_link() {
+            struct Gone(PathBuf);
+            impl Drop for Gone {
+                fn drop(&mut self) {
+                    let _ = fs::remove_dir_all(&self.0);
+                }
+            }
+            let d = Gone(tmp("part"));
+            let d = d.0.as_path();
+            let src = d.join("src.nt");
+            fs::write(&src, "<a> <b> <c> .\n").unwrap();
+            let victim = d.join("victim.txt");
+            fs::write(&victim, "keep me").unwrap();
+            std::os::unix::fs::symlink(&victim, d.join("out.zip.part")).unwrap();
+            pack_file(&src, &d.join("out.zip"), "src.nt").unwrap();
+            assert_eq!(fs::read_to_string(&victim).unwrap(), "keep me");
+            assert_eq!(
+                read_entry(&d.join("out.zip"), "src.nt", 100)
+                    .unwrap()
+                    .as_deref(),
+                Some(&b"<a> <b> <c> .\n"[..])
+            );
+
+            let real = d.join("real.zip");
+            fs::write(&real, "old").unwrap();
+            std::os::unix::fs::symlink("real.zip", d.join("link.zip")).unwrap();
+            let sub = d.join("sub");
+            fs::create_dir_all(&sub).unwrap();
+            fs::write(sub.join("a.nt"), "<a> <b> <c> .\n").unwrap();
+            assert_eq!(pack_dir(&sub, &d.join("link.zip")).unwrap(), 1);
+            assert!(
+                fs::symlink_metadata(d.join("link.zip"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "the link was replaced by the archive"
+            );
+            assert!(read_entry(&real, "a.nt", 100).unwrap().is_some());
+            assert_eq!(part_files(d), vec!["out.zip.part".to_string()]);
+        }
+
         #[test]
         fn packages_round_trip_and_are_checked() {
             let d = tmp("rt");
@@ -1441,7 +1566,9 @@ mod tests {
             fs::create_dir_all(src.join("empty")).unwrap();
             let z = d.join("p.zip");
             assert_eq!(pack_dir(&src, &z).unwrap(), 2);
-            assert!(!d.join("p.zip.part").exists());
+            // The temporary name is `p.zip.part-<pid>-<n>` (round-4 review
+            // of bulkcli#11), so whether one was left takes a scan.
+            assert_eq!(part_files(&d), Vec::<String>::new());
             let out = d.join("out");
             let files = unpack(&z, &out, &ZipLimits::default(), &nt).unwrap();
             let rels: Vec<_> = files

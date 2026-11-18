@@ -27,12 +27,15 @@
 //! writes a zip archive instead (feature `zip`): `<out>` with its extension
 //! replaced by `.zip`, holding the export file by its name (`out.nt`).
 //!
-//! The output is written under a temporary name beside its destination and
-//! renamed into place once complete and synced: an export that fails (a
-//! full disk, a write error) leaves no partial file, and an existing file of
-//! that name as it was. A symbolic link stays a link (the file it names is
-//! replaced, keeping its permission bits); a FIFO or a device is written in
-//! place.
+//! The output — the export file, or with `-z` the archive — is written
+//! under a temporary name beside its destination and renamed into place
+//! once complete and synced: an export that fails (a full disk, a write
+//! error) leaves no partial file, and an existing file of that name as it
+//! was. A symbolic link stays a link (the file it names is replaced,
+//! keeping its permission bits); a FIFO or a device is written in place (a
+//! FIFO cannot take an archive, whose writer seeks). The temporary file
+//! that replaces an existing file is private (`0600`) until it is complete,
+//! and so is a zip's intermediate export file.
 
 #[path = "common/cli.rs"]
 mod cli;
@@ -243,10 +246,12 @@ fn main() -> ExitCode {
 
     // The export file is written under a temporary name beside where it
     // goes and renamed into place once complete and synced; a zip's export
-    // file is packed from there as `<base name>[.<ext>]` (and the archive
-    // itself is written to `.part` and renamed). A failed export removes its
-    // temporary file and leaves whatever the destination held (review
-    // bulkcli#11: it wrote in place, leaving a partial file — or a
+    // file is packed from there as `<base name>[.<ext>]`, into an archive
+    // written the same way as a plain export (round-4 review of bulkcli#11:
+    // the archive went through a fixed, truncating, link-following
+    // `<archive>.part` renamed over the unresolved path). A failed export
+    // removes its temporary files and leaves whatever the destination held
+    // (review bulkcli#11: it wrote in place, leaving a partial file — or a
     // `.export-tmp` beside an archive — behind).
     let (dest, archive) = if zip {
         let mut entry = base
@@ -264,7 +269,7 @@ fn main() -> ExitCode {
     // (packed from there, never committed); a plain export goes where its
     // destination is (a link's file, a FIFO or a device written in place).
     let created = if archive.is_some() {
-        cli::OutputFile::beside(&dest)
+        cli::OutputFile::private_beside(&dest)
     } else {
         cli::OutputFile::create(&dest)
     };
@@ -292,7 +297,7 @@ fn main() -> ExitCode {
     let written = match archive {
         Some((archive, entry)) => {
             // `out` (the export file) is removed when it goes out of scope.
-            if let Err(e) = zipio::pack_file(out.path(), &archive, &entry) {
+            if let Err(e) = pack_archive(out.path(), &archive, &entry) {
                 eprintln!("gexport: export compress fail: {e}");
                 return ExitCode::FAILURE;
             }
@@ -315,4 +320,15 @@ fn main() -> ExitCode {
         written.display()
     );
     ExitCode::SUCCESS
+}
+
+/// Pack the export file `src` as `entry` into the archive `archive`,
+/// written through an [`OutputFile`](cli::OutputFile) like a plain export:
+/// committed only once complete, a symbolic link's file replaced keeping
+/// its mode and owner, the temporary file private until then.
+fn pack_archive(src: &Path, archive: &Path, entry: &str) -> Result<(), zipio::ZipError> {
+    let mut out = cli::OutputFile::create(archive)?;
+    zipio::pack_file_to(src, out.writer()?, entry)?;
+    out.commit()?;
+    Ok(())
 }

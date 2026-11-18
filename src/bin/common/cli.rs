@@ -313,6 +313,10 @@ pub fn unpack_packages(
     Ok(unpacked)
 }
 
+/// The mode a temporary file is created with when its content must not be
+/// readable by others before it is complete (less the umask).
+const PRIVATE_MODE: u32 = 0o600;
+
 /// An output file written under a temporary name beside its destination —
 /// `<dest>.part-<pid>-<n>`, created exclusively — and renamed over the
 /// destination only once it is complete and synced
@@ -332,6 +336,14 @@ pub fn unpack_packages(
 /// device such as `/dev/null`, a dangling link — is written in place,
 /// opened only when the output is ready (renaming over it would replace the
 /// FIFO or the device with a regular file).
+///
+/// The temporary file that replaces an existing file is created private
+/// (mode `0600`) and given the replaced file's owner and permission bits
+/// only once the content is written, just before it is synced and renamed
+/// (round-4 review of bulkcli#10/#11: it was created with the default mode
+/// — `0644` under the usual umask — so the output meant for a private
+/// `0600` destination could be opened by another user until the mode was
+/// copied).
 pub struct OutputFile {
     /// Where the output goes (a symbolic link resolved to the file it
     /// names).
@@ -341,6 +353,9 @@ pub struct OutputFile {
     tmp: Option<PathBuf>,
     /// The open file (in place: opened by the first [`writer`](Self::writer)).
     file: Option<std::io::BufWriter<std::fs::File>>,
+    /// The replaced file's metadata: its owner and permission bits are given
+    /// to the temporary file when it is finished.
+    keep: Option<std::fs::Metadata>,
     /// Whether [`finish`](Self::finish) closed the file.
     finished: bool,
     committed: bool,
@@ -363,9 +378,9 @@ impl OutputFile {
                 // user may not write is refused as the in-place write
                 // refused it (renaming over it would replace it anyway).
                 fs::OpenOptions::new().write(true).open(&target)?;
-                match OutputFile::beside(&target) {
-                    Ok(out) => {
-                        out.keep_attributes(&meta);
+                match OutputFile::beside_with_mode(&target, PRIVATE_MODE) {
+                    Ok(mut out) => {
+                        out.keep = Some(meta);
                         Ok(out)
                     }
                     // A writable file in a directory where no file can be
@@ -391,8 +406,23 @@ impl OutputFile {
     }
 
     /// A temporary file beside `dest` (whose directory must exist), renamed
-    /// over `dest` on [`commit`](Self::commit) — whatever `dest` is.
+    /// over `dest` on [`commit`](Self::commit) — whatever `dest` is. It has
+    /// the default mode of a new file (`0666` less the umask), as `dest`
+    /// will.
     pub fn beside(dest: &Path) -> std::io::Result<OutputFile> {
+        OutputFile::beside_with_mode(dest, 0o666)
+    }
+
+    /// [`beside`](Self::beside), readable and writable by its owner only
+    /// (mode `0600`): for content that is never committed under the
+    /// default mode — a scratch file packed into an archive.
+    pub fn private_beside(dest: &Path) -> std::io::Result<OutputFile> {
+        OutputFile::beside_with_mode(dest, PRIVATE_MODE)
+    }
+
+    /// [`beside`](Self::beside) with the temporary file created with `mode`
+    /// (less the umask; Unix only).
+    fn beside_with_mode(dest: &Path, mode: u32) -> std::io::Result<OutputFile> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let mut attempt = 0;
@@ -404,16 +434,19 @@ impl OutputFile {
                 SEQ.fetch_add(1, Ordering::Relaxed)
             ));
             let tmp = PathBuf::from(tmp);
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)
-            {
+            let mut open = std::fs::OpenOptions::new();
+            open.write(true).create_new(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut open, mode);
+            #[cfg(not(unix))]
+            let _ = mode;
+            match open.open(&tmp) {
                 Ok(f) => {
                     return Ok(OutputFile {
                         dest: dest.to_path_buf(),
                         tmp: Some(tmp),
                         file: Some(std::io::BufWriter::new(f)),
+                        keep: None,
                         finished: false,
                         committed: false,
                     })
@@ -433,17 +466,16 @@ impl OutputFile {
             dest: dest.to_path_buf(),
             tmp: None,
             file: None,
+            keep: None,
             finished: false,
             committed: false,
         }
     }
 
-    /// Give the temporary file the permission bits and, where this process
-    /// may, the owner of the file it replaces (best effort: a failure keeps
-    /// the defaults).
-    fn keep_attributes(&self, meta: &std::fs::Metadata) {
-        let Some(w) = &self.file else { return };
-        let f = w.get_ref();
+    /// Give the finished temporary file `f` the permission bits and, where
+    /// this process may, the owner of the file it replaces (best effort: a
+    /// failure keeps the private mode it was created with).
+    fn keep_attributes(f: &std::fs::File, meta: &std::fs::Metadata) {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -486,6 +518,11 @@ impl OutputFile {
         if let Some(w) = self.file.take() {
             let f = w.into_inner().map_err(|e| e.into_error())?;
             if self.tmp.is_some() {
+                // The content is complete: now the replaced file's owner
+                // and mode, then the sync (which makes them durable too).
+                if let Some(meta) = &self.keep {
+                    OutputFile::keep_attributes(&f, meta);
+                }
                 f.sync_all()?;
             }
         }
