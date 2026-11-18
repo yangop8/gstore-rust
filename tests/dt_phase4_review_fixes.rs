@@ -11,6 +11,9 @@
 //!   copying a rule directory never sees a half-done operation;
 //! * PFN (feature `pfn-wasm`): see the second half of the file.
 
+#[path = "common/alloc_counter.rs"]
+mod alloc_counter;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -496,40 +499,65 @@ fn a_failing_pfn_call_in_a_sub_select_fails_the_statement() {
 /// many `"?x"` keys overflowed the stack and aborted the process.
 #[test]
 fn a_wide_pfn_argument_neither_overflows_the_stack_nor_takes_quadratic_time() {
-    let mut text = String::from("{");
-    for i in 0..130_000 {
-        if i > 0 {
-            text.push(',');
+    let wide = |n: usize| {
+        let mut text = String::from("{");
+        for i in 0..n {
+            if i > 0 {
+                text.push(',');
+            }
+            text.push_str(&format!("\"k{i}\":\"?x\""));
         }
-        text.push_str(&format!("\"k{i}\":\"?x\""));
-    }
-    text.push('}');
-    let args = gstore::pfn::call::parse_args("f", &text).unwrap();
+        text.push('}');
+        (n, gstore::pfn::call::parse_args("f", &text).unwrap())
+    };
+    let inputs = [wide(65_000), wide(130_000)];
     // The 2 MiB stack of a `gstore-task` thread.
-    let h = thread::Builder::new()
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::Builder::new()
         .stack_size(2 << 20)
         .spawn(move || {
-            let t = Instant::now();
-            let mut calls = 0;
-            let r = gstore::pfn::call::evaluate(
-                "f",
-                &args,
-                false,
-                |v| (v == "x").then(|| vec!["<http://ex/a>".to_string()]),
-                |p| {
-                    calls += 1;
-                    assert!(p.contains(r#""k129999":"<http://ex/a>""#));
-                    Ok("1".into())
-                },
-                1 << 20,
-            );
-            (r.map_err(|e| e.to_string()), calls, t.elapsed())
+            let mut runs = Vec::new();
+            for (n, args) in &inputs {
+                let last = format!(r#""k{}":"<http://ex/a>""#, n - 1);
+                let mut calls = 0;
+                let (r, bytes) = alloc_counter::allocated_during(|| {
+                    gstore::pfn::call::evaluate(
+                        "f",
+                        args,
+                        false,
+                        |v| (v == "x").then(|| vec!["<http://ex/a>".to_string()]),
+                        |p| {
+                            calls += 1;
+                            assert!(p.contains(&last));
+                            Ok("1".into())
+                        },
+                        1 << 20,
+                    )
+                });
+                runs.push((r.map_err(|e| e.to_string()), calls, bytes));
+            }
+            let _ = tx.send(runs);
         })
         .unwrap();
-    let (r, calls, took) = h.join().unwrap();
-    assert_eq!(r.unwrap(), "[1]");
-    assert_eq!(calls, 1);
-    assert!(took < Duration::from_secs(10), "{took:?}");
+    // A hang guard, not the measurement (a quadratic expansion of 130 000
+    // keys runs for many minutes).
+    let runs = rx
+        .recv_timeout(Duration::from_secs(300))
+        .expect("the expansion neither finished nor failed (a quadratic regression?)");
+    for (r, calls, _) in &runs {
+        assert_eq!(r.as_deref(), Ok("[1]"));
+        assert_eq!(*calls, 1);
+    }
+    // review conc#16: linear, by the work done (the bytes the expansion
+    // allocates, the same on every machine) instead of a 10 s wall-clock
+    // bound: twice the keys may cost about twice the bytes, where a
+    // quadratic expansion costs four times as many.
+    let (half, full) = (runs[0].2, runs[1].2);
+    eprintln!("allocated: {half} bytes for 65 000 keys, {full} for 130 000");
+    assert!(
+        full * 2 < half * 5,
+        "{half} bytes for 65 000 keys, {full} for 130 000: more than linear"
+    );
 }
 
 /// Finding: every argument combination was built (and held) before the
@@ -544,19 +572,24 @@ fn pfn_argument_combinations_are_counted_before_anything_is_built() {
     text.push('}');
     let args = gstore::pfn::call::parse_args("f", &text).unwrap();
     let values: Vec<String> = (0..4).map(|i| format!("<http://ex/{i}>")).collect();
-    let t = Instant::now();
-    let e = gstore::pfn::call::evaluate(
-        "f",
-        &args,
-        false,
-        |_| Some(values.clone()),
-        |_| panic!("no call is made"),
-        1 << 20,
-    )
-    .unwrap_err()
-    .to_string();
+    let (r, held) = alloc_counter::peak_during(|| {
+        gstore::pfn::call::evaluate(
+            "f",
+            &args,
+            false,
+            |_| Some(values.clone()),
+            |_| panic!("no call is made"),
+            1 << 20,
+        )
+    });
+    let e = r.unwrap_err().to_string();
     assert!(e.contains("more than 1000000 argument combinations"), "{e}");
-    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    // review conc#16: nothing was built before the count, by the bytes held
+    // (the same on every machine) instead of a 1 s wall-clock bound: the
+    // 4^10 combinations of a 1 KB argument would hold a gigabyte, even the
+    // first thousand a megabyte.
+    eprintln!("held while counting: {held} bytes");
+    assert!(held < 256 << 10, "{held} bytes held while counting");
     // Under the limit, the calls are made in the order of the argument
     // texts, each once.
     let args = gstore::pfn::call::parse_args("f", r#"{"b":"?y","a":"?x","c":"k"}"#).unwrap();
@@ -760,13 +793,16 @@ mod runtime {
                 .unwrap();
         db.set_pfn_caller(Some(PfnCaller::new(reg, "root")));
         db.set_gfun_max_output_bytes(1 << 20);
-        let t = Instant::now();
-        let e = db
-            .query("SELECT (PFN.huge({}) AS ?v) WHERE {}")
-            .unwrap_err()
-            .to_string();
+        let (r, held) =
+            alloc_counter::peak_during(|| db.query("SELECT (PFN.huge({}) AS ?v) WHERE {}"));
+        let e = r.unwrap_err().to_string();
         assert!(e.contains("gfun_max_output_bytes"), "{e}");
-        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        // review conc#16: the bound is checked before an escaped copy is
+        // built, by the bytes held (the same on every machine) instead of a
+        // 2 s wall-clock bound: the guest's 64 MiB of zero bytes escape to
+        // 384 MiB (`\u0000` each).
+        eprintln!("held by the huge emit: {held} bytes");
+        assert!(held < 192 << 20, "{held} bytes held");
         let rows = select_rows(db.query("SELECT (PFN.small({}) AS ?v) WHERE {}"));
         let cell = rows[0][0].clone().unwrap();
         let v = gstore::sparql_results::upstream_binding(&cell);
