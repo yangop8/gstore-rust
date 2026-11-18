@@ -235,6 +235,39 @@ none
   passed; `--features rocksdb` (shared `target-rocks`, under its lock):
   clippy clean, `cargo test -p gstore --features rocksdb` 2968 passed, 0
   failed, 10 ignored (the three `fsync_audit::rocks::` tests included).
+- Independent review (branch head after the review's commits; shared
+  4-vCPU machine with other packages' builds running): each durability
+  fix reverted on its own fails its test — `backup_dir`
+  (`backups_sync_the_copy_and_its_directory`), the disk bulk build
+  (`a_bulk_install_syncs_every_step`), REST `/backup` (`handle_backup`,
+  `backup_target`), the `/api` backup's destinations and backups
+  directory (`the_api_server_syncs_a_backup_before_it_acknowledges`; the
+  test now removes the backups directory between the two protocols, so
+  each creates it), `RuleStore::ensure_dir` / `set_ledger`
+  (`rule_directory_writes_are_synced`), the PFN source and module
+  directories (`pfn_writes_are_synced`, the module directory with
+  `--features pfn-wasm`), `create_rocksdb` and the RocksDB bulk build
+  (`rocks::rocksdb_builds_sync_their_install`), `/upload` into a new name
+  (`databases_the_api_server_creates_or_restores_are_durable_before_it_answers`).
+  Removing the pager's batch-file fsync fails 10 audit tests, its
+  directory sync 9, the log append's `fdatasync` 1. The header-limit tests
+  fail with `MAX_HEADERS = 512` and with `MAX_HEADER_LINE = 128 KiB`
+  respectively. Parsing `/update` in the dispatch step (under the state
+  lock) fails the parse-off-lock test. Verification: `cargo fmt --check`
+  clean; `cargo clippy --workspace --all-targets -D warnings` clean;
+  `RUSTDOCFLAGS=-D warnings cargo doc -p gstore --no-deps --locked` clean;
+  `cargo test --workspace` 3100 passed, 0 failed, 10 ignored in each of
+  `GSTORE_DISK_QUERY_MODE=memory` and `stream`; `--features rocksdb`
+  (shared `target-rocks`, under its lock): clippy clean, `cargo test -p
+  gstore --features rocksdb` 2969 passed, 0 failed, 10 ignored;
+  `--features pfn-wasm`: clippy of the lib and `fsync_audit` clean,
+  `pfn_writes_are_synced` passed; with `--test-threads=1`: `fsync_audit`
+  21, `adversarial_coverage` 2, `dt_gapi_tasks` 16, `dt_rw_crash` 5 and
+  the touched lib tests (`server::`, `http_client::`, `gapi::tasks::`, the
+  http#20 `http_api` tests) 77, all passed. No hot path changed in the
+  review (`/upload`'s first save and the backups directory creation gain
+  a parent fsync; the rest is `#[cfg(test)]`), so the bench gate was not
+  rerun.
 
 ## Requests/Not yet
 
