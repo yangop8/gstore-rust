@@ -20,6 +20,7 @@
 //!   the directory it is served from, so REST `/backup` carries them even
 //!   when no `reasonManage` call reached it in this process.
 
+mod common;
 #[path = "upstream_scripts/harness.rs"]
 mod harness;
 
@@ -124,6 +125,9 @@ fn state(srv: &Server, db: &str) -> (String, usize, String, String) {
 /// `build` may read) and loaded as `db`.
 fn family_server(tag: &str, db: &str) -> Server {
     let data = scratch(&format!("{tag}_data"));
+    // Removed when the test ends, also when it fails (as review tests-a#10
+    // found for the cross-phase tests, these piled up under target/tmp).
+    common::tmp::remove_at_thread_exit(&data);
     let file = data.join("family.nt");
     fs::write(&file, FAMILY).unwrap();
     let srv = Server::start_with_dir(tag, Some(&data));
@@ -355,6 +359,8 @@ fn executing_a_rule_changes_what_a_pfn_function_sees() {
 #[test]
 fn refreshconf_applies_the_pfn_section() {
     let dir = scratch("p4w_refresh");
+    // Removed when the test ends (review tests-a#10's pattern).
+    common::tmp::remove_at_thread_exit(&dir);
     let conf = dir.join("conf.ini");
     let home = dir.join("home");
     let write_conf = |pfn: &str| {
