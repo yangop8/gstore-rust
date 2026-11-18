@@ -9122,11 +9122,21 @@ mod tests {
 
     /// The temp roots the current test thread made, removed when the thread
     /// ends — also when the test fails (a thread-local's destructor runs
-    /// after the unwinding).
-    struct TmpRoots(std::cell::RefCell<Vec<PathBuf>>);
+    /// after the unwinding) — and the servers [`start`] ran in them, stopped
+    /// and waited for first: a server still running (or shutting down)
+    /// writes its access log, endpoint log and databases below its root
+    /// after the test's last response, and recreated a removed root.
+    struct TmpRoots(
+        std::cell::RefCell<Vec<PathBuf>>,
+        std::cell::RefCell<Vec<(Arc<ApiServer>, std::thread::JoinHandle<()>)>>,
+    );
 
     impl Drop for TmpRoots {
         fn drop(&mut self) {
+            for (server, serving) in self.1.borrow_mut().drain(..) {
+                server.shutdown();
+                let _ = serving.join();
+            }
             for p in self.0.borrow().iter() {
                 let _ = fs::remove_dir_all(p);
             }
@@ -9134,7 +9144,12 @@ mod tests {
     }
 
     thread_local! {
-        static TMP_ROOTS: TmpRoots = const { TmpRoots(std::cell::RefCell::new(Vec::new())) };
+        static TMP_ROOTS: TmpRoots = const {
+            TmpRoots(
+                std::cell::RefCell::new(Vec::new()),
+                std::cell::RefCell::new(Vec::new()),
+            )
+        };
     }
 
     /// A unique temp directory for one server's databases + logs + user
@@ -9149,14 +9164,25 @@ mod tests {
         p
     }
 
-    /// Start an `ApiServer` (root password "root") in a background thread.
+    /// Start an `ApiServer` (root password "root") in a background thread,
+    /// stopped and joined when the test thread ends (see [`TmpRoots`]).
     fn start(tag: &str) -> (Arc<ApiServer>, SocketAddr) {
         let root = tmp_root(tag);
         let server = Arc::new(ApiServer::bind(&root, "root", "127.0.0.1:0").expect("bind"));
         let addr = server.local_addr().expect("addr");
-        let s2 = Arc::clone(&server);
-        std::thread::spawn(move || s2.serve_forever());
+        serve_until_the_test_ends(&server);
         (server, addr)
+    }
+
+    /// Serve `server` in a background thread until the test thread ends:
+    /// then it is stopped and joined before the temp roots are removed (see
+    /// [`TmpRoots`]).
+    fn serve_until_the_test_ends(server: &Arc<ApiServer>) {
+        let s2 = Arc::clone(server);
+        let serving = std::thread::spawn(move || {
+            s2.serve_forever();
+        });
+        TMP_ROOTS.with(|r| r.1.borrow_mut().push((Arc::clone(server), serving)));
     }
 
     /// Send one HTTP/1.1 request; return the full raw response (status line +
@@ -10444,8 +10470,7 @@ mod tests {
         // The PFN registry checks the same [pfn] limits.
         assert_eq!(server.pfn_registry().limits(), custom.pfn);
         let addr = server.local_addr().expect("addr");
-        let s2 = Arc::clone(&server);
-        std::thread::spawn(move || s2.serve_forever());
+        serve_until_the_test_ends(&server);
         let auth = basic("root", "root");
         let rest = |method: &str, target: &str, body: &str| {
             split_status_body(&raw_request(&addr, method, target, Some(&auth), body))
@@ -10564,8 +10589,7 @@ mod tests {
                 .with_config(GStoreConfig::load(&conf).unwrap()),
         );
         let addr = server.local_addr().expect("addr");
-        let s2 = Arc::clone(&server);
-        std::thread::spawn(move || s2.serve_forever());
+        serve_until_the_test_ends(&server);
         let auth = basic("root", "root");
         let rest = |target: &str, body: &str| {
             split_status_body(&raw_request(&addr, "POST", target, Some(&auth), body))
