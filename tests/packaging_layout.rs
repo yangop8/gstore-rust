@@ -382,11 +382,23 @@ fn systemd_analyze_verifies_the_unit() {
     );
     let file = dir.join("gserver.service");
     fs::write(&file, text).unwrap();
-    let out = std::process::Command::new(analyze)
-        .arg("verify")
-        .arg(&file)
+    // verify also loads the units the host's targets pull in, and a newer
+    // systemd warns about options of those (ubuntu-latest:
+    // "xfs_scrub_all.service: Support for option CPUAccounting= has been
+    // removed"). Only this unit's own messages count: --recursive-errors=no
+    // (systemd >= 250) keeps the others out of the exit status, and only
+    // lines naming gserver.service fail the test.
+    let help = std::process::Command::new(&analyze)
+        .arg("--help")
         .output()
-        .unwrap();
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    let mut cmd = std::process::Command::new(&analyze);
+    cmd.arg("verify");
+    if help.contains("--recursive-errors") {
+        cmd.arg("--recursive-errors=no");
+    }
+    let out = cmd.arg("--man=no").arg(&file).output().unwrap();
     let said = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -394,7 +406,11 @@ fn systemd_analyze_verifies_the_unit() {
     );
     assert!(out.status.success(), "{said}");
     // Unknown or misspelt keys are only warnings: none is allowed.
-    assert!(said.trim().is_empty(), "{said}");
+    let own: Vec<&str> = said
+        .lines()
+        .filter(|l| l.contains("gserver.service"))
+        .collect();
+    assert!(own.is_empty(), "{said}");
 }
 
 fn which(program: &str) -> Option<PathBuf> {
