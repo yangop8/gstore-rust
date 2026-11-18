@@ -450,8 +450,8 @@ impl SolveEngine {
     }
 
     /// Build the linker lazily with `build`: on first use and, after a
-    /// failure, again on a later request once `retry_every` has passed. Each
-    /// failure is logged. The build runs outside any request budget (it
+    /// failure (an error, or a panic, which reaches the caller), again on a
+    /// later request once `retry_every` has passed. Each error is logged. The build runs outside any request budget (it
     /// serves every later request) and at most one runs at a time; requests
     /// that arrive meanwhile proceed without a linker.
     pub fn with_linker_builder(
@@ -520,7 +520,12 @@ impl SolveEngine {
         if last.is_some_and(|t| t.elapsed() < src.retry_every) {
             return None;
         }
-        let started = Instant::now();
+        // The attempt is recorded before the build runs, so one that panics
+        // (the panic unwinds through here to the request's handler) also
+        // waits `retry_every` before the next: before, it left no timestamp
+        // and every later request ran the whole, unmetered build again
+        // (round-5 review follow-up of cluster-nlqa#16).
+        *last = Some(Instant::now());
         match crate::budget::unmetered(|| (src.build)()) {
             Ok(l) => {
                 let _ = self.linker.set(l);
@@ -528,7 +533,6 @@ impl SolveEngine {
                 self.linker.get()
             }
             Err(e) => {
-                *last = Some(started);
                 eprintln!(
                     "gnlqa: warning: building the entity linker failed (answers are not \
                      grounded in the KB vocabulary until it succeeds; retrying after {} s): {e}",

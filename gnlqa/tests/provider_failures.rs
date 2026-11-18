@@ -270,6 +270,34 @@ fn a_panicking_linker_build_does_not_disable_the_linker_for_good() {
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
+/// Round-5 review follow-up (cluster-nlqa#16): the retry interval also holds
+/// after a build that panicked. The failure time was recorded only for a
+/// build that returned an error, so after a panic every request ran the
+/// whole, unmetered build again.
+#[test]
+fn a_panicking_linker_build_is_retried_only_after_the_interval() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let c2 = Arc::clone(&calls);
+    let engine = SolveEngine::new(Box::new(MockLlm::fixed("x")), Box::new(MockKb::new(vec![])))
+        .with_linker_builder(Duration::from_secs(3600), move || {
+            c2.fetch_add(1, Ordering::SeqCst);
+            panic!("simulated bug in the linker build");
+        });
+    let attempts: Vec<_> = (0..3)
+        .map(|_| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.linker().is_some()))
+        })
+        .collect();
+    assert!(attempts[0].is_err(), "the first build panicked");
+    for later in &attempts[1..] {
+        assert!(
+            matches!(later, Ok(false)),
+            "within the interval: no linker, no build"
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "builds");
+}
+
 /// A KB whose endpoint is down: every query is a transport failure.
 struct DownKb;
 impl KbClient for DownKb {
