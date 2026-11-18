@@ -1,0 +1,10 @@
+# Environment for every build of this workspace, build scripts included.
+[env]
+# librocksdb-sys 0.16 (bundled RocksDB 8.10, the `rocksdb` feature) has headers
+# that use uint64_t without including <cstdint>. GCC 14 and later no longer
+# pull <cstdint> in through other standard headers, so the bundled C++ build
+# fails there with "'uint64_t' has not been declared" (seen on ubuntu-latest
+# GitHub runners). Pre-include it in every C++ file cc-rs compiles; harmless
+# on older compilers and on clang. A CXXFLAGS set in the environment takes
+# precedence over this one.
+CXXFLAGS = "-include cstdint"
