@@ -9,9 +9,12 @@
 
 #![cfg(feature = "rocksdb")]
 
+mod common;
+
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use gstore::bulk::{self, BulkInput, BulkOptions, BulkReport, BulkTarget};
 use gstore::model::id::LITERAL_FIRST_ID;
@@ -37,30 +40,32 @@ fn lubm_query(n: usize) -> String {
     std::fs::read_to_string(p).unwrap()
 }
 
-/// The temp directories the current test thread made, removed when the
-/// thread ends — also when the test fails (a thread-local's destructor runs
-/// after the unwinding).
-struct TmpDirs(std::cell::RefCell<Vec<std::path::PathBuf>>);
+/// A fresh, empty directory for the test, removed when its thread ends —
+/// also when it fails (tests/common).
+fn tmp(tag: &str) -> PathBuf {
+    common::tmp::thread_dir(&format!("dt_bulk_rocks_{tag}"))
+}
 
-impl Drop for TmpDirs {
-    fn drop(&mut self) {
-        for p in self.0.borrow().iter() {
-            // A directory, or a file (a store path).
-            let _ = std::fs::remove_dir_all(p).or_else(|_| std::fs::remove_file(p));
+/// Run `build` until it is not refused as "in use" (at most 20 s). A lock
+/// this test just released can still be held for a moment by a child
+/// another test of this binary forks (`mkfifo`, `gbuild`): the child shares
+/// the descriptor, and so the lock, between its fork and its exec, which
+/// closes it (review tests-a#12; dt_bulk_crash retries the same way).
+fn retry_while_in_use<T>(mut build: impl FnMut() -> gstore::Result<T>) -> T {
+    let t0 = Instant::now();
+    loop {
+        match build() {
+            Ok(r) => return r,
+            Err(e) => {
+                let e = e.to_string();
+                assert!(
+                    e.contains("in use") && t0.elapsed() < Duration::from_secs(20),
+                    "{e}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
         }
     }
-}
-
-thread_local! {
-    static TMP_DIRS: TmpDirs = const { TmpDirs(std::cell::RefCell::new(Vec::new())) };
-}
-
-fn tmp(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("gstore_dt_bulk_rocks_{tag}_{}", std::process::id()));
-    TMP_DIRS.with(|t| t.0.borrow_mut().push(d.clone()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
 }
 
 /// Strict, with blank-node labels kept as written (deterministic ids).
@@ -479,7 +484,8 @@ fn an_open_rocksdb_database_holds_the_directory_lock() {
             assert!(e.to_string().contains("in use"), "{e}");
             assert!(!dir.join(bulk::STAGING_DIR).exists());
             drop(holder);
-            bulk_text(&dir, "<http://ex/x> <http://ex/p> <http://ex/y> .\n").unwrap();
+            // review tests-a#12: released, but see `retry_while_in_use`.
+            retry_while_in_use(|| bulk_text(&dir, "<http://ex/x> <http://ex/p> <http://ex/y> .\n"));
             let mut db = Database::open(&dir).unwrap();
             assert!(matches!(
                 db.query("ASK { <http://ex/x> <http://ex/p> <http://ex/y> }")
@@ -507,6 +513,7 @@ fn a_store_opened_during_the_build_is_not_replaced() {
         let made = Command::new("mkfifo").arg(&fifo).status().unwrap();
         assert!(made.success());
         let lock = dir.join("rocksdb/LOCK");
+        let (fed, holder_rx) = std::sync::mpsc::channel();
         let feeder = {
             let fifo = fifo.clone();
             std::thread::spawn(move || {
@@ -522,7 +529,7 @@ fn a_store_opened_during_the_build_is_not_replaced() {
                 std::io::Write::write_all(&mut w, b"<http://ex/x> <http://ex/p> <http://ex/y> .\n")
                     .unwrap();
                 drop(w);
-                holder
+                let _ = fed.send(holder);
             })
         };
         let built = bulk::build(
@@ -534,7 +541,25 @@ fn a_store_opened_during_the_build_is_not_replaced() {
             target,
             &bulk_opts(2),
         );
-        let holder = feeder.join().unwrap();
+        // review tests-a#12: a build that returned before it opened its
+        // input (a regression failing a check at its start) left the feeder
+        // blocked in its open of the FIFO for writing, and the test hung in
+        // `join`. A reader of the test's own, opened without blocking, lets
+        // the feeder through whatever the build did; its result is awaited
+        // with a hang guard.
+        const O_NONBLOCK: i32 = 0o4000; // Linux
+        let _reader = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(O_NONBLOCK)
+                .open(&fifo)
+                .unwrap()
+        };
+        let holder = holder_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the feeder neither finished nor failed");
+        feeder.join().unwrap();
         let e = built.expect_err("built over a store opened during the build");
         assert!(e.to_string().contains("in use"), "{target:?}: {e}");
         assert!(!dir.join(bulk::STAGING_DIR).exists());
