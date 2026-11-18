@@ -179,7 +179,7 @@ ApiState(持有它时从不等待数据库锁)
         → DiskTriples 写闸门 → pager
 ```
 
-叶子锁只持有几条指令、其下不调用任何东西:取消桥(cancel bridge)的注册表、`gapi::ops_db` 正在运行的统计刷新的注册表。没有线程同时持有两个数据库守卫、重复获取自己已持有的守卫,或不先放下共享守卫就升级为独占;同一库在同一线程上的重入 `DbCell::read` / `write` 在所有构建里都返回错误("refused instead of deadlocking")而不是死锁。每个逻辑 kvstore 写在整个操作期间持有 pager 写锁;`DiskDict::intern` 只拿 pager 写锁(闸门 → pager 从不反向)。
+叶子锁只持有几条指令、其下不调用任何东西:取消桥(cancel bridge)的注册表、`gapi::ops_db` 正在运行的统计刷新的注册表。redo 日志与 update 日志的两个追加器(`Database` 的 `redo_writer` 与 `update_writer`,`src/db/logs.rs` 的 `LogWriter`)是 `persist_lock` 之下的叶子 mutex:只为一次追加或一次尾部扫描持有,持有时不再取任何锁。`backup` 与 `backup_incremental` 先取该库规则目录的锁(复制推理规则),再取 `persist_lock`,符合上面的顺序(review-fix campaign,r3-db-redo;conc#13)。没有线程同时持有两个数据库守卫、重复获取自己已持有的守卫,或不先放下共享守卫就升级为独占;同一库在同一线程上的重入 `DbCell::read` / `write` 在所有构建里都返回错误("refused instead of deadlocking")而不是死锁。每个逻辑 kvstore 写在整个操作期间持有 pager 写锁;`DiskDict::intern` 只拿 pager 写锁(闸门 → pager 从不反向)。
 
 **HTTP 服务器:读共享、写独占**(`src/server.rs`、`src/http_api.rs`):
 

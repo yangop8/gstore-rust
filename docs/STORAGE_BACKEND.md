@@ -95,6 +95,8 @@ MyRocks = MySQL 套 RocksDB 存储引擎,**经 SQL 访问**。作为**热查询�
 
 以下各节描述 Phase 6 结束时(phase6 分支)的实现,契约编号 C1–C9 指 `docs/PHASE6_PLAN.md` §4。文中的数字都注明出处:`bench/results/*.json` 中提交的结果(用 `gstore-bench report` 生成表格),或某个包"安静测量阶段"(quiet stage)的实测记录。
 
+之后的 review-fix campaign(对 Phase 6 代码 `7bbf4ae` 的代码审查,分五轮修复,2026-11)对这些节的更正就地标为"更新(review-fix campaign)";它新增或改写的提交协议、文件锁、替换与恢复规则集中在[下面的一节](#review-fix-campaign提交恢复与格式)。这次修复**没有改变任何数据库文件格式**,也没有新增 feature bit。
+
 ### 三种布局与布局检测
 
 | 布局 | 目录里的标志 | 查询时的 `Backend` | 说明 |
@@ -160,7 +162,7 @@ MyRocks = MySQL 套 RocksDB 存储引擎,**经 SQL 访问**。作为**热查询�
 2. 再经 `DiskTriples` 写三元组;`Ok(true)` 时才 `touched()`(C9);命名图四元组经 `DiskTriples::named_op`;
 3. 事务就是 store 的 overlay([下节](#事务-overlay-与写闸门c5)):提交前没有三元组进入 `kvstore.kv`,`rollback` 不碰它;默认图不需要 undo 日志(命名图仍有)。
 
-写失败会使 store 进入 **broken 状态**:之后的写、读(包括字典写,`DiskDict::with_write_check`)都被拒绝,直到重新打开数据库。`CLEAR DEFAULT` 在一个 read scope 里把默认图的 id 读进内存(每个三元组 12 字节),再在一次闸门 drain 下删除(没有范围删除,D9)。Stream 库从不构建内存子串索引(子串 FILTER 直接扫描,结果仍精确,D5)。`into_memory()` 读出整个 store 与全部词(保留 id)。
+写失败会使 store 进入 **broken 状态**:之后的写、读(包括字典写,`DiskDict::with_write_check`)都被拒绝,直到重新打开数据库(更新(review-fix campaign):broken 就是共享 pager 的 failed 状态,见[下节](#事务-overlay-与写闸门c5)的 broken 状态段与 [§Pager 与 WAL](#pager-与-wal提交协议失败状态与文件锁))。`CLEAR DEFAULT` 在一个 read scope 里把默认图的 id 读进内存(每个三元组 12 字节),再在一次闸门 drain 下删除(没有范围删除,D9)。Stream 库从不构建内存子串索引(子串 FILTER 直接扫描,结果仍精确,D5)。`into_memory()` 读出整个 store 与全部词(保留 id)。
 
 **`vstree.kv` 与 VS-tree 策略**:Stream 模式下 `vstree.kv` 只在新鲜(fresh)时使用,打开时从不重建(除非 `vstree_on_open`;Materialize 模式打开时会重建过期的 `vstree.kv`);`rebuild_index()` 一次流式扫描 SPO/OSP 重写它,在打开的事务结束后才执行,签名之前先做一次提交点(数据先落盘),并在 store 头部把它标记为 fresh。查询在默认的 `VsPolicy::Auto` 下**不读 `vstree.kv` 的页**:对 out-of-core 树,候选集的剩余谓词位直接对 store 检查,没有候选集的变量从 store 的 posting list 取出带这些位的实体;在与 store 一致的树上,所得候选集与遍历树完全相等(计划、答案和顺序都不变)。`vstree.kv` 的新鲜度仍决定 VS-tree 语义是否适用(过期的在打开时丢弃);`GSTORE_VS_POLICY=tree` 恢复页遍历。R4-VS 的安静测量(代码 `b9e8dc0`,univ 38,Stream):`GSTORE_VS_POLICY=tree` 时 Q1–Q14 几何均值 47.70 ms,`Auto` 时 11.66 ms。会话内发生删除之后,磁盘库的候选集跟随当前 store(答案不变,无 `ORDER BY` 时的顺序与新重建的树一致)。`vstree.kv` 的 pager 头部若带任何 feature bit 会被拒绝(打开和在其上构建时都检查)。
 
@@ -178,6 +180,8 @@ MyRocks = MySQL 套 RocksDB 存储引擎,**经 SQL 访问**。作为**热查询�
 
 **broken 状态**:任何写或 flush 错误都会使 store broken:之后拒绝写,读报告读错误,视图回答 `Io`,`disk_store()` / `shared_pager()` 返回错误,直到重新打开;broken 的 store 被丢弃时不 flush。`Drop` 先 drain 闸门、把视图标记为 closed、尽力 flush 已应用的写;`close()` 做同样的事并报告 flush 错误;打开的事务两者都丢弃。
 
+> 更新(review-fix campaign,C-1:durability#1、disk#1;M5:gap-txn-lifecycle#4):broken 的 `DiskTriples` 现在**就是**共享 pager 的 failed 状态(两者共用一个标志):pager 的一次提交在 WAL 得到正式名字之后失败,之后的写、分配页和提交都以 `GStoreError::StorageFailed` 拒绝,读照常,直到重新打开时重放完整的日志([§Pager 与 WAL](#pager-与-wal提交协议失败状态与文件锁))。Stream 模式下 out-of-core 字典做的提交失败同样使 store broken。Materialize 模式不只在写穿失败时 broken,提交点失败时也 broken:之后每个提交点都报告这次失败(`storage failed: …`)而不重试,丢弃数据库时什么也不提交。服务器不必重启就能重开这样的库:`/api` 或 REST 的 `unload` 不做提交点直接退役它(回答带 `warning`,写明失败原因和最近一次成功提交点之后丢弃了多少变更),再 `load`;对已载入的 broken 库直接 `load` 会就地重开。单库模式(`gserver DIR`)没有 unload,仍需重启。`Database::storage_failure` 说明原因与不持久的变更数。
+
 **锁顺序**(C8):`DiskTriples` 闸门 → pager;闸门的 mutex 从不跨 pager 操作持有;`DiskDict::intern` 只拿 pager 写锁(从不反向)。每个逻辑 kvstore 写在整个操作期间持有 pager 写锁(R1-KV 的 operation bracket:操作中途缓存不为腾地方而提交,出错或 panic 时整个操作连同计数器回滚);`DiskStore` 写入中的 panic 被回滚并以错误返回,不会毒化共享 pager。
 
 ### 字典(C4)
@@ -188,11 +192,11 @@ MyRocks = MySQL 套 RocksDB 存储引擎,**经 SQL 访问**。作为**热查询�
 - **out-of-core 后端** `DiskTermSource`:可失败、`&self`、`Send + Sync`;`lookup`、`resolve -> Arc<str>`、`resolve_sorted`、`intern` / `free`(默认拒绝;只读后端拒绝新词)、`prefetch`、`for_each`、`count`、`id_limit`、`generation`、`sync`。`DiskDict` 用 `BTree::get_with` / `IvArray::get_with`(无逐次拷贝)实现它;批量与预取按 id 顺序逐 run 读取(`IvArray::for_each_key`,只解码请求的槽);`DiskDict::writable()` 能 intern(新词推进 generation,缓存原地更新),`DiskDict::free` 同时推进 generation 与缓存 epoch(清空缓存);`slot()` 以已分配上限而不是存活数为界(有空洞时)。
 - **有界缓存**(`gstore::dict::cache`):`TermCache`(`(space, id) → Arc<str>`,默认 64 MiB)与 `KeyCache`(`(space, key) → id`,默认 16 MiB),各 16 个分片、CLOCK 淘汰、按字节计费(串长 + 72)。`DiskDict` 的缓存只在某个 id 或键可能改变含义时(释放了一个 id)整体清空;intern 只会新增,缓存原地更新。
 - **老 `&str` API**:`id_to_string` / `predicate_to_string` 只对内存字典回答;对 out-of-core 字典返回 `None` 并让语句失败(fail closed,不再 `Box::leak`)。生产代码已不再调用它们(图函数和 PFN 的 `GraphCtx` 经 `term()` / `pred()` 读标签)。
-- **查询侧**:SELECT 结果按 4096 行一块物化,字典在磁盘上时每块每个 id 空间一次排序批量解析;每查询的 id → term / id → value 备忘(`IdMemo`)只用于 out-of-core 字典,上限 8 MiB,超过 16 KiB 的键不进。子串索引(`CONTAINS` / `STRSTARTS` / `STRENDS` / 无元字符 `REGEX` 的候选剪枝)按字典 generation 缓存(`Database::string_index()`),只对内存字典构建,建好后常驻;R2-DICT 安静测量阶段(phase6 `0c9bdb6`)测得 univ 38 时它有 430,954,544 字节(D5)。
+- **查询侧**:SELECT 结果按 4096 行一块物化,字典在磁盘上时每块每个 id 空间一次排序批量解析;每查询的 id → term / id → value 备忘(`IdMemo`)只用于 out-of-core 字典,上限 8 MiB,超过 16 KiB 的键不进。子串索引(`CONTAINS` / `STRSTARTS` / `STRENDS` / 无元字符 `REGEX` 的候选剪枝)按字典 generation 缓存(`Database::string_index()`),只对内存字典构建,建好后常驻;R2-DICT 安静测量阶段(phase6 `0c9bdb6`)测得 univ 38 时它有 430,954,544 字节(D5)。更新(review-fix campaign,gap-accel-soundness#3、db#5):缓存的索引只存候选(不再另存一份词串和按串排序的 id 表),新增或释放词的写入之后由下一次子串查询增量扩展,而不是从整个字典重建(`docs/GAP_PLAN.md` §9.1 第 6c 行)。
 
 ### 格式注册表与兼容矩阵
 
-**注册表**(`src/kvstore/format.rs`,C3)是 `kvstore.kv` 与 `vstree.kv`(也是 pager 文件)全部版本标记、根槽与 feature bit 的唯一所有者;节点、IvArray、溢出链与 WAL 的格式在 Phase 6 中没有变化。
+**注册表**(`src/kvstore/format.rs`,C3)是 `kvstore.kv` 与 `vstree.kv`(也是 pager 文件)全部版本标记、根槽与 feature bit 的唯一所有者;节点、IvArray、溢出链与 WAL 的格式在 Phase 6 中没有变化,在 review-fix campaign 中也没有(该轮每项"无格式变化"的说明汇总在[§注册表:review-fix campaign 的结论](#注册表review-fix-campaign-的结论))。
 
 - 头部:`[magic 8 B][page_count u32][free_head u32][root slot × NROOTS u64]`;`NROOTS` 从 24 增至 32,24 槽的老文件把多出的槽读作 0,新代码写的 V1 头与 Phase 6 之前逐字节相同。
 - `MAGIC_V1 = "GSTOREKV"`(`FEATURES == 0`)、`MAGIC_V2 = "GSTOREK2"`(至少一个 feature bit)。每次打开都检查(`check_header`):`FEATURES == 0` ⇔ V1,两种不一致都拒绝;本二进制不支持的位被拒绝;某 feature 第一次使用时,它的位与 `MAGIC_V2` 随第一个需要它的结构在同一次 pager flush 中写入(`Pager::enable_feature`);`vstree.kv` 必须 `FEATURES == 0`。
@@ -216,6 +220,8 @@ MyRocks = MySQL 套 RocksDB 存储引擎,**经 SQL 访问**。作为**热查询�
 
 **快照布局**的 `dict.bin`、`store.bin`、`named.bin`、`vstree.bin`、`meta.bin` 字节格式不变(写时复制的 `TripleStore`、`NamedGraphs`、手写的 `VsTree` 序列化都与之前的 bincode 逐字节一致,有 golden 测试)。**RocksDB** 的 `LAYOUT_VERSION` 仍是 `"1"`,CF 集合与键编码不变,批量构建写出的每个键值与逐条构建完全相同。
 
+更新(review-fix campaign):快照布局的读取更严格,字节格式不变——`named.bin` 的读错误使打开失败,只有 `named.bin` 不存在才表示"没有命名图";快照的提交记录 `SNAPSHOT.commit` 只列成员文件名,不带每个成员的长度或校验和(r1-durable-ack)。RocksDB 的 `LAYOUT_VERSION` 仍是 `"1"`,只在 `meta` CF 里加了一个附加的键区间(见[§RocksDB 语句日志](#rocksdb语句日志与崩溃恢复))。
+
 #### 兼容矩阵(Phase 6 结束时实际情况)
 
 | 目录 | 新二进制 | Phase 6 之前的二进制 |
@@ -227,7 +233,11 @@ MyRocks = MySQL 套 RocksDB 存储引擎,**经 SQL 访问**。作为**热查询�
 | RocksDB layout `"1"`(含批量构建的) | 读写;打开时不重建 VS-tree | 读写 |
 | `vstree.kv` | 只接受 `FEATURES == 0` | 读写 |
 
-老文件**从不被隐式升级**。降级(V2 → 老二进制)的办法:新二进制 `gexport`,老二进制 `gbuild`。另外,`redo.log` / 增量备份里的 `CLEAR` / `DROP` / `MOVE` / `COPY` 记录(`C`、`N`)是新的,老二进制恢复这样的增量备份会以 "unknown redo.log op 'C'" 失败。
+老文件**从不被隐式升级**。降级(V2 → 老二进制)的办法:新二进制 `gexport`,老二进制 `gbuild`。
+
+`redo.log` / 增量备份里的 `CLEAR` / `DROP` / `MOVE` / `COPY` 记录(`C`、`N`)是 Phase 6 新增的。更正(review-fix campaign,gap-doc-claims#1;此处原先写"老二进制恢复这样的增量备份会以 "unknown redo.log op 'C'" 失败",对至今写出的日志并不成立):Phase 6 起到 review-fix campaign 第 2 轮为止写出的 clear 记录正文为空,Phase 6 之前的二进制(`eaf5320`、`6362b97^`)会**静默跳过**它们——用这些二进制恢复这样的增量,被清掉的数据会不报错地回来;不要跨这样的记录降级。从本版本起写出的 clear 记录带占位三元组 `<urn:x-gstore:redo> <urn:x-gstore:redo#op> "clear" .`,那些二进制以 "unknown redo.log op 'C'" 拒绝它(先在 `tests/redo_log_durability.rs` 里对照其读取器的逐行仿制检查,r4-storage-format 又用真实的 `eaf5320` 二进制经 `scripts/compat-fixtures.sh` 确认)。日志的新分帧见 [§redo 日志与增量备份](#redo-日志与增量备份)。
+
+**兼容矩阵现在有跨版本检查**(review-fix campaign,gap-doc-claims#8):`scripts/compat-fixtures.sh` 在临时 worktree 里构建 `eaf5320`(Phase 6 之前)并用两个版本的真实二进制检查上表(每周运行,`.github/workflows/compat.yml`,也可手动触发);它生成的夹具 `testdata/compat/eaf5320/`(`eaf5320` 写出的快照与 V1 磁盘库)由 `tests/format_compat.rs` 在每次 `cargo test` 中打开并查询。实测与上表一致:`eaf5320` 的 `gquery` 读新 `gbuild` 写出的快照与 `GSTORE_ID_RECLAIM=off` 磁盘库,拒绝默认的 V2 磁盘库("not a gStore KV file");`eaf5320` 的 `restore_incremental` 在本版本写出、含 `CLEAR DEFAULT` 的增量上以 "unknown redo.log op 'C'" 失败。
 
 ### 批量构建
 
@@ -246,7 +256,13 @@ sources ─▶ 解析(每个源一个解析线程,按源顺序重放) ─▶ 编
 - **scratch**:默认在 staging 区内,`--tmp-dir` / `build_tmp_dir` 可改;每个 scratch 目录以新名字独占创建(`gstore-bulk-scratch-<pid>-<seq>-<nonce>`),存续期间持有其中 `LOCK` 文件的咨询锁,构建会清扫无人持锁的残留目录(更早版本留下的、没有 `LOCK` 的目录不会被碰)。需要的空闲磁盘:新库加旧库,溢写时再加约一份编码后的三元组和签名。
 - **输出确定**:`kvstore.kv` 与 `vstree.kv` 与线程数、预算无关,逐字节相同(含空白节点的数据除外:每个文档的空白节点作用域是随机的)。
 - **磁盘安装**(`bulk::CRASH_POINTS`,`src/bulk/commit.rs` 的表):构建持有目录的 `DirLock` 与进程内的 `BuildGuard`,所有东西写在 `<db>/.bulk-tmp/`(从来不是数据库;残留的由下次构建删除)。步骤:`staged` → `marked`(写 `COMMIT`)→ `cleared`(把旧 store 残留的 `kvstore.kv.wal` 重放进旧文件并删除——重放失败则停在这里、日志保留;删除旧 `vstree.kv`)→ `kv-renamed`(新 `kvstore.kv` 改名覆盖,**提交点**)→ `kv-synced` → `vstree-placed`(在规则目录锁下删除被替换库的 `reason_rule_files/`,放入新 `vstree.kv`)→ `layouts-removed`(删除快照文件;`rocksdb/` 先持久改名移开再删)→ `cleaned`。每一步后都 sync 目录,崩溃总是留下旧库或新库,未修改的二进制都能打开。提交点之前的任何错误都不动旧库;之后的错误不使构建失败,而是进 `BulkReport::warnings`(gbuild 打印 "built (the new database is in place), but its install did not finish: …" 并以 1 退出)。安装前会再查一次 `rocksdb/LOCK`,防止构建期间有只拿 RocksDB 自身锁的老二进制打开了它。
-- **RocksDB 目标**(`BulkTarget::RocksDb`,需 `rocksdb` feature):同样的排序流按 CF 写成 `SstFileWriter` 文件(每个 CF 用自己的选项,256 MiB 切分):`spo`、`pos`、`osp`、`gspo`、`dict` 及每个统计计数器(精确,零值计数器不写);在 `.bulk-tmp/rocksdb` 新建的 store 依次 ingest(`move_files`,同一 CF 的文件互不重叠,直接落到最底层,字典最先),最后写 `meta` 名字和 `layout = "1"`,flush、sync WAL、关闭、重开校验计数器、fsync 每个文件。键值与逐条构建 `Database::build_rocksdb_*` 完全相同(任意长度的词都能构建)。安装(`bulk::ROCKS_CRASH_POINTS`):`staged` → `swapped`(经 `rocksdb.new` 改名为 `rocksdb/`,**提交点**,下次打开会补完)→ `rules-removed` → `layouts-removed` → `cleaned`。
+  更新(review-fix campaign,durability#12、bulkcli#15、bulkcli#13、bulkcli#12、tests-a#19;无格式变化,D7):
+  - `marked` 步写的 `COMMIT` 标记是**咨询性**的:它记录安装开始时暂存的文件已完整并已 sync,没有任何恢复读它(没有前滚:提交点之前旧库就是数据库,之后新 store 已在位),只作事后取证;残留的 `.bulk-tmp/` 不论是否带标记,都由下一次构建删除。
+  - 构建用 `BuildGuard::lock(dir)` 一步完成声明目录与取锁(在锁注册表的 mutex 下);声明存续期间,本进程的其它线程打开该目录(`DirLock::acquire`,因而 `Database::open`)被拒绝。此前"本进程是否打开着"的检查与取可重入目录锁是两步,同进程的另一线程(如 `/build` 进行中的 REST `/load`)能共享构建的锁,它已确认的写落进随后被安装替换掉的文件。增量构建同样如此。
+  - 并行写 POS、OSP、统计与字典的写者各在按预测数预留的页区间里写;页数与预留不符原先只是 `debug_assert`,现在 release 构建也检查,不符时在安装之前使构建失败("the POS index took N page(s), but M were reserved for it …"),旧库不动。
+  - `GSTORE_BULK_CRASH=<step>` 是崩溃测试的失败点(release 二进制里也生效):设置时,进程的每个批量构建在该安装步骤之后立即中止,并在标准错误上说明;值不是安装步骤名时说明它被忽略。进程内的对应钩子是 `debug_crash_at`。不要在崩溃测试之外设置它。
+  - 增量磁盘构建(`gbuild --disk --incremental`、`build_disk_from_sources_incremental`)也不再写在被替换的库上:它把 `kvstore.kv` + `vstree.kv` 暂存在 `.bulk-tmp/`,再走同一个批量安装(见 [§布局替换](#布局替换与崩溃安全))。
+- **RocksDB 目标**(`BulkTarget::RocksDb`,需 `rocksdb` feature):同样的排序流按 CF 写成 `SstFileWriter` 文件(每个 CF 用自己的选项,256 MiB 切分):`spo`、`pos`、`osp`、`gspo`、`dict` 及每个统计计数器(精确,零值计数器不写);在 `.bulk-tmp/rocksdb` 新建的 store 依次 ingest(`move_files`,同一 CF 的文件互不重叠,直接落到最底层,字典最先),最后写 `meta` 名字和 `layout = "1"`,flush、sync WAL、关闭、重开校验计数器、fsync 每个文件。键值与逐条构建 `Database::build_rocksdb_*` 完全相同(任意长度的词都能构建)。安装(`bulk::ROCKS_CRASH_POINTS`):`staged` → `swapped`(经 `rocksdb.new` 改名为 `rocksdb/`,**提交点**,下次打开会补完)→ `rules-removed` → `layouts-removed` → `cleaned`。更新(review-fix campaign,r2-integration):`rocksdb.new` 无法改名就位时(安装、它的恢复与重试中),构建失败,不再打开——从而新建——一个空的 `rocksdb/`(下次打开的恢复会留下它而删掉真正的构建 `rocksdb.new`),也不删除其它布局;下次打开把构建移到位。
 - **谁走批量路径**:布局为 disk 或 RocksDB 的构建。`gbuild` 的布局由 `--disk`、`--rocksdb` 或 `--layout snapshot|disk|rocksdb` 决定,都没给时取 `./conf/conf.ini` 的 `[storage] default_layout`,再缺省为 snapshot(快照在内存中构建后保存);`--layout` 与 `--disk` / `--rocksdb` 矛盾是用法错误。库函数 `Database::build_disk`、`build_disk_from_sources`、`build_disk_bulk_from_sources`。REST `/build` 与 `/api build` 的 `layout=snapshot|disk|rocksdb`(也接受 `memory`、`kvstore`、`rocks`;默认取服务器配置的 `default_layout`,否则 snapshot;RocksDB 需要服务器带 `rocksdb` feature,否则 `400` / `1003`)。旧的逐条路径保留为 `#[doc(hidden)] build_disk_incremental` / `build_disk_from_sources_incremental`(`gbuild --disk --incremental`、比较测试)。`Database::build_rocksdb_*` 是逐条写的小数据辅助函数(D15)。
 - **gbuild 参数与配置**:`--memory MB`(默认 1024)、`--threads N`(`0` = 全部核心,默认)、`--tmp-dir DIR`、`--fill PCT`(50–100,默认 90,只用于 disk 布局)、`--incremental`;布局不是 disk / RocksDB 时这些参数是用法错误(退出码 2)。`conf.ini` `[system]`:`build_memory_mb`、`build_threads`、`build_tmp_dir`、`build_fill_factor`,`build_multi_thread=off` 表示一个线程;gbuild 读 `./conf/conf.ini`(若存在),包括 `[system] id_reclaim` 与 RocksDB 调优键。
 - **构建拒绝的目录**:另一进程持有的目录、本进程有数据库打开着的目录(`DirLock::held_here`,"is open in this process")、正被另一个批量构建重建的目录,以及 RocksDB store 正被任何进程打开的目录(Linux 上从 `/proc/locks` 读 `rocksdb/LOCK`,`bulk::commit::rocksdb_lock_holder`)。服务器要重建一个已载入的库,先 unload(释放句柄)再构建,REST `/build` 就是这么做的:先保存(check_point off 时未保存的已确认写)、退役已载入的副本、构建、再打开并服务新库;构建失败则重新服务旧库。
@@ -255,19 +271,19 @@ sources ─▶ 解析(每个源一个解析线程,按源顺序重放) ─▶ 编
 
 `src/db/reclaim.rs`,`gstore::db::{IdReclaim, set_default_id_reclaim, default_id_reclaim, ENV_ID_RECLAIM}`。
 
-- **策略**:`IdReclaim::Immediate`(默认,`on`)或 `Off`(Phase 6 之前的行为:id 只由显式的 `Database::reclaim_unused` / `gcompact --reclaim` 释放)。`conf.ini` `[system] id_reclaim=on|off` 由 gserver(启动时与 `/api refreshconf`)和 gbuild 读取;其它命令行工具(gadd、gsub、gquery…)只看环境变量 `GSTORE_ID_RECLAIM=on|off`,环境变量总是优先。`Database::set_id_reclaim` / `id_reclaim` / `reclaims_ids` 针对单个库。
+- **策略**:`IdReclaim::Immediate`(默认,`on`)或 `Off`(Phase 6 之前的行为:id 只由显式的 `Database::reclaim_unused` / `gcompact --reclaim` 释放)。`conf.ini` `[system] id_reclaim=on|off` 由 gserver(启动时与 `/api refreshconf`)和 gbuild 读取;其它命令行工具(gadd、gsub、gquery…)只看环境变量 `GSTORE_ID_RECLAIM=on|off`,环境变量总是优先。`Database::set_id_reclaim` / `id_reclaim` / `reclaims_ids` 针对单个库。更新(review-fix campaign,disk#8、design#6):`GSTORE_ID_RECLAIM` / `[system] id_reclaim` 只决定**新建** store 文件的格式(带 `FREE_IDS` 的 V2 或 V1),并显式传给它们——`BulkOptions::free_ids`(批量镜像的头部按它写,不再读进程策略)与 `OpenOptions::free_ids_if_new` / `with_free_ids_if_new`(打开时新建 store 文件的情形);已有的 `kvstore.kv` 保持其头部记录的格式,不论进程策略如何,只有 `gcompact --enable-reclaim` 升级。
 - **何时**:每次实际生效的删除——`DELETE DATA` / `DELETE … WHERE`、四元组删除、`CLEAR` / `DROP` / `MOVE` / `COPY`、`remove_sources`(`gsub`、`/api batchRemove`)、失败 `LOAD` 的撤销、事务新增的回滚——之后,被删三元组的 subject、predicate、object(及图 IRI)成为候选;语句结束时(auto-commit)或 `commit` 时(事务把释放推迟成一批)释放其中无人引用的。事务 `rollback` 时,它新铸造的词也是候选。
 - **"被引用"**:节点 id 是默认图的 subject 或 object(`has_subject` / `has_object`,读错误时为 `true`),或命名图计数它(`NamedGraphs::node_refs`,含图 IRI——`GSPO` 以图为首键,所以四元组的引用以内存中的 `NamedGraphs` 计数为准);谓词同理(`has_predicate`、`NamedGraphs::pred_refs`)。每个候选凭自己的探查独立判定:读错误使其悬而未决的候选不释放也不丢弃,在下一条语句再查,最多 `CHECK_ATTEMPTS`(4)次,之后记一条警告留给 `gcompact --reclaim`;它不拖住其它候选。
 - **顺序与各布局的持久化**:释放总在语句的 redo 记录和写穿之后;先持久化,再由字典 retire 该 id、`touched()`,等到没有比 retire 更早的 pin 时才 release 供复用。
   - 快照:下次 `save` 时(`dict.bin` 的空闲列表,升序)。
   - Materialize:键级写穿 `DiskOp::Free`;复用之后 store 自己的 id 可能与工作集不同(写本来就按键,重开时重读 store 的 id)。
   - Stream:`DiskTriples::free_ids` 在写闸门下按 id 释放,先防御性地复查三元组索引——若仍被引用则拒绝(并使 store broken),而不是破坏它。
-  - RocksDB:自动提交时在三元组批之后删除 `dict` CF 条目,事务中放进清日志的那一批;打开时日志重放留下的无引用词也被释放(`take_replayed`;每条语句和每次提交后都会接手重放交出的词)。`delete_terms` 失败则词保留在内存与 `dict` CF 中(孤儿,下个提交点报告)。
+  - RocksDB:释放的 `dict` CF 条目放进删除 undo 日志的那一批——事务在提交时,自动提交语句在语句结束时(更新(review-fix campaign,H-11、gap-rocksdb-exec#1、#4):此前自动提交时在三元组批之后删除;现在每条自动提交语句也记日志,它释放的 id 等到语句结束才删除和复用);rollback 的重放留下的无引用词在删日志的那一批里删除;打开时恢复崩溃留下的日志,则把这些候选与删除的日志记录写进同一批、放进 `meta` CF 的待定区间,`Database` 在服务之前处理完——没有哪个崩溃窗口会留下孤儿词(见 [§RocksDB 语句日志](#rocksdb语句日志与崩溃恢复))。底层用户经 `take_replayed` 接手重放交出的词(每条语句和每次提交后都会接手)。`delete_terms` 失败则词保留在内存与 `dict` CF 中(孤儿,下个提交点报告)。
 - **复用顺序**:每个空间**最低 id 优先**;释放最高 id 会降低该空间的高水位,并连带降低随之成为最高的空闲 id(trim cascade),所以计数根可以下降。`entity_num` / `literal_num` / `predicate_num` 现在恰好等于数据引用的词数。
 - **pin**:内存字典的克隆是写时复制的,各自拥有自己的 id 版本,不需要 pin。out-of-core(Stream)字典的克隆共享磁盘字典,克隆期间 pin 住它(`Dictionary::pin()` / `DictPin`);Stream 库在有比候选更早的 pin 时推迟释放:候选带上 pin 时钟的戳,按戳排序,pin 消失后每个候选只检查一次,pin 期间不重复探查。磁盘 `/begin` 快照只在自己的 `DiskReadView` 里读字典(写闸门会先 drain 它),所以用 `clone_unpinned()`;`ConcurrentDb` 的 Stream 快照在任何读视图之外解析物化的 store,所以保持 pin——`ConcurrentDb` 包着 Stream 库时,它构造时的基准快照在它整个生命周期都 pin 着字典,不释放任何 id,丢弃时才运行这些释放并持久化。被 pin 推迟的释放只在内存中:重启(或丢弃一个普通 `Database`)时仍被 pin 住的释放会丢失,这些词成为孤儿,直到 `gcompact --reclaim`。
 - **VS-tree**:被释放的实体留在树里(可靠超集,直到 `rebuild_index()`;没有自动重建阈值,`Database::vs_shrink_debt()` 只计数);一个实体得到第一条边(新词或被复用的 id)时获得精确签名,而不是并到旧条目上。
 - **内存库的批量写**:`INSERT DATA`、`DELETE DATA`、`DELETE/INSERT … WHERE`、`LOAD`(及其撤销)、`ADD` / `COPY` / `MOVE`、`gadd` / `gsub`、`/api batchInsert` / `batchRemove` 和事务回滚,把一条语句(或一个导入批)的默认图三元组一次交给 store(`TripleStore::insert_many` / `remove_many`)。最低 id 优先复用会让新词拿到小 id,逐条插入会把长列表的大部分移动一次又一次;批量归并消除了这一点。结果、计数、错误语义、undo/redo、写穿和回收都与逐条路径相同;Stream 与 RocksDB 仍逐条写。
-- **redo 日志**:`CLEAR` / `DROP` / `MOVE` / `COPY` 写 redo 记录(一个图 `C`,全部命名图 `N`),`replay_redo_log` 与 `restore_incremental` 会重放它们;RocksDB 上部分被拒的 clear 按实际删除的每个三元组 / 四元组记 `D` 记录。
+- **redo 日志**:`CLEAR` / `DROP` / `MOVE` / `COPY` 写 redo 记录(一个图 `C`,全部命名图 `N`),`replay_redo_log` 与 `restore_incremental` 会重放它们;RocksDB 上部分被拒的 clear 按实际删除的每个三元组 / 四元组记 `D` 记录。降级时这些记录的行为见[兼容矩阵](#兼容矩阵phase-6-结束时实际情况)下的更正,review-fix campaign 的分帧见 [§redo 日志与增量备份](#redo-日志与增量备份)。
 - **工具与 API**:`gcompact <db> [--reclaim] [--enable-reclaim] [--check]`(可组合;取目录锁)——`--reclaim` 运行 `Database::reclaim_unused` 并持久化(快照库重新保存),`--enable-reclaim` 把 Phase 6 之前的 `kvstore.kv` 升为 V2(老二进制从此拒绝它),`--check` 运行 `Database::verify_integrity`。`gmonitor` 显示 `id_reclaim` 和每个空间的 `live / free / id_limit`(`Database::id_space_stats`)。`reclaim_unused` 返回 `Result<usize>`,在事务内和 V1 `kvstore.kv` 上被拒,释放了东西时推进 `mutation_count`。
 
 **行为变化**:删除之后 id 会被复用,跨删除缓存 id 的应用不能再这样做;实体 / 字面量 / 谓词计数随删除下降;`DiskStore::entity_num` 计存活词(已分配减空闲)。
@@ -281,10 +297,10 @@ sources ─▶ 解析(每个源一个解析线程,按源顺序重放) ─▶ 编
 
 ### RocksDB
 
-- **布局**:CF `spo` / `pos` / `osp`(4 字节大端 id 的复合键)、`gspo`、`dict`(`tag ‖ be32(id) → key`,空洞即空闲 id)、`stats`(计数器:全局 `T`/`P`/`S`/`O`,逐谓词 `c|`/`u|`/`v|p`,逐 subject `s|s`、逐 object `o|o`,`x|p|s`、`y|p|o`)、`meta`(名字、`layout = "1"`)。事务的每个写在同一原子批里带 undo 记录,`commit()` 删除日志,`rollback()` 与崩溃后的打开重放它。
+- **布局**:CF `spo` / `pos` / `osp`(4 字节大端 id 的复合键)、`gspo`、`dict`(`tag ‖ be32(id) → key`,空洞即空闲 id)、`stats`(计数器:全局 `T`/`P`/`S`/`O`,逐谓词 `c|`/`u|`/`v|p`,逐 subject `s|s`、逐 object `o|o`,`x|p|s`、`y|p|o`)、`meta`(名字、`layout = "1"`)。事务的每个写在同一原子批里带 undo 记录,`commit()` 删除日志,`rollback()` 与崩溃后的打开重放它。更新(review-fix campaign):自动提交语句也走这个日志,提交点只 fsync WAL,打开时的恢复分块进行——见 [§RocksDB 语句日志](#rocksdb语句日志与崩溃恢复)。
 - **读**:有界的 raw iterator 扫描(`iterate_upper_bound` = 前缀的后继,键原地解码);iterator 状态错误或失败的点读经 `note_read_error` 上报(C2),语句失败而不是从截短的列表作答;读不出来的写(存在性检查、计数器)直接失败。C1 计数各是一次计数器点读(`count_po_by_s` = `s|s`、`count_ps_by_o` = `o|o`、`count_o_by_sp` = `x|p|s`、`count_s_by_po` = `y|p|o`、`count_so_by_p` = `c|p`),与默认值逐一相等;`c|`/`u|`/`v|` 在内存中有镜像(打开、每次日志重放后重新加载,只在写批成功后更新),`pred_card` 等不再碰 RocksDB;`iter_all` 按契约 `(p, s, o)` 顺序返回;`subs_by_p` / `objs_by_p` 读 `x|p` / `y|p` 键,无需排序。
 - **打开**:不重建 VS-tree(打开时索引是 stale 的,`stats().index_valid == false`,`gshow` / `gmonitor` 显示 stale),查询不用 VS-tree,直到 `rebuild_index()`;`vstree_on_open`(或 `GSTORE_VSTREE_ON_OPEN=1`)恢复打开时构建。打开仍要把字典读进内存(D4)。`bench/results/phase6-final-lubm38.json`:univ 38 冷 / 热打开 738.9 / 678.0 ms(`bench/results/pre-phase6-lubm38.json`:60810.7 / 59389.4 ms)。
-- **调优键**(只是选项,不改格式,有无 bloom 写出的文件都能打开):`[storage] rocksdb_block_cache_mb`(默认 256;`0` = RocksDB 默认的每 CF 32 MiB 缓存)——一个 LRU block cache 由所有 CF、以及本进程所有同容量的 store 共享;`[storage] rocksdb_bloom`(每键位数,默认 10,`on` / `off`)——给点查 CF(`spo`、`stats`、`gspo`)的整键 bloom filter。gserver 启动时与 `refreshconf` 时、gbuild 启动时安装它们(`GStoreConfig::install_storage_defaults`、`set_default_rocks_tuning`);环境变量 `GSTORE_ROCKS_BLOCK_CACHE_MB`(纯 MiB 数字;其它写法记一次警告后用 256)覆盖 block cache。`RocksStore::open_with(path, &RocksTuning)` 供库直接使用。
+- **调优键**(只是选项,不改格式,有无 bloom 写出的文件都能打开):`[storage] rocksdb_block_cache_mb`(默认 256;`0` = RocksDB 默认的每 CF 32 MiB 缓存)——一个 LRU block cache 由所有 CF、以及本进程所有同容量的 store 共享;`[storage] rocksdb_bloom`(每键位数,默认 10,`on` / `off`)——给点查 CF(`spo`、`stats`、`gspo`)的整键 bloom filter。gserver 启动时与 `refreshconf` 时、gbuild 启动时安装它们(`GStoreConfig::install_storage_defaults`、`set_default_rocks_tuning`);环境变量 `GSTORE_ROCKS_BLOCK_CACHE_MB`(纯 MiB 数字;其它写法记一次警告后用 256)覆盖 block cache。`RocksStore::open_with(path, &RocksTuning)` 供库直接使用。更新(review-fix campaign,H-12):`[storage] rocksdb_max_open_files`(默认 4096,`0` = 不限,即 RocksDB 默认)限制每个已载入 RocksDB 库打开的文件数;另外只保留 4 个旧 info 日志(`LOG.old.*`),WAL 总量上限 256 MiB(超出时 flush 仍持有最老日志的 CF)。同样只是选项,文件不变,任何取值都能打开。
 - **批量构建**:见[批量构建](#批量构建)的 RocksDB 目标(SST ingest,`rocksdb.new` 交换)。
 - **目录锁**:`Database::open` / `open_rocksdb_with` 和逐条构建 `create_rocksdb`(`build_rocksdb_*`)为 RocksDB 布局也取 `<dir>/LOCK`(在 `rocksdb/` 旁边),库存活期间一直持有;RocksDB 自己仍取 `rocksdb/LOCK`。`build_rocksdb_*` 拒绝本进程正服务着的目录。
 - **仍未做**:out-of-core 字典与原生快照(D4);`/begin` 与 `ConcurrentDb` 快照仍物化整个 store(`bench/results/phase6-final-lubm38.json` 的 `/api begin` 点:univ 38 中位数 2132.55 ms、RSS 增长 269.3 MiB);不持久化 VS-tree(D6,`vstree_on_open` 时在内存中构建)。
@@ -293,28 +309,121 @@ sources ─▶ 解析(每个源一个解析线程,按源顺序重放) ─▶ 编
 
 `src/db/dirlock.rs`。一个数据库目录**同一时间只能被一个进程打开写入**。
 
-- **`DirLock`**:`<dir>/LOCK` 上的操作系统咨询锁(Unix `flock`,Windows `LockFileEx`;持有者崩溃时由内核释放),所有布局都取,持有到 `Database` 被丢弃为止。另一进程打开时得到点名持有者 pid 的错误("… is locked by another process (pid N) …")。进程内按规范路径引用计数:同一进程再次打开共享这把锁(测试、服务器恢复后重开都依赖这一点),进程内两个写者的互斥由调用方负责(服务器用已载入库的注册表与按名字的生命周期预留)。不支持咨询锁的文件系统上跳过加锁,库照常打开。
-- **`BuildGuard`**:进程内对"正在被批量构建重建的目录"的声明(`DirLock` 在进程内共享,挡不住同进程的第二个构建)。
+- **`DirLock`**:`<dir>/LOCK` 上的操作系统咨询锁(Unix `flock`,Windows `LockFileEx`;持有者崩溃时由内核释放),所有布局都取,持有到 `Database` 被丢弃为止。另一进程打开时得到点名持有者 pid 的错误("… is locked by another process (pid N) …")。进程内按被锁的文件引用计数:同一进程再次打开共享这把锁(测试、服务器恢复后重开都依赖这一点),进程内两个写者的互斥由调用方负责(服务器用已载入库的注册表与按名字的生命周期预留)。不支持咨询锁的文件系统上跳过加锁,库照常打开。更新(review-fix campaign,db#10):进程内的注册表按被锁的 `LOCK` 文件的 (device, inode) 作键(Unix 之外是规范路径),不再按路径:`DirLock::acquire` 只在本进程持有的正是 `<dir>/LOCK` 所指的那个文件时共享,否则取新的系统锁(打开与加锁之间文件被移走就重试)——一个带着锁被移走的目录(恢复交换、`/api rename`)不再把注册表条目借给同一路径上的新目录。新增 `DirLock::holds(dir)`。同一进程里**往同一个目录保存**由写者互斥(`DirLock::writing`)串行化:每次保存到外部目录都持有它,快照库在自己目录里的保存持有自己锁的写者互斥,第二个保存等待,不会装出两次保存的混合(db#11)。
+- **`BuildGuard`**:进程内对"正在被批量构建重建的目录"的声明(`DirLock` 在进程内共享,挡不住同进程的第二个构建)。更新(review-fix campaign,bulkcli#13):`BuildGuard::lock(dir)` 一步完成声明与取锁,声明存续期间同进程的其它打开被拒绝;`gbuild` 用 `BuildGuard::create_and_lock` 声明数据库目录(持久地新建它及缺失的上级目录)。
+- **锁冲突的错误类型**(review-fix campaign,r3-rest-parity、r3-integration):`DirLock` / `SideLock` / `BuildGuard` 的冲突,以及另一进程持有的 pager 文件([§Pager 与 WAL](#pager-与-wal提交协议失败状态与文件锁)),都是 `GStoreError::Locked`(`ErrorKind::Locked`,每个 REST 端点答 `409`);锁文件上的 I/O 错误是 `Io`。无格式变化。
 - **`SideLock`**:目录旁边的锁文件 `<dir><suffix>`,给要创建目录、尚无 `LOCK` 可取的操作用:恢复到一个还不存在的库时持有 `<dir>.restore-lock`,从暂存之前到交换完成;最后一个持有者在持锁时删除该文件。
 - **先锁后修复**:`Database::open` 在读任何东西之前、在补完中断的 store 交换(`rocksdb.new` / `.old` / `.tmp`)之前加锁;中断恢复(`<dir>.restore-*`)只在目录(或移开期间的 `<dir>.restore-old`)的锁下修复;另一进程持锁时失败且不碰任何东西。`Database::backup_dir` 只在源目录的锁下修复源里中断的提交或交换。
 - **`Database::read_copy`** 不取锁、不碰目录,读一个快照库的分离副本(只限快照布局)。
+- **保存到另一个目录也锁它**(review-fix campaign,db#11、db#17):`Database::save` / `backup` 保存到不是数据库自己目录的地方时,先建目标目录并取它的锁——新目录、空目录也一样(此前只在目录里已有数据库时才锁),所以另一进程持有的目录立即以 "is locked by another process" 失败、什么也不写;锁在保存返回时释放。这样的新目标(以及 `Database::backup` 写的备份目录:REST `/backup`、`/api backup` 备份已载入的库,`gbackup` 备份快照库)此后都有一个 `LOCK` 文件,zip 备份里带一个 `LOCK` 条目(几个字节,写者的 pid;没有恢复路径复制它)。公开函数 `Database::load_disk` / `load_disk_with` 像 `open` 一样取目录锁并持有到库关闭(此前不取锁,嵌入方在 gserver 旁边用它们会有两个写者)。
 
 | 工具 / 路径 | 锁什么、何时 | 目录被另一进程持有时 |
 |---|---|---|
 | `gquery`、`gadd`、`gsub`、`gexport`、`gshow <db>`、`gmonitor`、`gcompact`、`gconsole --local`、`gserver <dir>`(都经 `Database::open`) | `<dir>/LOCK`,打开时取,持有到库关闭;RocksDB 另有 `rocksdb/LOCK` | 打开失败(上面的错误),不碰目录 |
 | `gserver --api`(`ApiServer`) | 每个已载入库持有其 `<dir>/LOCK`(所有布局,`hold_dir_lock`);替换、改名、删除库目录的操作(drop、rename、restore、重建的 `/build`)先 `DirLock::acquire_existing` | 载入失败;生命周期操作回答 `409` / `1005 … locked by another process` |
-| `gbuild`(快照,含 `--force`) | 构建在内存中进行;`save` 覆盖一个已有数据库的目录(`--force`)时先取该目录的锁(新目录里没有可锁的库) | 保存失败,原目录不动 |
-| `gbuild --disk` / `--rocksdb` / `--layout disk\|rocksdb`(批量) | `DirLock` + `BuildGuard`;安装前再查 `rocksdb/LOCK` | 构建失败,旧库不动;本进程打开着该目录时报 "is open in this process" |
-| `gbuild --disk --incremental` | 取目录锁,也拒绝本进程打开着的目录 | 构建失败 |
+| `gbuild`(快照,含 `--force`) | `gbuild` 从开始到结束持有数据库目录(`BuildGuard::create_and_lock`);构建在内存中进行,`save` 保存到外部目录时取它的锁(新目录、空目录也取) | 立即失败(状态 1),原目录不动;失败的构建只删除它自己新建、仍持有且不含数据库的目录 |
+| `gbuild --disk` / `--rocksdb` / `--layout disk\|rocksdb`(批量) | `BuildGuard::lock`(一步声明并取 `DirLock`);安装前再查 `rocksdb/LOCK` | 构建失败,旧库不动;本进程打开着该目录时报 "is open in this process" |
+| `gbuild --disk --incremental` | 取目录锁,也拒绝本进程打开着的目录;暂存后经批量安装替换 | 构建失败 |
 | `gbackup` | 整个备份期间持有源库的锁(所有布局) | 拒绝("… is locked by another process (pid N)");正被服务的库请经服务器备份(`/api backup`、REST `/backup`、`gconsole` 的 `backup`) |
 | `grestore`(`Database::restore_into`)、REST `/restore`、`/api restore` | 暂存之前锁目标(先锁、再修复上一次中断的恢复、再锁修复重建的目标),持有到交换完成;目标不存在时持有 `<dir>.restore-lock` | 拒绝(REST `409`、`/api` `1005 … locked by another process`),不暂存任何东西 |
-| `gdrop` | `DirLock::acquire_existing`,然后删除目录 | 拒绝 |
+| `gdrop` | `DirLock::acquire_existing`,然后把目录持久地改名为 `<name>.db.drop-old` 再删除(见 [§布局替换](#布局替换与崩溃安全)) | 拒绝 |
 | `gconsole`(连接服务器时) | 不碰目录,是 `/api` 的 HTTP 客户端 | — |
 
 同一秒内对同一个库的多个备份(REST 与 `/api` 都算,目标路径相同)按目标路径的声明(`BackupClaim`)排成先后。
 
 ---
 
+## Review-fix campaign:提交、恢复与格式
+
+本节汇总 review-fix campaign(2026-11,见 `CHANGELOG.md` 的 "Review-fix campaign" 一节)对提交点、崩溃恢复和磁盘文件的改动。各项都带审查编号;括号里的包名(如 r1-storage-failstate)是做这项修复的工作包,可在 git 历史里按名字找到(合并的分支 `fix/<包名>`,以及收尾时删除的片段 `changelog.d/<包名>.md`)。所有改动都**不改变数据库文件格式**([§注册表结论](#注册表review-fix-campaign-的结论))。仍未做的后续(WAL 不记录所属文件的身份、只读的 pager 打开模式、`vstree.kv` 的页校验和等)见 `docs/REFACTOR_BACKLOG.md`。
+
+### Pager 与 WAL:提交协议、失败状态与文件锁
+
+`src/kvstore/pager.rs`(模块文档是权威描述)。
+
+- **提交协议**(C-1:durability#1、disk#1;durability#8、robust#12;r1-storage-failstate):`flush` 把这一批(头页 + 脏页)暂存为 `<file>.wal.tmp`,fsync,改名为 `<file>.wal`,fsync 目录;然后把这一批应用到文件,fsync 文件,删除日志,再 fsync 目录。日志**从不被截断或原地重写**,文件仍需要的日志只能被一个完整的新日志原子地替换。改名之前的失败不改变磁盘上的任何东西,在 pager 层可以重试;残留的 `*.wal.tmp`(暂存时崩溃)不是提交,下次打开时删除。
+- **failed 状态**:日志得到正式名字之后的任何错误(应用某页、某次 fsync、删除日志)都使 pager **failed**:之后的写、分配页和提交都以 `GStoreError::StorageFailed` 拒绝,读照常(这一批的页都在缓存里且是脏的),它再也不写这个文件(也没有 `Drop` 时的 flush)。重新打开时重放完整的日志,所以文件恰好是最后一个日志完整的批次,绝不是两者的混合。此前下一次提交点、保存、关闭或丢弃会重试提交,截断唯一完整的日志,重写时再次失败,留下一个再也打不开的库(`I/O error: failed to fill whole buffer`)。broken 状态与服务器上的恢复见[上文](#事务-overlay-与写闸门c5)。
+- **打开**(M1:disk#2、durability#7、robust#12):只有 "not found" 表示"没有日志";其它读错误(EIO、EACCES、日志位置上是一个目录……),或重放之后删不掉日志,都使 `Pager::open` 失败——因而数据库打开失败——而不是打开一个可能只应用了一半、日志会被下次提交覆盖的文件。比头部 `page_count × 4096` 字节短的 `kvstore.kv` / `vstree.kv` 被拒绝("torn or truncated")。
+- **提交时只短暂独占**(disk#10,r3-storage-kernel):`DiskStore::commit`(每个提交点)经 `Pager::commit_shared` 在 pager 的**共享**守卫下计算校验和、写日志、应用、fsync;只有取走这一批和把它标记为干净(`Pager::finish_commit`)持有独占守卫。共享这个 pager 的读者(out-of-core 字典、只读视图、`ConcurrentDb` 的快照读者)不再等日志写入和两次 fsync;两步之间被写者改动的页保持脏,留给下一次提交。日志的 CRC-32 改为查表(slicing by 8),日志经 1 MiB 缓冲流式写出,不再先整份复制。r3-storage-kernel 的实测:默认页缓存的整批(4,097 页,16,797,704 字节)的 CRC-32,逐位循环 68.0 ms,查表 11.3 ms(5 次取最好,`rustc +1.99.1 -O`,负载约 9)。日志格式不变。
+- **毒化的锁**(conc#8):`Pager::lock_read` / `lock_write` 恢复被 panic 毒化的锁,并把 pager 标记为 failed——读继续,之后的写和提交以 `StorageFailed` 拒绝,而不是 panic。
+- **每个文件一个进程**(disk#9,r3-storage-kernel、r3-integration):`Pager::open` 在看日志**之前**对文件取咨询排他锁(Unix `flock`,Windows `LockFileEx`,即 std 的 `File::try_lock`),只要本进程还有这个文件上的 pager 活着就一直持有。另一进程的打开以 `GStoreError::Locked`("'…/kvstore.kv' is in use: another process has it open")失败,什么也不碰(连日志也不碰);此前两个进程可以互相重放、删除对方的日志并覆盖对方的页。进程内这把锁是共享的(与目录锁一样):同一进程对同一文件的第二个 pager 不会被拒绝,一个文件一个 pager 仍是调用方的责任(共享 `Arc<RwLock<Pager>>`,见 `DiskStore::shared_pager`;服务器在目录锁下只打开一次数据库)。进程的最后一个 pager 显式释放这把锁,所以正在 spawn 的子进程(短暂共享描述符)不会把它延续到 `exec`。不支持咨询锁的文件系统照旧不加锁打开。
+- **唯一的 WAL 路径规则**(disk#9):`Pager::wal_path(path)` 是 `<path>.wal` 的唯一推导,`persist::wal_of`、批量安装的 `wal_of` 与 `DiskStore::open_with` 都调用它。`Pager::remove_with_wal(path)` 删除一个分页文件连同它的日志和暂存的 `.wal.tmp`——先删日志,日志绝不比文件活得久——并 fsync 目录,只忽略 "not found";`Database::use_streaming_vstree` 用它,删不掉的陈旧日志使调用在构建任何东西之前失败。
+- **提交结果与 D12**(gap-txn-lifecycle#3,r2-txn):一次提交的结果取决于它的某次 flush 是否已给 WAL 起了正式名字(`Pager::wal_batches` / `DiskStore::wal_batches` / `DiskTriples::wal_batches`,只是内存中的计数):暂存不了日志 → 回滚,不可见,重载后也不持久;日志完整但应用失败 → 不持久的回答,可见,重新打开时保留。D12 的交互:脏页超过页缓存的事务,中途的 flush 已成功、之后的 flush 失败时回答"不持久",因为它的前缀已经持久。已提交事务释放的 id 留在它自己的提交点里;Materialize 模式在那个提交点成功之后才在内存字典里 retire 它们。
+- **格式**:无变化。没有 feature bit;暂存文件从不被重放,所以老二进制仍然正确;WAL 记录分帧与每个头部都与之前相同。WAL 仍不记录所属文件的身份(disk#9 的那一半需要新的分帧和 feature bit,会让每个新文件对老二进制不可读,见 `docs/REFACTOR_BACKLOG.md`);跨进程锁、唯一的路径规则和先删日志的检查删除已经关闭了审查指出的失败路径。
+
+### 布局替换与崩溃安全
+
+`src/db/fsutil.rs` 的 stage + swap + fsync 原语(`StagedDir`:暂存在目标旁边,整棵树 fsync,换入时 fsync 父目录;`InstallError::committed` 区分提交点之后的失败;durability#15)与 `src/db/persist.rs`。
+
+- **构建从不写在它要替换的库上**(durability#5、durability#15,r2-layout-cli):批量构建以及现在的增量磁盘构建把 `kvstore.kv` + `vstree.kv` 暂存在 `.bulk-tmp/`,再走批量安装([§批量构建](#批量构建));增量 RocksDB 构建暂存 `rocksdb.tmp/` 再换入(`rocksdb.tmp` → `rocksdb.new` →(`rocksdb` → `rocksdb.old`)→ `rocksdb`,每次打开照旧恢复)。卡在交换提交点之后的构建被拒绝,由下一次打开补完(r2-integration)。
+- **删除数据库**(durability#10):目录先持久地改名为 `<name>.db.drop-old`(改名后 fsync 父目录,从此数据库就没有了),再删除。中断的删除(崩溃、断电、删除时的 I/O 错误)留下的 `<name>.db.drop-old` 不被列出、不被注册,也没有谁读它的数据——手工删除,或再删一次同名库(下一次删除这个名字时会清掉它)。
+- **备份复制**(`Database::backup_dir`,`gbackup` 对未打开目录的文件级复制;durability#4):复制之前先持久地删除目标中的 `vstree.kv`、各 WAL、快照提交记录、`meta.bin`、陈旧的 `rocksdb/`(r2-integration)以及源里没有的每个数据库文件,最后才复制 `meta.bin`(快照布局的标志),所以复制中途失败或崩溃不会留下新 store 配旧 VS-tree(header 说它新鲜,`GSTORE_VS_POLICY=tree` 时会剪掉之后加入的实体)或混合的快照。`gbackup` 与 `backup_dir` 拒绝数据库目录本身或其内部的目标(bulkcli#4)。
+- **旧式影子快照**(durability#9):在磁盘库上保存的快照,若保存在删掉 `kvstore.kv` 之前崩溃,下次打开时合并进 `kvstore.kv`(需要几次页提交就几次)。"应用影子"这一决定现在先记在持久的标记 `SHADOW.apply` 里(内容 `kvstore.kv dev=<d> ino=<i>`,绑定 store 文件的设备与 inode);发现它的打开会再次(幂等地)应用影子,然后才退役影子文件(`store.bin` 最后)和标记。此前合并的提交让 `kvstore.kv` 比影子新,第二次中途崩溃后的打开按 mtime 跳过影子,服务两种状态的混合。`remove_other_layouts` 删除这个标记;指向另一个 store 文件的陈旧标记什么也不决定。目录切换到别的布局时,先删快照的提交记录和 `store.bin`,磁盘布局的文件先于它们的 WAL 删除。第一次决定是否应用影子仍按 mtime(`>=`),那是旧版构建留下的唯一信息。
+- **规则目录的交换**(durability#11,r4-ext-docs、r4-integration):`reason_rule_files/` 经数据库目录里 `STORE_SWAP` 的兄弟名字(`reason_rule_files.tmp` / `.new` / `.old`)替换;残留的由下一次规则操作补完或删除(强制重建时由 `remove_rule_dir` 删除)。`gbuild --force`、批量重建与覆盖已有库的 REST `/build` 在规则锁下把被替换库的规则先改名移开再删除,中断的规则交换或删除途中的崩溃都不会让旧规则回到重建的库里。
+
+### RocksDB:语句日志与崩溃恢复
+
+`src/backend/rocks.rs`,r1-rocksdb(H-11、H-12,gap-rocksdb-exec#1、#2、#4、#6、#7,disk#11)。
+
+1. **每条自动提交语句都记 undo 日志**,与事务一样:一个 SPARQL UPDATE 请求(`INSERT DATA`、`DELETE`/`INSERT … WHERE`、`LOAD`、`CLEAR`、`DROP`、`ADD`/`COPY`/`MOVE`)和一次 `insert_sources` / `remove_sources` 导入(`gadd`、`gsub`、`/api batchInsert` / `batchRemove`)。中途崩溃(SIGKILL、OOM、断电)在下次打开时整体撤销,库总是停在语句边界上,不论语句多大(磁盘布局的语句只在脏页装得下页缓存时才崩溃原子,D12)。中途失败的语句保留它已应用的部分(既定语义),它的日志也照常提交——panic 时也是——所以日志不会一直开着去拒绝之后的语句或在下次打开时撤销之后的写。语句释放的 id 在语句结束时、在删除日志的那一批里释放,`dict` CF 条目也在那一批删除。仍然只按三元组原子的:直接 API 的写(`insert_triple`、`materialize_rdfs` …)、REST `/batchInsert` / `/batchRemove` 和对已载入库的 REST `/upload`(见 `docs/REFACTOR_BACKLOG.md`)。
+2. **日志的词记录**:事务或语句里新写的词与它在同一批里记进日志(种类字节 2,`-` 操作,`(id, id, id)`),所以词与三元组之间的崩溃让下次打开释放这个词。每个更早的二进制都读得懂:它把词记录重放成一次空删除加上同样的回收。没有新 feature bit,`LAYOUT_VERSION` 仍是 `"1"`,CF 与键不变。
+3. **提交点 = WAL fsync**:在库自己目录的保存(服务器每次已确认写之后的 `check_point` 保存)只 fsync RocksDB 的 WAL,不再 flush 全部七个 CF 的 memtable(此前每次写留下约三个表文件和三个打开的描述符,写入慢几倍——审查测得 5–6 倍,这里约 13 倍——几百次写之后在 `ulimit -n 1024` 下以 `Too many open files` 结束)。memtable 由显式的 `Database::checkpoint`(`gcompact`)、备份和关闭时 flush。打开文件数、info 日志与 WAL 总量有界([上文](#rocksdb)的调优键)。
+4. **代价**:记日志的语句为它改动的每个三元组 / 四元组(再加每个新词)在同一批里往 `meta` CF 写一条日志记录,语句结束时删除(至多 1,024 条用点删除,否则一次范围删除)。所以 RocksDB 上非常大的 `gadd` / `gsub` / `LOAD` 会暂时存下与其变更集一样大的日志;它释放的 id 一直留到语句结束(`remove_sources` 在批次之间只保留已死的候选,每个候选在它所在批被读到时和结束时各探查一次)。
+5. **打开时的崩溃恢复是分块、可续的**:每次撤销最新的 65,536 条日志记录(在上一块之下的反向迭代器),撤销后把这一块的记录在一批里删除,同一批把回收候选写进 `meta` CF 新的**待定区间**(`\0reclaim-pending\0` ‖ 空间标记 ‖ be32(id),空值)。磁盘上的日志始终是更老的前缀,恢复中途被打断就从停下的地方继续。`Database` 在服务之前以每批 65,536 个处理待定候选,把每批与它的无引用词的 `dict` CF 条目一起删除(`RocksStore::pending_reclaim` / `settle_pending`;`take_replayed` 一次性交出待定候选,供底层用户使用)。代价:内存以一块(加 RocksDB 的 memtable)为界;时间约为每条记录一次写批,与语句本身相当。此前打开把整个日志读进内存,9000 万条记录的日志每次打开都会重复耗尽内存。
+6. **格式**:`meta` CF 里附加的键区间,没有 feature bit,`LAYOUT_VERSION` 仍是 `"1"`。早于它的二进制忽略这个区间,崩溃恢复留在那里的候选一直保持已分配,直到 `gcompact --reclaim`(没有损坏)。
+7. **校验**:`gcompact --check`(`Database::verify_integrity`)运行 `RocksStore::verify_stats`:`stats` CF 的每个计数器都等于从 SPO 键重新计数的结果,POS 与 OSP 恰好持有 SPO 的三元组,全局、缓存与镜像的计数器一致——流式进行(内存恒定,每种排序与计数器前缀各读一次)。每个解码的键都检查长度,长度不对的键(不完整的复制、外部工具、位腐烂)使语句以点名 CF 的读错误失败,而不是 panic。载入 `dict` CF 时先按 id 空间的界检查每个 id,再可失败地预留槽位:越界的 id 使打开以 "corrupt RocksDB dictionary: entity id N is beyond its id space" 失败,不再分配约 100 GB 后中止进程(db#18,r3-storage-kernel)。
+
+### redo 日志与增量备份
+
+`src/db/logs.rs`(分帧、遍历、追加器),r3-db-redo(durability#6、db#2、db#3、db#8、db#9、robust#10、gap-doc-claims#1)与 r2-terms。这些日志只是库 API(`Database::enable_redo_log*`、`enable_update_log*`、`replay_*`、`backup_incremental`、`restore_incremental`),服务器与命令行工具都不打开它们。
+
+- **提交规则**:一次提交(一个自动提交的 UPDATE、一个事务、一个直接 API 变更或批量调用、一次 `materialize_rdfs` / `run_rules`)的记录一次 `write` 追加;自动提交 UPDATE 与事务的记录在其提交点**之后**追加并 `fdatasync`。直接 API 的变更没有自己的提交点,应用时追加,由下一个提交点 `fdatasync`;`Database::sync()` 也是日志的提交点。update 日志只收已提交的语句。
+- **分帧**:每条记录的头部带 CRC-32 记号 `c=<8 位十六进制>`,一次提交的最后一条带 `e=<8 位十六进制>`(`REDO I 0 44 e=1a2b3c4d`、`REC <millis> <changed> <len> e=…`)。重放只在读到某次提交的 `e=` 记录后才应用它,被崩溃截断的事务追加整个不重放。没有记号的记录(此前写的所有日志)照旧重放,每条自成一次提交;早于记号的读取器忽略这个尾部头部记号,逐条读新的插入 / 删除记录(没有全有或全无规则),对新的 clear 记录则明确拒绝("unknown redo.log op 'C'",见[兼容矩阵](#兼容矩阵phase-6-结束时实际情况)下的更正)。本版本读每一种更老的日志。增量备份的 `INCREMENTAL` 标记仍是 `GSTORE-INCREMENTAL 1`。
+- **残尾与损坏**:追加途中崩溃留下的不完整的最后一次提交,重放时跳过(带警告),下一次追加(或备份)把它截掉,从最后一个完整的提交开始;此前下一会话接在残尾之后追加,之后的每条记录都读不到。日志中间损坏的记录(校验和、终止符)报告为损坏(`redo.log is corrupt at byte N: …`),绝不静默跳过。判据:有缺陷的记录是残尾,除非它后面跟着一个完整的记录(完整且校验和正确)——那说明它的长度字段坏了,是损坏;正文里只是看起来像记录头的文本(update 日志的语句可能有一行以 `REC ` 开头)不算。增量的 `incr.log` 必须整体可重放:不完整,或长度与 `INCREMENTAL` 标记不符,都使 `restore_incremental` 失败。
+- **追加失败**:失败的追加(`ENOSPC`、`EFBIG`、`fdatasync` 失败)立即再截掉,文件仍止于提交边界,它的记录按顺序欠给下一次追加;自动提交 UPDATE 报错("the update is applied and committed, but appending to redo.log '…' failed: …"),`commit()` 报 `CommitFailure::CommittedWithError`,`sync()` 报告它。`backup_incremental` 在有欠账时拒绝,在提交结果未知的提交点失败之后("logs in doubt")也拒绝,日志范围里有损坏记录时同样拒绝,直到一次完整的 `backup()` 开始新的链(r3-integration)。打不开的日志(除 "not found" 之外的 I/O 错误)对 `backup` / `backup_incremental` 是错误。
+- **畸形的旧词**(r2-terms):格式良好的词的记录不变。只有更老的版本才可能存下严格读取器拒绝的空白节点标签或语言标签;这样的记录把标签写成 `\uXXXX` 转义——老二进制本来就重放不了这种记录。快照、磁盘与 RocksDB store 的格式都不变(D7:字典键不动,`Term` 的 `Display` 仍是存储的键形式)。
+- **格式注册表不覆盖它们**:`redo.log`、`update.log` 与 `incr.log` 不是分页文件,kvstore 的格式注册表(feature bit,`kvstore/format.rs`)管不到它们;`c=` / `e=` 分帧不需要 feature bit(每个老读取器都忽略的尾部头部记号)。
+
+### 读取时的校验
+
+r4-storage-format(disk#4、disk#5、disk#15、gap-accel-soundness#4、robust#11),无格式变化:
+
+- **`vstree.kv` 边读边校验**:种类字节、条目数 ≤ 32、子节点 id 在 `1..page` 且在父节点之下、每个节点的签名是其条目签名的并且等于父节点里它那一项、叶子深度一致、深度 ≤ 8、每个节点至多访问一次、头部的根与计数。损坏的文件不过滤任何东西;`open_disk` 拒绝缺失、为空或头部损坏的 `vstree.kv`("… (remove it to rebuild the index)")。没有页校验和,有些损坏仍看不出来(叶子里被改掉的实体 id,或某个叶子条目丢了一位而同一叶子的另一条目也置了这一位,仍可能藏住一个匹配)。`eaf5320` 夹具里的 `vstree.kv` 能通过新校验。
+- **`pred_stats` 计数饱和**:磁盘布局逐谓词的 `pred_stats` 计数是 `u32`,在 `u32::MAX` 处饱和(表示"未知,至少这么大"),删除不会让它回落,直到 `DiskStore::rebuild_stats` 重新计数;RocksDB 的 `c|p` 是精确的 `u64`(批量与增量构建都是)。
+- **溢出链的读取有界**:记录长度至多为文件各页的有效载荷,提前结束的链是错误。
+
+### 持久性审计(fsync)
+
+r5-test-audit(tests-b#3、tests-a#13),无格式变化。
+
+- 提交点依赖的 fsync 都经 `fsutil` 的 `sync_file` / `sync_file_data` / `sync_dir`(pager 的 WAL、批量安装、redo 与 update 日志、规则文件),RocksDB 的 WAL sync 也自行报告;doc-hidden 的 `gstore::sync_probe` 为每个活着的 `Probe` 记录每次 sync(文件身份、长度、mtime、文件内容摘要、目录项、调用点)。没有 probe 时每次 fsync 只多一次原子读。
+- `tests/fsync_audit.rs`(23 个测试,`--features rocksdb` 再加 4 个)检查每个提交点前后:每个改动过的文件在最后一次写之后被 sync 过,每个改动过的目录在最后一次目录项变化之后被 sync 过,RocksDB store 的日志在最后一次写之后被 sync 过;协议文档化的每个中间状态(pager 的 WAL;快照提交记录;批量安装的 `cleared` / `kv-synced` / 删除规则 / `vstree-placed` / `layouts-removed` / `cleaned`;目录交换;外部保存与备份的复制;规则账本先于规则文件、先于它记录的插入)都按顺序被某次目录 sync 记录下来。覆盖的提交点列表见 `CHANGELOG.md`。
+- 审计发现并修好的:提交点**新建的每个目录**都在父目录里持久化(`fsutil::create_dir_durable`:数据库目录、备份目录、服务器的根目录、PFN 与规则目录);构建或外部保存之前就已存在的数据库目录(工具的声明),其目录项同样 sync(`fsutil::ensure_dir_durable`,每次构建或保存一次目录 fsync;`BuildGuard::create_and_lock` 持久地新建目录及缺失的上级目录)。
+- 审计不能察觉其删除的三个 sync 作为双保险保留(`persist::write_vstree_kv` 的目录 sync,RocksDB 批量构建在 memtable flush 之后的 `sync_wal` 与它对暂存区的 `sync_dir`);整体改名数据库目录的操作(`/api rename`、`is_backup=true` 的 `drop`)不在审计之内(审计按路径记文件)。见 `docs/REFACTOR_BACKLOG.md`。
+
+### 注册表:review-fix campaign 的结论
+
+格式注册表(`src/kvstore/format.rs`)没有新增 feature bit,`MAGIC_V1` / `MAGIC_V2`、根槽表与上面的兼容矩阵都不变;RocksDB 的 `LAYOUT_VERSION` 仍是 `"1"`。逐项(D7):
+
+| 改动 | 落在哪里 | 为什么不需要格式变化 |
+|---|---|---|
+| WAL 暂存为 `<file>.wal.tmp` 再改名 | pager 文件旁的临时文件 | 暂存文件从不被重放;老二进制看不到它也照样正确;WAL 分帧不变 |
+| pager 文件锁、唯一的 WAL 路径 | 进程内状态 | 不写任何东西 |
+| `named.bin` 读错误使打开失败;`SNAPSHOT.commit` 只列成员名 | 快照布局 | 只是读得更严格,字节不变 |
+| `SHADOW.apply` | 磁盘库目录里的临时恢复标记 | 不是格式变化;老二进制忽略它,照旧按 mtime 决定 |
+| 规则目录交换的 `reason_rule_files.tmp` / `.new` / `.old` | 数据库目录 | 老二进制忽略它们;残留的由下一次规则操作处理 |
+| `<name>.db.drop-old` | 数据库目录的兄弟 | 不被列出、不被注册,只是中断的删除 |
+| 保存 / 备份目标里的 `LOCK` 文件,zip 备份里的 `LOCK` 条目 | 目录 / zip | 锁文件,恢复路径不复制它 |
+| 批量安装的 `COMMIT` 标记 | `.bulk-tmp/` | 咨询性,没有恢复读它 |
+| RocksDB 日志的词记录(种类字节 2) | `meta` CF 的日志 | 每个更早的二进制把它读成空删除加同样的回收 |
+| RocksDB 回收待定区间 `\0reclaim-pending\0…` | `meta` CF | 附加的键区间;老二进制忽略,候选保持已分配直到 `gcompact --reclaim` |
+| redo / update 日志的 `c=` / `e=` 记号;clear 记录的占位三元组;畸形旧词的 `\uXXXX` 转义 | `redo.log`、`update.log`、`incr.log` | 不是分页文件,注册表不覆盖;老读取器忽略尾部记号,对新 clear 记录明确拒绝 |
+| `Pager::wal_batches` | 内存计数 | 不写任何东西 |
+| `vstree.kv` 校验、`pred_stats` 饱和 | 读取路径 | 读得更严格;饱和值 `u32::MAX` 是已有的 `u32` 字段 |
+| `raft.journal`(魔数 `GSRAFTJ1`,CRC 校验的只追加记录,头部记录所属节点 id) | 实验性集群 `gnode cluster --state-dir` | 是集群的新文件,不是数据库格式,自带魔数(r5-cluster) |
+
+---
+
 ## 不变量
 
-任何新后端只需实现 `TripleSource + MutableStore`(即 `StorageBackend`)+ 字典 seam。**VS-tree、优化器、图算法、SPARQL 引擎一行都不改**——这正是本设计要保护的核心资产。Phase 6 之后,一个新后端还要遵守:读面的顺序契约与 C1 计数的精确性([上文](#读面契约顺序契约与-c1-计数)),读错误经 `note_read_error` 上报且 `has_*` 在出错时回答 `true`(C2),词先于引用它的三元组持久化,以及只在数据确实变化时推进 `mutation_count`(C9)。
+默认图的读路径(VS-tree、优化器、图算法、SPARQL 引擎)对 `TripleSource` 泛型,新后端在这一面只需实现 `TripleSource + MutableStore`(即 `StorageBackend`)+ 字典 seam,**这几样一行都不改**——这正是本设计要保护的核心资产。命名图始终在内存 `TripleStore` 中(D11:`Evaluator.named` 的类型是 `Option<&BTreeMap<u32, TripleStore>>`,SERVICE 构建的是 `Evaluator<TripleStore>`),持久化、日志、事务与 id 回收按布局写在 `Database` 里(封闭的 `Backend` 枚举加 Materialize sink,约 70 处分派):新增布局要改这些位置;`src/db/layout_matrix_tests.rs` 在每种布局上跑同一组写/维护操作(结果、内容、计数、`verify_integrity` 都必须与快照布局相同,并经得起 checkpoint 与重开;布局经对 `StorageKind` / `DiskQueryMode` 的穷尽 `match` 列出,新变体不加入矩阵就编译不过),漏掉的分支会让它失败;`tests/storage_backend_conformance.rs` 对 `TripleStore`、`Backend` 的各变体、`DiskTriples`、`DiskStore`、`DiskSource`、`OverlayView`、`ShardedStore` 与 `RocksStore` 跑同一套泛型检查(契约顺序、写的回答、C1 计数;r4-api-hygiene,design#17)。(更正,review-fix campaign,gap-doc-claims#7、db#6、design#5:本段原先说新后端只需实现这两个 trait 与字典 seam、引擎一行都不改,那只对默认图的读路径成立。)Phase 6 之后,一个新后端还要遵守:读面的顺序契约与 C1 计数的精确性([上文](#读面契约顺序契约与-c1-计数)),读错误经 `note_read_error` 上报且 `has_*` 在出错时回答 `true`(C2),词先于引用它的三元组持久化,以及只在数据确实变化时推进 `mutation_count`(C9)。

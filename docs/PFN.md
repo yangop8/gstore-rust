@@ -32,6 +32,11 @@ fails with an error that names the `pfn-wasm` feature.
 All three operations need only valid credentials: every user has them
 (upstream grants `funquery`, `funcudb` and `funreview` to every new user).
 Each user works on **their own functions only**; there is no `db_name`.
+The examples below log in as `root`; `<password>` stands for root's
+password. gserver no longer accepts upstream's default root password
+`123456` unless the loopback-only upstream-compat switch
+`[server] allow_default_root_password=on` is set (see
+[`docs/DEPLOY.md`](DEPLOY.md#secure-defaults-and-upstream-compat-switches)).
 
 `funInfo` is upstream's `PFNInfo`, a JSON object (or a string holding one):
 
@@ -62,11 +67,11 @@ the value and `pfn query use <ms> ms.`.
 `type` is `"1"` create, `"2"` update, `"3"` delete, `"4"` compile:
 
 ```sh
-curl -s localhost:9000/api -d '{"operation":"funcudb","username":"root","password":"123456",
+curl -s localhost:9000/api -d '{"operation":"funcudb","username":"root","password":"<password>",
   "type":"1","funInfo":{"funName":"outDegree","funDesc":"out-degree of a vertex",
   "funBody":"…","funSubs":"…"}}'
 # {"StatusCode":0,"StatusMsg":"Function create success."}
-curl -s localhost:9000/api -d '{"operation":"funcudb","username":"root","password":"123456",
+curl -s localhost:9000/api -d '{"operation":"funcudb","username":"root","password":"<password>",
   "type":"4","funInfo":{"funName":"outDegree"}}'
 # {"StatusCode":0,"StatusMsg":"Function build success."}
 ```
@@ -89,7 +94,7 @@ curl -s localhost:9000/api -d '{"operation":"funcudb","username":"root","passwor
 ### `funquery` — list
 
 ```sh
-curl -s localhost:9000/api -d '{"operation":"funquery","username":"root","password":"123456",
+curl -s localhost:9000/api -d '{"operation":"funquery","username":"root","password":"<password>",
   "funInfo":{"funStatus":"2"}}'
 # {"StatusCode":0,"StatusMsg":"success","list":[{"funBody":"…","funDesc":"…",
 #   "funName":"outDegree","funStatus":"2","funSubs":"…","lastTime":"2026-10-31 12:00:00"}]}
@@ -103,7 +108,7 @@ page, in creation order, and the answer adds `totalSize`, `totalPage`,
 ### `funreview` — preview the generated module
 
 ```sh
-curl -s localhost:9000/api -d '{"operation":"funreview","username":"root","password":"123456",
+curl -s localhost:9000/api -d '{"operation":"funreview","username":"root","password":"<password>",
   "funInfo":{"funName":"f","funBody":"(i32.const 1)"}}'
 # {"StatusCode":0,"StatusMsg":"success","result":"%3B%3B+gStore+PFN+function…"}
 ```
