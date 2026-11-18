@@ -47,10 +47,12 @@ format change, no API removed):
   commit points rely on go through `sync_file` / `sync_file_data` /
   `sync_dir` (fsutil, the pager's write-ahead log, the bulk install, the
   redo and update logs, rule files) and RocksDB's WAL sync reports itself;
-  each sync is recorded (file identity, length, mtime, a directory's
-  entries, call site) for every live `Probe`. With no probe alive the
+  each sync is recorded (file identity, length, mtime, a file's content
+  digest, a directory's entries, call site) for every live `Probe`
+  watching the path (the digest only then: it reads the file). With no
+  probe alive the
   record costs one atomic load per fsync. Not a supported API.
-- New `tests/fsync_audit.rs` (21 tests, 3 more with `--features rocksdb`):
+- New `tests/fsync_audit.rs` (23 tests, 4 more with `--features rocksdb`):
   around one commit point, every changed file must have been synced after
   its last write, every changed directory after its last entry change and a
   RocksDB store's log after its last write; and every intermediate state a
@@ -77,6 +79,17 @@ format change, no API removed):
   more than 256 header fields and a header line or request target over
   64 KiB are refused with `400` before authentication on the
   single-database and `/api` servers, and the worker serves on.
+- Round-5 review follow-up (tests-b#3): the audit told a file written after
+  its last sync only by length and mtime, so a same-length in-place write
+  (a pager page) within one timestamp tick — on a kernel without
+  fine-grained timestamps, as on CI — moved after the file's last sync went
+  unseen. The probe now records a content digest with every file sync
+  (`SyncEvent::digest`, `sync_probe::content_digest`, FNV-1a), and the
+  audit compares the final content with it (and with the content before
+  the commit point, to tell a changed file). Self-test
+  `fsync_audit::the_audit_sees_an_in_place_write_that_keeps_length_and_mtime`
+  (an in-place overwrite with the mtime put back, after the last sync and
+  in an unsynced file) failed before.
 - Tests corrected (D6, with `review <id>` notes): `gapi::tasks`'s
   `callbacks_report_delivery_failures` only ever saw the host-local
   refusal; it now pins the refusal (nothing connects), a transport error

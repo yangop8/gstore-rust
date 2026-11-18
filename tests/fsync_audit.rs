@@ -12,8 +12,10 @@
 //!
 //! * every file the operation created or wrote was synced (`fsync` or
 //!   `fdatasync`, through any name it had — a staged file renamed into place
-//!   keeps its inode) **after its last write**: its length and modification
-//!   time at its last sync are its final ones;
+//!   keeps its inode) **after its last write**: its length, modification
+//!   time and content digest at its last sync are its final ones (the
+//!   digest catches an in-place write that keeps the length within one
+//!   timestamp tick, which kernels without fine-grained timestamps allow);
 //! * every directory whose entries changed (a file created, renamed or
 //!   removed in it) was synced after the last change: the entries recorded at
 //!   its last sync are its final ones;
@@ -104,6 +106,8 @@ struct Node {
     dir: bool,
     len: u64,
     modified: SystemTime,
+    /// A regular file's content digest (`sync_probe::content_digest`).
+    digest: Option<u64>,
     /// A directory's entries.
     entries: BTreeMap<OsString, Option<FileId>>,
 }
@@ -141,6 +145,10 @@ fn scan_into(root: &Path, path: &Path, out: &mut Tree) {
             dir: md.is_dir(),
             len: md.len(),
             modified: md.modified().unwrap(),
+            digest: md
+                .is_file()
+                .then(|| gstore::sync_probe::content_digest(path))
+                .flatten(),
             entries,
         },
     );
@@ -313,7 +321,9 @@ impl Audit {
                 }
             } else {
                 let changed = !same_object
-                    || before.is_some_and(|b| b.len != node.len || b.modified != node.modified);
+                    || before.is_some_and(|b| {
+                        b.len != node.len || b.modified != node.modified || b.digest != node.digest
+                    });
                 if !changed {
                     continue;
                 }
@@ -322,13 +332,24 @@ impl Audit {
                         "file {shown}: written ({} bytes) but never synced",
                         node.len
                     )),
-                    Some(e) if e.len != node.len || e.modified != Some(node.modified) => problems
-                        .push(format!(
-                            "file {shown}: written after its last sync (at {}: {} bytes, now {})",
+                    Some(e)
+                        if e.len != node.len
+                            || e.modified != Some(node.modified)
+                            || e.digest != node.digest =>
+                    {
+                        problems.push(format!(
+                            "file {shown}: written after its last sync (at {}: {} bytes, now {}; \
+                             content {})",
                             e.site(),
                             e.len,
-                            node.len
-                        )),
+                            node.len,
+                            if e.digest == node.digest {
+                                "unchanged"
+                            } else {
+                                "changed"
+                            }
+                        ))
+                    }
                     Some(_) => {}
                 }
             }
@@ -1299,6 +1320,78 @@ fn a_bulk_install_syncs_every_step() {
         bulk_install(&events, &dir, rules, round == "a snapshot database");
         assert_eq!(count(&mut Database::open(&dir).unwrap()), 2, "{round}");
     }
+}
+
+/// Round-5 review follow-up (tests-b#3): the audit told a file written
+/// after its last sync only by its length and modification time. A
+/// same-length in-place write (a pager page) within one timestamp tick keeps
+/// both on a kernel without fine-grained timestamps (CI's), so moving such a
+/// write after the file's last sync went unseen; the probe now records a
+/// content digest with every file sync. Simulated here by overwriting a
+/// file in place and putting its modification time back: after the commit
+/// point's last sync of it, and — in a file the commit point did not touch
+/// otherwise — during the commit point.
+#[test]
+fn the_audit_sees_an_in_place_write_that_keeps_length_and_mtime() {
+    use std::io::{Seek, SeekFrom};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    let overwrite_in_place = |path: &Path| {
+        let modified = fs::metadata(path).unwrap().modified().unwrap();
+        let mut f = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let mut first = [0u8; 1];
+        f.read_exact(&mut first).unwrap();
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.write_all(&[!first[0]]).unwrap();
+        f.set_modified(modified).unwrap();
+        drop(f);
+        assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), modified);
+    };
+    let refusal = |run: &mut dyn FnMut()| -> String {
+        let caught = catch_unwind(AssertUnwindSafe(run)).expect_err("the audit passed");
+        caught.downcast_ref::<String>().cloned().unwrap_or_default()
+    };
+
+    let tmp = TmpDir::new("same_tick");
+    let dir = tmp.path().join("audit.db");
+    let db = Database::build_from_str("audit", BASE).unwrap();
+    let mut audit = Some(Audit::begin(tmp.path()));
+    db.save(&dir).unwrap();
+    let member = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.is_file() && p.file_name().is_some_and(|n| !is_lock_file(n)))
+        .expect("a saved member file");
+    overwrite_in_place(&member);
+    let msg = refusal(&mut || {
+        audit
+            .take()
+            .unwrap()
+            .finish("save(), then an unsynced write", &[]);
+    });
+    assert!(
+        msg.contains("written after its last sync") && msg.contains("content changed"),
+        "{msg}"
+    );
+
+    // A file the commit point does not sync, written in place meanwhile.
+    let bystander = tmp.path().join("bystander.bin");
+    fs::write(&bystander, b"0123456789").unwrap();
+    let mut audit = Some(Audit::begin(tmp.path()));
+    overwrite_in_place(&bystander);
+    let msg = refusal(&mut || {
+        audit
+            .take()
+            .unwrap()
+            .finish("an unsynced in-place write", &[]);
+    });
+    assert!(
+        msg.contains("bystander.bin: written (10 bytes) but never synced"),
+        "{msg}"
+    );
 }
 
 /// Round-5 review follow-up (tests-b#3, db#12): a database directory that

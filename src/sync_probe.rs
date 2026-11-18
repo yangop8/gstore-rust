@@ -7,8 +7,9 @@
 //! that syncs from one that does not. This probe can. Each `fsync` /
 //! `fdatasync` a commit point relies on goes through `sync_file`,
 //! `sync_file_data` or `sync_dir` here, which sync and then record what
-//! was synced — the path, the file's identity (device and inode), its length
-//! and modification time at that moment, and the call site — for every live
+//! was synced — the path, the file's identity (device and inode), its length,
+//! modification time and a digest of its content at that moment, and the
+//! call site — for every live
 //! [`Probe`] watching a directory the path lies in; RocksDB's write-ahead-log
 //! sync reports itself through `rocks_wal_synced` with the lengths of the
 //! store's log files. `tests/fsync_audit.rs` compares those records with
@@ -83,6 +84,13 @@ pub struct SyncEvent {
     /// Its modification time then: a later write (a directory: a later entry
     /// change) moves it on.
     pub modified: Option<SystemTime>,
+    /// [`SyncKind::File`] / [`SyncKind::FileData`]: the [`content_digest`] of
+    /// the file right after the sync. A later write that keeps the length
+    /// and lands within the same timestamp tick (an in-place page write on
+    /// a kernel without fine-grained timestamps) leaves `len` and
+    /// `modified` as they were, but not this (round-5 review follow-up of
+    /// tests-b#3).
+    pub digest: Option<u64>,
     /// [`SyncKind::Dir`]: the directory's entries (name and identity) right
     /// after the sync — what a crash from then on keeps.
     pub entries: Vec<(OsString, Option<FileId>)>,
@@ -212,6 +220,19 @@ fn entries_of(dir: &Path) -> Vec<(OsString, Option<FileId>)> {
     out
 }
 
+/// A digest of the content of the file at `path` (FNV-1a, 64 bit): what
+/// [`SyncEvent::digest`] records, for comparing with the file's content
+/// later. `None` when it cannot be read.
+pub fn content_digest(path: &Path) -> Option<u64> {
+    let bytes = fs::read(path).ok()?;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Some(h)
+}
+
 fn record(
     kind: SyncKind,
     md: Option<fs::Metadata>,
@@ -219,10 +240,24 @@ fn record(
     wal_files: Vec<(PathBuf, u64)>,
     site: &'static Location<'static>,
 ) {
+    // Only for the probes watching `path`: a file's digest reads it whole.
+    let mut canonical = None;
+    let watchers: Vec<u64> = watches()
+        .iter()
+        .filter(|w| w.covers(path, &mut canonical))
+        .map(|w| w.id)
+        .collect();
+    if watchers.is_empty() {
+        return;
+    }
     let entries = if kind == SyncKind::Dir {
         entries_of(path)
     } else {
         Vec::new()
+    };
+    let digest = match kind {
+        SyncKind::File | SyncKind::FileData => content_digest(path),
+        SyncKind::Dir | SyncKind::RocksWal => None,
     };
     let event = SyncEvent {
         kind,
@@ -230,14 +265,14 @@ fn record(
         id: md.as_ref().and_then(FileId::of),
         len: md.as_ref().map_or(0, fs::Metadata::len),
         modified: md.as_ref().and_then(|m| m.modified().ok()),
+        digest,
         entries,
         wal_files,
         site,
         seq: SEQ.fetch_add(1, Ordering::Relaxed),
     };
-    let mut canonical = None;
     for w in watches().iter_mut() {
-        if w.covers(path, &mut canonical) {
+        if watchers.contains(&w.id) {
             w.events.push(event.clone());
         }
     }

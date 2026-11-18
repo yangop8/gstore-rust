@@ -109,7 +109,7 @@ jobs, but the feature, RocksDB and stream-mode runs overlapped each other
   failed, 10 ignored. Convention 13e inside them:
   `tests/executor_differential.rs` 5 passed, `tests/w3c_subset.rs` 18
   passed (no round-5 package added case dirs); the new suites of the
-  round: `tests/fsync_audit.rs` 21, `tests/adversarial_coverage.rs` 2,
+  round: `tests/fsync_audit.rs` 21 (23 after the review follow-ups), `tests/adversarial_coverage.rs` 2,
   `tests/api_session_tokens.rs` 1, `tests/conformance_harness.rs` 2,
   `tests/package_smoke.rs` 1 (curl, `systemd-analyze` and
   `deb-systemd-helper` are installed here, so the packaging tests ran
