@@ -263,8 +263,8 @@ token; cluster-nlqa#13, sec#18).
   proxy all clients share the proxy's). `refreshconf` applies the three
   keys. `[server] upstream_login_lockout=on` restores upstream's rule (per
   address; `login`, `testConnect` and REST `/login` exempt and still
-  evaluating guesses; any successful login resets the address; until
-  restart).
+  evaluating guesses; the address stays locked until a successful `login`
+  from it or a restart).
 - Library: `IpFilter::locked_out` (with `note_failure`, upstream's
   per-address lockout) locks out only a filter built
   `with_upstream_lockout(true)`; a filter from `IpFilter::new` counts
@@ -528,8 +528,9 @@ token; cluster-nlqa#13, sec#18).
   `<begin>_<tid>` form (REST no longer accepts a sign, `+2`). The begin time
   of a `<begin>_<tid>` id must be the transaction's; otherwise the id names
   no open transaction and gets the remembered end of the earlier transaction
-  it names ("not running (already committed …)"), else "Wrong transaction
-  id" (REST 404, `/api` 1005). Before, the begin time was ignored, so after
+  it names ("not running (already committed …)"), else, when it names no
+  transaction, REST 404 ("no open transaction N …") / `/api` 1005 ("Wrong
+  transaction id"). Before, the begin time was ignored, so after
   a reload or restart the Workbench's "roll back the stale RUNNING row"
   ended the new transaction with the same number. Ended outcomes keep their
   database's load generation and begin time and survive reloads; at start a
@@ -994,11 +995,15 @@ token; cluster-nlqa#13, sec#18).
   `sync()` reports it, and `backup_incremental` refuses while commits are
   owed; an unreadable log is an error for `backup` / `backup_incremental`.
   Committed records survive a later `rollback()` and `disable_redo_log` /
-  `disable_update_log`. After a failed commit point the logs follow what a
-  reopen keeps; when that is in doubt they are marked so and
-  `backup_incremental` refuses until a full `backup()`, which starts a new
-  chain. `backup_incremental` walks the copied range as the restore does and
-  fails on a damaged commit (it copied it and answered `Ok`).
+  `disable_update_log`. An UPDATE or reasoning run that panics part-way
+  keeps what it applied, and its redo records are appended on the way out;
+  before, the statement's redo hold stayed set, held back the records of
+  later direct-API writes, and a later `rollback()` dropped them. After a
+  failed commit point the logs follow what a reopen keeps; when that is in
+  doubt they are marked so and `backup_incremental` refuses until a full
+  `backup()`, which starts a new chain. `backup_incremental` walks the
+  copied range as the restore does and fails on a damaged commit (it copied
+  it and answered `Ok`).
 - **Redo replay refuses what it cannot read** (db#9, gap-doc-claims#1): a
   length field beyond `usize` or an overflowing sum fails `replay_redo_log`,
   `replay_update_log` and `restore_incremental` (it panicked); an op other

@@ -848,8 +848,9 @@ Most changes keep data and wire formats; what an upgraded server, client or
 script may notice is listed in [`docs/DEPLOY.md`'s upgrade
 notes](docs/DEPLOY.md#upgrade-notes) and, in full, in
 [`CHANGELOG.md`](CHANGELOG.md). In short: the API server refuses root's
-default password `123456` on every address; browser clients need their
-origin in `cors_allow_origin`; downloads need credentials, and exports and
+default password `123456` on every address; browser front ends served from
+another origin (e.g. upstream's Workbench) need their origin in
+`cors_allow_origin`; downloads need credentials, and exports and
 query results are deleted after a week; uploads whose credentials travel in
 the body stop at 64 MiB and every upload at 256 MiB; idle transactions are
 rolled back after 10 minutes; `conf.ini` inline comments follow a narrower

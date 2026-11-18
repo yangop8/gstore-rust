@@ -70,12 +70,14 @@ only warns that it has no effect) lifts the host-local rule for `SERVICE`
 and `remote=true` downloads alike and prints a startup warning — unsafe on
 a shared server: clients can then reach services listening on the server's
 loopback and cloud metadata endpoints. Asynchronous-operation callbacks
-(any user holding the load, update, backup or restore privilege on a
-database may name a callback URL) are not gated by `--allow-service`: they
-refuse host-local addresses (the same set) unless the library setting
-`TaskConfig::callback_allow_local` is on, but reach other internal hosts —
-restrict the server's outbound connections with a firewall if that
-matters (review sec#13).
+(any user who may run an asynchronous operation on a database may name a
+callback URL: `query` with the query privilege, `batchInsert` /
+`batchRemove` with the update privilege, `load`, `unload`, `backup` and
+`restore` with their own; `build` and `loadcsr` are root-only) are not
+gated by `--allow-service`: they refuse host-local addresses (the same set)
+unless the library setting `TaskConfig::callback_allow_local` is on, but
+reach other internal hosts — restrict the server's outbound connections
+with a firewall if that matters (review sec#13).
 
 ## Docker
 
@@ -401,7 +403,7 @@ key fails the run).
 | `[server] allow_get_update` | `off`: `GET /sparql` with an UPDATE answers `400`; `POST /update` with `text/plain` or `multipart/form-data` answers `415` | `on` (GET runs updates; `/update` takes any body type) | `<img src=…/sparql?query=DROP ALL>` or a cross-site `text/plain` form wipes data (CSRF) | no |
 | `[server] trust_proxy_headers` | `off`: a loopback peer forwarding `Forwarded`, `X-Forwarded-For` or `X-Real-IP` is a reverse proxy, not a local client | `on` (every loopback peer is local) | a same-host reverse proxy hands loopback privileges — the unauthenticated single-database server, root's default password, `/api`'s `trust_inner_localhost`, the pre-body credential check — to the internet | no |
 | `[server] allow_default_root_password` | `off`: `gserver` (API mode) refuses to start while root has `123456`, on every address | `on` — upstream accepts `123456` anywhere; here the switch allows it on a loopback address only, from local clients only | anyone who can reach the server as a local client is root, including any web page open in a browser on that machine (`/api` `GET` operations carry credentials in the URL, and the Origin guard covers state-changing methods only) | **yes** |
-| `[server] upstream_login_lockout` | `off`: failed logins counted per account and client address, with an expiring back-off, on every password path (see [Login lockout](#login-lockout)) | `on`: upstream's rule — per address only; `login`, `testConnect` and REST `/login` exempt and still evaluating guesses; any successful login resets the address; locked until a restart | unlimited online password guessing through `login` / `testConnect`, one PBKDF2 hash per guess (an unauthenticated CPU amplifier); behind a proxy or NAT any client's failures lock every client out until a restart | no |
+| `[server] upstream_login_lockout` | `off`: failed logins counted per account and client address, with an expiring back-off, on every password path (see [Login lockout](#login-lockout)) | `on`: upstream's rule — per address only; `login`, `testConnect` and REST `/login` exempt and still evaluating guesses; the address stays locked until a successful `login` from it or a restart | unlimited online password guessing through `login` / `testConnect`, one PBKDF2 hash per guess (an unauthenticated CPU amplifier); behind a proxy or NAT any client's failures lock every client out until a successful login or a restart | no |
 | `[system] txn_idle_timeout` | `600` (seconds): an open transaction without a statement in flight for that long is rolled back (see [Transactions](#transactions)) | `0` (never expires) | a client that vanishes after `begin` blocks its database's writes, maintenance and further begins until root rolls the transaction back or the server restarts; on RocksDB it also pins a full copy of the store | no |
 | `[upload] anonymous_download` | `off`: `/file/download` needs credentials and passes the owner check; an anonymous request gets `401` with `WWW-Authenticate: Basic` and a `1001` envelope (see [Downloads and exports](#downloads-and-exports)) | `on` (a public export directory: every file of it to anyone) | anyone who reaches the port and learns a file name downloads whole-database exports and `format=file` query results (the names carry 128 random bits, so it takes a leaked name); where the CORS policy lets an origin in, a page from it reads the file through a visitor's browser | **yes** |
 
@@ -424,7 +426,7 @@ startup line; `conformance.sh` sets none of them):
 | `[server] max_conns_per_ip` | `64` open connections per address (waiting ones included) | none (`0`) | with `0` one address can occupy every worker and the queue; behind a proxy or NAT the default may refuse legitimate clients (raise it there) |
 | `[server] query_timeout` | `3600` s of evaluation per statement | none (`0` = off) | a runaway read holds its database (and a writer queued behind it) longer |
 | `[server] max_result_bytes` | `1073741824` (1 GiB) per answer | none (`0` = off) | larger answers serialized in memory |
-| `[server] login_lockout_failures`, `login_lockout_max_seconds` | `4` (the 5th failure locks), `900` s | `errornum > 4`, locked until a restart (with `upstream_login_lockout=on`) | more guesses per account and address before a lock, shorter locks |
+| `[server] login_lockout_failures`, `login_lockout_max_seconds` | `4` (the 5th failure locks), `900` s | `errornum > 4`, locked until a successful `login` from that address or a restart (with `upstream_login_lockout=on`) | more guesses per account and address before a lock, shorter locks |
 | `[upload] download_max_concurrent` | `8` streaming downloads at once; further ones `503` + `Retry-After: 1` | none (`0`) | each download holds a worker of `thread_num` |
 | `[upload] file_retention_hours` | `168`: recorded uploads, exports and query results removed after a week | `0` (kept forever) | with `0` exports, results and uploads accumulate on disk and stay readable longer; with the default, copy the exports you want to keep |
 | `[upload] upload_user_quota` | `0` (no quota) | none | — (bytes of retained uploads per user; beyond it `1005 "Upload quota exceeded: …"`) |
@@ -644,9 +646,10 @@ uploads per user, `0` = none) refuses an upload beyond it with `1005
 "Upload quota exceeded: …"`.
 
 REST `/export` writes an unnamed scratch file in the export directory
-(`[upload]`'s, by default `<root>/export`) under the database's shared
-guard and streams it once the guard is released: the directory needs room
-for one export per concurrent `/export`.
+(`<root>/export`; embedders can move it with `GapiConfig::export_dir`,
+there is no `conf.ini` key) under the database's shared guard and streams
+it once the guard is released: the directory needs room for one export per
+concurrent `/export`.
 
 ### HTTPS, sessions and `gconsole`
 
@@ -947,7 +950,8 @@ analogue of upstream's log4cplus `SLOG_*` log):
   their real `statusCode` / `statusMsg` — `/api` query errors, unknown
   formats, timeouts and too-large answers (upstream records successes only)
   as well as the REST endpoints' failures; a write applied in memory but not
-  saved is recorded with `statusCode` 500.
+  saved is recorded with `statusCode` 500 by the REST endpoints and `1005`
+  by `/api`.
 * `accesslog_mode` / `accesslog_path` / `accesslog_days`: one JSON record
   per `/api` operation (`reasonManage`, `funcudb`, `funquery`, `funreview`
   included) with the client IP. Every HTTP request (REST and
@@ -1010,8 +1014,9 @@ every other write to the database are refused (`/api` `1008` / `1004`, REST
   transaction log's `<begin>_<tid>` form, whose begin time must be the
   transaction's (REST no longer accepts a sign, `+2`): a stale id gets the
   remembered end of the transaction it names ("not running (already
-  committed …)") or "Wrong transaction id" (REST `404`, `/api` `1005`),
-  never another transaction with the same number.
+  committed …)") or, when it names no transaction, REST `404` ("no open
+  transaction N …") / `/api` `1005` ("Wrong transaction id"), never
+  another transaction with the same number.
 * **Monitoring.** REST `/show` and `/monitor` and `/api` `show` / `monitor`
   report each database's open transaction as a `transaction` object
   (`TID`, `txnlog_TID`, `user`, `isolation`, `begin_time`, `idle_seconds`,
@@ -1207,12 +1212,30 @@ Behaviour an upgraded server or script may notice (the
 * **Uploads** by clients that send their credentials in the body (the
   upstream SDKs, Workbench) stop at 64 MiB, and every upload at 256 MiB
   (was 1 GiB): see [Request and resource limits](#request-and-resource-limits).
+* **Slow clients and crowded addresses.** A request body must arrive at
+  `min_body_rate` (64 KiB/s on average after a 30 s grace), and one address
+  holds at most `max_conns_per_ip` (64) connections: raise them behind NAT
+  or a reverse proxy, see [Request and resource
+  limits](#request-and-resource-limits).
+* **Statements and answers are bounded.** A statement stops after
+  `query_timeout` (3600 s) of evaluation, an answer at `max_result_bytes`
+  (1 GiB): see [Request and resource limits](#request-and-resource-limits).
 * **Downloads** need credentials, and exports and query results are deleted
   after a week: see [Downloads and exports](#downloads-and-exports).
 * **Idle transactions** are rolled back after 10 minutes
   (`txn_idle_timeout`), and **failed logins** lock the account for the
   client's address with a back-off: see [Transactions](#transactions) and
   [Login lockout](#login-lockout).
+* **Write failures.** A write applied in memory but not saved is answered
+  as a failure — REST `500`, `/api` `1005`, `"applied in memory but not
+  durable: …"` — instead of success with a warning: see [Write failures
+  and `storage failed`](#write-failures-and-storage-failed).
+* **SPARQL refusals.** A failed non-`SILENT` `SERVICE` fails the query, an
+  aggregate query may project only grouped variables, the string and hash
+  functions refuse non-string arguments, and `CREATE` / `DROP` /
+  `CLEAR GRAPH` follow the graph-existence rule (`SILENT` keeps the old
+  no-op): see the README's [SPARQL semantics and known
+  deviations](../README.md#sparql-semantics-and-known-deviations).
 * **Deleting blank-node triples.** Blank nodes are refused at parse time in
   `DELETE DATA`, `DELETE WHERE` and DELETE templates, so a client deleting
   the upstream way (`DELETE DATA { <a> <p> _:x }`,
@@ -1239,6 +1262,14 @@ Behaviour an upgraded server or script may notice (the
 * **`gbuild` exit status `3`** (built, statements skipped) and **`gserver`
   exit status `2`** (invalid arguments): see [Command-line
   tools](#command-line-tools).
+* **The packaged systemd unit** creates files that are not
+  world-readable (`UMask=0027`), does not restart a server that exits with
+  status `1` or `2` (a refused configuration, invalid arguments;
+  `RestartPreventExitStatus=1 2`), stops restarting one that crashed 5
+  times within 5 minutes (`StartLimitIntervalSec=300`,
+  `StartLimitBurst=5`), and hides `/home`, `/root` and `/run/user` from it
+  (`ProtectHome=yes`); a port below 1024 needs a drop-in: see
+  [systemd](#systemd).
 * **`gnode cluster`** needs `--state-dir DIR` or `--ephemeral`; **`gnlqa`**
   reads no `gnlqa.conf` from the working directory any more (move it to
   `~/.config/gnlqa/gnlqa.conf` or name it with `GNLQA_CONFIG`), and
