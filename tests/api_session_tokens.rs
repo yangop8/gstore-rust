@@ -187,3 +187,118 @@ fn the_upstream_api_takes_a_login_session_in_place_of_the_password() {
     let j = api_with_token(&srv, &token, &[("operation", "show"), ("username", "root")]);
     assert_eq!(code(&j), 1001, "{j:?}");
 }
+
+/// Round-5 review follow-up (ext#12): a `login` that authenticates with a
+/// session token checks no password, so it must leave the failed-login
+/// lockout alone. It cleared the account's count at the caller's address
+/// (and an active lock with it), so anyone holding bob's token could guess
+/// bob's password without limit: a token `login` after every four wrong
+/// guesses.
+#[test]
+fn a_session_login_leaves_the_failed_login_lockout_alone() {
+    use gstore::config::GStoreConfig;
+    use gstore::gapi::ipfilter::{LockoutPolicy, MAX_AUTH_FAILURES};
+    use gstore::http_api::ApiServer;
+    use std::sync::Arc;
+
+    /// Stops the server and removes its root, also when the test fails.
+    struct Running(Arc<ApiServer>, std::path::PathBuf);
+    impl Drop for Running {
+        fn drop(&mut self) {
+            self.0.shutdown();
+            let _ = std::fs::remove_dir_all(&self.1);
+        }
+    }
+    let root = harness::scratch("api_session_lockout");
+    let mut config = GStoreConfig::default();
+    config.ip_deny_path = None;
+    // The first lock lasts an hour, not a second, so the refusals below do
+    // not depend on how fast the test runs.
+    let server = Arc::new(
+        ApiServer::bind(&root, PASSWORD, "127.0.0.1:0")
+            .unwrap()
+            .with_config(config)
+            .with_lockout_policy(LockoutPolicy {
+                first_lock: Duration::from_secs(3600),
+                max_lock: Duration::from_secs(3600),
+                ..LockoutPolicy::default()
+            }),
+    );
+    let running = Running(Arc::clone(&server), root);
+    let addr = server.local_addr().unwrap();
+    std::thread::spawn(move || server.serve_forever());
+
+    let api = |headers: &[(&str, &str)], body: Json| {
+        let (status, j) = exchange(
+            &addr,
+            "/api",
+            headers,
+            "application/json",
+            &body.to_string(),
+        );
+        assert_eq!(status, 200, "{j:?}");
+        j
+    };
+    ok(&api(
+        &[],
+        Json::obj()
+            .with("operation", "usermanage")
+            .with("username", "root")
+            .with("password", PASSWORD)
+            .with("type", "1")
+            .with("op_username", "bob")
+            .with("op_password", "bobpw"),
+    ));
+    let (status, j) = exchange(
+        &addr,
+        "/login",
+        &[],
+        "application/x-www-form-urlencoded",
+        "username=bob&password=bobpw",
+    );
+    assert_eq!(status, 200, "{j:?}");
+    let bearer = format!(
+        "Bearer {}",
+        j.get("session").and_then(Json::as_str).unwrap()
+    );
+    let test_connect = |password: &str| {
+        api(
+            &[],
+            Json::obj()
+                .with("operation", "testConnect")
+                .with("username", "bob")
+                .with("password", password),
+        )
+    };
+    let token_login = || {
+        api(
+            &[("Authorization", &bearer)],
+            Json::obj()
+                .with("operation", "login")
+                .with("username", "bob"),
+        )
+    };
+
+    // The failures let through, a session login, then one more: it locks.
+    for _ in 0..MAX_AUTH_FAILURES {
+        assert_eq!(code(&test_connect("wrong")), 1001);
+    }
+    ok(&token_login());
+    assert_eq!(code(&test_connect("wrong")), 1001);
+    let j = test_connect("bobpw");
+    assert_eq!(
+        code(&j),
+        1101,
+        "a session login cleared bob's failed-login count: {j:?}"
+    );
+    // Nor does a session login lift the lock; the session itself still works.
+    ok(&token_login());
+    assert_eq!(code(&test_connect("bobpw")), 1101);
+    ok(&api(
+        &[("Authorization", &bearer)],
+        Json::obj()
+            .with("operation", "show")
+            .with("username", "bob"),
+    ));
+    drop(running);
+}

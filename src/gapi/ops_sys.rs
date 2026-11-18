@@ -55,8 +55,16 @@ fn version_fields(ctx: &Ctx<'_>, msg: &str) -> GResp {
 /// `login` — verify the credentials (done by the dispatcher) and report the
 /// server version. Upstream's `RootPath` field is commented out in its code
 /// (only its docs mention it), so it is not sent.
+///
+/// A login with a session token in place of the password checked no
+/// password, so it leaves the failed-login lockout alone: clearing it let
+/// anyone holding a user's session token guess that user's password
+/// without limit, with a token `login` after every few wrong ones (round-5
+/// review follow-up of ext#12).
 fn login(ctx: &mut Ctx<'_>, _p: &Params) -> GResp {
-    auth::note_login_success(ctx);
+    if !ctx.session_auth {
+        auth::note_login_success(ctx);
+    }
     version_fields(ctx, "login successfully")
 }
 

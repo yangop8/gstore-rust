@@ -272,15 +272,18 @@ pub fn authenticate(ctx: &mut Ctx<'_>, params: &Params) -> Result<String, GResp>
 /// in once instead of sending the password with every request. A
 /// `username` given must name the session's user. An unknown, expired,
 /// logged-out or revoked token (a password change ends the user's
-/// sessions) → `1001`. No password is checked, so nothing counts towards
-/// the failed-login lockout (the `/login` that issued the token did); the
-/// IP checks have run before, as for every operation.
+/// sessions) → `1001`. No password is checked, so the request neither
+/// counts towards the failed-login lockout (the `/login` that issued the
+/// token did) nor clears it: [`Ctx::session_auth`] tells the `login`
+/// operation not to (round-5 review follow-up of ext#12). The IP checks
+/// have run before, as for every operation.
 fn session_user(ctx: &mut Ctx<'_>, params: &Params, token: &str) -> Result<String, GResp> {
     let user = ctx.state().users.session_user(token);
     let named = params.str("username").filter(|n| !n.is_empty());
     match user {
         Some(user) if named.as_deref().is_none_or(|n| n == user) => {
             ctx.user = Some(user.clone());
+            ctx.session_auth = true;
             Ok(user)
         }
         _ => Err(GResp::error(

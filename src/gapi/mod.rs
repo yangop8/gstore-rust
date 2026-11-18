@@ -160,6 +160,10 @@ pub struct Ctx<'a> {
     /// Whether the caller was let in as an upstream *inner* request (see
     /// [`GapiConfig::trust_inner_localhost`]).
     pub inner_request: bool,
+    /// Whether the caller authenticated with a `POST /login` session token
+    /// instead of a password ([`auth::authenticate`]): no password was
+    /// checked, so the request must not clear the failed-login lockout.
+    pub session_auth: bool,
     /// A snapshot of the layer's settings, taken when the request arrived.
     pub config: GapiConfig,
     /// When the request arrived.
@@ -472,6 +476,7 @@ pub(crate) fn serve(
         user: None,
         db_name: None,
         inner_request: false,
+        session_auth: false,
         config,
         started: Instant::now(),
     };

@@ -1593,12 +1593,13 @@ pub(crate) fn run_async(ctx: &mut Ctx<'_>, spec: &OpSpec, params: &Params) -> GR
     params.set("async", false);
     let handler = spec.handler;
     let local_trusted = ctx.local_trusted;
-    let (remote_ip, op, user, db_name, inner_request, config) = (
+    let (remote_ip, op, user, db_name, inner_request, session_auth, config) = (
         ctx.remote_ip.clone(),
         ctx.op.clone(),
         ctx.user.clone(),
         ctx.db_name.clone(),
         ctx.inner_request,
+        ctx.session_auth,
         ctx.config.clone(),
     );
     let task_spec = TaskSpec {
@@ -1638,6 +1639,7 @@ pub(crate) fn run_async(ctx: &mut Ctx<'_>, spec: &OpSpec, params: &Params) -> GR
             user,
             db_name,
             inner_request,
+            session_auth,
             config,
             started: Instant::now(),
         };
