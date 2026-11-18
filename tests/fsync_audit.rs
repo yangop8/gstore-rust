@@ -1611,6 +1611,21 @@ fn pfn_writes_are_synced() {
     let audit = Audit::begin(tmp.path());
     reg.update("alice", info("(module (func))")).unwrap();
     audit.finish("PFN update", &[]);
+    // Compiling writes the user's first module: its new `lib/` directory
+    // is durable too (only with a runtime to compile with).
+    #[cfg(feature = "pfn-wasm")]
+    {
+        let g = PfnInfo {
+            name: "g".into(),
+            body: url_encode("(i32.const 1)"),
+            subs: url_encode(""),
+            ..PfnInfo::default()
+        };
+        reg.create("alice", g).unwrap();
+        let audit = Audit::begin(tmp.path());
+        reg.compile("alice", "g").unwrap().unwrap();
+        audit.finish("PFN compile, the user's first module", &[]);
+    }
     let audit = Audit::begin(tmp.path());
     reg.delete("alice", "f").unwrap();
     audit.finish(
