@@ -1932,6 +1932,24 @@ pub mod test_hooks {
                 *n += 1;
             }
         }
+        if PARKING.load(Ordering::Relaxed) {
+            park_point(&verification_key(name));
+        }
+    }
+
+    /// The parking key of user name `name`'s verifications: no password a
+    /// test parks starts with a NUL.
+    fn verification_key(name: &str) -> String {
+        format!("\0verify:{name}")
+    }
+
+    /// Park every password verification of user name `name` — the slow hash
+    /// of a credential check, or the equal work for an unknown user (see
+    /// [`count_verifications`]) — until the returned guard is released (use
+    /// a name no other test uses). Lets a test look at the server while a
+    /// hash is under way (review http#20).
+    pub fn park_verifications_of(name: &str) -> HashPark {
+        park_hash_of(&verification_key(name))
     }
 
     /// Parks the hashing of one new password (every hash of a new plaintext

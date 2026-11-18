@@ -2395,7 +2395,15 @@ fn output_dir(
             format!("cannot create '{}': {e}", root.display()),
         )
     };
-    fs::create_dir_all(root).map_err(io)?;
+    // Durably: a backup's success answer must not outlive its directory
+    // (review tests-b#3: the fsync audit found that a backups directory
+    // created here was never synced into its parent).
+    crate::db::fsutil::create_dir_durable(root).map_err(|e| {
+        GResp::error(
+            Status::OperationFailed,
+            format!("cannot create '{}': {e}", root.display()),
+        )
+    })?;
     let requested = requested.filter(|r| {
         let r = lexical(r);
         !aliases.iter().any(|a| lexical(a) == r) && lexical(&root.to_string_lossy()) != r
@@ -2485,7 +2493,9 @@ fn backup(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
         (dbh, dir)
     };
     let fail = |msg: String| GResp::error(Status::OperationFailed, format!("Backup fail: {msg}"));
-    if let Err(e) = fs::create_dir_all(&target) {
+    // Durably (review tests-b#3: the fsync audit found the backup
+    // directory's entry was not).
+    if let Err(e) = crate::db::fsutil::create_dir_durable(&target) {
         return fail(e.to_string());
     }
     let name = format!("{db}{DB_SUFFIX}_{}", ops_file::timestamp_now());
@@ -2512,8 +2522,10 @@ fn backup(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
             // it is served from (`DbSlot::prepare`), as upstream's
             // whole-directory copy does. Marked as a backup in progress
             // first: one a crash stops is never restored (round-3 review).
-            fs::create_dir_all(&dest)
-                .map_err(crate::GStoreError::from)
+            // The new directory's entry (and the backups directory's)
+            // durably (review tests-b#3: the fsync audit found they were
+            // not).
+            crate::db::fsutil::create_dir_durable(&dest)
                 .and_then(|()| crate::http_api::mark_backup_started(&dest, &db))
                 .and_then(|()| slot.db.backup(&dest))
                 .map_err(|e| e.to_string())
@@ -2526,8 +2538,7 @@ fn backup(ctx: &mut Ctx<'_>, p: &Params) -> GResp {
             match DirLock::acquire(&dir) {
                 Ok(_lock) => {
                     let _ = fs::remove_dir_all(&dest);
-                    fs::create_dir_all(&dest)
-                        .map_err(crate::GStoreError::from)
+                    crate::db::fsutil::create_dir_durable(&dest)
                         .and_then(|()| crate::http_api::mark_backup_started(&dest, &db))
                         .and_then(|()| Database::backup_dir(&dir, &dest))
                         .map_err(|e| e.to_string())

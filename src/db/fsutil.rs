@@ -56,16 +56,11 @@ fn parent_of(path: &Path) -> &Path {
 }
 
 /// `fsync` a directory so renames/unlinks inside it are durable. A no-op off
-/// unix, where directories cannot be opened for syncing.
+/// unix, where directories cannot be opened for syncing. Recorded by the
+/// sync probe under the caller's location (review tests-b#3).
+#[track_caller]
 pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        File::open(dir)?.sync_all()?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = dir;
-    }
+    crate::sync_probe::sync_dir(dir)?;
     Ok(())
 }
 
@@ -184,7 +179,7 @@ where
         let mut w = BufWriter::new(file);
         fill(&mut w)?;
         let file = w.into_inner().map_err(|e| e.into_error())?;
-        file.sync_all()?;
+        crate::sync_probe::sync_file(&file, &tmp)?;
         Ok(())
     })();
     if let Err(e) = written {
@@ -752,7 +747,8 @@ pub(crate) fn sync_tree(dir: &Path) -> Result<()> {
         if kind.is_dir() {
             sync_tree(&entry.path())?;
         } else if kind.is_file() {
-            File::open(entry.path())?.sync_all()?;
+            let path = entry.path();
+            crate::sync_probe::sync_file(&File::open(&path)?, &path)?;
         }
     }
     sync_dir(dir)

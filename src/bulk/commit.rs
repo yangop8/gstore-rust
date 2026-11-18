@@ -209,8 +209,11 @@ fn wal_of(path: &Path) -> PathBuf {
     Pager::wal_path(path)
 }
 
+/// `fsync` the file at `path` (recorded by the sync probe under the
+/// caller's location, review tests-b#3).
+#[track_caller]
 fn sync_file(path: &Path) -> Result<()> {
-    File::open(path)?.sync_all()?;
+    crate::sync_probe::sync_file(&File::open(path)?, path)?;
     Ok(())
 }
 
@@ -223,7 +226,9 @@ pub(crate) fn build_disk(
     bulk: &BulkOptions,
 ) -> Result<BulkReport> {
     let started = Instant::now();
-    fs::create_dir_all(dir)?;
+    // A new database directory's entry is made durable (review tests-b#3:
+    // the fsync audit found it was not).
+    crate::db::fsutil::create_dir_durable(dir)?;
     // The claim and the lock in one step (review bulkcli#13): refused while
     // a database of this process has the directory open (replacing its
     // files under it would strand its later writes, and a WAL of the old
@@ -417,7 +422,7 @@ fn newer_than_snapshots(dir: &Path, staged_kv: &Path) -> Result<()> {
         let later = newest + Duration::from_secs(1);
         let f = File::options().write(true).open(staged_kv)?;
         f.set_modified(later.max(SystemTime::now()))?;
-        f.sync_all()?;
+        crate::sync_probe::sync_file(&f, staged_kv)?;
     }
     Ok(())
 }
@@ -452,7 +457,7 @@ fn install(dir: &Path, staging: &Path, fp: &mut Failpoints) -> Result<Vec<String
     {
         let mut f = File::create(&marker)?;
         f.write_all(format!("{KV_FILE}\n{VSTREE_KV_FILE}\n").as_bytes())?;
-        f.sync_all()?;
+        crate::sync_probe::sync_file(&f, &marker)?;
     }
     sync_dir(staging)?;
     fp.hit("marked")?;

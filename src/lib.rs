@@ -99,6 +99,10 @@ pub mod sparql_results;
 /// quietly (`outln!` / `out!` instead of `println!` / `print!`).
 pub mod stdout;
 pub mod store;
+// A test probe recording the fsyncs behind every commit point (review
+// tests-b#3; `tests/fsync_audit.rs`). Not part of the supported API.
+#[doc(hidden)]
+pub mod sync_probe;
 // The system store: users, per-database privileges, the database registry.
 pub mod sysdb;
 // The decoders the protocol layers share (form / URL decoding, base64).

@@ -287,7 +287,9 @@ impl<'a> RuleStore<'a> {
                     Err(e) if e.kind() == ErrorKind::AlreadyExists => return Ok(false),
                     Err(e) => return Err(e.into()),
                 };
-                let written = f.write_all(text.as_bytes()).and_then(|()| f.sync_all());
+                let written = f
+                    .write_all(text.as_bytes())
+                    .and_then(|()| crate::sync_probe::sync_file(&f, &path));
                 if let Err(e) = written {
                     drop(f);
                     let _ = fs::remove_file(&path);
@@ -392,7 +394,8 @@ impl<'a> RuleStore<'a> {
                 Self::ensure_dir(db_dir)?;
                 let dir = Self::rule_dir(db_dir).join(LEDGER_DIR);
                 match fs::create_dir(&dir) {
-                    Ok(()) => {}
+                    // The new directory's entry durably (review tests-b#3).
+                    Ok(()) => fsutil::sync_dir(&Self::rule_dir(db_dir))?,
                     Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
                     Err(e) => return Err(e.into()),
                 }
@@ -414,7 +417,9 @@ impl<'a> RuleStore<'a> {
             return Err(StoreError(NO_DB_DIR.to_string()));
         }
         match fs::create_dir(Self::rule_dir(db_dir)) {
-            Ok(()) => Ok(()),
+            // The new directory's entry durably (review tests-b#3: the fsync
+            // audit found it was not).
+            Ok(()) => Ok(fsutil::sync_dir(db_dir)?),
             Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(()),
             Err(e) => Err(e.into()),
         }

@@ -1928,11 +1928,19 @@ mod tests {
 
     #[test]
     fn query_and_large_results_spill_to_files_removed_on_prune() {
+        /// Removes the directory, also when the test fails.
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
         let dir = std::env::temp_dir().join(format!(
             "gstore_tasks_spill_{}_{}",
             std::process::id(),
             now_ms()
         ));
+        let _cleanup = Cleanup(dir.clone());
         let m = TaskManager::new(TaskConfig {
             max_finished: 1,
             spill_threshold: 64,
@@ -1987,7 +1995,6 @@ mod tests {
             .unwrap();
         assert_eq!(wait_state(&m, big), TaskState::Succeeded);
         assert!(matches!(m.result(big), Some(TaskResult::File(_))));
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2020,19 +2027,22 @@ mod tests {
             ..TaskConfig::default()
         });
         let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let (started_tx, started) = std::sync::mpsc::channel::<()>();
         let first = m
             .submit(
                 TaskSpec::default(),
                 Box::new(move |_| {
-                    let _ = rx.recv_timeout(Duration::from_secs(10));
+                    let _ = started_tx.send(());
+                    let _ = rx.recv_timeout(Duration::from_secs(60));
                     Json::obj()
                 }),
             )
             .unwrap();
-        // Wait until the runner took it, then fill the queue.
-        while m.shared.lock().active == 0 {
-            std::thread::sleep(Duration::from_millis(2));
-        }
+        // Wait until the runner took it (a latch: the job says so), then
+        // fill the queue.
+        started
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the runner never took the first job");
         let second = m
             .submit(TaskSpec::default(), Box::new(|_| Json::obj()))
             .unwrap();
@@ -2055,45 +2065,123 @@ mod tests {
         assert_eq!(m.get(second).unwrap().state, TaskState::Cancelled);
     }
 
+    /// review gapi#21: this test used to post to a closed loopback port
+    /// with the default `callback_allow_local = false`, so it only ever saw
+    /// the host-local refusal — never a transport error nor the retry. Now
+    /// each path is pinned on its own: the refusal (nothing connects), a
+    /// transport error retried and reported, and a 5xx that a retry
+    /// recovers from.
     #[test]
     fn callbacks_report_delivery_failures() {
-        let m = TaskManager::new(TaskConfig {
-            callback_timeout: Duration::from_secs(2),
+        use std::io::{Read as _, Write as _};
+        let deliver = |config: TaskConfig, url: String| {
+            let m = TaskManager::new(config);
+            let id = m
+                .submit(
+                    TaskSpec {
+                        callback: Some(url),
+                        ..TaskSpec::default()
+                    },
+                    Box::new(|_| Json::obj()),
+                )
+                .unwrap();
+            assert_eq!(
+                m.get(id).unwrap().callback_status.as_deref(),
+                Some("pending")
+            );
+            assert!(m.wait_async_idle(Duration::from_secs(60)));
+            let info = m.get(id).unwrap();
+            assert_eq!(
+                info.state,
+                TaskState::Succeeded,
+                "a callback's outcome does not change the task's"
+            );
+            info.callback_status.unwrap()
+        };
+        let config = |allow_local: bool| TaskConfig {
+            callback_timeout: Duration::from_secs(10),
             callback_retries: 1,
+            callback_allow_local: allow_local,
             ..TaskConfig::default()
-        });
+        };
+
+        // The default refuses a host-local callback before connecting.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let status = deliver(config(false), format!("http://127.0.0.1:{port}/cb"));
+        assert!(
+            status.starts_with("failed:") && status.contains("host-local"),
+            "{status}"
+        );
+        assert!(
+            matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "nothing connected to the refused callback"
+        );
+        drop(listener);
+
+        // Allowed, a transport error (nothing listens) is retried, then
+        // reported.
         let port = {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap().port()
         };
-        let id = m
-            .submit(
-                TaskSpec {
-                    callback: Some(format!("http://127.0.0.1:{port}/cb")),
-                    ..TaskSpec::default()
-                },
-                Box::new(|_| Json::obj()),
-            )
-            .unwrap();
-        assert_eq!(
-            m.get(id).unwrap().callback_status.as_deref(),
-            Some("pending")
-        );
-        assert!(m.wait_async_idle(Duration::from_secs(10)));
-        let info = m.get(id).unwrap();
-        assert_eq!(
-            info.state,
-            TaskState::Succeeded,
-            "a failed callback does not fail the task"
-        );
+        let status = deliver(config(true), format!("http://127.0.0.1:{port}/cb"));
         assert!(
-            info.callback_status
-                .as_deref()
-                .unwrap()
-                .starts_with("failed:"),
-            "{:?}",
-            info.callback_status
+            status.starts_with("failed:") && !status.contains("host-local"),
+            "{status}"
         );
+
+        // A 5xx is retried, and a retry that succeeds is a delivery.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let receiver = std::thread::spawn(move || {
+            let mut bodies = Vec::new();
+            for status in ["503 Service Unavailable", "200 OK"] {
+                let (mut s, _) = listener.accept().unwrap();
+                s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+                let mut req = Vec::new();
+                let mut buf = [0u8; 4096];
+                // Head, then a body of its Content-Length.
+                let body_len = loop {
+                    let n = s.read(&mut buf).unwrap();
+                    assert!(n > 0, "the request ended early");
+                    req.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&req).to_ascii_lowercase();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let len = text
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .map_or(0, |v| v.trim().parse::<usize>().unwrap());
+                        break end + 4 + len;
+                    }
+                };
+                while req.len() < body_len {
+                    let n = s.read(&mut buf).unwrap();
+                    assert!(n > 0, "the body ended early");
+                    req.extend_from_slice(&buf[..n]);
+                }
+                bodies.push(String::from_utf8_lossy(&req).into_owned());
+                s.write_all(
+                    format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
+                .unwrap();
+            }
+            bodies
+        });
+        let status = deliver(config(true), format!("http://127.0.0.1:{port}/cb"));
+        assert_eq!(status, "delivered (HTTP 200)");
+        let bodies = receiver.join().unwrap();
+        assert_eq!(bodies.len(), 2, "one failed attempt, one retry");
+        assert!(
+            bodies
+                .iter()
+                .all(|b| b.starts_with("POST /cb HTTP/1.1\r\n")),
+            "{bodies:?}"
+        );
+        assert_eq!(bodies[0], bodies[1], "the retry posts the same result");
+
         assert!(check_callback_url("http://127.0.0.1:1/x", true).is_ok());
         assert!(check_callback_url("http://example.com:1/x", false).is_ok());
         assert!(check_callback_url("http://10.1.2.3/x", false).is_ok());

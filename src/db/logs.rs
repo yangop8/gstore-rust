@@ -596,7 +596,7 @@ impl LogWriter {
             let valid = self.boundary(&mut file, kind, 0)?;
             let written = file.write_all(&self.unwritten).and_then(|()| {
                 if sync {
-                    file.sync_data()
+                    crate::sync_probe::sync_file_data(&file, path)
                 } else {
                     Ok(())
                 }
@@ -619,7 +619,7 @@ impl LogWriter {
                 .append(true)
                 .open(path)
                 .map_err(fail)?;
-            file.sync_data().map_err(fail)?;
+            crate::sync_probe::sync_file_data(&file, path).map_err(fail)?;
             self.unsynced = false;
         }
         if sync && self.dir_unsynced {

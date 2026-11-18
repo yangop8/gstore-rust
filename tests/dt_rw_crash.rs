@@ -8,6 +8,13 @@
 //! appear. Each test runs `GSTORE_RW_CRASH_SEEDS` seeds (default 10);
 //! the seed picks how long the load runs before the kill and how the
 //! writers pace themselves.
+//!
+//! A `SIGKILL` keeps the kernel's page cache: every `write()` the server
+//! made survives it, synced or not, so this test cannot see a missing
+//! `fsync` (review tests-b#3). `tests/fsync_audit.rs` checks that instead:
+//! each commit point — the `/update` and `/commit` these writes go through
+//! included — synced every file and directory it changed before it
+//! answered.
 
 #![cfg(unix)]
 

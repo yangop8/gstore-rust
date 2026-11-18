@@ -2293,7 +2293,11 @@ impl DbSlot {
         // a database created in memory (`/upload` into a new name) takes the
         // lock before its first save, and keeps it while it is served.
         if !db.holds_dir_lock() {
-            fs::create_dir_all(dir)?;
+            // Created durably: the save below finds the directory there and
+            // syncs only what is inside it (review tests-b#3: the fsync
+            // audit found that a database `/upload` created could lose its
+            // directory entry to a power cut after the success answer).
+            crate::db::fsutil::create_dir_durable(dir)?;
             db.hold_dir_lock(dir)?;
         }
         db.save(dir)
@@ -4848,6 +4852,8 @@ impl ApiInner {
             // Parsed once, with no lock held: the parse classifies the
             // statement (privilege, shared or exclusive guard) and is what
             // the job runs.
+            #[cfg(test)]
+            parse_test_hook::parsing(&sparql);
             let stmt = Statement::parse(&sparql).ok();
             let is_update = stmt.as_ref().is_some_and(Statement::is_update);
             let op = if is_update { "update" } else { "query" };
@@ -4898,6 +4904,8 @@ impl ApiInner {
         let fmt = ResultFormat::negotiate(req.param("format").as_deref(), req.header("accept"));
         let user = user.to_string();
         Dispatch::Deferred(Box::new(move |inner| {
+            #[cfg(test)]
+            parse_test_hook::parsing(&sparql);
             let stmt = Statement::parse(&sparql).ok();
             log_query(&inner.config(), &inner.root, &name, &user, &sparql);
             let qlog = RestQueryLog::start(inner, &name, &sparql, fmt);
@@ -6980,8 +6988,10 @@ impl ApiInner {
                     .ok()
                     .as_deref()
                     == Some(name.as_str());
-            let backed_up = fs::create_dir_all(&path)
-                .map_err(GStoreError::from)
+            // The new directory's entry (and the backups directory's)
+            // durably (review tests-b#3: the fsync audit found they were
+            // not).
+            let backed_up = crate::db::fsutil::create_dir_durable(&path)
                 .and_then(|()| mark_backup_started(&path, &name))
                 .and_then(|()| {
                     #[cfg(test)]
@@ -8008,7 +8018,9 @@ fn backup_target(
     name: &str,
     requested: Option<&str>,
 ) -> Result<(PathBuf, BackupClaim), Resp> {
-    if let Err(e) = fs::create_dir_all(backup_dir) {
+    // Durably (review tests-b#3: the fsync audit found the backup
+    // directory's entry was not).
+    if let Err(e) = crate::db::fsutil::create_dir_durable(backup_dir) {
         return Err(Resp::fail(
             500,
             &format!("backup failed: cannot create the backup directory: {e}"),
@@ -8561,6 +8573,8 @@ fn parse_batch_payload(
     format: Option<&str>,
     payload: &str,
 ) -> Result<(&'static str, Vec<Triple>), String> {
+    #[cfg(test)]
+    parse_test_hook::parsing(payload);
     let explicit = format
         .map(|f| f.trim().to_ascii_lowercase())
         .filter(|f| !f.is_empty() && f != "json");
@@ -8786,6 +8800,71 @@ pub(crate) mod backup_test_hook {
         for hook in hooks {
             hook();
         }
+    }
+}
+
+/// Test hook (review http#20): parks the parse of a statement or a batch
+/// payload whose text holds a marker, so that a test can look at the state
+/// lock while the parse is under way — deterministically, where it used to
+/// sample the lock while big requests were parsed.
+#[cfg(test)]
+pub(crate) mod parse_test_hook {
+    use std::sync::{Condvar, Mutex, PoisonError};
+
+    struct Parks {
+        /// Marker → whether a parse holding it is parked.
+        marked: Vec<(String, bool)>,
+    }
+
+    static PARKS: Mutex<Parks> = Mutex::new(Parks { marked: Vec::new() });
+    static CHANGED: Condvar = Condvar::new();
+
+    /// Parks every parse of a text holding `marker` until dropped.
+    pub(crate) struct Park(String);
+
+    impl Park {
+        /// Park the parses of texts holding `marker` (use a marker no other
+        /// test sends).
+        pub(crate) fn new(marker: &str) -> Park {
+            let mut p = PARKS.lock().unwrap_or_else(PoisonError::into_inner);
+            p.marked.push((marker.to_string(), false));
+            Park(marker.to_string())
+        }
+
+        /// Wait until a parse is parked; `false` after `timeout` (a hang
+        /// guard).
+        pub(crate) fn wait_parked(&self, timeout: std::time::Duration) -> bool {
+            let p = PARKS.lock().unwrap_or_else(PoisonError::into_inner);
+            let (p, _) = CHANGED
+                .wait_timeout_while(p, timeout, |p| {
+                    !p.marked.iter().any(|(m, parked)| *m == self.0 && *parked)
+                })
+                .unwrap_or_else(PoisonError::into_inner);
+            p.marked.iter().any(|(m, parked)| *m == self.0 && *parked)
+        }
+    }
+
+    impl Drop for Park {
+        fn drop(&mut self) {
+            let mut p = PARKS.lock().unwrap_or_else(PoisonError::into_inner);
+            p.marked.retain(|(m, _)| *m != self.0);
+            CHANGED.notify_all();
+        }
+    }
+
+    /// Called right before a statement or a batch payload is parsed.
+    pub(super) fn parsing(text: &str) {
+        let mut p = PARKS.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(i) = p.marked.iter().position(|(m, _)| text.contains(m.as_str())) else {
+            return;
+        };
+        let marker = p.marked[i].0.clone();
+        p.marked[i].1 = true;
+        CHANGED.notify_all();
+        // Released when the park is dropped.
+        let _released = CHANGED
+            .wait_while(p, |p| p.marked.iter().any(|(m, _)| *m == marker))
+            .unwrap_or_else(PoisonError::into_inner);
     }
 }
 
@@ -9402,97 +9481,84 @@ mod tests {
     /// for an unknown user). That hash must run with the state lock released:
     /// otherwise every client sending bad credentials — no account needed —
     /// holds the server-wide lock for the whole hash, and every other request
-    /// (`/cancel`, `/tasklist`, …) queues behind it. Sampled directly: while
-    /// clients hammer bad credentials through Basic auth, `/login`, `/shutdown`
-    /// and the `/api` protocol, the state lock must be free nearly always.
+    /// (`/cancel`, `/tasklist`, …) queues behind it. Checked on every path
+    /// that takes credentials — Basic auth, `/login`, `/shutdown` and the
+    /// `/api` protocol: the hash is parked (a test hook) while the test
+    /// looks at the lock. review http#20: this used to sample the lock
+    /// while clients hammered it ("held in under a quarter of the samples").
     #[test]
     fn bad_credentials_never_hash_under_the_state_lock() {
+        use crate::http_users::test_hooks::park_verifications_of;
         let (server, addr) = start("pbkdf2_lock");
-        let stop = Arc::new(AtomicBool::new(false));
-        let bad = basic("nobody", "x");
-        let wrong = basic("root", "wrong");
-        let mut attackers = Vec::new();
-        for i in 0..3 {
-            let stop = Arc::clone(&stop);
-            let (bad, wrong) = (bad.clone(), wrong.clone());
-            attackers.push(std::thread::spawn(move || {
-                let mut n = 0usize;
-                while !stop.load(Ordering::Relaxed) {
-                    let (s, _) = match (i + n) % 5 {
-                        0 => {
-                            split_status_body(&raw_request(&addr, "GET", "/status", Some(&bad), ""))
-                        }
-                        1 => split_status_body(&raw_request(
-                            &addr,
-                            "GET",
-                            "/tasklist",
-                            Some(&wrong),
-                            "",
-                        )),
-                        2 => split_status_body(&raw_request(
-                            &addr,
-                            "POST",
-                            "/login",
-                            None,
-                            "username=root&password=wrong",
-                        )),
-                        3 => split_status_body(&raw_request(
-                            &addr,
-                            "POST",
-                            "/shutdown",
-                            None,
-                            "username=root&password=wrong",
-                        )),
-                        _ => split_status_body(&raw_request(
-                            &addr,
-                            "POST",
-                            "/api",
-                            None,
-                            r#"{"operation":"testConnect","username":"nobody","password":"x"}"#,
-                        )),
-                    };
-                    // 429: the account got locked out at this address
-                    // (failed logins; review http#6: the lockout covers
-                    // `/login` and Basic credentials, and answers 429 with
-                    // Retry-After — upstream's per-address 403 is the
-                    // upstream_login_lockout switch).
-                    assert!(
-                        s == 401 || s == 200 || s == 403 || s == 429,
-                        "unexpected status {s}"
-                    );
-                    n += 1;
-                }
-                n
-            }));
+        type Send = fn(&SocketAddr, &str) -> String;
+        let paths: [(&str, Send); 4] = [
+            ("Basic auth", |addr, name| {
+                raw_request(addr, "GET", "/tasklist", Some(&basic(name, "x")), "")
+            }),
+            ("/login", |addr, name| {
+                raw_request(
+                    addr,
+                    "POST",
+                    "/login",
+                    None,
+                    &format!("username={name}&password=x"),
+                )
+            }),
+            ("/shutdown", |addr, name| {
+                raw_request(
+                    addr,
+                    "POST",
+                    "/shutdown",
+                    None,
+                    &format!("username={name}&password=x"),
+                )
+            }),
+            ("/api", |addr, name| {
+                raw_request(
+                    addr,
+                    "POST",
+                    "/api",
+                    None,
+                    &format!(r#"{{"operation":"testConnect","username":"{name}","password":"x"}}"#),
+                )
+            }),
+        ];
+        for (i, (path, send)) in paths.into_iter().enumerate() {
+            // An unknown user each (one failure apiece: no lockout) — but
+            // `/shutdown` verifies only root's credentials (one wrong
+            // password does not lock root out either).
+            let name = if path == "/shutdown" {
+                "root".to_string()
+            } else {
+                format!("hash_lock_probe_{i}")
+            };
+            let park = park_verifications_of(&name);
+            let request = {
+                let name = name.clone();
+                std::thread::spawn(move || split_status_body(&send(&addr, &name)))
+            };
+            assert!(
+                park.wait_parked(Duration::from_secs(60)),
+                "{path}: the bad credentials were never verified"
+            );
+            assert!(
+                server.inner.state.try_lock().is_ok(),
+                "{path}: the state lock is held while bad credentials are hashed"
+            );
+            park.release();
+            let (s, b) = request.join().unwrap();
+            assert!(
+                [200, 401, 403].contains(&s) && !b.contains("\"StatusCode\":0"),
+                "{path}: refused: {s} {b}"
+            );
         }
-        // Let the attackers get going, then sample the lock for a while.
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let (mut samples, mut busy) = (0u32, 0u32);
-        let until = Instant::now() + std::time::Duration::from_millis(1500);
-        while Instant::now() < until {
-            samples += 1;
-            if server.inner.state.try_lock().is_err() {
-                busy += 1;
-            }
-            std::thread::sleep(std::time::Duration::from_micros(500));
-        }
-        // Authenticated requests are still served meanwhile (refused, 429,
-        // once the failed logins from this same address locked root out —
-        // review http#6).
+        // Authenticated requests are still served.
         let root = basic("root", "root");
-        let (s, _) = split_status_body(&raw_request(&addr, "GET", "/tasklist", Some(&root), ""));
-        assert!(s == 200 || s == 429, "{s}");
-        stop.store(true, Ordering::Relaxed);
-        let attempts: usize = attackers.into_iter().map(|h| h.join().unwrap()).sum();
-        assert!(attempts > 0);
-        assert!(
-            busy * 4 < samples,
-            "the state lock was held in {busy} of {samples} samples while bad credentials \
-             were being checked"
-        );
+        let (s, b) = split_status_body(&raw_request(&addr, "GET", "/tasklist", Some(&root), ""));
+        assert_eq!(s, 200, "{b}");
         assert!(
             server.inner.state.try_lock().is_ok(),
-            "the lock is free once the attackers stop"
+            "the lock is free once the requests are done"
         );
         server.shutdown();
     }
@@ -9950,9 +10016,12 @@ mod tests {
     /// Classifying a SPARQL statement (a full parse) and parsing a batch
     /// payload — up to the request body cap — run with the state lock
     /// released, so a big request cannot stall `/cancel` and every other
-    /// client behind it. Sampled directly while such requests are processed.
+    /// client behind it. Each parse is parked (a test hook) while the test
+    /// looks at the lock. review http#20: this used to sample the lock while
+    /// such requests were parsed ("held in under an eighth of the samples").
     #[test]
     fn statements_and_batch_payloads_are_parsed_off_the_state_lock() {
+        use super::parse_test_hook::Park;
         let (server, addr) = start("parse_off_lock");
         let root = basic("root", "root");
         assert_eq!(
@@ -9967,52 +10036,48 @@ mod tests {
             200
         );
         let mut nt = String::new();
-        for i in 0..150_000 {
+        for i in 0..1_000 {
             nt.push_str(&format!(
                 "<http://ex/s{i}> <http://ex/p> \"value number {i}\" .\n"
             ));
         }
         let mut values = String::from("SELECT * WHERE { VALUES ?x { ");
-        for i in 0..150_000 {
+        for i in 0..1_000 {
             values.push_str(&format!("<http://ex/s{i}> "));
         }
         values.push_str("} }");
-        let requests: Vec<(&str, String)> = vec![
-            ("/batchRemove?db_name=b", nt.clone()),
-            ("/batchRemove?db_name=b&format=ttl", nt),
-            ("/sparql?db_name=b", values.clone()),
-            ("/update?db_name=b", values),
+        let requests: [(&str, &String); 4] = [
+            ("/batchRemove?db_name=b", &nt),
+            ("/batchRemove?db_name=b&format=ttl", &nt),
+            ("/sparql?db_name=b", &values),
+            ("/update?db_name=b", &values),
         ];
-        let stop = Arc::new(AtomicBool::new(false));
-        let worker = {
-            let (stop, root) = (Arc::clone(&stop), root.clone());
-            std::thread::spawn(move || {
-                for (target, body) in requests {
-                    let (s, b) =
-                        split_status_body(&raw_request(&addr, "POST", target, Some(&root), &body));
-                    assert!(s == 200 || s == 400, "{target}: {s} {b}");
-                }
-                stop.store(true, Ordering::Relaxed);
-            })
-        };
-        let (mut samples, mut busy) = (0u32, 0u32);
-        while !stop.load(Ordering::Relaxed) {
-            samples += 1;
-            if server.inner.state.try_lock().is_err() {
-                busy += 1;
-            }
-            std::thread::sleep(std::time::Duration::from_micros(200));
+        for (i, (target, body)) in requests.into_iter().enumerate() {
+            // A comment only this request carries marks its parse.
+            let marker = format!("parse-off-lock-{i}");
+            let body = format!("{body}\n# {marker}\n");
+            let park = Park::new(&marker);
+            let request = {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    split_status_body(&raw_request(&addr, "POST", target, Some(&root), &body))
+                })
+            };
+            assert!(
+                park.wait_parked(Duration::from_secs(60)),
+                "{target}: the request was never parsed"
+            );
+            assert!(
+                server.inner.state.try_lock().is_ok(),
+                "{target}: the state lock is held while the request is parsed"
+            );
+            drop(park);
+            let (s, b) = request.join().unwrap();
+            assert!(s == 200 || s == 400, "{target}: {s} {b}");
         }
-        worker.join().unwrap();
         assert!(
-            samples > 20,
-            "the requests took too little time to sample: {samples}"
-        );
-        // Parsing under the lock shows up as ~35% here; what remains without
-        // it (copying the body out of the request) is ~5%.
-        assert!(
-            busy * 8 < samples,
-            "the state lock was held in {busy} of {samples} samples while requests were parsed"
+            server.inner.state.try_lock().is_ok(),
+            "the lock is free once the requests are done"
         );
         server.shutdown();
     }
@@ -10654,6 +10719,22 @@ mod tests {
     }
 
     /// The served handle of database `name`.
+    /// Wait until a writer queues for `h` behind the reader the caller
+    /// holds. The standard library's lock refuses new readers while a
+    /// writer waits (`try_read` fails then, which is also why monitoring
+    /// must not take a read guard), so that is the latch (review http#20:
+    /// it used to be a 100 ms sleep); the deadline is a hang guard.
+    fn wait_writer_queued(h: &DbCell) {
+        let until = Instant::now() + Duration::from_secs(60);
+        while h.slot.try_read().is_ok() {
+            assert!(
+                Instant::now() < until,
+                "the writer never queued for the database"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     fn served(server: &ApiServer, name: &str) -> DbHandle {
         Arc::clone(
             locked(&server.inner.state)
@@ -10801,8 +10882,12 @@ mod tests {
         ));
         assert!(warm.contains("\"tripleNum\":\"2\""), "{warm}");
         let h = served(&server, "mon");
+        // review http#20: the test holds the database for the whole check,
+        // so a request that waited for it would never be answered — the
+        // 30 s read timeout is a hang guard, not the assertion (this used
+        // to be "within a second").
         let check = |what: &str| {
-            let second = Duration::from_secs(1);
+            let guard = Duration::from_secs(30);
             for (method, target, body, expect) in [
                 ("GET", "/status", String::new(), "\"total_triples\":2"),
                 ("GET", "/monitor", String::new(), "\"triples\":2"),
@@ -10826,17 +10911,11 @@ mod tests {
                     "\"StatusCode\":0",
                 ),
             ] {
-                let t0 = Instant::now();
-                let got = request_within(&addr, method, target, Some(&auth), &body, second);
+                let got = request_within(&addr, method, target, Some(&auth), &body, guard);
                 let (s, b) =
                     got.unwrap_or_else(|| panic!("{method} {target} {body} waited ({what})"));
                 assert_eq!(s, 200, "{target}: {b}");
                 assert!(b.contains(expect), "{target} ({what}): {b}");
-                assert!(
-                    t0.elapsed() < second,
-                    "{target} took {:?} ({what})",
-                    t0.elapsed()
-                );
             }
         };
         {
@@ -10853,7 +10932,7 @@ mod tests {
             let writer = std::thread::spawn(move || {
                 let _w = h2.write().unwrap();
             });
-            std::thread::sleep(Duration::from_millis(100));
+            wait_writer_queued(&h);
             check("a reader holds it and a writer waits");
             drop(shared);
             writer.join().unwrap();
@@ -10880,8 +10959,10 @@ mod tests {
             .db
             .query("INSERT DATA { <http://ex/c> <http://ex/p> <http://ex/d> }")
             .unwrap();
+        // (As above, review http#20: the database is held throughout, the
+        // timeout is a hang guard.)
         let check = |what: &str| {
-            let second = Duration::from_secs(1);
+            let guard = Duration::from_secs(30);
             for (body, expect) in [
                 (monitor.clone(), "\"tripleNum\":\"3\""),
                 (
@@ -10889,12 +10970,10 @@ mod tests {
                     "\"StatusCode\":0",
                 ),
             ] {
-                let t0 = Instant::now();
-                let got = request_within(&addr, "POST", "/api", Some(&auth), &body, second);
+                let got = request_within(&addr, "POST", "/api", Some(&auth), &body, guard);
                 let (s, b) = got.unwrap_or_else(|| panic!("{body} waited ({what})"));
                 assert_eq!(s, 200, "{b}");
                 assert!(b.contains(expect), "{what}: {b}");
-                assert!(t0.elapsed() < second, "{what}: took {:?}", t0.elapsed());
             }
         };
         {
@@ -10907,7 +10986,7 @@ mod tests {
             let writer = std::thread::spawn(move || {
                 let _w = h2.write().unwrap();
             });
-            std::thread::sleep(Duration::from_millis(100));
+            wait_writer_queued(&h);
             check("a reader holds it and a writer waits");
             drop(shared);
             writer.join().unwrap();
@@ -10964,7 +11043,7 @@ mod tests {
         let reader = h.read().unwrap();
         let h2 = Arc::clone(&h);
         let writer = std::thread::spawn(move || drop(h2.write().unwrap()));
-        std::thread::sleep(Duration::from_millis(100));
+        wait_writer_queued(&h);
         for _ in 0..5 {
             let t0 = Instant::now();
             let got = request_within(
@@ -11121,21 +11200,22 @@ mod tests {
         let long_read = std::thread::spawn(move || {
             let _r = h2.read().unwrap();
             held_tx.send(()).unwrap();
-            // Bounded: a read that waits for this one fails the test below
-            // instead of hanging it.
-            rx.recv_timeout(Duration::from_secs(5)).ok();
+            // Held until the read below is done. Bounded: a read that waits
+            // for this one would find the settings synced once it gets the
+            // database, and fail the test below instead of hanging it
+            // (review http#20: that, not a one-second bound, is the
+            // assertion).
+            rx.recv_timeout(Duration::from_secs(60)).ok();
         });
         held_rx.recv().unwrap();
         server.inner.apply_query_settings(new);
-        let t0 = Instant::now();
         {
             let slot = server.inner.read_synced(&h).unwrap();
-            assert!(
-                t0.elapsed() < Duration::from_secs(1),
-                "the read waited {:?} for the other read",
-                t0.elapsed()
+            assert_eq!(
+                slot.db.query_settings(),
+                old,
+                "busy: not synced yet (a read that waited for the other read would have synced)"
             );
-            assert_eq!(slot.db.query_settings(), old, "busy: not synced yet");
         }
         tx.send(()).unwrap();
         long_read.join().unwrap();
@@ -11490,13 +11570,12 @@ mod tests {
             integer_division: IntegerDivision::Truncate,
             ..old
         };
-        let t0 = Instant::now();
+        // The readers are parked in the gate until it opens below: installing
+        // settings that waited for them would only return once the gate's
+        // hang guard let them go, and they would then be applied — so "not
+        // yet" is the assertion (review http#20: it used to be a one-second
+        // bound).
         server.inner.apply_query_settings(new);
-        assert!(
-            t0.elapsed() < Duration::from_secs(1),
-            "installing settings waited for the readers ({:?})",
-            t0.elapsed()
-        );
         assert_eq!(h.read().unwrap().db.query_settings(), old, "not yet: busy");
         gate.open();
         for r in readers {

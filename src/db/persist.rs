@@ -1426,7 +1426,9 @@ impl Database {
             default: ids,
             named,
         } = acc;
-        fs::create_dir_all(dir)?;
+        // A new database directory's entry durably (review tests-b#3: the
+        // fsync audit found it was not).
+        fsutil::create_dir_durable(dir)?;
         // A database of this process serving `dir` would lose its files below
         // (and a RocksDB one its store), and another build of this process
         // would share the staging directory — refused, like a bulk build, the
@@ -1653,7 +1655,9 @@ impl Database {
         } else {
             None
         };
-        fs::create_dir_all(dst)?;
+        // A new directory's entry durably (review tests-b#3: the fsync
+        // audit found it was not).
+        fsutil::create_dir_durable(dst)?;
         // A database another process has open in `dst` is not rewritten
         // under it (as a save into another directory refuses).
         let _dst_lock = if Database::storage_kind(dst).is_some() {

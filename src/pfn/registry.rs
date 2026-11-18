@@ -360,7 +360,9 @@ impl PfnRegistry {
             i.to_json().into_sorted().write_to(&mut text);
             text.push('\n');
         }
-        fs::create_dir_all(self.src_dir(user))?;
+        // New directories durably (review tests-b#3: the fsync audit found
+        // they were not).
+        crate::db::fsutil::create_dir_durable(&self.src_dir(user))?;
         crate::db::fsutil::atomic_write(&self.data_file(user), text.as_bytes())
     }
 
@@ -506,7 +508,7 @@ impl PfnRegistry {
                 all.len()
             )));
         }
-        fs::create_dir_all(self.src_dir(user))?;
+        crate::db::fsutil::create_dir_durable(&self.src_dir(user))?;
         let source = self.source_file(user, &info.name);
         crate::db::fsutil::atomic_write(&source, src.as_bytes())?;
         info.status = STATUS_PENDING.to_string();
@@ -653,7 +655,7 @@ impl PfnRegistry {
         let mut written = None;
         let result = match outcome {
             Ok(bytes) => {
-                fs::create_dir_all(self.lib_dir(user))?;
+                crate::db::fsutil::create_dir_durable(&self.lib_dir(user))?;
                 let target = self.module_file(user, name, &info.last_time);
                 crate::db::fsutil::atomic_write(&target, &bytes)?;
                 written = Some(target);

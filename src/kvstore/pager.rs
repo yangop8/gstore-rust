@@ -923,7 +923,7 @@ impl Pager {
             let _ = i;
             self.write_page_at(*id, data)?;
         }
-        self.file.sync_all()?;
+        crate::sync_probe::sync_file(&self.file, &file_of_wal(&self.wal_path))?;
         remove_wal(&self.wal_path)?;
         sync_parent_dir(&self.wal_path)
     }
@@ -1293,23 +1293,26 @@ fn wal_tmp_path(wal: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// The paged file a write-ahead log at `wal` belongs to (`<file>.wal` →
+/// `<file>`).
+fn file_of_wal(wal: &Path) -> PathBuf {
+    let s = wal.as_os_str().to_string_lossy();
+    PathBuf::from(s.strip_suffix(".wal").unwrap_or(&s).to_string())
+}
+
 /// `fsync` the directory holding `path`, so a rename or removal inside it is
 /// durable. A no-op off unix, where directories cannot be opened for syncing.
+/// Recorded by the sync probe under the caller's location (review
+/// tests-b#3).
+#[track_caller]
 fn sync_parent_dir(path: &Path) -> Result<()> {
     #[cfg(test)]
     failpoints::count_dir_sync();
-    #[cfg(unix)]
-    {
-        let dir = match path.parent() {
-            Some(p) if !p.as_os_str().is_empty() => p,
-            _ => Path::new("."),
-        };
-        File::open(dir)?.sync_all()?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    crate::sync_probe::sync_dir(dir)?;
     Ok(())
 }
 
@@ -1405,7 +1408,7 @@ fn write_wal<P: Deref<Target = Page>>(path: &Path, batch: &[(PageId, P)]) -> Res
         w.write_all(&crc.finish().to_le_bytes())?;
         w.write_all(COMMIT_MAGIC)?;
         let file = w.into_inner().map_err(|e| e.into_error())?.file;
-        file.sync_all()?;
+        crate::sync_probe::sync_file(&file, &tmp)?;
         drop(file);
         std::fs::rename(&tmp, path)?;
         Ok(())
@@ -1444,7 +1447,7 @@ fn recover_wal(file: &mut File, path: &Path) -> Result<()> {
             file.seek(SeekFrom::Start(id as u64 * PAGE_SIZE as u64))?;
             file.write_all(&page)?;
         }
-        file.sync_all()?;
+        crate::sync_probe::sync_file(file, &file_of_wal(path))?;
     }
     remove_wal(path)?;
     sync_parent_dir(path)
