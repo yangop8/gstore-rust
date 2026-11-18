@@ -104,6 +104,23 @@ fn every_package_installs_exactly_the_binary_targets() {
         .filter(|l| l.contains("target/release/"))
         .collect();
     assert!(listed.is_empty(), "a hand-kept deb binary list: {listed:?}");
+    // The package description (`apt show gstore`) names the tools by hand:
+    // every binary target, as a whole word.
+    let deb_text = deb.join("\n");
+    let description = deb_text
+        .split("extended-description = \"\"\"")
+        .nth(1)
+        .and_then(|rest| rest.split("\"\"\"").next())
+        .expect("the deb's extended-description");
+    let words: BTreeSet<&str> = description
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .collect();
+    for b in &targets {
+        assert!(
+            words.contains(b.as_str()),
+            "the deb's description does not name {b}"
+        );
+    }
 
     // The rpm: one /usr/bin asset per binary target, nothing else there.
     let rpm = table(&toml, "[package.metadata.generate-rpm]");
