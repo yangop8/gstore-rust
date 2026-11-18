@@ -253,6 +253,21 @@ impl Audit {
             let before = self.before.get(rel);
             let same_object = before.is_some_and(|b| b.id == node.id && b.dir == node.dir);
             if node.dir {
+                // Entries that are not audited at all (an exemption's whole
+                // tree, e.g. a log directory) are left out on every side.
+                let audited = |entries: BTreeMap<OsString, Option<FileId>>| {
+                    entries
+                        .into_iter()
+                        .filter(|(n, _)| {
+                            let path = rel.join(n);
+                            let as_dir = PathBuf::from(format!("{}/", path.display()));
+                            !exempt.iter().any(|x| {
+                                x.covers(&path, How::Unaudited) || x.covers(&as_dir, How::Unaudited)
+                            })
+                        })
+                        .collect::<BTreeMap<_, _>>()
+                };
+                let without_locks = |e| audited(without_locks(e));
                 let entries = without_locks(node.entries.clone());
                 // Entries gone since a state that may come back after a
                 // power cut, harmlessly: a recovered leftover, or what an
@@ -276,10 +291,15 @@ impl Audit {
                 }
                 match last(&[SyncKind::Dir], node.id) {
                     None => problems.push(format!(
-                        "directory {shown}: its entries changed but it was never synced"
+                        "directory {shown}: its entries changed but it was never synced \
+                         (before: {:?}, now: {:?})",
+                        before.map(|b| without_locks(b.entries.clone())
+                            .into_keys()
+                            .collect::<Vec<_>>()),
+                        entries.keys().collect::<Vec<_>>()
                     )),
                     Some(e) => {
-                        let synced = benign(without_locks(e.entries.iter().cloned()));
+                        let synced = benign(without_locks(e.entries.iter().cloned().collect()));
                         if synced != entries {
                             problems.push(format!(
                                 "directory {shown}: its entries changed after its last sync \
@@ -1010,6 +1030,64 @@ fn the_api_server_syncs_updates_and_commits_before_it_acknowledges() {
             );
         }
     }
+    server.shutdown();
+    serving.join().unwrap();
+}
+
+/// The server's own logs (under `root/`): appended, not commit points.
+const SERVER_LOGS: [Exempt; 2] = [
+    Exempt {
+        prefix: "root/access.log",
+        how: How::Unaudited,
+        why: "the access log: appended, never acknowledged as durable",
+    },
+    Exempt {
+        prefix: "root/logs/",
+        how: How::Unaudited,
+        why: "the query and API logs: appended, never acknowledged as durable",
+    },
+];
+
+/// A server's backups, REST `/backup` and the `/api` `backup` operation: the
+/// backup (its files, its directory's own entry, the backups directory's)
+/// is durable before the server answers success.
+#[test]
+fn the_api_server_syncs_a_backup_before_it_acknowledges() {
+    let tmp = TmpDir::new("api_backup");
+    let root = tmp.path().join("root");
+    let mut cfg = gstore::config::GStoreConfig::default();
+    cfg.ip_deny_path = None;
+    let server = Arc::new(
+        gstore::http_api::ApiServer::bind(&root, "pw", "127.0.0.1:0")
+            .unwrap()
+            .with_config(cfg),
+    );
+    let addr = server.local_addr().unwrap();
+    let s2 = Arc::clone(&server);
+    let serving = thread::spawn(move || s2.serve_forever());
+    let (s, b) = request(
+        addr,
+        "POST",
+        "/build?db_name=bak&layout=disk",
+        Some(ROOT),
+        BASE,
+    );
+    assert_eq!(s, 200, "build: {b}");
+    let audit = Audit::begin(tmp.path());
+    let (s, b) = request(addr, "POST", "/backup?db_name=bak", Some(ROOT), "");
+    assert_eq!(s, 200, "REST /backup: {b}");
+    audit.finish("REST /backup", &SERVER_LOGS);
+    let audit = Audit::begin(tmp.path());
+    let (s, b) = request(
+        addr,
+        "POST",
+        "/api",
+        None,
+        r#"{"operation":"backup","db_name":"bak","username":"root","password":"pw"}"#,
+    );
+    assert_eq!(s, 200, "/api backup: {b}");
+    assert!(b.contains("\"StatusCode\":0"), "/api backup: {b}");
+    audit.finish("/api backup", &SERVER_LOGS);
     server.shutdown();
     serving.join().unwrap();
 }

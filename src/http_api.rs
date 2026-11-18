@@ -6975,8 +6975,10 @@ impl ApiInner {
                     .ok()
                     .as_deref()
                     == Some(name.as_str());
-            let backed_up = fs::create_dir_all(&path)
-                .map_err(GStoreError::from)
+            // The new directory's entry (and the backups directory's)
+            // durably (review tests-b#3: the fsync audit found they were
+            // not).
+            let backed_up = crate::db::fsutil::create_dir_durable(&path)
                 .and_then(|()| mark_backup_started(&path, &name))
                 .and_then(|()| {
                     #[cfg(test)]
@@ -8003,7 +8005,9 @@ fn backup_target(
     name: &str,
     requested: Option<&str>,
 ) -> Result<(PathBuf, BackupClaim), Resp> {
-    if let Err(e) = fs::create_dir_all(backup_dir) {
+    // Durably (review tests-b#3: the fsync audit found the backup
+    // directory's entry was not).
+    if let Err(e) = crate::db::fsutil::create_dir_durable(backup_dir) {
         return Err(Resp::fail(
             500,
             &format!("backup failed: cannot create the backup directory: {e}"),
